@@ -24,6 +24,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
+from volsto.analytics.conditional_variance import mean_and_stderr, pair_average, ratio_of_means
 from volsto.analytics.forward_smile import (
     ForwardSmile,
     forward_ratio,
@@ -37,10 +38,12 @@ from volsto.market.dupire import LocalVolSurface
 from volsto.market.surface import SSVISurface
 from volsto.models.base import Model
 from volsto.models.localvol import LocalVol
-from volsto.products.base import Product
+from volsto.products.base import Product, daily_schedule
 from volsto.products.cliquet import AdditiveCliquet
+from volsto.products.conditional_variance import DownVar, KnockOutVarianceSwap, UpVar
 from volsto.products.forward_start import ForwardStartOption
 from volsto.products.variance import VarianceSwap, VolSwap
+from volsto.products.vko import VolKnockOutPut
 
 log = logging.getLogger(__name__)
 
@@ -73,8 +76,22 @@ def headline_models(
     spec_2f: CalibrationSpec | None,
     *,
     omegas: Sequence[float] = HEADLINE_OMEGAS,
+    n_particles: int | None = None,
 ) -> tuple[dict[str, Model], SSVISurface]:
-    """Pure LV plus the calibrated LSV models (cache hits or fresh calibrations)."""
+    """Pure LV plus the calibrated LSV models (cache hits or fresh calibrations).
+
+    ``n_particles`` overrides the specs' particle count: production numbers (headline tables,
+    regression baselines, viewer precompute) use 8·10⁵ with a single seed (owner decision at
+    M4b acceptance), development paths keep the specs' 2·10⁵.
+    """
+    if n_particles is not None:
+        base_1f = dataclasses.replace(
+            base_1f, particle=dataclasses.replace(base_1f.particle, n_particles=n_particles)
+        )
+        if spec_2f is not None:
+            spec_2f = dataclasses.replace(
+                spec_2f, particle=dataclasses.replace(spec_2f.particle, n_particles=n_particles)
+            )
     _, surface, _ = build_market(base_1f)
     models: dict[str, Model] = {
         LV_NAME: LocalVol(LocalVolSurface.from_implied(surface, base_1f.local_vol))
@@ -116,6 +133,24 @@ class HeadlineResult:
             ]
             cells += [f"{r[c]:.3f} ± {r[c + '_stderr']:.3f}" for c in cliquets]
             lines.append(f"| {r['model']} | " + " | ".join(cells) + f" | {r['wall_s']:.0f} |")
+        if "upvar_100" in t.columns:
+            lines += [
+                "",
+                "| model | up-var B=100% (fair vol) | down-var B=100% | KO var B=110% | P(KO) | "
+                "VKO 12m 100% put @30% (% notional) | VKO discount | P(KO) |",
+                "|---|---|---|---|---|---|---|---|",
+            ]
+            for _, r in t.iterrows():
+                lines.append(
+                    f"| {r['model']} | {r['upvar_100'] * 100:.2f} ± "
+                    f"{r['upvar_100_stderr'] * 100:.2f}"
+                    f" | {r['downvar_100'] * 100:.2f} ± {r['downvar_100_stderr'] * 100:.2f}"
+                    f" | {r['kovar_110'] * 100:.2f} ± {r['kovar_110_stderr'] * 100:.2f}"
+                    f" | {r['kovar_110_p_ko']:.3f} ± {r['kovar_110_p_ko_stderr']:.3f}"
+                    f" | {r['vko_30']:.3f} ± {r['vko_30_stderr']:.3f}"
+                    f" | {r['vko_30_discount']:.3f} ± {r['vko_30_discount_stderr']:.3f}"
+                    f" | {r['vko_30_p_ko']:.3f} ± {r['vko_30_p_ko_stderr']:.3f} |"
+                )
         w = self.wing
         names = [c[:-4] for c in w.columns if c.endswith("_vol")]
         lines += [
@@ -142,8 +177,15 @@ def run_headline(
     strikes: Sequence[float] = HEADLINE_STRIKES,
     cliquet_maturities: Sequence[float] = (1.0, 2.0),
     per_year: int = 252,
+    conditional: bool = True,
+    vko_barrier: float = 0.30,
 ) -> HeadlineResult:
-    """Price the headline set for every model on one path set each (same seed across models)."""
+    """Price the headline set for every model on one path set each (same seed across models).
+
+    With ``conditional`` (M4c) the set also carries the 1y daily up-var and down-var swaps at
+    B = 100% of spot, the 1y up-and-out KO variance swap at B = 110% (fair vols, P(KO)) and the
+    12m 100% VKO put at ``vko_barrier`` (price in % of notional, ratio to the vanilla put, P(KO)).
+    """
     rows = []
     smiles: dict[str, ForwardSmile] = {}
     for name, model in models.items():
@@ -158,7 +200,30 @@ def run_headline(
         products.append(VarianceSwap([t1, t2], 0.0, discount, use_simulation_grid=True))
         products.append(VolSwap.daily(t2, 0.0, discount, start=t1, per_year=per_year))
         products += [AdditiveCliquet.study(T, discount) for T in cliquet_maturities]
-        res = MonteCarlo(sim).price_many(products, model)
+        n_base = len(products)
+        cond: dict[str, Product] = {}
+        if conditional:
+            times_d = daily_schedule(1.0, per_year)
+            spot = model.spot
+            up = UpVar(times_d, spot, 0.0, discount)
+            down = DownVar(times_d, spot, 0.0, discount)
+            ko = KnockOutVarianceSwap(times_d, 1.1 * spot, 0.0, discount)
+            # notional 1/spot: prices as a fraction of the (spot) notional, reported in %
+            vko = VolKnockOutPut(spot, 1.0, vko_barrier, times_d, discount, notional=1.0 / spot)
+            cond = {
+                "up_acc": up.leg("accrued"),
+                "up_cnt": up.leg("count"),
+                "down_acc": down.leg("accrued"),
+                "down_cnt": down.leg("count"),
+                "ko_acc": ko.leg("accrued"),
+                "ko_cnt": ko.leg("count"),
+                "ko_ko": ko.leg("ko"),
+                "vko": vko,
+                "vko_van": vko.vanilla(),
+                "vko_ko": vko.leg("ko"),
+            }
+            products += list(cond.values())
+        res = MonteCarlo(sim).price_many(products, model, keep_payoffs=conditional)
         n_k = ks.size
         df = float(discount.df(t2))
         smile = forward_smile_from_prices(t1, t2, f_r, ks, cps, res[:n_k], df, sim.n_paths)
@@ -175,10 +240,29 @@ def run_headline(
             "volswap_vol": res[n_k + 1].mean / df,
             "volswap_vol_stderr": res[n_k + 1].stderr / df,
         }
-        for T, r in zip(cliquet_maturities, res[n_k + 2 :], strict=True):
+        for T, r in zip(cliquet_maturities, res[n_k + 2 : n_base], strict=True):
             tag = f"cliquet_{T:g}y"
             row[tag] = 100.0 * r.mean
             row[tag + "_stderr"] = 100.0 * r.stderr
+        if conditional:
+            pay = {
+                name: pair_average(np.asarray(res[n_base + j].payoffs), sim.antithetic)
+                for j, name in enumerate(cond)
+            }
+            for tag, acc, cnt in (
+                ("upvar_100", "up_acc", "up_cnt"),
+                ("downvar_100", "down_acc", "down_cnt"),
+                ("kovar_110", "ko_acc", "ko_cnt"),
+            ):
+                k2, se2 = ratio_of_means(pay[acc], pay[cnt])
+                row[tag] = float(np.sqrt(k2))
+                row[tag + "_stderr"] = se2 / (2.0 * float(np.sqrt(k2)))
+            row["kovar_110_p_ko"], row["kovar_110_p_ko_stderr"] = mean_and_stderr(pay["ko_ko"])
+            price, van = pay["vko"], pay["vko_van"]
+            row["vko_30"], row["vko_30_stderr"] = (100.0 * x for x in mean_and_stderr(price))
+            ratio, se_ratio = ratio_of_means(price, van)
+            row["vko_30_discount"], row["vko_30_discount_stderr"] = ratio, se_ratio
+            row["vko_30_p_ko"], row["vko_30_p_ko_stderr"] = mean_and_stderr(pay["vko_ko"])
         row["wall_s"] = time.perf_counter() - t0
         rows.append(row)
         log.info("%s: %s", name, row)

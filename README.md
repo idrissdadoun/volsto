@@ -12,7 +12,8 @@ repricing diagnostics and the content-addressed leverage cache (M3); the Histori
 option-chain importer and SSVI/eSSVI fitter (M3b); forward-start options, the FVA, the cliquet
 family with exact decompositions, forward-smile analytics and the headline study runner (M4);
 the second-order SV spot step, the adaptive particle-regression grid and the restored
-1/1460–1/365–1/250 schedule (M4b).
+1/1460–1/365–1/250 schedule (M4b); conditional / corridor / knock-out variance swaps and the
+volatility knock-out put with production-count (8e5-particle) headline baselines (M4c).
 
 ## Install
 
@@ -123,7 +124,7 @@ lookup inside a step uses the slice at the step start.  A single calibration wit
 particles carries ±0.035 vol points of seed noise per variance-swap pillar; use seed averages or
 8·10⁵ particles for production figures (SPEC §4.2, M4b notes).
 
-## Forward-start products and forward-smile analytics (M4)
+## Forward-start, conditional-variance and VKO products (M4, M4c)
 
 `ForwardStartOption` pays `(cp (S_T2/S_T1 − k))⁺` (book §3.1; `k` is a moneyness, `t1 = 0` and
 a deferred pay date are allowed), `ForwardStartStraddle`, `FVA` (the forward-start ATM-forward
@@ -132,6 +133,14 @@ straddle less its Black premium at the agreed vol, so the fair strike is the for
 monthly 2%-capped, zero-floored structure), `ReverseCliquet` and `Napoleon`.  `decompose()` on
 the cliquets returns cash + a strip of forward-start calls (long at `1 + LF`, short at `1 + LC`)
 + a put / call on the accumulated sum (`AccumulatedSumOption`); the identity holds path by path.
+
+`ConditionalVarianceSwap` (`UpVar` / `DownVar` desk helpers: accrue where the spot is above or
+below a barrier on the previous, current or both closes; conditional or corridor convention),
+`ConvexitySpread`, `KnockOutVarianceSwap` (up-and-out, close-to-close, variant b) and
+`VolKnockOutPut` (put alive only if the life realised vol ends below the vol barrier) reuse the
+fixing-date realised variance; `volsto.analytics.conditional_variance` gives their fair strikes
+with delta-method errors, the LSV-minus-LV differential and the VKO report (price, discount to
+the vanilla put, P(KO)).
 
 `volsto.analytics.forward_smile` inverts out-of-the-money forward-start prices with the model's
 own forward ratio `F(T2)/F(T1)` (`forward_smile`, `forward_atm_vol`), prices the forward ATM
