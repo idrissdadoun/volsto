@@ -1,6 +1,8 @@
 """Closed forms and semi-analytic tools (SPEC §3.3, §7).
 
-The mixing solution lives in :mod:`volsto.analytics.mixing` (imported explicitly: it depends on
+The mixing solution lives in :mod:`volsto.analytics.mixing`, the smile-dynamics analytics in
+:mod:`volsto.analytics.smile_dynamics` / :mod:`volsto.analytics.var_decomp` and the VIX check in
+:mod:`volsto.analytics.vix` (all imported explicitly: they depend on
 the Bergomi model, which itself uses the closed forms here)."""
 
 from __future__ import annotations
