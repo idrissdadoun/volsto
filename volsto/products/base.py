@@ -99,8 +99,11 @@ class Product(ABC):
 
     def aged(self, dt: float) -> Product:
         """The same contract seen ``dt`` years later with the state held (theta, fixing risk):
-        every fixing after ``dt`` moves earlier by ``dt``; a fixing inside ``(0, dt]`` raises
-        because the product would have fixed in the roll window (SPEC v2 §7.3)."""
+        every fixing after ``dt`` moves earlier by ``dt``; a contractual fixing inside ``(0, dt]``
+        raises because the product would have fixed in the roll window (SPEC v2 §7.3).  Barrier
+        *monitoring* dates inside ``(0, dt]`` are not fixings: they were observed at the held
+        spot and drop out, ``t = 0`` stays (M6 convention shared by the barrier and autocall
+        products, so daily-monitored contracts can be aged by one business day)."""
         raise NotImplementedError(f"{type(self).__name__} cannot be aged")
 
     @abstractmethod
@@ -119,6 +122,8 @@ class Portfolio(Product):
         self.weights = [1.0] * len(self.legs) if weights is None else [float(w) for w in weights]
         if len(self.weights) != len(self.legs):
             raise ValueError("one weight per leg")
+        # a continuous-barrier leg needs every simulation step recorded (M6)
+        self.requires_all_steps = any(leg.requires_all_steps for leg in self.legs)
 
     @property
     def fixing_times(self) -> FloatArray:

@@ -2,6 +2,14 @@
 
 from __future__ import annotations
 
+from volsto.market.barrier_bs import (
+    bs_barrier_price,
+    bs_digital_price,
+    bs_hit_discount,
+    bs_hit_probability,
+    bs_no_touch_price,
+    bs_one_touch_price,
+)
 from volsto.market.bs import (
     black_price,
     black_vega,
@@ -35,8 +43,14 @@ __all__ = [
     "SSVISurface",
     "black_price",
     "black_vega",
+    "bs_barrier_price",
     "bs_delta",
+    "bs_digital_price",
     "bs_gamma",
+    "bs_hit_discount",
+    "bs_hit_probability",
+    "bs_no_touch_price",
+    "bs_one_touch_price",
     "bs_price",
     "bs_rho",
     "bs_theta",

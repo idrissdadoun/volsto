@@ -5,7 +5,7 @@ studies: Black–Scholes, Dupire local vol, two-factor lognormal Bergomi forward
 LSV with particle-calibrated leverage, Monte Carlo with common random numbers, and viewers over a
 precomputed parameter cache.  The full design is in [SPEC.md](SPEC.md).
 
-Status: **M5** — market layer, BS, local vol, MC engine, vanilla / variance products (M1); the
+Status: **M6 (in progress)** — market layer, BS, local vol, MC engine, vanilla / variance products (M1); the
 two-factor lognormal Bergomi forward-variance model with exact factor stepping, its closed forms
 and the mixing-solution smile (M2); particle-method leverage calibration, the LSV model, §4.2
 repricing diagnostics and the content-addressed leverage cache (M3); the HistoricalData.net
@@ -17,6 +17,10 @@ volatility knock-out put with production-count (8e5-particle) headline baselines
 leverage cache, five delta regimes, vega variants, theta split, vega-T waves, forward-variance /
 skew / curvature ladders, spot and cliquet gamma profiles, parameter sensitivities, product risks,
 likelihood-ratio / conditional / control-variate estimators, P&L attribution and `RiskReport`.
+M6: barrier machinery (discrete and Brownian-bridge continuous monitoring, barrier shift,
+Reiner–Rubinstein closed forms), autocall / Phoenix notes with exact leg decompositions and
+analytics, and a 1F LSV ADI PDE cross-check; the calibration-side pass (Part 0) is measured and
+stopped for the owner's decision (SPEC §4.2 M6 Part 0 notes).
 
 ## Install
 
@@ -151,6 +155,25 @@ vol, the forward variance swap and the forward vol swap on one path set
 (`forward_vol_comparison`) and lays forward smiles of several models side by side
 (`put_wing_table`).  `scripts/m4_headline.py` (`volsto.studies.m4`) reproduces the M4 headline
 table: LV and the 1F LSV for ω = 1, 2, 3 and the 2F Table 8.2 set on the reference surface.
+
+## Barriers, autocalls and the PDE cross-check (M6)
+
+```python
+from volsto.products import Autocall, KnockOutOption, Digital
+from volsto.analytics import autocall_report
+from volsto.pde import LSV1FPDE
+
+ko = KnockOutOption(100.0, 1.0, "call", 90.0, "down", disc, monitoring="continuous")  # bridge weights
+note = Autocall([1.0, 2.0, 3.0], disc, spot_reference=100.0, coupons=0.06, ki_level=0.6,
+                ki_type="european", ki_monitoring="discrete", final_redemption="knock_in")
+rep = autocall_report(note, model, sim)        # price, expected life, P(KI), legs, all with stderr
+pde = LSV1FPDE(lsv_model)                      # theta = 0 kernels; 400 x 121 grid, HV ADI
+print(pde.vanilla(100.0, 1.0, 1).price, pde.knock_out_call(100.0, 1.0, 90.0, "down").price)
+```
+
+Conventions are explicit arguments (`strict` for discrete barriers, `rebate_timing`, `survival`,
+`final_redemption`); every Monte Carlo number carries its standard error; the decompositions
+reprice path by path. Measured accuracies and the open conventions are in SPEC §6.8.
 
 ## Risk layer (M5)
 

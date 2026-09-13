@@ -5,6 +5,19 @@ the Bergomi model, which itself uses the closed forms here)."""
 
 from __future__ import annotations
 
+from volsto.analytics.autocall import (
+    AutocallReport,
+    autocall_probabilities,
+    autocall_report,
+    expected_life,
+    forward_skew_exposure,
+    ki_probability,
+    leg_attribution,
+    lsv_minus_lv_table,
+    skew_tent_perturbation,
+    skew_tent_slope,
+    state_model_factory,
+)
 from volsto.analytics.bergomi import (
     alpha_theta,
     atmf_skew_order1,
@@ -45,6 +58,7 @@ from volsto.analytics.forward_smile import (
 )
 
 __all__ = [
+    "AutocallReport",
     "FairStrike",
     "ForwardSmile",
     "ForwardVolComparison",
@@ -53,24 +67,34 @@ __all__ = [
     "alpha_theta",
     "atmf_skew_order1",
     "atmf_skew_order1_flat",
+    "autocall_probabilities",
+    "autocall_report",
     "chi",
     "cov_x_diag",
     "cov_xi_diag",
     "eta_u",
+    "expected_life",
     "fair_strike",
     "forward_atm_vol",
     "forward_ratio",
+    "forward_skew_exposure",
     "forward_smile",
     "forward_smile_from_prices",
     "forward_vol_comparison",
     "forward_vs_vol_of_vol_flat",
+    "ki_probability",
+    "leg_attribution",
     "lsv_minus_lv",
+    "lsv_minus_lv_table",
     "mean_and_stderr",
     "pair_average",
     "put_wing_table",
     "ratio_of_means",
+    "skew_tent_perturbation",
+    "skew_tent_slope",
     "ssr_order1",
     "ssr_order1_flat",
+    "state_model_factory",
     "strike_differential",
     "var_integrated_variance",
     "vko_analysis",

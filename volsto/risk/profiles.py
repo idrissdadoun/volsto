@@ -11,7 +11,8 @@ cached) and give the price only.  ``gamma_fd`` is the second difference of the p
 fixing ``t_j`` as a function of the accumulated sum ``A_j`` (local-linear Gaussian-kernel
 regression of the payoff forward-valued to ``t_j`` on ``A_j`` over the simulated paths, the
 calibration's :func:`~volsto.calibration.particle.kernel_regression`), its second difference in
-``A_j`` (the gamma profile of the study), and the Bachelier cross-check of the study: with the
+``A_j`` (the gamma profile of the study), and the Bachelier cross-check of the study — an
+approximation, never exact under Black–Scholes (owner's correction at the M5 review): with the
 remaining capped returns independent under Black–Scholes, the remaining sum has mean ``μ = Σ
 E[clip(r_i)]`` and variance ``s² = Σ Var[clip(r_i)]`` (exact per-leg moments by Gauss–Hermite
 quadrature) and, treating it as Gaussian, ``E[max(GF, A + Σ)] = GF + (A + μ − GF) N(d) + s φ(d)``,

@@ -28,7 +28,8 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
+from collections.abc import Sequence
+from dataclasses import dataclass, field
 
 import numpy as np
 from numpy.typing import NDArray
@@ -217,6 +218,9 @@ class CalibrationResult:
     bandwidths: FloatArray
     wall_time: float
     passes: int
+    #: particle clouds ``(log_spot, factors)`` at requested slice times (diagnostics: the
+    #: pricing kernel must reproduce them to 1e-12 on the calibration grid, M6 Part 0)
+    snapshots: dict[float, tuple[FloatArray, FloatArray]] = field(default_factory=dict)
 
     def __repr__(self) -> str:
         return (
@@ -252,8 +256,13 @@ def calibrate_leverage(
     *,
     local_vol_cfg: LocalVolConfig | None = None,
     local_vol: LocalVolSurface | None = None,
+    snapshot_times: Sequence[float] | None = None,
 ) -> CalibrationResult:
     """Calibrate ``L(t, S)`` so that the LSV model reprices ``surface`` (SPEC §4.1).
+
+    ``snapshot_times``: the particle cloud (last pass) is stored at the grid time nearest each
+    requested time (``CalibrationResult.snapshots``, keyed by the actual grid time) — a
+    diagnostic hook, no effect on the calibration.
 
     ``sim`` supplies the step schedule and scheme shared with pricing; ``cfg`` the particle
     settings.  ``local_vol`` may be passed to reuse a Dupire surface (its ``k`` grid becomes the
@@ -296,6 +305,12 @@ def calibrate_leverage(
     results: list[LeverageFunction] = []
     bandwidths = np.empty(n_steps)
     final_ls = final_fac = None
+    snap_idx: dict[int, float] = {}
+    if snapshot_times:
+        for ts in snapshot_times:
+            j_snap = int(np.argmin(np.abs(times - float(ts))))
+            snap_idx[j_snap] = float(times[j_snap])
+    snapshots: dict[float, tuple[FloatArray, FloatArray]] = {}
     n_pass = 2 if cfg.second_pass else 1
     for p in range(n_pass):
         seed = cfg.seed + p
@@ -342,6 +357,8 @@ def calibrate_leverage(
             bandwidths[j] = h
             ev = conditional_variance_estimate(k, v, k_grid, h, cfg)
             L[j + 1] = np.clip(np.sqrt(target_var(j + 1) / ev), cfg.l_min, cfg.l_max)
+            if j + 1 in snap_idx:
+                snapshots[snap_idx[j + 1]] = (ls.copy(), fac.copy())
         final_ls, final_fac = ls, fac
         results.append(
             LeverageFunction(
@@ -366,4 +383,4 @@ def calibrate_leverage(
     assert final_ls is not None and final_fac is not None
     wall = time.perf_counter() - t_start
     lev.metadata["wall_time"] = wall
-    return CalibrationResult(lev, grid, final_ls, final_fac, bandwidths, wall, n_pass)
+    return CalibrationResult(lev, grid, final_ls, final_fac, bandwidths, wall, n_pass, snapshots)

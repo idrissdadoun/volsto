@@ -357,11 +357,21 @@ def realised_variance_exposure(
             seg = ls[:, c_lo : c_hi + 1] - ls[:, [c_lo]]
             tail = ls[:, [c_hi]] - ls[:, [c_lo]]
             vals = []
+            sq = paths.sum_sq
+            sq_seg = sq[:, c_lo : c_hi + 1] - sq[:, [c_lo]]
+            sq_tail = sq[:, [c_hi]] - sq[:, [c_lo]]
             for s in (1.0 + eps, 1.0 - eps):
                 mod = ls.copy()
                 mod[:, c_lo : c_hi + 1] = ls[:, [c_lo]] + s * seg
                 mod[:, c_hi + 1 :] = ls[:, c_hi + 1 :] + (s - 1.0) * tail
-                vals.append(product.payoff(dataclasses.replace(paths, log_spot=mod), idx))
+                # the squared-increment accumulator follows the same homothety (the barrier
+                # products check it against the recorded log-returns, M6)
+                sq_mod = sq.copy()
+                sq_mod[:, c_lo : c_hi + 1] = sq[:, [c_lo]] + s * s * sq_seg
+                sq_mod[:, c_hi + 1 :] = sq[:, c_hi + 1 :] + (s * s - 1.0) * sq_tail
+                vals.append(
+                    product.payoff(dataclasses.replace(paths, log_spot=mod, sum_sq=sq_mod), idx)
+                )
             num_parts[b].append(vals[0] + vals[1] - 2.0 * base)
             r2 = np.diff(ls[:, cols[lo : hi + 1]], axis=1) ** 2
             den_parts[b].append(np.sum(r2, axis=1))
