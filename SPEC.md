@@ -1,6 +1,7 @@
 # volsto — Stochastic-volatility pricing library for light-exotic and exotic parameter studies
 
-Specification v1.1 — 13 September 2026 (v1.1: §3.3/§4.4 aligned to Bergomi's book notation and equation numbers)
+Specification v2.0 — 14 September 2026
+Consolidates v1.1 plus every addendum agreed during M1–M4 (scheme, calibration, importer, products, risk layer M5, fitting M7). Where a number here conflicts with a measured value already recorded in the repository's SPEC.md by the implementer, the measured value wins; where a definition conflicts, this document wins. §17 lists the changes.
 Owner: Idriss (hybrid trading desk). Implementer: Claude Code.
 
 ---
@@ -22,7 +23,7 @@ In scope for v1:
 
 Explicitly deferred: multi-asset / worst-of, discrete cash dividends, jumps, stochastic rates, adjoint Greeks. Design so that these can be added without changing the product interface (see §3 on path containers).
 
-Language and stack: Python 3.11+, numpy, scipy, numba (path loop and kernel regression), pandas, pyarrow (cache), plotly + streamlit (viewers), pytest, pyyaml. No pandas inside numba kernels. Type hints everywhere. No global state.
+Language and stack: Python 3.12+ (numpy ≥ 2.5 dropped 3.11), numpy, scipy, numba (path loop and kernel regression), pandas, pyarrow (cache), plotly + streamlit (viewers), pytest, pyyaml. No pandas inside numba kernels. Type hints everywhere. No global state.
 
 ---
 
@@ -36,6 +37,7 @@ volsto/
     __init__.py
     config.py            # dataclasses + YAML loading/validation for every config object
     market/
+      import_hdn.py      # HistoricalData.net EOD chain importer (§13)
       curves.py          # discount factors, forward curve (r, q) — piecewise-flat and interpolated
       surface.py         # ImpliedSurface ABC; SSVISurface; GridSurface (market slices)
       dupire.py          # local vol from total-variance surface (Gatheral formula)
@@ -52,6 +54,9 @@ volsto/
     calibration/
       particle.py        # particle method for L(t,S)
       diagnostics.py     # repricing error vs target surface at pillars, var-swap check
+      history.py         # historical estimators from a surface history (§15)
+      fit_2f.py          # staged fit of the 2F parameters (§15)
+      stability.py       # rolling refits and identifiability diagnostics (§15)
       cache.py           # content-addressed cache of calibrated leverage functions
       ssr.py             # skew-stickiness ratio estimator and 2F fitting helpers
     engine/
@@ -66,6 +71,8 @@ volsto/
       forward_start.py
       variance.py        # VarianceSwap, VolSwap, FVA, forward variance swap
       cliquet.py         # additive, local cap/floor, global floor/cap, reverse, Napoleon
+      conditional_variance.py  # up/down var, convexity spread, KO var (§6.1)
+      vko.py             # volatility knock-out put (§6.2)
       autocall.py        # single-underlying autocall, Phoenix (memory), KI put decomposition
       barrier.py         # discrete/continuous KI/KO, barrier shift, digital
     risk/
@@ -74,6 +81,9 @@ volsto/
       profiles.py        # spot-shift and gamma profiles
       volsto_sens.py     # sensitivities to (omega, theta, k1, k2, rho...) with recalibration
       attribution.py     # P&L explain
+      engine.py          # BumpSpec / RiskEngine / RiskReport (§7.1, §7.13)
+      product_risk.py    # fixing, barrier and realised-variance risks (§7.10)
+      estimators.py      # likelihood-ratio, conditional and control-variate Greeks (§7.11)
     hedging/
       instruments.py     # hedge instruments priced under a pricing model
       hedger.py          # rebalancing loop, realised-world model, P&L distribution
@@ -82,9 +92,13 @@ volsto/
       forward_smile.py   # forward-start implied smiles, forward ATM vol vs forward var swap
       smile_dynamics.py  # conditional smile after spot move, SSR, vol-of-vol term structure
       var_decomp.py      # Var(V) decomposition (predictable at T1 vs within-period), closed forms
+      conditional_variance.py  # LSV-minus-LV fair strikes vs parameters (§6.1)
+      vix.py             # VIX futures/options by 2D quadrature in the 2F model (§15 Part 5)
+      mixing.py          # mixing solution for pure-SV vanilla smiles (ch. 8 App. A)
     pde/
       lsv1f.py           # 2D finite-difference pricer for the 1F degenerate case (validation only)
     studies/
+      m4.py              # headline study runner behind the M4/M4b tables (implemented)
       runner.py          # run a study from YAML, write parquet + LaTeX tables + figures
       latex.py
     viewers/
@@ -113,14 +127,16 @@ volsto/
 
 `SSVISurface(theta_T, rho, phi)` — Gatheral–Jacquier SSVI: `w(k,T) = θ_T/2 · (1 + ρ φ(θ_T) k + sqrt((φ(θ_T) k + ρ)² + 1 − ρ²))`, with `φ(θ) = η / (θ^γ (1+θ)^(1−γ))` (power-law) and `θ_T` an interpolated ATM total variance term structure. Must implement the no-arbitrage checks (`θφ(θ)(1+|ρ|) < 4`, `θφ(θ)²(1+|ρ|) ≤ 4`) and raise on violation.
 
+`ESSVISurface` — SSVI with a per-pillar ρ_T (Hendriks–Martini conditions); the default for imported market surfaces (§13), since a single power-law φ cannot follow 1–2m index weeklies. Plain SSVI stays the default for synthetic surfaces.
+
 `GridSurface` — market slices (K or delta, T) with arbitrage-free interpolation in total variance (linear in `w` along `k`, linear in `w` along `T` at fixed `k`), extrapolation flat in implied vol beyond wings. Enough for feeding a Bloomberg export later.
 
 ### 2.3 Dupire local vol
 `LocalVolSurface.from_implied(surface)`:
-`σ_loc²(k,T) = ∂_T w / (1 − k/w ∂_k w + ¼(−¼ − 1/w + k²/w²)(∂_k w)² + ½ ∂_kk w)`, derivatives by central finite differences on the analytic SSVI (step sizes configurable), floored at a small positive value, and stored on a (T, k) grid with bilinear interpolation. Provide `check_positive()` diagnostic.
+`σ_loc²(k,T) = ∂_T w / (1 − k/w ∂_k w + ¼(−¼ − 1/w + k²/w²)(∂_k w)² + ½ ∂_kk w)`, derivatives by central finite differences on the analytic SSVI (step sizes configurable), floored at a small positive value, and stored on a (T, k) grid with bilinear interpolation: square-root-spaced t grid (400 points), k grid ±3.0 with dk = 0.0025 (measured: ±1.5 made 2y/3y variance swaps 0.08/0.22 vp low). Provide `check_positive()` diagnostic.
 
 ### 2.4 Variance swaps and ξ₀
-`varswap_strike(surface, T)`: log-contract replication `K_var(T) = (2/T) ∫ [P(K)/K² (K<F) + C(K)/K² (K>F)] e^{rT} dK`, adaptive quadrature in `k` with wide bounds. `xi0_curve(surface)`: forward variance `ξ₀(T) = d/dT [T · K_var(T)]`, computed on a fine T grid and interpolated; must be positive.
+`varswap_strike(surface, T)`: log-contract replication `K_var(T) = (2/T) ∫ [P(K)/K² (K<F) + C(K)/K² (K>F)] e^{rT} dK`, adaptive quadrature in `k` over `[−k_max, k_max]` with `k_max = max(25 σ_ATM √T, 3)` (measured: SSVI put wings decay slowly — `k_max = 2.4` at 1y truncated 0.01 vp on the reference surface, and a Dupire grid limited to ±1.5 priced the 2y/3y variance swaps 0.08/0.22 vp low). `xi0_curve(surface)`: forward variance `ξ₀(T) = d/dT [T · K_var(T)]` via a PCHIP interpolant of the strip so positivity and exact integration back to the strip hold by construction.
 
 ---
 
@@ -137,7 +153,13 @@ class Model(ABC):
 ```
 `PathSet` holds arrays of shape `(n_paths, n_times)` for `log_spot`, `V` (instantaneous variance), `factors` `(n_paths, n_times, n_factors)`, plus accumulated realised variance `∫V dt` and realised log-return sum-of-squares between consecutive fixing indices. Products access only `PathSet` and a `fixing_index` map from dates to columns. `PathSet` is written so that a second underlying can later be added as an extra leading axis without touching products.
 
-All simulation is log-Euler in the spot with the variance frozen over each step; factors are stepped exactly (§3.3). The spot step's variance is chosen by `SchemeConfig` (owner amendment after M1): time-averaged local/forward variance over the step (`local_var_time_average`), an optional weak predictor–corrector (`predictor_corrector`, drift θ = ½ with the Itô correction, diffusion weight `pc_eta`), or — the default — Platen's explicit weak order-2 step (`weak_order2`). Step sizes come from `SimConfig.dt_max`, a `StepSchedule` (default 1/2920 below 3m, 1/730 to 2y, 1/500 after since the pre-M4 amendment; the LSV step is first order in time and needed the halving, see §4.2) shared by pricing and calibration, with the union of fixing dates always included; `record_all_steps` records every grid step when a product needs the path between fixings.
+Factors are stepped exactly (§3.3). The spot step is Platen's explicit weak order-2 scheme by default (`scheme="weak2"`), with `log_euler`, `local_var_time_average` and `predictor_corrector` (Andersen θ = ½ with the Kloeden–Platen Itô drift correction) kept as options. Milstein is deliberately not offered: it raises strong, not weak, order and its correction term has zero mean. All leverage lookups within a step use the step-start slice of L ("frozen-L rule"), identically in the particle calibration and in pricing, through one shared stepping routine.
+
+Time grid: `StepSchedule` on `SimConfig`, a piecewise-constant dt schedule shared by engine and calibration. Default after M4b: 1/1460 for t < 3m, 1/365 to 2y, 1/250 beyond (the finer 1/2920–1/730–1/500 schedule was needed before the second-order SV step of M4b). The union of fixing dates is always included. `SimConfig.record_all_steps` / `Product.requires_all_steps` make every grid step a record column (Brownian-bridge barriers, short-horizon SSR estimator), with a chunk memory budget.
+
+Second-order SV spot step (M4b): exact factor increments with the intra-step spot/variance covariance (Andersen-type), removing the O(dt) error from freezing leverage and SV variance over the step; acceptance: on the coarse schedule, VS error ≤ 0.05 vp at every pillar 1m–3y for N = 2·10⁵ and 8·10⁵ particles, put wing ≤ 0.05 vp at 2 SE, 3y calibration ≈ 30 s. **Status (measured, §4.2 M4b notes):** accepted on seed averages — calibration 33 s at 2·10⁵ particles; variance swap within 0.05 vp at 1m–6m and 3y, −0.04 to −0.06 at 1y–2y; single runs at 2·10⁵ particles carry ±0.035 vp of particle-seed noise per pillar. The kernel's own step error at dt = 1/365 was ≤ 0.03 vp even with the frozen step (CRN refinement), so the second-order step's visible gains are on the pure SV model (1m: variance swap −0.06 → 0.00 vp, smile 0.14 vp flatter → within 0.03 vp of the mixing solution) while the calibrated-LSV improvements came from the calibration side.
+
+Implemented scheme switches (measured on the reference surface, 1m ATM, dt = 1/365, 200k paths): `SchemeConfig` / `SimConfig` expose boolean flags rather than a `scheme` string — `weak_order2` (default; +0.03 vp), `local_var_time_average` (time-averaged local/forward variance, +0.29 vp alone), `predictor_corrector` with `pc_eta` (θ = η = ½, +0.78 vp: it over-corrects the local-variance curvature 2×, kept as an option), `local_var_time_eval` (`"start"` / `"midpoint"`, diagnostic), plain log-Euler (+0.36 vp) when the first three are off, and `sv_order2` (default True, the M4b step; off = the frozen-variance step of M2/M3). `volsto.engine.refinement_study` measures such biases under common random numbers (Talay–Tubaro extrapolant).
 
 ### 3.2 Black–Scholes and local vol
 Trivial. Local vol uses `σ_loc(t, S_t)` interpolated on the grid.
@@ -214,22 +236,20 @@ Standard, QE scheme (Andersen). Comparison only; leverage on top optional.
 ## 4. Calibration
 
 ### 4.1 Particle method (Guyon–Henry-Labordère; book §12.2.5)
-Target: `L(t,S)² = σ_loc²(t,S) / E[V_t | S_t = S]`.
+Target: `L(t,S)² = σ_loc²(t,S) / E[V_t | S_t = S]`, with `L` stored in `k = ln(S/F(t))`.
 
-Algorithm, on the simulation time grid:
-1. At `t_0`, `L(0,S) = σ_loc(0,S)/sqrt(ξ_0^0)`.
-2. Step all `N` particles from `t_i` to `t_{i+1}` with the current `L(t_i, ·)`.
-3. At `t_{i+1}`, estimate `E[V | S]` by Nadaraya–Watson kernel regression in `ln S` (Gaussian or quartic kernel), bandwidth `h_i = c · σ_ref · sqrt(t_{i+1}) · N^{−1/5}` with `σ_ref` the ATM vol and a floor `h_min`; `c` default 1.5 (configurable). Evaluate on the leverage `ln S` grid; outside the particle cloud's 0.5%–99.5% quantiles hold `E[V|S]` flat.
-4. Set `L(t_{i+1}, S)` and continue.
+Algorithm on the shared `StepSchedule` with the shared spot step (frozen-L rule):
+1. `L(0,·) = σ_loc(0,·)/sqrt(ξ_0^0)`.
+2. Step all `N` particles with the current slice of `L`.
+3. Estimate `E[V | S]` at the new slice by **local-linear kernel regression in k with a plug-in ½h²m″ curvature correction**, evaluated on a 201-point grid spanning the particle cloud's trusted `[q, 1−q]` quantile range at each slice (adaptive since M4b; a fixed grid over the whole leverage range biased the short end low, §4.2) and interpolated onto the fine leverage grid (dk = 0.0025, the Dupire grid), with the ½h²m″ term differenced on a bandwidth-wide stencil; bandwidth `h = c·σ_ref·sqrt(t)·N^{−1/5}` with `c = 1.5` and a k-NN window floor of `max(2000, 0.01 N)` particles (so the tail bandwidth does not shrink with N); saturating log-quadratic tails outside the cloud. Nadaraya–Watson with flat tails remains an option (measured 0.27 vp max error vs 0.11 for the default; VS +0.34 vs +0.07).
+4. Set the new slice and continue. Optional second pass with a fresh seed, averaged.
 
-Numba `@njit(parallel=True)` for the kernel regression (O(N × n_grid); use sorted particles and a truncated kernel window to make it O(N + n_grid) when N is large). Default `N = 2·10⁵` particles, `dt = 1/365` up to 1y then 1/250, leverage `ln S` grid of 201 points spanning ±6 ATM standard deviations at the maturity.
-
-Optional second pass: re-run with the calibrated `L` and a fresh seed and average the two `L` surfaces (reduces particle noise).
+Defaults: `N = 2·10⁵`, leverage grid floor ±2.5 in k (±2.08 made 3y variance swaps 0.18 vp rich), 3y horizon. Timings at the M4b scheme: ≈ 30 s per 3y calibration; the §9 default grid (105 points) ≈ 1 h. Production numbers — headline tables, regression baselines, viewer precompute — use `N = 8·10⁵` with a single seed (owner decision at M4b acceptance; ≈ 124 s per 3y calibration, so the §9 grid ≈ 4 h); development and fast paths keep `2·10⁵`.
 
 Implementation notes (M3, measured on the reference surface, see `ParticleConfig`): the regression is local-linear rather than Nadaraya–Watson (NW carries the design bias `h² m′ f′/f`, which with `c = 1.5` skewed the ±10% repricing by 0.3 vol points), with a plug-in `½ h² m″` curvature correction (otherwise a −0.10 vp level bias at 1y), a 2000-particle window floor in the tails, and `E[V|S]` extrapolated beyond the trusted quantiles with a saturating log-quadratic (the flat rule mis-priced the 3m +30% call by 1 vp and variance swaps by 0.3 vp). `E[V|S]` is estimated on the 201-point grid and interpolated onto the fine leverage grid (dk = 0.0025, the Dupire grid) where `σ_loc²` is resolved. All lookups within a simulation step use `L(t_n, ·)` (frozen-leverage rule), identically in calibration and pricing.
 
 ### 4.2 Diagnostics
-`calibration/diagnostics.py`: reprice the target surface on a pillar grid (T ∈ {1m, 3m, 6m, 1y, 18m, 2y, 3y}, k ∈ ±{0, 0.05, 0.1, 0.2, 0.3}) with the calibrated LSV via MC (CRN, `n_paths ≥ 4·10⁵`), report implied-vol error in vol points with MC standard error, plus variance-swap strikes vs the replication values.
+`calibration/diagnostics.py`: `CalibrationReport` repricing the target surface on pillars T ∈ {1m, 3m, 6m, 1y, 18m, 2y, 3y} × k ∈ ±{0, 0.05, 0.1, 0.2, 0.3} via MC (CRN, `n_paths ≥ 4·10⁵`), implied-vol error in vol points with MC stderr, plus variance-swap strikes vs replication. Acceptance is noise-aware (an error fails only if it exceeds both the tolerance and 3 stderr) and bounded at 2.5 ATM standard deviations; the tolerances and the measured values are the table below (the slow test's gate is `CalibrationReport.passes(0.15 vp, T ≤ 2y, |k| ≤ 0.2, z = 3, max_std = 2.5)`); variance swaps ≤ 0.10 vp at every pillar, ≤ 0.05 targeted after M4b (met on seed averages except 1y–2y at −0.04 to −0.06, see the M4b notes). The 2F 1m +20% cell (a 3.4σ sub-basis-point option) sits outside the acceptance region.
 
 Acceptance table (updated after M1; pure local vol measured with the default scheme — Platen weak order 2 — and the default step schedule 1/1460 below 3m, 1/365 to 2y, 1/250 after; 800k paths; `tests/test_scheme.py`, `tests/test_surface.py`):
 
@@ -258,10 +278,10 @@ Implementation notes (M4b — second-order SV step; measured on the placeholder 
 | frozen, 1/2920–1/730–1/500 | −0.05 | −0.01 | 0.00 | −0.03 | −0.03 | −0.05 | +0.03 | −0.02 | +0.06 | +0.07 | +0.05 | +0.05 | 67 s |
 
 Single-run spread ±0.04 vp on the variance swap. The coarse schedule is the default again: it reprices as well on average at half the cost, and the halved schedule carries a systematic +0.05–0.08 vp ATM bias at 1y–3y with *either* step, i.e. the bias sits in the calibration at fine slices (the M3.2 record with the fixed regression grid had |ATM| ≤ 0.05 there), not in the spot step; its origin is open.
-5. *Acceptance against the §12 M4b criteria.* Calibration time: met (33 s at `N = 2·10⁵`, 124 s at `8·10⁵`). Variance swap ≤ 0.05 vp at every pillar: met on seed averages at 1m–6m and 3y, missed by 0.01 at 1y–2y (−0.04 to −0.06), and not met by single runs at `N = 2·10⁵` because of the ±0.04 noise; the `8·10⁵` single run (seed 12345) gives 1m–6m within 0.03, 1y–2y −0.05 to −0.06, 3y +0.02. Put wing at −20% / −30%, 1y–3y: within 0.05 vp + 2 SE at every pillar (excess over the LV pricing baseline ≤ 0.03). Open items: 1m ATM −0.06 vp (all seeds, both schedules), 3y ATM +0.06 on the coarse schedule, the fine-schedule long-end bias — all calibration-side; a seed-averaged (or `8·10⁵`) calibration is the recommendation for production numbers until they are resolved.
+5. *Acceptance against the §12 M4b criteria.* Calibration time: met (33 s at `N = 2·10⁵`, 124 s at `8·10⁵`). Variance swap ≤ 0.05 vp at every pillar: met on seed averages at 1m–6m and 3y, missed by 0.01 at 1y–2y (−0.04 to −0.06), and not met by single runs at `N = 2·10⁵` because of the ±0.04 noise; the `8·10⁵` single run (seed 12345) gives 1m–6m within 0.03, 1y–2y −0.05 to −0.06, 3y +0.02. Put wing at −20% / −30%, 1y–3y: within 0.05 vp + 2 SE at every pillar (excess over the LV pricing baseline ≤ 0.03). Open items, tagged **calibration-side pass before M6**: 1m ATM −0.06 vp (all seeds, both schedules), 3y ATM +0.06 on the coarse schedule, the fine-schedule long-end bias of +0.05 to +0.08 vp at 1y–3y. Owner's prescribed first diagnostic for that pass (M4b acceptance): calibrate `L` on the daily slice grid but simulate on the fine schedule with `L` interpolated linearly in `t` between slices; if the long-end bias disappears, the cause is regression bias compounding with the slice count and the fix is bandwidth/stencil scaling with the slice spacing, not the scheme — report before changing anything. Production convention (owner decision at M4b acceptance): headline tables, regression baselines and viewer precompute use `8·10⁵` particles with a single seed; development and fast paths keep `2·10⁵`; the M4 regression baseline is re-recorded once at `8·10⁵` in M4c with the particle count noted in the baseline file.
 
 ### 4.3 Cache
-Content-addressed: key = SHA-256 of (surface params, curves, model params, particle config, seed, code version tag). Store leverage `.npz` + diagnostics `.json` + a `manifest.parquet` row. `get_or_calibrate(cfg)` is the only entry point studies and viewers use. Calibration must never run silently inside a viewer; the viewer reads the cache and reports what is missing.
+Content-addressed: key = SHA-256 of (surface params, curves, model params, particle config, seed, calibration code tag). The code tag is manual (so the precompute is not invalidated by every commit); `code_tag_guard.json` stores hashes of the particle, leverage, LSV, Bergomi and local-vol modules and a test fails when they change without a tag bump. Store leverage `.npz` + diagnostics `.json` + a `manifest.parquet` row. `get_or_calibrate(cfg)` is the only entry point studies and viewers use. Calibration must never run silently inside a viewer; the viewer reads the cache and reports what is missing.
 
 ### 4.4 SSR and 2F fitting helpers
 Skew-stickiness ratio (book eq. 9.3 / 12.50):
@@ -284,11 +304,12 @@ Volatilities of ATMF volatilities: same state-bump partials, squared and combine
 
 ## 5. Monte Carlo engine
 
-- `TimeGrid.build(fixing_dates, dt_max, calibration_grid=None)`: union, sorted, with `fixing_index` map. When an LSV model is used the grid must contain the calibration time slices (or interpolate `L` in t — do the latter, linear in t).
+- `TimeGrid.build(fixing_dates, dt_max, calibration_grid=None)`: union, sorted, with `fixing_index` map. When an LSV model is used the grid contains the calibration time slices (`Model.required_times()`), so that the frozen-L rule of §3.1 applies identically in calibration and pricing; interpolating `L` linearly in `t` on a finer grid is the diagnostic prescribed for the calibration-side pass (§4.2 M4b notes), not the pricing rule.
 - `GaussianDraws(seed, n_paths, n_steps, n_brownians, antithetic=True)`: PCG64 generator; the same `(seed, path index, step, brownian index)` always gives the same normal so CRN bumps are exact. Generate in blocks to bound memory; `n_paths` default 2·10⁵, chunk 5·10⁴.
 - `MonteCarlo.price(product, model, grid, draws, cv=None) -> PriceResult(mean, stderr, n_paths, per_path_payoffs optional)`.
 - Control variates: vanilla with the same maturity (analytic BS price under the model's implied vol at that strike from the target surface — valid because the LSV reprices the surface) and variance swap (replication strike). Coefficient estimated on the sample; report variance reduction.
-- All results carry standard errors; the library never returns a bare float for a MC quantity.
+- All results carry standard errors; the library never returns a bare float for a MC quantity. `engine/stats.py` provides batch-means standard errors for variance-type statistics.
+- Realised-variance accumulators: `int_var` is a left-point Riemann sum (its exact discrete moments are exposed by `BergomiSV.integrated_variance_moments` for tests); realised variance of products is always the sum of squared log returns on **fixing** dates.
 
 ---
 
@@ -307,6 +328,32 @@ Volatilities of ATMF volatilities: same state-bump partials, squared and combine
 
 Every product has a `__repr__` that reads like a term sheet.
 
+### 6.1 Conditional and knock-out variance products (`products/conditional_variance.py`)
+Notation: daily closes `S_0..S_N` on the fixing schedule, `r_i = ln(S_i/S_{i−1})`, `A = 252`, barrier `B`, strike `K` quoted as a volatility, variance notional `N_var`.
+
+**ConditionalVarianceSwap(barrier, side, indicator, convention, strict=True, daily_cap=None).** `side` "up" (accrue where S > B) or "down" (S < B). `indicator` is required, never defaulted: `"prev"` I_i = 1{S_{i−1} in region}; `"curr"` I_i = 1{S_i in region}; `"both"` I_i = 1{S_{i−1} in region}·1{S_i in region}. Desk conventions: up-var "prev" (T−1) or "both" (T & T−1); down-var "curr" (T) or "both". `D = Σ I_i`.
+- conditional: `Payoff = N_var [ (A/N) Σ r_i² I_i − K² D/N ]`, zero if D = 0 (quoted as `(D/N)(σ_cond² − K²)` with `σ_cond² = (A/D) Σ r_i² I_i`).
+- corridor: `Payoff = N_var [ (A/N) Σ r_i² I_i − K² ]`.
+`strict` selects >/< vs ≥/≤; `daily_cap` c replaces r_i² by min(r_i², c²). `fair_strike()`: `K² = A E[Σ r_i² I_i]/E[D]` (conditional; ratio of expectations, delta-method stderr) or `A E[Σ r_i² I_i]/N` (corridor). Ordering on a negatively skewed surface: `K_up < K_var < K_down` for any B (Gyöngy: the strike averages local variance over the accrual region).
+
+**ConvexitySpread(upvar, varswap, notional_ratio=1.0)**: long the conditional product, short the plain variance swap; `decompose()` returns the legs; reports `K_up² − K_var²`.
+
+**KnockOutVarianceSwap(barrier, direction="up", strict=True)**: up-and-out, close-to-close monitoring, `j = min{i : S_i > B}`, `τ = min(j, N)`, variant (b) only: `Payoff = N_var [ (A/N) Σ_{i≤τ} r_i² − K² τ/N ]` (the KO day's return accrues). `fair_strike()`: `K² = A E[Σ_{i≤τ} r_i²]/E[τ]`; diagnostics P(KO), E[τ]. Continuous monitoring and variants (a) nothing paid / (c) unscaled strike raise NotImplemented. Note for the study document: `K_KO > K_var` holds under negative skew and a non-inverted term structure (survival-weighted average of local variance over lower spot states) but is not a theorem — it can flip for symmetric smiles or inverted term structures; the model dependence enters through the hitting probabilities, which differ between models sharing all marginals.
+
+Analytics (`analytics/conditional_variance.py`): LSV fair strike minus pure-LV fair strike, same surface and seed, versus model parameters.
+
+Tests: Gyöngy invariance (corridor, single-close indicator, daily grid: same strike under LV and LSV for ω ∈ {1,2,3} within 2 stderr, equal to `(A/N) Σ E[σ_loc²(t_i,S_{i−1}) dt · I_i]` on LV paths); complementarity (up "prev" + down "prev" corridor = variance swap path by path; up "both" + down "both" = variance swap minus crossing-day variance); ordering at 3 stderr for B ∈ {90,100,110}% (up/down) and {105,110,120}% (KO); KO limits (B → ∞ recovers the var swap; strike monotone in B; P(KO) decreasing in B); conditional up-var with B outside the spot range equals the var swap; ConvexitySpread decompose reprices.
+
+### 6.2 Volatility knock-out put (`products/vko.py`)
+**VolKnockOutPut(strike, maturity, vol_ko, fixing_schedule, daily_cap=None, monitoring="maturity")**: `σ_real² = (A/N) Σ r_i²` over the life; `Payoff = (K − S_T)⁺ · 1{σ_real < vol_ko}`. `monitoring="running"` (flag, not the traded form) kills the option on the first day the accrued Σ r_i² exceeds `vol_ko² N/A`. Reference terms: 100% or 95% strike, 12m, vol_ko = 30% on SPX. `decompose()`: vanilla put minus the vol-knock-in put; reprices path by path. Reports price, ratio to the vanilla put (the "VKO discount") and P(KO).
+
+Background for the study document: a longstanding FX/equity exotic; Citi sold ≈ $30bn of 95–100% strike, 12m, 30–40 vol-barrier VKO puts from late 2021 on the view of a slow, low-realised-vol correction; 2022 delivered exactly that (SPX −20%, VIX 16–37), holders made 7–10× premium, and dealer hedging of "spot down, vol down" exposure is credited with flattening 2022 skew. The product is a pure bet on the realised spot–vol relationship versus the one the surface implies; in the 2F LSV that is governed by the SSR and ν, so the VKO discount ties directly to §7.14/§15 smile-dynamics analytics, and 2022 H2 is the natural backtest window.
+
+Tests: vol_ko → ∞ recovers the vanilla put, vol_ko → 0 gives zero, monotone in vol_ko and ≤ vanilla; decompose reprices; LSV discount larger than LV discount at ω = 2, 3 (sign only until archive tests exist); "running" ≤ "maturity" path by path.
+
+Headline table additions: fair strikes (B = 100% up/down var, B = 110% KO var, 1y, daily fixings) and the 12m 100% VKO put at vol_ko = 30% (price, discount, P(KO)), for ω = 0/1/2/3 in 1F and the Table 8.2 2F set.
+
+### 6.3 M4 notes (implemented)
 Implementation notes (M4, measured on the placeholder reference surface). **Products.** `ForwardStartOption(t1, t2, k, cp, pay_time=None)` pays `(cp (S_T2/S_T1 − k))⁺`; `k` is a moneyness (book §3.1; `k = 1` is eq. 3.13), `t1 = 0` is allowed (a vanilla on `S_T2/S_0`) and the pay date may be deferred past `T2` so that every leg of a cliquet decomposition settles on the cliquet's maturity; a `k = 0` call pays the forward return itself. `ForwardStartStraddle` decomposes into the call and the put. `FVA(t1, t2, K_vol, moneyness=F(T2)/F(T1))` pays `|R − m| − Straddle_Black(m, m, τ, K_vol)` at `T2` (the relative-performance FVA of book §3.1.9, footnote 9 — the FX form `(S_T2 − k S_T1)⁺` of eq. 3.18 is not implemented), so its fair strike is exactly the forward ATM-forward implied vol. `AdditiveCliquet(fixings, local_floor, local_cap, global_floor, global_cap)` pays `clip(Σ clip(r_i, LF, LC), GF, GC)`; `decompose()` uses `clip(x, LF, LC) = LF + (x − LF)⁺ − (x − LC)⁺` (with no local floor `x = (R − 0)⁺ − 1`) and `clip(Σ, GF, GC) = Σ + (GF − Σ)⁺ − (Σ − GC)⁺`: cash + long forward-start calls struck `1 + LF` − short calls struck `1 + LC` + a put on the accumulated sum struck `GF` (`AccumulatedSumOption`) − a call struck `GC`; the identity is exact path by path (`tests/test_cliquet.py`). `AdditiveCliquet.study(T)` is the study structure (monthly, local cap 2%, no local floor, global floor 0). `ReverseCliquet(coupon, LF, GF)` = `C + clip(Σ clip(r_i, LF, 0), GF − C, ∞)` decomposes through the same identities; `Napoleon` (coupon + worst period return) has no additive decomposition. **Analytics.** `analytics/forward_smile.py` prices out-of-the-money forward-start options on a moneyness grid (ATM-forward strike added) and inverts them with the model's own forward ratio `F_R = F(T2)/F(T1)`, `τ = T2 − T1` and `DF(T2)`; vol standard errors are price standard errors over the Black vega. `forward_vol_comparison` prices on one path set the forward ATM-forward vol, the forward variance swap on the simulation grid (the calibration diagnostics' convention) and the forward vol swap on daily fixings; `put_wing_table` lays several models' forward smiles side by side with the spread across models per strike. The BS closed form (eqs. 3.1–3.2), path-wise parity, the FVA fair strike and the ordering ATM forward vol < vol-swap vol < variance-swap vol for `ρ < 0` (pure 1F SV, ω = 3: 14.6 < 15.4 < 20.2%) are the fast tests.
 
 Headline comparison (M4; 400k paths, seed 2024, default schedule and scheme shared with calibration; leverage calibrated at N = 2·10⁵, 3y horizon, 60–66 s per model; pricing 21–37 s per model for the whole set; `scripts/m4_headline.py`, baselines in `tests/test_m4_regression.py` with tolerance max(2 stderr, 0.02% of notional / 0.02 vol points)):
@@ -335,15 +382,64 @@ What moved against the M4 table (M4b − M4, in units of the combined stderr): e
 
 ---
 
-## 7. Risk and analytics
 
-- `greeks.py`: delta, gamma, vega (parallel surface bump with recalibration or with sticky leverage — both), theta; all via CRN bump-and-reprice; report stderr of the difference, not of the levels.
-- `ladders.py`: forward-variance vega ladder: bump `ξ_0` multiplicatively by `1 + ε` on bucket `[T_i, T_{i+1}]` (monthly buckets by default). Variant A "sticky leverage": keep `L`. Variant B "recalibrated": recalibrate `L` to the bumped surface (bumped surface = surface with the bucket variance-swap bump propagated to total variance at fixed skew shape — document the mapping). Output per-bucket vega per vol point of forward variance-swap vol, as in the original study (net ladder units: % of notional per vol point per forward month).
-- `profiles.py`: spot-shift profiles of price/delta/gamma/vega (shift `S_0`, sticky leverage), gamma profile across the cliquet accumulated sum (reuse the Bachelier-call-on-remaining-capped-sum decomposition from the study as an analytic cross-check).
-- `volsto_sens.py`: sensitivities to `(ω, θ, k1, k2, ρ1, ρ2, ρ12)` with recalibration of `L` (each point is a cache entry).
-- `smile_dynamics.py`: conditional smile at `t` given a spot move (regression-based conditional pricing as in §4.4), SSR term structure, vol-of-vol term structure implied by the model (variance of the forward variance-swap strike at horizon `t`).
-- `var_decomp.py`: as §3.3.
-- `attribution.py`: P&L explain of a hedged position between two dates: delta, gamma, vega buckets, vol-of-vol, residual.
+---
+
+## 7. Risk and analytics (M5 — detailed)
+
+### 7.1 General machinery (`risk/engine.py`)
+- `BumpSpec(name, apply, size, scheme="central"|"forward")` and a `RiskEngine` pricing base and bumped states under common random numbers, returning `Sensitivity(value, stderr)` with the stderr of the *difference*, path by path.
+- Bumps that change the surface or a model parameter recalibrate through `LeverageCache.get_or_calibrate` (each is a cache entry; the second run of a ladder is free); bumps of S0 or the factor state do not.
+- Surface perturbations are an additive layer on `ImpliedSurface` (δσ(k,T) in implied vol), with the no-arbitrage checks re-run; on failure halve the bump, retry, report.
+- Default bump sizes: delta/gamma 1% of spot in log space (central three-point); vega 1 vol point; forward-variance buckets +1 vp of the bucket's forward VS vol; model parameters 5% relative (ν, k1, k2), 0.05 absolute (θ, correlations) with the PSD check re-run. Configurable.
+
+### 7.2 Delta and gamma regimes (`risk/greeks.py`)
+Smile in `k = ln(K/S)`, `Δ = ln(S0_new/S0_old)`, `s_T` = ATM skew dσ/dk at maturity T from the surface.
+- `"model"`: bump S0, L and factors fixed — default, the hedger's delta.
+- `"sticky_strike"`: `σ_new(k,T) = σ_old(k + Δ, T)`.
+- `"sticky_moneyness"`: `σ_new(k,T) = σ_old(k, T)`.
+- `"sticky_skew"`: `σ_new(k,T) = σ_old(k,T) + s_T Δ` (ATM vol slides along the old smile; shape re-centred with the same skew and curvature).
+- `"sticky_local_vol"`: `σ_new(k,T) = σ_old(k,T) + 2 s_T Δ` (Derman's sticky-implied-tree regime, SSR = 2; reference only).
+All but "model" rebuild the surface, recalibrate L (cached), reprice under CRN. Report all five deltas and gammas side by side. Tests: coincide in BS; ATM vanilla sticky_strike vs sticky_skew agree to first order (report the curvature term); ATM-vol shift per unit Δ ordered 0 < s_T < 2 s_T; the "model" shift equals `SSR_T · s_T` (§4.4, lands with M7).
+
+### 7.3 Vega, theta (`risk/greeks.py`)
+- Parallel vega: +1 vp at every (K,T); variants `"recalibrated"` (default) and `"sticky_leverage"` (L held, ξ₀ moves with the strip); the difference is the leverage vega, a study quantity.
+- Theta: t + 1 business day, surface held in (K, absolute expiry), factors at zero, forward rolled; only for products with no fixing in the roll window. Split into carry (rates/divs), pure decay (surface held in time-to-maturity) and roll-down. BS test: θ + ½σ²S²Γ + rate terms = 0.
+
+### 7.4 Vega by maturity — desk "wave" convention (`risk/ladders.py`, `vega_T`)
+Pillars: the surface's expiry pillars (default 1m, 2m, 3m, 6m, 9m, 1y, 18m, 2y, 3y). `tent_i(T)` linear 0 → 1 → 0 over (T_{i−1}, T_i, T_{i+1}), flat beyond the ends. Pillar bump i: `σ → σ + 0.01·tent_i(T)`; check the calendar condition on every ramp (`(σ+0.01)² T_i ≤ σ² T_{i+1}`, i.e. `T_{i+1}/T_i ≥ 1.10` at σ = 20%; raise for pillar sets that violate it). Wave j = all pillars with T_i ≤ T_j bumped together; wave n = parallel vega. Report cumulative vega per wave and the projection at T_j = wave_j − wave_{j−1}; projections sum to the parallel vega. Recalibrated (default) and sticky-leverage variants; units % of notional per vol point. Tests: projections equal the single-pillar tent ladder within 2 stderr; wave_n equals parallel vega within 2 stderr. `RiskReport` docstring states that (i) projections equal single-pillar bumps only to first order (recalibration and vega convexity add a cross term), (ii) an expiry between pillars shows vega in both neighbouring projections in proportion to distance.
+
+### 7.5 Forward-variance vega ladder (`risk/ladders.py`, `fwd_var_ladder`)
+Buckets monthly to 1y, quarterly to 3y. Bump `ξ₀^T → (1+ε)ξ₀^T` on the bucket; propagated to the surface as `dW(T) = ε ∫_{bucket∩[0,T]} ξ₀` added to `w(k,T)` for every k (parallel shift in total variance per maturity; skew preserved in total-variance terms). ε sized so the bucket's forward VS vol rises 1 vp; units % of notional per vol point of bucket forward VS vol. Variants recalibrated / sticky-leverage. Tests: ladder sums to the parallel forward-variance bump (both variants, 2 stderr); flat and analytic for a plain variance swap. Second-order (diagonal convexity per bucket, three-point) on request.
+
+### 7.6 Skew and curvature risk (`risk/ladders.py`, `skew_T`, `curvature_T`)
+Skew bump i: `σ → σ + s·k·tent_i(T)`, s sized so `σ(ln 0.9) − σ(ln 1.1)` at T_i rises 1 vp (rotation around ATM); units per vol point of 90/110 skew. Curvature bump i: `σ → σ + c·k²·tent_i(T)`, c sized so `[σ(ln 0.9)+σ(ln 1.1)]/2 − σ(0)` rises 1 vp; units per vol point of 90/110 butterfly. No-arbitrage checks as §7.1; both variants. Tests: ATM vanilla zero skew vega, 90% put positive; 90/110 risk reversal zero curvature vega, strangle positive; `skew_T` sums to a global rotation within 2 stderr.
+
+### 7.7 Cross-Greeks (`risk/greeks.py`)
+Vanna as both `∂vega/∂ln S` and `∂delta/∂σ` (equal only in BS; the LSV difference is informative); volga `∂vega/∂σ`; charm and veta (one-business-day rolls, surface in (K, absolute expiry)); rho (+1 bp rates); repo/dividend delta (+1 bp in q). Cross terms `∂delta/∂ρ_SX1`, `∂delta/∂ρ_SX2`, `∂delta/∂ν` (recalibrated): the hedge ratio's own dependence on the vol-sto parameters.
+
+### 7.8 Spot-shift profiles (`risk/profiles.py`)
+S0 grid −30% to +30% in 2.5% steps; price, model delta/gamma/vega per shift under "model" dynamics (other regimes optional, recalibrated per shift, cached); gamma profile as second difference. Cliquet gamma profile versus the accumulated sum at an intermediate date, with the Bachelier call-on-remaining-capped-sum decomposition of the original study as analytic cross-check (exact in BS with independent legs; report the LSV deviation).
+
+### 7.9 Model-parameter sensitivities (`risk/volsto_sens.py`)
+Partials to each of (ν, θ, k1, k2, ρ12, ρ_SX1, ρ_SX2) with recalibration; ν also sticky-leverage. Central differences, PSD check on correlation bumps. One table per product.
+
+### 7.10 Product-specific risks (`risk/product_risk.py`)
+- Fixing risk: forward-start and cliquet delta/gamma/vega at T1 − 1d and T1 + 1d (state held), reported as the jump; per fixing for cliquets.
+- Barrier risk: `∂price/∂B` for KO var and KI put; delta and gamma within ±5% of the barrier at 0.5% steps; VKO `∂price/∂H` (vol points of the vol barrier) and `∂P(KO)/∂ln S`.
+- Realised-variance exposure: expected dollar-gamma-weighted variance per fixing period along the path; flat and equal to notional for a variance swap.
+
+### 7.11 Precision options (`risk/estimators.py`)
+Likelihood-ratio delta and vega for discontinuous payoffs (barriers, KO var, VKO, digitals) with the bump estimate as cross-check (flag > 3 stderr disagreement); conditional Greeks at a future date by regression of payoff and CRN bumps on a polynomial basis in (ln S_t, X¹_t, X²_t) — the hedger's engine; control variate on the difference (BS Greek at market vol for vanilla-like products), with variance reduction reported.
+
+### 7.12 P&L attribution (`risk/attribution.py`)
+`explain(product, state_0, state_1)`: sequential CRN revaluation in the order spot (delta, gamma), surface (parallel vega, vega-T waves, skew/curvature), model parameters, factor state; residual = actual minus sum. States carry S0, surface, model params, factor values, date. Tests: pure spot move residual at the gamma-cubed level (report); pure parallel vega move residual within 2 stderr.
+
+### 7.13 RiskReport and budget
+One object per product with every sensitivity, stderr, bump specs, cache keys; `to_dataframe()`, `to_excel()`. A full report is ≈ 80–100 recalibrations; print count and wall clock — it is the viewer precompute budget.
+
+### 7.14 Smile-dynamics analytics (`analytics/smile_dynamics.py`, `analytics/var_decomp.py`)
+As §4.4 and §15 Part 1: numerical SSR (LSV joint-bump, pure SV), eq. 12.52 decomposition, short-horizon regression estimator; vols of ATMF vols (eq. 12.56); conditional smile after a spot move at horizon t; vol-of-vol term structure; Var(V) decomposition (closed form pure SV, regression estimator LSV).
 
 ---
 
@@ -386,7 +482,9 @@ Unit and property tests (pytest, fast, `n_paths` small with loose tolerances; a 
 - PDE cross-check: 1F LSV, 2D finite differences (ADI) on `(ln S, X1)`, vanilla and forward-start prices vs MC within 2 stderr.
 - Products: cliquet decomposition (strip of capped calls + global-floor put) reprices the product; KI put decomposition reprices the autocall's put leg; discrete barrier converges to continuous with the bridge correction.
 - Risk: CRN bump Greeks vs analytic BS Greeks in the BS model; vega ladder sums to the parallel vega.
-- Regression tests (`slow`, recalled from the original study — must be re-verified against the study archive; the SSVI parameters and seeds must be taken from that archive, not guessed): with the study surface, 1F, `ρ = −0.7`, `κ = 1.5`: 1y-into-1y ATM forward vol 21.5% (LV) → 18.6% (ω = 3), forward variance-swap level 25.2–25.5% across ω; 1y capped cliquet (2% cap, global floor 0) 1.082% / 1.194% / 1.472% / 1.763% of notional for ω = 0/1/2/3 with stderr 0.004–0.009%; 2y version 0.639% → 1.718%. Tolerance: 2 stderr, or 0.02% of notional if the seeds cannot be matched. M4 status: the archive is still absent (tests skipped); the same set measured on the placeholder surface is the regression baseline (`tests/test_m4_regression.py`, `slow`), see the §6 notes.
+- Scheme tests: pure LV vs SSVI at 1m/3m/6m ATM within 0.1 vp on the default schedule; bias halves when dt halves; Richardson diagnostic 2P(dt/2) − P(dt) under CRN; the calibrated LSV simulated with the calibration seed reproduces the particle cloud at the horizon to 1e-12; acceptance tests price on fresh seeds.
+- M4 regression baseline (placeholder surface, 400k paths, seed 2024; `tests/test_m4_regression.py`), re-recorded at M4b on the second-order step and the 1/1460–1/365–1/250 schedule with 2·10⁵ particles: 1y→2y ATMF forward vol 21.44/20.76/19.69/18.45 (ω = 0/1/2/3, 1F ρ = −0.7, κ = 1.5) and 19.17 (2F Table 8.2); forward VS 25.1–25.3; capped cliquet 1y 1.193/1.314/1.624/1.968 % and 2y 0.754/0.951/1.459/2.024 %; tolerance max(2 stderr, 0.02% of notional / 0.02 vol points). Against the M4 record every entry moved by less than 2 stderr except the 2y cliquet at ω ≥ 2 and the 2F set (+0.017–0.025% of notional, 2.1–2.9σ) and the ω = 3 forward vol swap (−0.05 vp, 2.3σ). To be re-recorded once at 8·10⁵ particles in M4c, with the particle count stated in the baseline file. The study-archive tests are skipped until `study_archive/` is present.
+- Regression tests (`slow`, recalled from the original study — must be re-verified against the study archive; the SSVI parameters and seeds must be taken from that archive, not guessed): with the study surface, 1F, `ρ = −0.7`, `κ = 1.5`: 1y-into-1y ATM forward vol 21.5% (LV) → 18.6% (ω = 3), forward variance-swap level 25.2–25.5% across ω; 1y capped cliquet (2% cap, global floor 0) 1.082% / 1.194% / 1.472% / 1.763% of notional for ω = 0/1/2/3 with stderr 0.004–0.009%; 2y version 0.639% → 1.718%. Tolerance: 2 stderr, or 0.02% of notional if the seeds cannot be matched.
 
 ---
 
@@ -398,143 +496,104 @@ Unit and property tests (pytest, fast, `n_paths` small with loose tolerances; a 
 - Standard errors everywhere; no MC number printed without one.
 - Logging via `logging`, not print. A `--profile` flag on the study runner.
 - Reproducibility: every artefact (cache entry, study output) records the git commit, config hash and seed.
+- Particle counts (owner decision, M4b): production numbers — headline tables, regression baselines, viewer precompute — use 8·10⁵ particles, single seed; development and fast paths use 2·10⁵. Baseline files state the particle count.
 - Style: black, ruff, mypy (strict on `volsto/`), 100-char lines.
 - README with a 20-line quickstart that calibrates a 1F LSV on the reference surface and prices the study cliquet.
 
 ---
 
-## 12. Milestones (in order; each ends with green tests)
+## 12. Milestones (in order; each ends with green tests and a commit — standing rule: commit every green milestone without asking)
 
-M1. Market layer + BS + local vol + MC engine + vanilla/variance products + tests §10 (BS, SSVI, var swap).
-M2. Bergomi 2F kernel with exact stepping + closed-form tests + 1F degeneracy test.
-M3. Particle calibration + cache + diagnostics; reproduce the study's calibration accuracy.
-M4. Forward-start, cliquet family, forward smile analytics; regression tests against the study numbers.
-M4b (owner, before M5; done 2026-09-13, see §4.2 notes — calibration time met, variance-swap criterion met on seed averages except 1y–2y by 0.01, single runs at 2·10⁵ particles are noise-limited). Second-order SV spot step (exact factor increments with the intra-step spot/variance covariance, Andersen-type), shared by calibration and pricing under the frozen-L-per-step rule. Acceptance on the previous coarse schedule (1/1460 – 1/365 – 1/250): variance-swap error ≤ 0.05 vol points at every pillar 1m–3y for N = 2·10⁵ and 8·10⁵, put wing ≤ 0.05 vol points at 2 SE, calibration time back to ~30 s; re-run the M4 tables and report what moved.
-M5. Risk layer (Greeks, ladders, profiles, vol-sto sensitivities with recalibration).
-M6. Autocall/Phoenix/barrier products with decompositions; PDE 1F cross-check.
-M7. Smile dynamics, SSR estimators, 2F fitting helper; Var(V) decomposition.
+M1. Market layer + BS + local vol + MC engine + vanilla/variance products. **Done.**
+M2. Bergomi 2F kernel, exact stepping, closed-form tests, 1F degeneracy, mixing solution. **Done.**
+M3. Particle calibration + cache + diagnostics (+ M3.2 tail/scheme fixes, code-tag guard). **Done.**
+M3b. HistoricalData.net importer, eSSVI, snapshot configs (§13). **Done.**
+M4. Forward-start, cliquet family, FVA, forward smile analytics, headline table, regression baseline. **Done.**
+M4b. Second-order SV spot step shared by calibration and pricing (§3.1); rerun the M4 tables and report what moved. **Done, accepted 2026-09-13** on seed averages (1y–2y variance swap at −0.04 to −0.06 vp noted); open residuals tagged "calibration-side pass before M6" (§4.2 M4b notes).
+M4c. Conditional/KO variance products and the VKO put (§6.1–6.2), headline table extended.
+M5. Risk layer (§7).
+M6. Autocall/Phoenix/barrier products with decompositions; PDE 1F cross-check; the calibration-side pass of §4.2 (owner's diagnostic first) and the 1F put-wing re-check precede the KI put.
+M7. Smile dynamics, SSR estimators, historical estimators, 2F fitting, stability, VIX check (§15).
 M8. Hedging framework; port the cliquet and FVA hedging studies as regression tests.
 M9. Precompute CLI + Streamlit viewers + Excel export.
-M10. Study runner with LaTeX output; regenerate the original paper's tables from the library.
+M10. Study runner with LaTeX output; regenerate the original paper's tables; backtest study on the market history (§15 Part 4).
 
-Open items for the owner (do not block M1–M3): the study archive (zip with SSVI parameters, seeds, tables) for the regression tests; the 2F target parameterisation (SSR target, which maturities); whether hedging transaction-cost assumptions should follow the original study or be re-specified.
+Open items for the owner: the original study archive (SSVI parameters, seeds, tables) — the M4 cliquet baseline is ≈ 10–16% above the study at every ω with ratios across ω agreeing to 1%, consistent with a surface difference; the paid EOD archive for a multi-year backtest.
 
 ---
 
-## 13. Addendum — market data import (milestone M3b, after M3)
+## 13. Market data import (M3b, implemented)
 
-Added by the owner during M1 (13 September 2026).
+`market/import_hdn.py`: importer for the HistoricalData.net EOD option-chain CSV (34 columns, one file per trading day; the free `options_sample_2022H2.zip` in `./data/hdn_sample/`, git-ignored, uses the paid format). Pipeline: `load_day` (SPX and SPXW roots for the index surface, both quotes required, AM/PM settlement in the time-to-expiry convention, manifest Treasury curve); `implied_forward` (regression of C − P on K near the money; the vendor's parity forward as cross-check — their iv and Greeks are never inputs, since quotes across contracts are not synchronised snapshots); `to_grid_surface` (OTM mids, liquidity filter using iv_bid/iv_ask, butterfly and calendar pruning); `fit_ssvi` (θ at the SPEC pillars by isotonic least squares, global (ρ, η, γ) constrained; **eSSVI per-pillar ρ is the default for imported surfaces**, `--ssvi` opts out); `snapshot_config` (dated YAML with provenance: vendor, checksum, filters). CLI `volsto-import --vendor hdn --date … --underlying SPX`. Slices are grouped by (root, expiration) because SPX AM and SPXW PM share dates; fits use expiries from 3 weeks and |k| ≤ 0.25, vega-weighted; expiries under 3m are reported outside the acceptance region. `scripts/capture_yfinance.py` writes today's SPX/SPY chain in the same layout for daily accumulation.
 
-Add `volsto/market/import_hdn.py`: importer for the HistoricalData.net EOD option-chain CSV format (34 columns, one file per trading day; schema at https://historicaldata.net/options.html). The free sample `options_sample_2022H2.zip` is in `./data/hdn_sample/` (git-ignored). Pipeline, one function per step, each testable:
-
-1. `load_day(path, underlying) -> DataFrame`. Keep only SPX and SPXW roots for the index surface; drop rows with missing bid or ask; record `settlement_time` (AM/PM) and use it in the time-to-expiry convention. Use the rate curve shipped in the ZIP manifest.
-2. `implied_forward(chain, expiry) -> F`: from put-call parity on the mid prices near ATM (regression of C − P on K), with the discount factor from the rate curve. Do not use the vendor's iv or Greeks as inputs; they are cross-checks only (the vendor documents that quotes across contracts are not synchronized snapshots).
-3. `to_grid_surface(chain, forwards) -> GridSurface`: OTM options only, mid implied vols against the implied forward, liquidity filter (min bid, max relative bid/ask spread in vol terms, using `iv_bid`/`iv_ask` where present), and butterfly/calendar arbitrage checks on the retained points.
-4. `fit_ssvi(grid_surface) -> SSVISurface`: `theta_T` from ATM total variance, global `(rho, eta, gamma)` by least squares in vol space with the no-arbitrage constraints enforced; report residuals per expiry. Add an eSSVI option (slice-dependent rho) behind a flag for later single-stock use.
-5. `snapshot_config(date) -> YAML` market config (surface params, forward curve, rate curve, provenance: vendor, file checksum, filters used) so a dated market snapshot runs through calibration exactly like the synthetic configs.
-
-Tests: on one sample day, implied forwards agree with the vendor's parity-based forward (`iv_flag == 0` rows) to within a few bp; SSVI residuals inside ±20% moneyness ≤ 0.3 vol points for T ≤ 2y; the fitted surface passes the SSVI no-arbitrage checks; a CLI `volsto-import --vendor hdn --date 2022-09-15 --underlying SPX` writes the config. Also add `scripts/capture_yfinance.py`: saves today's SPX/SPY chain in the same 34-column layout (blank where unavailable) so a daily cron can accumulate history.
-
-Milestone order becomes: M1, M2, M3, **M3b (market data import)**, M4, … M10.
+Measured on 2022-09-15: implied forwards within 0.7 bp (≤ 6m) / 3.5 bp (2y) of the vendor's; SSVI RMS 0.20 vp inside ±20% from 3m; eSSVI RMS 0.17 / 0.08 vp (3m–2y / 6m–2y); 1–2m weeklies 1–4 vp off under SSVI; ≈ 1 s per day.
 
 Implementation notes (M3b, measured on the 2022 H2 SPX sample): contracts are grouped by (root, expiration) as the vendor does — SPX (AM) and SPXW (PM) share expiration dates but differ by one day in `T`; the implied forward is the regression `C − P = a + b K` on two-sided pairs within ±10% of spot (`F = −a/b`, discount `−b`, delta-method standard error), which agrees with the vendor's closest-strike parity forward within 0.7 bp to 6m and 3.5 bp at 2y (the vendor discounts at the Treasury rate, the market-implied rate was 0.4–0.6% higher); our Black-76 inversion reproduces the vendor's `iv` on `iv_flag = 0` rows to a median 0.1 vp near the money. Butterfly pruning is iterative convexity of OTM prices in strike; the calendar check runs on the common quoted `k` range of consecutive slices (a global fixed point dropping the worst violating quote), which is also what `GridSurface` enforces. `θ_T` is fitted at the SPEC pillar tenors (1m, 3m, 6m, 1y, 18m, 2y, 3y) by isotonic least squares through the slices' ATM total variances; the global `(ρ, η, γ)` least squares (vega-weighted, |k| ≤ 0.25, expiries ≥ 3 weeks) enforces both SSVI butterfly conditions through a bounded reparametrisation of `η`; imported surfaces default to eSSVI — `ρ` fitted at the pillars (piecewise-linear `ρ_T`, `ESSVISurface`) — with `--ssvi` as the single-`ρ` opt-out; synthetic surfaces (`configs/surfaces/reference_ssvi.yaml`, the study parameters) stay plain SSVI. Expiries under 3m are reported in the residual tables but sit outside the acceptance region. Fit quality on four sample days, inside ±20% moneyness: RMS 0.12–0.22 vp and max 0.4–1.0 vp from 3m to 2y (eSSVI RMS 0.08–0.16 from 6m); the 1–2 month weeklies of these high-volatility days are 1–7 vp off — a single power-law φ cannot follow them, so the §13 target of 0.3 vp holds in RMS from 3m but not as a maximum below 3m. The snapshot YAML has `market` + `ssvi` sections (loadable by `load_ssvi_surface`) and a `provenance` section (vendor, file and manifest SHA-256, filters, forwards, rate curve, fit residuals, code version). `scripts/capture_yfinance.py` writes the same 34-column layout (blank calculated columns, `iv_flag = 7`) plus a manifest with a user-supplied Treasury curve.
 
----
-
-## 14. Addendum — smile dynamics for delta and gamma (amends §7 `greeks.py`, milestone M5)
-
-Added by the owner during M1 (13 September 2026).
-
-Delta and gamma take a `smile_dynamics` argument:
-
-- `"model"` — bump `S0`, leverage `L` and factors held fixed, CRN. Default.
-- `"sticky_strike"` — bump `S0`, rebuild the target surface with total variance held fixed per strike `K` (convert SSVI to a strike grid before the bump), recalibrate `L`, reprice. Cached.
-- `"sticky_moneyness"` — bump `S0`, keep the SSVI parameters (surface fixed in `k = ln K/F`), recalibrate `L`, reprice. Cached.
-
-Report all three side by side in risk reports; the hedger uses `"model"` unless the strategy config overrides it.
-
-Test: for a vanilla, the `sticky_strike` delta equals the BS delta at the market vol, the `sticky_moneyness` delta equals BS delta minus vega × ATM skew / `S0` to first order, and the model delta lies between them with the ordering set by the sign of the SSR minus one; the ATM vol shift under `"model"` per unit log-spot move equals SSR × ATM skew (ties §4.4 to the delta).
+Data sourcing decisions: build against the free sample; buy the HistoricalData.net full archive ($799 one-time, daily updates $79/month) for a multi-year backtest; ThetaData's free tier (1y EOD) as a second-source check; rates from FRED/SOFR or the desk's OIS curve; forwards and dividends always implied per expiry from put-call parity on the chain.
 
 ---
 
-## 15. Addendum — conditional and knock-out variance products (amends §6; after M4b)
-
-Add after the cliquet family; they reuse the realised-variance accumulators. Notation: daily closes `S_0..S_N` on the fixing schedule, `r_i = ln(S_i/S_{i-1})`, `A = 252`, barrier `B`, strike `K` quoted as a volatility, variance notional `N_var`.
-
-New file `volsto/products/conditional_variance.py`:
-
-1. `ConditionalVarianceSwap(barrier, side, indicator, convention, strict=True, daily_cap=None)`. `side`: `"up"` (accrue where `S > B`) or `"down"` (`S < B`). `indicator`, applied to the side's inequality: `"prev"` `I_i = 1{S_{i-1} in region}`; `"curr"` `I_i = 1{S_i in region}`; `"both"` `I_i = 1{S_{i-1} in region} · 1{S_i in region}`. Desk conventions (constructor helpers `UpVar`, `DownVar`): up-var uses `"prev"` or `"both"`; down-var uses `"curr"` or `"both"`. The indicator is a required argument on the base class, never defaulted. `D = Σ_i I_i`. Convention `"conditional"`: payoff `N_var [ (A/N) Σ_i r_i² I_i − K² D/N ]`, zero if `D = 0`. Convention `"corridor"`: payoff `N_var [ (A/N) Σ_i r_i² I_i − K² ]`. `strict` selects `>` / `<` versus `>=` / `<=`. `daily_cap c` replaces `r_i²` by `min(r_i², c²)`. `fair_strike()`: `K² = A E[Σ r_i² I_i] / E[D]` for conditional (ratio of expectations, stderr by the delta method), `A E[Σ r_i² I_i]/N` for corridor.
-2. `ConvexitySpread(upvar, varswap, notional_ratio=1.0)`: long the conditional product, short the plain variance swap on the same schedule; `decompose()` returns the two legs. Report the strike differential `K_up² − K_var²`.
-3. `KnockOutVarianceSwap(barrier, direction="up", strict=True)`. Close-to-close monitoring only: `j = min{ i : S_i > B }`, `τ = min(j, N)`. Variant (b) only: payoff `N_var [ (A/N) Σ_{i≤τ} r_i² − K² τ/N ]`, where the KO day's own return `r_j` accrues. `fair_strike()`: `K² = A E[Σ_{i≤τ} r_i²] / E[τ]`, delta-method stderr. Expose `P(KO)` and `E[τ]` as diagnostics. Continuous monitoring and variants (a)/(c) are deferred (raise `NotImplementedError`).
-
-Analytics (`volsto/analytics/conditional_variance.py`): for each product, the LSV fair strike minus the pure local-vol fair strike on the same surface and seed, as a function of the model parameters; that difference is the study quantity.
-
-Tests: Gyöngy invariance — the corridor-convention swap with a single-close indicator (`"prev"` for up, `"curr"` for down), priced on a daily grid, gives the same fair strike under LV and under LSV for ω ∈ {1, 2, 3} within 2 stderr, and equals the LV quantity `(A/N) Σ_i E[σ_loc²(t_i, S_{i-1}) dt · I_i]` computed on the LV paths. Complementarity — up `"prev"` + down `"prev"` with the same `B` and corridor convention equals the plain variance swap path by path; up `"both"` + down `"both"` equals the variance swap minus the variance on barrier-crossing days, path by path. Ordering on the reference (negatively skewed) surface — `K_up < K_var < K_down` for `B ∈ {90%, 100%, 110%}` of spot, and `K_KO > K_var` for `B ∈ {105%, 110%, 120%}`, all at 3 stderr, under LV and LSV (document in the test that the KO ordering is a property of negative skew and non-inverted term structure, not a theorem). KO var — `B → ∞` recovers the plain variance swap; the fair strike is monotone in `B`; `P(KO)` decreases in `B`. Conditional-convention `D/N` scaling — with `B` far outside the spot range the conditional up-var equals the plain variance swap. `decompose()` of `ConvexitySpread` reprices it.
-
-Add these products to the M4 headline table (fair strikes with stderr for ω = 0/1/2/3 in 1F and for the Table 8.2 2F set; `B = 100%` for up/down var, `B = 110%` for KO var, 1y maturity, daily fixings).
+## 14. (superseded — the delta regimes are now §7.2)
 
 ---
 
-## 16. Addendum — volatility knock-out put (amends §6; with the §15 products)
+## 15. Smile dynamics, SSR and fitting the 2F parameters (M7)
 
-`VolKnockOutPut(strike, maturity, vol_ko, fixing_schedule, daily_cap=None, monitoring="maturity")` (same file as §15 or `volsto/products/vko.py`). Realised volatility over the life on the fixing schedule, `σ_real² = (A/N) Σ_{i=1}^N r_i²` (`r_i²` capped at `c²` if `daily_cap`). Payoff `(K − S_T)⁺ · 1{σ_real < vol_ko}`. `monitoring "maturity"` (default, the traded form): the condition is checked once at `T` on the full-life realised vol. `monitoring "running"` (flag): knock out on the first day the accrued variance `Σ r_i²` exceeds `vol_ko² N / A`, i.e. the option is dead as soon as the full-life realised vol can no longer be below the barrier; document that this is not the traded convention. Reference terms: 100% or 95% strike, 12m, `vol_ko = 30%` on SPX. `decompose()`: vanilla put minus the "vol-knock-in" put `(K − S_T)⁺ 1{σ_real ≥ vol_ko}`; reprices path by path. Report price, the ratio to the vanilla put (the "VKO discount") and `P(knock-out)`.
+### Part 1 — smile-dynamics analytics
+Numerical SSR at t = 0 for the LSV (book §12.4.3 joint-bump trick) and for pure SV (§9.8); the analytic decomposition eq. 12.52 with R^LV from 12.53–12.54 and R^SV from 9.21; the slow short-horizon regression estimator. Tests as §4.4, plus enabling the M5 test "model-regime ATM-vol shift per unit Δ = SSR_T·s_T". Vols of ATMF vols (eq. 12.56). Conditional smile after a spot move at horizon t; Var(V) decomposition.
 
-Why it is in the study: the price is `E[(K − S_T)⁺ 1{RV < H²}]`, the joint law of terminal spot and realised variance. Under local vol, realised variance is nearly a deterministic function of the path's spot levels, so the LV VKO price is close to a hard threshold on `S_T`; stochastic vol spreads RV conditional on `S_T`, and the spread is governed by ν and ρ. Expect the largest model dependence of any product in the library. The study quantity is the VKO discount versus the vanilla put as a function of `(ν, ρ, θ)` and of `vol_ko ∈ {25, 30, 35, 40}%`.
+### Part 2 — historical estimators from a surface history (`calibration/history.py`)
+Input `SurfaceHistory`: dated snapshots (importer configs or synthetic) with forward curves; pillars at constant time-to-maturity T ∈ {1m, 3m, 6m, 1y, 2y, 3y}. Per date and pillar: `vs_vol` (log-contract strip), `atm_vol` (k = 0), `skew` (dσ/dk at k = 0), `ln_spot`. Estimators with Newey–West standard errors:
+1. `volvol_hist(T) = sqrt(252)·std(Δ ln vs_vol(·,T))` and the cross-pillar correlation matrix of Δ ln vs_vol.
+2. `SSR_hist(T) = slope(T) / mean skew(·,T)`, slope from regressing Δ atm_vol(·,T) on Δ ln_spot (book eq. 9.3 read historically); report R².
+3. Mean and latest ATMF skew term structure.
+4. Realised spot/vol correlation per pillar (diagnostic).
+Windows: 250 days default for 1 and 3, 60 days for the SSR (regime-dependent), both reported; rolling versions for Part 4.
 
-Tests: `vol_ko → ∞` recovers the vanilla put; `vol_ko → 0` gives zero; the price is monotone increasing in `vol_ko` and never above the vanilla put. `decompose()` reprices path by path. With the reference surface (ATM vol ~20%), 12m ATM put, `vol_ko = 30%`: the LSV discount is materially larger than the LV discount at ω = 2, 3 (assert the sign and report the values; no fixed number until the archive tests exist). `"running"` monitoring price ≤ `"maturity"` monitoring price path by path.
+Test (identifiability): simulate the pure 2F model daily for 3 years (Table 8.2, flat 20% VS curve), compute each day's VS vols from the factor state and ATMF vols/skews via the mixing solution, feed the estimators: `volvol_hist` recovers eq. 7.39, `SSR_hist` recovers eq. 9.21 (order-one accuracy, 2 SE), cross-pillar correlations recover eq. 7.20.
 
-Add to the headline table: 12m 100% put VKO at `vol_ko = 30%`, price as % of notional, VKO discount versus vanilla, and `P(KO)`, for ω = 0/1/2/3 in 1F and the Table 8.2 2F set.
+### Part 3 — fitting (`calibration/fit_2f.py`)
+Parametrisation: book notation; stage 2 uses the eq. 8.56 form (ρ_SX1, χ) so PSD holds by construction; ν stored, ω = 2ν exposed.
+
+**Stage 1 — variance dynamics (ν, θ, k1, k2 | ρ12).** Targets: `volvol_hist(T)` at the pillars (log space), optionally VIX-implied vol-of-vol at horizons ≤ 9m (Part 5) with its own weight. Model: instantaneous vol of VS vol, eq. 7.39 (A_i from 7.38; the non-flat-curve form if the window's mean VS curve is sloping). Weighted LS in log(volvol), weights 1/SE². ρ12 fixed by default (0 or user value); option `from_correlation`: fit ρ12 by matching the model's corr(Δ ln vs_vol_3m, Δ ln vs_vol_2y) (eq. 7.20 machinery) to the historical one, iterating twice. Bounds: ν ∈ [0.3, 4], θ ∈ [0, 1], k1 ∈ [1, 20], k2 ∈ [0.05, 1.5], k1 > k2; report Jacobian singular values and flag k2 as bound-driven when insensitive. Degeneracy check: rerun from Table 7.1 Sets I–III as starting points and report all optima — Bergomi's Table 7.1 shows that for a given decay exponent many parameter sets fit the vol-of-vol curve equally well; the correlation target is what separates them (§7.4.2: higher forward-variance vols go with lower correlations; correlations are invariant to shifting all k's).
+
+**Stage 2 — spot/vol correlations (ρ_SX1, ρ_SX2), stage 1 frozen.** Targets: ATMF skew term structure (latest surface for a pricing date) and `SSR_hist(T)` (60-day window). Model: order-one skew eq. 8.55 (9.18 for a sloping curve) and SSR eq. 9.21 (9.19), then a refinement replacing the skew formula by the mixing-solution skew of the naked 2F model. Weighted LS on both curves (default weights put skew residuals in vol points per unit k / 10 and SSR residuals in units of 0.1 on the same scale; SSR pillars beyond 1y down-weighted). Outputs: fitted correlations and the naked-skew-vs-market-skew table (the leverage absorbs the residual; small means the SV carries the skew, as intended). Forward-skew consensus marks (Totem) are not used: not available on the desk and noisy; Bergomi's point that mixed models can be parametrised for given *future* skews is applied as a stage-3 check instead.
+
+**Stage 3 — validation on the calibrated LSV.** Calibrate leverage; report (a) mean |L − 1| over the grid, (b) model SSR (numerical) vs `SSR_hist`, (c) model vol-of-vol of VS vols with leverage vs `volvol_hist`, (d) forward-start ATM vol and forward 90/110 skew at 1y-into-1y and 2y-into-1y, (e) the headline product table on this fit. Nothing is refit here.
+
+API: `fit_2f(history, pricing_date, config) -> FitResult(params, stage1_report, stage2_report, stage3_report, config_yaml)`; the YAML is a loadable model config with provenance (window, settings, objectives).
+
+Tests: recovery on the synthetic history (ν, θ, k1 within 10%, k2 within its sensitivity band; ρ_SX1, ρ_SX2 within 0.05); degeneracy (three Table 7.1 starts, near-identical objectives with ρ12 free, unique optimum with the correlation target); real-data end-to-end on the 2022 H2 sample (no fixed numbers).
+
+Rationale: in an LSV the leverage absorbs the vanilla surface, so vanillas identify none of the seven parameters; each group is pinned by a non-vanilla observable and fitted in stages (Bergomi ch. 7, ch. 12 conclusion; Guyon 2019/2022 on VIX-based calibration of 1F/2F Bergomi; the 2025 quantisation study reporting stable daily 2F parameters from VIX futures and options). VIX pins ν and the fast factor only (futures liquid to ~9m, options to ~6m read a 1m forward variance), so the historical route is the base for the whole term structure and VIX a short-end check for SPX.
+
+### Part 4 — stability (`calibration/stability.py`)
+Rolling refits (stage 1 monthly on a trailing 250-day window, stage 2 daily) → parameter time series with SEs; flag parameters whose day-to-day changes exceed their SE band consistently (unidentified, not informative); plot the objective along the ν ⟷ correlations degeneracy direction. Used by the backtest study.
+
+### Part 5 — VIX in the 2F model (`analytics/vix.py`, check only)
+`VIX²_T = (1/Δ) ∫_T^{T+Δ} ξ_T^u du`, Δ = 30/365; in the 2F model `ξ_T^u` is explicit in (X¹_T, X²_T) (eqs. 7.30–7.35), so VIX futures and calls price by 2D Gauss–Hermite quadrature (book §7.7.2). Implied vol-of-vol at horizon T from the ATM VIX option. Tests: quadrature vs factor Monte Carlo within 2 stderr; VIX² futures vs forward 1m VS variance up to the convexity term; short-horizon implied vol-of-vol → eq. 7.39 as T → 0. Optional stage-1 target for SPX only, fitting futures and ATM VIX vols never the wings (book §7.7.4: the lognormal 2F model under-produces the VIX smile's upward skew).
 
 ---
 
-## 17. Addendum — M5 risk layer (extends §7 and §14; four parts, the later wins where they overlap: the vega-T "wave" block of part C replaces the vega-T paragraph of part B)
+## 16. Desk conventions recorded
+- "P1 deco" = this LSV two-factor Bergomi model. ω = 2ν; the earlier studies' ω = 3 is ν = 150%.
+- Surfaces: the desk marks with SABRW (in-house); the library keeps SSVI/eSSVI (public, arbitrage-free by construction, analytic Dupire); `ImpliedSurface` is an ABC so another parametrisation can be added without touching calibration.
+- Vega by maturity is by cumulative "waves" (§7.4). Delta regimes include sticky skew (§7.2).
+- Up-var indicator "T−1" or "T & T−1"; down-var "T" or "T & T−1"; KO var is up-and-out, close-to-close, variant (b) (§6.1).
 
-Reporting: same format as the milestone reports, plus the performance budget (number of recalibrations, wall clock) for a full `RiskReport`.
+---
 
-### 17.A General machinery, delta/gamma, vega, forward-variance ladder, profiles, parameter sensitivities, attribution
-
-General machinery (`volsto/risk/engine.py`): `BumpSpec(name, apply: Model|Surface|State -> bumped, size, scheme="central"|"forward")` and a `RiskEngine` that prices base and bumped states under common random numbers (same seed, same grid) and returns `Sensitivity(value, stderr)` where `stderr` is that of the *difference*, estimated path by path. Any bump that changes the surface or a model parameter triggers a recalibration through `LeverageCache.get_or_calibrate`; bumps that change only `S0` or the factor state do not. Every recalibrating bump is a cache entry, so the second run of a ladder is free. Surface perturbations are an additive perturbation layer on `ImpliedSurface` (`δσ(k, T)` added in implied vol), reused by every bump and delta regime below, with the no-arbitrage checks re-run on the perturbed surface; if a check fails, halve the bump, retry and report. Default bump sizes: delta/gamma 1% of spot in log space (central three-point); vega 1 vol point of implied vol; forward-variance buckets +1 vol point of the bucket's forward VS vol; model parameters 5% relative (`ν, k1, k2`), 0.05 absolute (`θ`, correlations) with the PSD check re-run. All configurable.
-
-Delta and gamma (`greeks.py`): `smile_dynamics` regimes as defined in 17.B (five regimes; `"model"` is the default and the one the hedger uses). Report all regimes side by side.
-
-Vega (`greeks.py`): parallel bump, implied vol +1 vp at every `(K, T)`. Two variants: `"recalibrated"` (leverage refit to the bumped surface, default) and `"sticky_leverage"` (`L` held; only `ξ_0` moves with the bumped strip). Report both; the difference is the "leverage vega", a study quantity. Theta: price at `t + 1` business day with the surface held fixed in `(K, absolute expiry)`, factors at zero, forward rolled; only for products with no fixing in the roll window (raise otherwise). Test in the BS model: `θ + ½σ²S²Γ + r-terms = 0` for a vanilla within stderr.
-
-Forward-variance vega ladder (`ladders.py`, `fwd_var_ladder`): buckets monthly to 1y, quarterly to 3y by default; configurable. Bump `ξ_0^T → (1+ε) ξ_0^T` for `T` in bucket `[T_i, T_{i+1}]`. Propagation to the surface: the VS total variance at maturity `T` shifts by `dW(T) = ε ∫_{bucket ∩ [0,T]} ξ_0`; apply the same shift additively to `w(k, T)` for every `k` (parallel shift in total variance per maturity, skew preserved in total-variance terms). Document this mapping. `ε` chosen so the bucket's forward VS vol rises by 1 vp. Units: % of notional per vol point of bucket forward VS vol. Variants `"recalibrated"` (default) and `"sticky_leverage"`. Test: for both variants the ladder sums to the corresponding parallel forward-variance bump within 2 stderr; for a plain variance swap the recalibrated ladder is flat and equals its analytic sensitivity.
-
-Spot-shift profiles (`profiles.py`): `S0` shifts on a grid (default −30% to +30% in 2.5% steps), prices and model delta/gamma/vega at each shift under `"model"` dynamics by default (leverage fixed, factors at zero); optional other regimes, which recalibrate per shift (cached). Gamma profile as the second difference. Cliquet gamma profile also versus the accumulated sum at an intermediate date, reusing the Bachelier call-on-remaining-capped-sum decomposition from the original study as an analytic cross-check (exact under BS with independent legs; report the deviation under the LSV).
-
-Vol-of-vol and model-parameter sensitivities (`volsto_sens.py`): partial sensitivities to each of `(ν, θ, k1, k2, ρ12, ρ_SX1, ρ_SX2)` with recalibration; for `ν` also the sticky-leverage variant. Central differences, PSD check on correlation bumps (reduce the bump if violated, report). Output as one table per product: value, stderr and the price per unit parameter under both variants.
-
-P&L attribution (`attribution.py`): `explain(product, state_0, state_1)`: sequential CRN revaluation from `state_0` to `state_1` in the order spot (delta, gamma), surface (parallel vega, then vega-T waves, then skew/curvature), model parameters, factor state; residual = actual change minus the sum. States carry `S0`, surface, model params, factor values, date. Used by the hedger's regime breakdown in M8.
-
-`RiskReport`: one object per product holding every sensitivity with stderr, the bump specs used, the cache keys of every recalibration, and `to_dataframe()` / `to_excel()`. Docstring must state: (i) wave projections equal single-pillar bumps only to first order (recalibration and vega convexity add a small cross term, tested within 2 stderr); (ii) an expiry between two pillars shows vega in both neighbouring projections, in proportion to its distance from each, because the bump lives at the pillars and the interpolation ramps it.
-
-Performance: a full report (recalibrated fwd-var ladder of 18 buckets, vega-T waves, skew and curvature ladders, 5 regime deltas, parallel vega, 7 parameter sensitivities, cross-Greeks of 17.D) is on the order of 80–100 recalibrations. Print the count and the wall clock; that is the viewer precompute budget.
-
-Tests (in addition to those inline above): BS model — delta, gamma, vega, theta versus analytic within 3 stderr for calls and puts; all delta regimes coincide in BS. Forward-start option before `T1` — model delta small relative to vega (report the ratio); sticky_moneyness delta ≈ 0 within stderr. Capped cliquet (study structure) — fwd-var ladder recalibrated vs sticky-leverage, reproduce the qualitative result of the original study (net ladder units: % of notional per vol point per forward month). Attribution — for a pure spot move the residual is at the gamma-cubed level (report), for a pure parallel vega move the residual is within 2 stderr.
-
-### 17.B Skew and curvature risk, delta regimes
-
-Skew and curvature risk (`ladders.py`, `skew_T` and `curvature_T`): pillars = the surface's expiry pillars (default 1m, 2m, 3m, 6m, 9m, 1y, 18m, 2y, 3y). `tent_i(T)` linear from 0 at `T_{i-1}` to 1 at `T_i` to 0 at `T_{i+1}`, flat beyond the last pillar and before the first. Skew bump `i`: `σ(k, T) → σ(k, T) + s · k · tent_i(T)`, with `s` chosen so that `σ(ln 0.9) − σ(ln 1.1)` at `T_i` rises by 1 vp (rotation around ATM). Units: % of notional per vol point of 90/110 skew at the pillar. Curvature bump `i`: `σ(k, T) → σ(k, T) + c · k² · tent_i(T)`, with `c` chosen so that `[σ(ln 0.9) + σ(ln 1.1)]/2 − σ(0)` at `T_i` rises by 1 vp. Units per vol point of 90/110 butterfly. Recalibrated and sticky-leverage variants; no-arbitrage checks as in 17.A. Tests: ATM vanilla has zero skew vega within stderr, a 90% put has positive skew vega; a 90/110 risk reversal has zero curvature vega within stderr, a 90/110 strangle has positive curvature vega; `skew_T` sums to a global rotation bump within 2 stderr.
-
-Delta regimes (replaces §14 `smile_dynamics`): smile in log-moneyness `k = ln(K/S)`; `Δ = ln(S0_new / S0_old)`; `s_T` = ATM skew `dσ/dk` at maturity `T` from the surface.
-- `"model"`: bump `S0`, `L` and factors fixed (default; the hedger's delta).
-- `"sticky_strike"`: `σ_new(k, T) = σ_old(k + Δ, T)`.
-- `"sticky_moneyness"`: `σ_new(k, T) = σ_old(k, T)`.
-- `"sticky_skew"`: `σ_new(k, T) = σ_old(k, T) + s_T Δ` (ATM vol slides along the old smile; shape re-centred at the new spot with the same skew and curvature).
-- `"sticky_local_vol"`: `σ_new(k, T) = σ_old(k, T) + 2 s_T Δ` (Derman's sticky-implied-tree regime, SSR = 2; reference point only).
-All except `"model"` rebuild the surface as above, recalibrate `L` (cached) and reprice under CRN. Report all five deltas and gammas side by side. Tests: in BS all five coincide; for an ATM vanilla, sticky_strike and sticky_skew deltas agree to first order (difference bounded by the curvature term, report it); the ordering of ATM-vol shifts per unit `Δ` is `0 (moneyness) < s_T (strike, skew) < 2 s_T (local vol)`, and the `"model"` regime's shift equals `SSR_T · s_T` from §4.4 within tolerance (this test lands when the §4.4 estimator lands in M7; mark it skipped until then).
-
-### 17.C Vega by maturity, desk "wave" convention (replaces any vega-T paragraph above)
-
-Vega by maturity (`ladders.py`, `vega_T`): pillar bump `i`: `σ(k, T) → σ(k, T) + 0.01 · tent_i(T)`, `tent_i` as in 17.B (the bump lives at the pillars; interpolation ramps to the neighbours). Check the calendar condition on every ramp after bumping: at `σ = 20%` it requires `T_{i+1}/T_i ≥ 1.10`, which the default pillars satisfy; raise if a custom pillar set does not. Wave `j`: bump every pillar with `T_i ≤ T_j` simultaneously, i.e. the sum of tents `1..j`; wave `n` (all pillars) equals the parallel vega bump. Report both: cumulative vega per wave, and the vega projection at pillar `T_j = wave_j − wave_{j-1}`. Projections sum to the parallel vega by construction. Tests: the projection ladder equals the single-pillar tent ladder within 2 stderr; `wave_n` equals the parallel vega within 2 stderr. Recalibrated (default) and sticky-leverage variants. Units: % of notional per vol point.
-
-### 17.D Additional Greeks
-
-Cross-Greeks (`greeks.py`), all CRN central differences with stderr of the difference, under the `"model"` regime unless stated: vanna `d(vega)/d(ln S)` and `d(delta)/d(σ)`, both reported (they agree only in BS; the difference under the LSV is informative); volga `d(vega)/d(σ)`; charm and veta: one-business-day roll of delta and vega with the surface held in `(K, absolute expiry)`; rho: parallel +1 bp in rates; repo/dividend delta: +1 bp in `q`. Theta split into carry (rates/divs), pure decay (surface held in time-to-maturity) and roll-down (difference). Cross terms `d(delta)/d(ρ_SX1)`, `d(delta)/d(ρ_SX2)`, `d(delta)/d(ν)`: the hedge ratio's own dependence on the vol-sto parameters (recalibrated).
-
-Product-specific (`risk/product_risk.py`): fixing risk — for forward-start and cliquet products, delta/gamma/vega at `T1` minus one day and `T1` plus one day (state held), reported as the jump; for cliquets, per fixing. Barrier risk — `d(price)/d(barrier)` for KO var and KI put; delta and gamma profile within ±5% of the barrier at 0.5% steps; for the VKO, `d(price)/d(H)` in vol points of the vol barrier and `d(P(KO))/d(ln S)`. Realised-variance exposure — expected dollar-gamma-weighted variance per fixing period along the path, as a profile; for a variance swap it must be flat and equal to the notional within stderr. Second-order forward-variance ladder — diagonal convexity per bucket (three-point second difference on the bucket bump); off-diagonal cross terms only on request.
-
-Precision options (`risk/estimators.py`): likelihood-ratio delta and vega (score function on the Gaussian draws) for discontinuous payoffs (barriers, KO var, VKO, digitals), with the bump estimate as the cross-check; report both with stderr and flag when they differ by more than 3 stderr. Conditional Greeks at a future date `t`: regression of the discounted payoff and its CRN bumps on a polynomial basis in `(ln S_t, X1_t, X2_t)`, returning delta, gamma, vega as functions of the state; this is the hedger's engine in M8. Control variate on the difference: for vanilla-like products use the BS Greek at the market vol as control variate on (bumped minus base) and report the variance reduction.
-
-Tests: vanna and volga in BS versus analytic within 3 stderr; realised-variance exposure flat for a variance swap; fixing-risk jump for a forward-start straddle is a vega-to-delta conversion (report); likelihood-ratio and bump delta agree within 3 stderr on a digital; conditional delta at `t` regressed equals the `t = 0` delta when `t → 0`.
+## 17. Change log v1.1 → v2.0
+- §2: Dupire grid (√t spacing, ±3.0), replication bounds ±25 sd, PCHIP ξ₀, eSSVI class.
+- §3.1: Platen weak-2 default, frozen-L rule, StepSchedule, record_all_steps, M4b second-order SV step; Milstein explicitly excluded.
+- §4: local-linear particle regression with curvature correction and k-NN floor, L in k, leverage grid ±2.5, noise-aware acceptance, code-tag guard.
+- §5: batch-means stderr, accumulator conventions.
+- §6: conditional/KO variance products, VKO put, M4 implementation notes.
+- §7: full M5 risk layer (regimes incl. sticky skew and sticky local vol, vega-T waves, forward-variance ladder, skew/curvature, cross-Greeks, product risks, precision estimators, attribution).
+- §12: milestone status, M4b/M4c inserted, standing commit rule.
+- §13: importer as implemented and data sourcing decisions.
+- §14: superseded by §7.2.
+- §15: M7 smile dynamics, historical estimators, staged 2F fitting, stability, VIX check.
+- §16: desk conventions.
+- 2026-09-13 merge (this file): the implementer's measured tables and notes re-applied over v2.0 — §2.4 replication bounds, §3.1 scheme switches and M4b status, §3.3 second-order step, §4.1 M3 notes and production particle count, §4.2 acceptance table, pre-M4 findings and M4b notes, §5 grid rule, §6.3 M4/M4b tables, §10 M4b baseline, §11 particle-count convention, §12 M4b status, §13 M3b notes.
