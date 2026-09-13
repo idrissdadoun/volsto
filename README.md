@@ -5,13 +5,12 @@ studies: Black–Scholes, Dupire local vol, two-factor lognormal Bergomi forward
 LSV with particle-calibrated leverage, Monte Carlo with common random numbers, and viewers over a
 precomputed parameter cache.  The full design is in [SPEC.md](SPEC.md).
 
-Status: **M3b** — market layer, BS, local vol, MC engine, vanilla / variance products (M1); the
+Status: **M4** — market layer, BS, local vol, MC engine, vanilla / variance products (M1); the
 two-factor lognormal Bergomi forward-variance model with exact factor stepping, its closed forms
 and the mixing-solution smile (M2); particle-method leverage calibration, the LSV model, §4.2
 repricing diagnostics and the content-addressed leverage cache (M3); the HistoricalData.net
-option-chain importer and SSVI/eSSVI fitter (M3b).  The cliquet of the SPEC §11
-quickstart lands with M4; the quickstart below calibrates the 1F LSV and prices a vanilla and a
-variance swap with it.
+option-chain importer and SSVI/eSSVI fitter (M3b); forward-start options, the FVA, the cliquet
+family with exact decompositions, forward-smile analytics and the headline study runner (M4).
 
 ## Install
 
@@ -28,8 +27,9 @@ from volsto.calibration import LeverageCache, reprice_surface
 from volsto.calibration.cache import build_market
 from volsto.config import CalibrationSpec, SimConfig, load_yaml
 from volsto.engine import MonteCarlo
+from volsto.analytics import forward_vol_comparison
 from volsto.market import implied_vol
-from volsto.products import EuropeanOption, VarianceSwap
+from volsto.products import AdditiveCliquet, EuropeanOption, VarianceSwap
 
 # 1F LSV (omega = 3, kappa = 1.5, rho = -0.7) on the reference SSVI surface: surface, curves,
 # Bergomi kernel, particle settings, step schedule and scheme all come from one YAML spec
@@ -44,6 +44,10 @@ call = mc.price(EuropeanOption(K, T, "call", surface.discount), model)
 iv = implied_vol(call.mean, K, K, T, 1, surface.discount.df(T))
 print(call, f"LSV implied {iv:.4%} vs surface {surface.implied_vol(K, T):.4%}")
 print(mc.price(VarianceSwap.daily(T, 0.0, surface.discount), model))  # fair variance strike
+
+cliquet = AdditiveCliquet.study(1.0, surface.discount, notional=100.0)  # monthly, cap 2%, floor 0
+print(cliquet, mc.price(cliquet, model))                                 # in % of notional
+print(forward_vol_comparison(model, 1.0, 2.0, SimConfig(n_paths=200_000, seed=1)))  # 1y-into-1y
 
 report = reprice_surface(model, surface, SimConfig(n_paths=400_000, seed=2))  # §4.2 table
 print(report.summary())
@@ -90,12 +94,12 @@ print(skew, atmf_skew_order1_flat(params, 1.0), ssr_order1_flat(params, 1.0), vs
 
 ```bash
 volsto-import --vendor hdn --date 2022-09-15 --underlying SPX \
-    --root data/hdn_sample/options_sample_2022H2 --out configs/surfaces/snapshots   # add --essvi for a slice-dependent rho
+    --root data/hdn_sample/options_sample_2022H2 --out configs/surfaces/snapshots   # eSSVI by default; --ssvi for a single rho
 ```
 
 Reads one HistoricalData.net daily CSV (34 columns), keeps the SPX/SPXW roots, derives implied
 forwards by put–call-parity regression, builds an arbitrage-checked `GridSurface` from OTM mid
-quotes, fits SSVI (or eSSVI) and writes a dated market YAML with provenance that runs through
+quotes, fits eSSVI (rho per pillar; `--ssvi` for a single rho) and writes a dated market YAML with provenance that runs through
 calibration like the synthetic configs.  `scripts/capture_yfinance.py` saves today's SPX/SPY
 chain from Yahoo in the same layout (`pip install -e ".[data]"`).
 
@@ -107,6 +111,23 @@ kernel regression of E[ξ|S] (Nadaraya–Watson carries an h² m′f′/f design
 in the tails, and a saturating log-quadratic tail extrapolation (the flat rule mis-priced the 3m
 +30% call by 1 vol point and variance swaps by 0.3).  Calibration and pricing share the kernel
 step for step: every leverage lookup inside a step uses the slice at the step start.
+
+## Forward-start products and forward-smile analytics (M4)
+
+`ForwardStartOption` pays `(cp (S_T2/S_T1 − k))⁺` (book §3.1; `k` is a moneyness, `t1 = 0` and
+a deferred pay date are allowed), `ForwardStartStraddle`, `FVA` (the forward-start ATM-forward
+straddle less its Black premium at the agreed vol, so the fair strike is the forward ATM vol),
+`AdditiveCliquet` (local floor/cap, global floor/cap; `AdditiveCliquet.study(T)` is the study's
+monthly 2%-capped, zero-floored structure), `ReverseCliquet` and `Napoleon`.  `decompose()` on
+the cliquets returns cash + a strip of forward-start calls (long at `1 + LF`, short at `1 + LC`)
++ a put / call on the accumulated sum (`AccumulatedSumOption`); the identity holds path by path.
+
+`volsto.analytics.forward_smile` inverts out-of-the-money forward-start prices with the model's
+own forward ratio `F(T2)/F(T1)` (`forward_smile`, `forward_atm_vol`), prices the forward ATM
+vol, the forward variance swap and the forward vol swap on one path set
+(`forward_vol_comparison`) and lays forward smiles of several models side by side
+(`put_wing_table`).  `scripts/m4_headline.py` (`volsto.studies.m4`) reproduces the M4 headline
+table: LV and the 1F LSV for ω = 1, 2, 3 and the 2F Table 8.2 set on the reference surface.
 
 ## Development
 

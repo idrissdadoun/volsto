@@ -6,6 +6,8 @@ Pipeline, one function per step (each testable):
    underlying's root), drop rows without both quotes, record ``settlement_time`` and use it in
    the time-to-expiry convention (vendor README §5.2: calendar days / 365, minus one day for AM
    settlement), attach the manifest's Treasury par-yield curve interpolated at ``T`` (README §6).
+   Slices are grouped by **(root, expiration)** as the vendor does: SPX (AM-settled monthlies)
+   and SPXW (PM weeklies / end-of-month) share expiration dates but differ by one day in ``T``.
 2. :func:`implied_forward` — put–call parity on mid prices near the money: regression of
    ``C − P`` on ``K`` gives ``F = −a/b`` and the implied discount factor ``−b`` (the vendor's
    ``iv`` / Greeks are cross-checks only; its quotes are not a synchronised snapshot).
@@ -15,7 +17,9 @@ Pipeline, one function per step (each testable):
    (total variance non-decreasing in ``T``) checks on the retained points.
 4. :func:`fit_ssvi` — ``θ_T`` from the ATM total variance per expiry, global ``(ρ, η, γ)`` by
    least squares in vol space with the no-arbitrage constraints enforced through a bounded
-   reparametrisation; residuals per expiry.  ``essvi=True`` fits a slice-dependent ``ρ_T``.
+   reparametrisation; residuals per expiry.  Imported surfaces default to eSSVI (``ρ`` per
+   pillar, ``essvi=True``); synthetic configs keep plain SSVI.  Expiries under 3m are reported
+   but sit outside the acceptance region (a single power-law φ cannot follow them).
 5. :func:`snapshot_config` — a dated market YAML (surface params, forward and rate curves,
    provenance: vendor, file checksum, filters, code version) loadable with
    :func:`volsto.market.loaders.load_ssvi_surface`.
@@ -784,7 +788,7 @@ def import_day(
     underlying: str = "SPX",
     *,
     filters: HdnFilters | None = None,
-    essvi: bool = False,
+    essvi: bool = True,
 ) -> tuple[dict[str, Any], SSVIFit, SurfacePoints, pd.DataFrame]:
     """Run the whole pipeline for one day; returns ``(config, fit, points, chain)``."""
     root = Path(root)
@@ -815,7 +819,11 @@ def main(argv: list[str] | None = None) -> int:
         help="sample / archive directory (contains day_by_date/)",
     )
     ap.add_argument("--out", default="configs/surfaces/snapshots", help="output directory")
-    ap.add_argument("--essvi", action="store_true", help="fit a slice-dependent rho (eSSVI)")
+    ap.add_argument(
+        "--ssvi",
+        action="store_true",
+        help="fit a single rho (SSVI); imported surfaces default to eSSVI (rho per pillar)",
+    )
     ap.add_argument("--min-bid", type=float, default=HdnFilters.min_bid)
     ap.add_argument("--max-rel-spread", type=float, default=HdnFilters.max_rel_spread_vol)
     ap.add_argument("--max-years", type=float, default=HdnFilters.max_years)
@@ -825,12 +833,10 @@ def main(argv: list[str] | None = None) -> int:
         min_bid=args.min_bid, max_rel_spread_vol=args.max_rel_spread, max_years=args.max_years
     )
     cfg, fit, points, _ = import_day(
-        args.root, args.date, args.underlying, filters=filters, essvi=args.essvi
+        args.root, args.date, args.underlying, filters=filters, essvi=not args.ssvi
     )
-    out = (
-        Path(args.out)
-        / f"{args.underlying.lower()}_{args.date}{'_essvi' if args.essvi else ''}.yaml"
-    )
+    suffix = "_ssvi" if args.ssvi else ""
+    out = Path(args.out) / f"{args.underlying.lower()}_{args.date}{suffix}.yaml"
     write_snapshot(cfg, out)
     log.info(
         "wrote %s (%d points, %d expiries)",

@@ -116,22 +116,23 @@ def test_grid_surface_and_ssvi_fit(pipeline) -> None:
     _cfg, fit, points, _chain = pipeline
     assert points.table["expiry"].nunique() >= 25 and len(points.table) > 3000
     assert set(points.dropped) >= {"butterfly", "calendar", "spread", "min_bid"}
-    assert isinstance(fit.surface, SSVISurface)
+    assert isinstance(fit.surface, ESSVISurface)  # imported surfaces default to eSSVI
     fit.surface.check_no_arbitrage()  # raises on violation
     # SSVI: rms ≤ 0.3 vp inside ±20% from 3m to 2y (single power law cannot follow the 1-2m
     # weeklies of this high-vol day: reported, not asserted)
     assert fit.rms_error(2.0, 0.2, 0.25) < 0.30, fit.rms_error(2.0, 0.2, 0.25)
     assert fit.max_error(2.0, 0.2, 0.5) < 1.0
-    assert -0.9 < fit.params["rho"] < -0.3 and 0.05 < fit.params["gamma"] <= 1.0
+    assert all(-0.9 < r < -0.3 for r in fit.params["rho"]) and 0.05 < fit.params["gamma"] <= 1.0
     # ATM term structure at the pillar tenors, in a plausible range for Sept 2022
     assert all(0.15 < v < 0.40 for v in fit.params["atm_vols"])
 
 
 def test_essvi_fit_improves_near_money(pipeline) -> None:
-    _cfg, fit, _points, _chain = pipeline
-    _, fit_e, _, _ = import_day(SAMPLE, DAY, "SPX", essvi=True)
-    assert isinstance(fit_e.surface, ESSVISurface)
-    fit_e.surface.check_no_arbitrage()
+    _cfg, fit_e, _points, _chain = pipeline
+    _, fit, _, _ = import_day(SAMPLE, DAY, "SPX", essvi=False)  # plain SSVI, single rho
+    assert isinstance(fit.surface, SSVISurface) and isinstance(fit_e.surface, ESSVISurface)
+    fit.surface.check_no_arbitrage()
+    assert -0.9 < fit.params["rho"] < -0.3
     assert fit_e.rms_error(2.0, 0.2, 0.25) <= fit.rms_error(2.0, 0.2, 0.25) + 1e-9
     assert fit_e.rms_error(2.0, 0.2, 0.5) < 0.20
     assert len(fit_e.params["rho"]) == len(fit_e.params["atm_maturities"])
@@ -144,7 +145,8 @@ def test_snapshot_config_round_trip(pipeline, tmp_path: Path) -> None:
     market = load_yaml(p, MarketConfig, section="market")
     ssvi = load_yaml(p, SSVIConfig, section="ssvi")
     assert market.spot == pytest.approx(chain.attrs["spot"])
-    assert ssvi.rho == pytest.approx(fit.params["rho"])
+    assert isinstance(surface, ESSVISurface)
+    assert ssvi.rho == pytest.approx(float(np.mean(fit.params["rho"])))
     np.testing.assert_allclose(surface.atm_vol(1.0), fit.surface.atm_vol(1.0), rtol=1e-9)
     prov = cfg["provenance"]
     assert prov["vendor"] == "historicaldata.net" and prov["file_sha256"] == prov["manifest_sha256"]
@@ -154,7 +156,7 @@ def test_snapshot_config_round_trip(pipeline, tmp_path: Path) -> None:
 
 
 def test_essvi_snapshot_round_trip(tmp_path: Path) -> None:
-    cfg, fit, _, _ = import_day(SAMPLE, DAY, "SPX", essvi=True)
+    cfg, fit, _, _ = import_day(SAMPLE, DAY, "SPX")
     p = write_snapshot(cfg, tmp_path / "spx_essvi.yaml")
     surface = load_ssvi_surface(p)
     assert isinstance(surface, ESSVISurface)

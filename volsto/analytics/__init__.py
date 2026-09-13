@@ -20,8 +20,20 @@ from volsto.analytics.bergomi import (
     vs_vol_of_vol,
     vs_vol_of_vol_flat,
 )
+from volsto.analytics.forward_smile import (
+    ForwardSmile,
+    ForwardVolComparison,
+    forward_atm_vol,
+    forward_ratio,
+    forward_smile,
+    forward_smile_from_prices,
+    forward_vol_comparison,
+    put_wing_table,
+)
 
 __all__ = [
+    "ForwardSmile",
+    "ForwardVolComparison",
     "alpha_theta",
     "atmf_skew_order1",
     "atmf_skew_order1_flat",
@@ -29,7 +41,13 @@ __all__ = [
     "cov_x_diag",
     "cov_xi_diag",
     "eta_u",
+    "forward_atm_vol",
+    "forward_ratio",
+    "forward_smile",
+    "forward_smile_from_prices",
+    "forward_vol_comparison",
     "forward_vs_vol_of_vol_flat",
+    "put_wing_table",
     "ssr_order1",
     "ssr_order1_flat",
     "var_integrated_variance",

@@ -3,8 +3,8 @@
 Realised variance is computed on the **fixing** dates (daily by default), not on the simulation
 grid:  ``RV = A · Σ_i ln²(S_{t_i}/S_{t_{i-1}})`` with annualisation ``A = 1/(t_n − t_0)`` by
 default or ``A = annualisation / n`` (e.g. 252/n) when given.  A swap whose first fixing is at
-``T₁ > 0`` is a forward variance swap over ``[T₁, T₂]``.  FVA (forward-start straddle vs forward
-vol) is added with the forward-start products in M4.
+``T₁ > 0`` is a forward variance swap over ``[T₁, T₂]``.  :class:`FVA` is the forward volatility
+agreement on the relative performance (a forward on the ``T₁``-dated ATM-forward straddle).
 """
 
 from __future__ import annotations
@@ -14,12 +14,14 @@ from typing import TYPE_CHECKING
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
-from volsto.products.base import Product, daily_schedule
+from volsto.market.bs import black_price
+from volsto.products.base import CashFlow, Product, daily_schedule
+from volsto.products.forward_start import ForwardStartStraddle
 
 if TYPE_CHECKING:
     from volsto.engine.grid import FixingIndex
     from volsto.engine.paths import PathSet
-    from volsto.market.curves import DiscountCurve
+    from volsto.market.curves import DiscountCurve, ForwardCurve
 
 FloatArray = NDArray[np.float64]
 
@@ -209,4 +211,83 @@ class VolSwap(_RealisedVarianceProduct):
         return (
             f"{kind}: [{self.start:g}y, {self.maturity:g}y], {self.n_returns} returns, "
             f"strike {self.strike_vol * 100:.4g}% vol, vol notional {self.notional:g}"
+        )
+
+
+class FVA(Product):
+    """Forward volatility agreement on the relative performance ``R = S_T2/S_T1``.
+
+    Pays at ``T2``::
+
+        notional · ( |R − m| − Straddle_Black(m, m, τ, K_vol) ),   τ = T2 − T1,
+
+    i.e. the holder receives the forward-start straddle struck at the ratio ``m`` and pays its
+    Black premium at the agreed volatility ``K_vol`` (settled at ``T2`` together with the
+    straddle, so ``DF(T2)`` is the only financing term).  ``m`` defaults to the model's forward
+    ratio ``F(T2)/F(T1) = E[R]`` (deterministic rates), the ATM-forward straddle, so the fair
+    ``K_vol`` is exactly the forward ATM-forward implied volatility of
+    :func:`volsto.analytics.forward_smile.forward_atm_vol` (``E[|R − m|] = Straddle_Black(m, m,
+    τ, σ̂_ATMF)`` by definition of the forward smile, book §3.1).  Bergomi §3.1.9 treats the FX
+    variant ``(S_T2 − k S_T1)⁺`` whose ``S_T1`` prefactor changes the hedge instruments to
+    ``S ln S`` contracts (eq. 3.18); footnote 9 there names this relative-performance form.
+    Checked by ``tests/test_forward_start.py::test_fva_fair_strike_is_forward_atm_vol``.
+    """
+
+    def __init__(
+        self,
+        t1: float,
+        t2: float,
+        strike_vol: float,
+        discount: DiscountCurve,
+        *,
+        forward_curve: ForwardCurve | None = None,
+        moneyness: float | None = None,
+        notional: float = 1.0,
+    ) -> None:
+        super().__init__(discount, notional)
+        if t1 < 0 or t2 <= t1:
+            raise ValueError("need 0 ≤ t1 < t2")
+        if strike_vol < 0:
+            raise ValueError("strike_vol must be non-negative")
+        if moneyness is None:
+            if forward_curve is None:
+                raise ValueError("give the forward curve (ATM-forward straddle) or a moneyness")
+            moneyness = float(forward_curve.forward(t2) / forward_curve.forward(t1))
+        if moneyness <= 0:
+            raise ValueError("moneyness must be positive")
+        self.T1 = float(t1)
+        self.T2 = float(t2)
+        self.strike_vol = float(strike_vol)
+        self.moneyness = float(moneyness)
+
+    @property
+    def tau(self) -> float:
+        return self.T2 - self.T1
+
+    @property
+    def straddle_premium(self) -> float:
+        """Undiscounted Black straddle value ``Σ_cp Black(m, m, τ, K_vol, cp)`` paid at ``T2``."""
+        m, tau, v = self.moneyness, self.tau, self.strike_vol
+        return float(black_price(m, m, tau, v, 1) + black_price(m, m, tau, v, -1))
+
+    @property
+    def fixing_times(self) -> FloatArray:
+        return np.array([self.T1, self.T2])
+
+    def payoff(self, paths: PathSet, idx: FixingIndex) -> FloatArray:
+        r = np.exp(paths.log_return(idx[self.T1], idx[self.T2]))
+        cf = np.abs(r - self.moneyness) - self.straddle_premium
+        return np.asarray(self.notional * float(self.df(self.T2)) * cf, dtype=np.float64)
+
+    def decompose(self) -> list[Product]:
+        return [
+            ForwardStartStraddle(self.T1, self.T2, self.moneyness, self.discount, self.notional),
+            CashFlow(-self.straddle_premium, self.T2, self.discount, self.notional),
+        ]
+
+    def __repr__(self) -> str:
+        return (
+            f"FVA: forward-start straddle |S_T2/S_T1 - {self.moneyness:.6g}| less its Black "
+            f"premium at {self.strike_vol * 100:.4g}% vol, T1 {self.T1:g}y, T2 {self.T2:g}y, "
+            f"notional {self.notional:g}"
         )

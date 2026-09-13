@@ -89,3 +89,28 @@ class Product(ABC):
 
     @abstractmethod
     def __repr__(self) -> str: ...
+
+
+class CashFlow(Product):
+    """Deterministic amount ``notional · amount`` paid at ``pay_time`` (decomposition building
+    block: the cash leg of a cliquet or of a forward volatility agreement).  Its only fixing is
+    the pay date, so it never extends a grid beyond the product it decomposes."""
+
+    def __init__(
+        self, amount: float, pay_time: float, discount: DiscountCurve, notional: float = 1.0
+    ) -> None:
+        super().__init__(discount, notional)
+        if pay_time <= 0 or not np.isfinite(amount):
+            raise ValueError("pay_time must be positive and amount finite")
+        self.amount = float(amount)
+        self.T = float(pay_time)
+
+    @property
+    def fixing_times(self) -> FloatArray:
+        return np.array([self.T])
+
+    def payoff(self, paths: PathSet, idx: FixingIndex) -> FloatArray:
+        return np.full(paths.n_paths, self.notional * self.amount * float(self.df(self.T)))
+
+    def __repr__(self) -> str:
+        return f"Cash flow: {self.amount:g} x notional {self.notional:g} paid at {self.T:g}y"
