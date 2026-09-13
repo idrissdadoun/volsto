@@ -59,6 +59,7 @@ payoff path by path.  Checked by ``tests/test_autocall.py``.
 from __future__ import annotations
 
 import hashlib
+import weakref
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -66,6 +67,13 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 from volsto.products.base import Product, daily_schedule, shift_times
+from volsto.products.gap import (
+    GapReport,
+    GapSpec,
+    LevelFactors,
+    month_grid,
+    regress_at_level,
+)
 from volsto.products.vanilla import DigitalOption, EuropeanOption
 
 if TYPE_CHECKING:
@@ -91,6 +99,8 @@ STATISTICS = (
     "put_loss",
 )
 _TOL = 1e-9
+_Eval = tuple[dict[str, FloatArray], dict[str, FloatArray], FloatArray]
+_SmartMemo = tuple["weakref.ref[PathSet]", "weakref.ref[FixingIndex]", _Eval]
 
 
 def _unique_times(ts: ArrayLike) -> FloatArray:
@@ -153,6 +163,7 @@ class Autocall(Product):
         guaranteed_coupons: bool = False,
         non_call_periods: int = 0,
         final_redemption: str = "knock_in",
+        gap: GapSpec | None = None,
         notional: float = 1.0,
     ) -> None:
         super().__init__(discount, notional)
@@ -245,6 +256,22 @@ class Autocall(Product):
         self.coupons = coupons_arg
         self.coupon_barrier = None if coupon_barrier is None else float(coupon_barrier)
         self.memory = bool(memory)
+        # gap convention (owner addendum at the M6 review): None = no shift; GapSpec(mode="fixed")
+        # is the signed fixed shift of the monitored levels; "smart" = the state-dependent signed
+        # gap of volsto.products.gap (two-pass evaluation, see _evaluate)
+        if gap is not None and not isinstance(gap, GapSpec):
+            raise TypeError("gap must be a GapSpec or None")
+        if (
+            gap is not None
+            and gap.smart
+            and ki_type == "american"
+            and ki_monitoring == "continuous"
+        ):
+            raise NotImplementedError(
+                "the smart gap is implemented for discrete knock-in monitoring (and the "
+                "European knock-in); use ki_monitoring='discrete'"
+            )
+        self.gap = gap
         self.ki_level = float(ki_level)
         self.ki_type = ki_type
         self.ki_monitoring = ki_monitoring
@@ -269,6 +296,7 @@ class Autocall(Product):
             "autocall_barriers": self.autocall_barriers.copy(),
             "coupon_barrier": self.coupon_barrier,
             "memory": self.memory,
+            "gap": self.gap,
             "ki_monitoring": self.ki_monitoring,
             "ki_fixing_times": (
                 None if self.ki_fixing_times is None else self.ki_fixing_times.copy()
@@ -326,6 +354,7 @@ class Autocall(Product):
         ac_index: IntArray,
         life: FloatArray,
         s_t: FloatArray,
+        ki_levels: LevelFactors | None = None,
     ) -> FloatArray:
         """``ki_breach``: the knock-in level breached at a monitoring date ``≤ life`` (0/1; a
         weight in ``[0, 1]`` for the continuous variant).  Discrete comparisons are strict and in
@@ -333,12 +362,22 @@ class Autocall(Product):
         b = self.ki_barrier
         if self.ki_type == "european":
             # the only monitoring date is T_N: an autocalled path never observes it
-            return ((s_t < b) & (ac_index > self.n_dates)).astype(np.float64)
+            b_eff = (
+                b
+                if ki_levels is None
+                else b * ki_levels.at(self.maturity_date, paths.n_paths)[:, 0]
+            )
+            return ((s_t < b_eff) & (ac_index > self.n_dates)).astype(np.float64)
         if self.ki_monitoring == "discrete":
             assert self.ki_fixing_times is not None
             spots = paths.spot_at(idx.indices(self.ki_fixing_times))
             within = self.ki_fixing_times[None, :] <= life[:, None] + _TOL
-            return ((spots < b) & within).any(axis=1).astype(np.float64)
+            b_eff = (
+                b if ki_levels is None else b * ki_levels.at(self.ki_fixing_times, paths.n_paths)
+            )
+            return ((spots < b_eff) & within).any(axis=1).astype(np.float64)
+        if ki_levels is not None:
+            raise NotImplementedError("gap shifts with continuous knock-in monitoring")
         from volsto.products.barrier import continuous_survival_weight
 
         ln_b = float(np.log(b))
@@ -358,14 +397,53 @@ class Autocall(Product):
     def _evaluate(
         self, paths: PathSet, idx: FixingIndex
     ) -> tuple[dict[str, FloatArray], dict[str, FloatArray], FloatArray]:
-        """Per-path statistics, discounted legs (notional included) and the total payoff."""
+        """Per-path statistics, discounted legs (notional included) and the total payoff.
+
+        Gap conventions (:mod:`volsto.products.gap`): a fixed gap shifts every monitored level
+        by ``fixed_shift``; the smart gap runs two passes — the unshifted evaluation gives the
+        remaining cash flows per path, per-date regressions of those cash flows on the state give
+        the seller's liabilities just inside / outside each level (``ΔV``), the sign rule and the
+        sizing function give a per-path, per-date effective level, and the second pass evaluates
+        the note on those levels (same paths: common random numbers).  The per-path ``ΔV`` and
+        shifts are returned in the statistics (``gap_dv_ac_i``, ``gap_shift_ac_i``,
+        ``gap_dv_ki_j``, ``gap_shift_ki_j`` for the knock-in regression grid dates) and
+        summarised by :meth:`gap_report`.
+        """
+        if self.gap is None:
+            return self._evaluate_levels(paths, idx, None, None)[:3]
+        if not self.gap.smart:
+            f = 1.0 + self.gap.fixed_shift
+            ac = np.broadcast_to(self.autocall_levels * f, (paths.n_paths, self.n_dates)).copy()
+            return self._evaluate_levels(paths, idx, ac, LevelFactors(fixed=f))[:3]
+        # the two-pass evaluation is memoised on the path set (weak reference): the legs and
+        # statistics priced on the same paths reuse it instead of repeating the regressions
+        memo: _SmartMemo | None = getattr(self, "_smart_memo", None)
+        if memo is not None and memo[0]() is paths and memo[1]() is idx:
+            return memo[2]
+        result = self._evaluate_smart(paths, idx)
+        self._smart_memo: _SmartMemo = (weakref.ref(paths), weakref.ref(idx), result)
+        return result
+
+    def _evaluate_levels(
+        self,
+        paths: PathSet,
+        idx: FixingIndex,
+        ac_levels: FloatArray | None,
+        ki_levels: LevelFactors | None,
+    ) -> tuple[dict[str, FloatArray], dict[str, FloatArray], FloatArray, dict[str, FloatArray]]:
+        """The evaluation on given levels — ``ac_levels`` ``(n_paths, N)`` effective autocall
+        levels (``None``: the term sheet's), ``ki_levels`` the knock-in level factors (``None``:
+        the term sheet's) — returning the statistics, the discounted legs, the payoff and the
+        per-date matrices ``(n_paths, N)`` the smart gap needs: ``cash`` (undiscounted cash flow
+        at each observation date, notional 1) and ``coupons`` (the coupon part of it)."""
         obs = self.observation_times
         n = self.n_dates
         n_paths = paths.n_paths
         s_ref = self.spot_reference
         spots = paths.spot_at(idx.indices(obs))  # (n_paths, N)
         dates = np.arange(1, n + 1)
-        cond = spots >= self.autocall_levels[None, :]
+        levels = self.autocall_levels[None, :] if ac_levels is None else ac_levels
+        cond = spots >= levels
         if self.non_call_periods:
             cond[:, : self.non_call_periods] = False
         autocalled = cond.any(axis=1)
@@ -396,7 +474,7 @@ class Autocall(Product):
             ac_coupon = c
         s_t = spots[:, -1]
         survive = ~autocalled
-        breach = self._ki_breach(paths, idx, ac_index, life, s_t)
+        breach = self._ki_breach(paths, idx, ac_index, life, s_t, ki_levels)
         ki = breach * survive  # the knock-in event of the life (module docstring)
         if self.final_redemption == "coupon_barrier":
             assert self.coupon_barrier is not None
@@ -416,13 +494,20 @@ class Autocall(Product):
         legs["coupon"] = nt * np.sum(amount * df[None, :], axis=1)
         legs["put"] = -nt * df_t * loss_ind * put_loss
         if self.ki_type == "european":
+            # the identity's two components on the effective (possibly per-path) level, so that
+            # put = put_vanilla + put_digital holds path by path under every gap convention
             b = self.ki_barrier
+            b_eff = b if ki_levels is None else b * ki_levels.at(self.maturity_date, n_paths)[:, 0]
             scale = -nt / s_ref * df_t * survive
-            legs["put_vanilla"] = np.asarray(scale * np.maximum(b - s_t, 0.0), dtype=np.float64)
-            legs["put_digital"] = np.asarray(scale * (s_ref - b) * (s_t < b), dtype=np.float64)
+            legs["put_vanilla"] = np.asarray(scale * np.maximum(b_eff - s_t, 0.0), dtype=np.float64)
+            legs["put_digital"] = np.asarray(
+                scale * (s_ref - b_eff) * (s_t < b_eff), dtype=np.float64
+            )
         total = legs["bond"] + legs["coupon"] + legs["put"]
         for i in range(n):
             total = total + legs[f"autocall_{i + 1}"]
+        cash = amount + ac_event * (1.0 + ac_coupon)[None, :]
+        cash[:, -1] += survive * (1.0 - loss_ind * put_loss)
         stats = {
             "ac_index": ac_index.astype(np.float64),
             "autocalled": autocalled.astype(np.float64),
@@ -434,7 +519,199 @@ class Autocall(Product):
             "redemption": np.where(autocalled, 1.0, 1.0 - loss_ind * put_loss),
             "put_loss": np.asarray(loss_ind * put_loss, dtype=np.float64),
         }
-        return stats, legs, np.asarray(total, dtype=np.float64)
+        extra = {
+            "cash": np.asarray(cash, dtype=np.float64),
+            "coupons": np.asarray(amount, dtype=np.float64),
+        }
+        return stats, legs, np.asarray(total, dtype=np.float64), extra
+
+    def _evaluate_smart(
+        self, paths: PathSet, idx: FixingIndex
+    ) -> tuple[dict[str, FloatArray], dict[str, FloatArray], FloatArray]:
+        """Two-pass smart gap (:mod:`volsto.products.gap`).  Pass 1 evaluates the note on the
+        term-sheet levels and keeps the undiscounted cash flow of every path at every observation
+        date.  **Autocall barrier** ``i``: for the paths alive at ``T_i`` the seller's liability
+        when called is analytic, ``1 + c_i^AC`` (plain autocall) or ``1 +`` the date's coupon at
+        the level (Phoenix: ``c_i`` plus the memory coupons when ``AC_i ≥ CB``, else nothing);
+        the continuing liability is the §7.11 regression, over the paths continuing at ``T_i``,
+        of their cash flows from ``T_i`` on (date-``T_i`` money) on ``(ln S_i − ln AC_i, X_i,
+        knock-in status, memory state)``, evaluated at the level in each alive path's own state;
+        ``ΔV = L_called − L_continuing``.  **Knock-in barrier**: on the regression grid dates of
+        :func:`~volsto.products.gap.month_grid` (the single date ``T_N`` for the European type)
+        two regressions of the cash flows from the date on — over the paths already knocked in
+        and over the others — give, at the level, ``ΔV = L_knocked − L_alive`` for every path not
+        yet settled; the factor holds until the next grid date (piecewise constant in time, per
+        path).  Sign and size per path: :func:`~volsto.products.gap.conservative_shift` with the
+        spec's sizing function; a date whose regression has fewer than ``min_paths`` paths on a
+        side keeps the fixed shift (``n_fit = 0`` in the report).  Pass 2 evaluates the note on
+        the effective levels with the same paths (common random numbers).  Each path's own
+        variance / knock-in / memory state enters its ``ΔV``: the paths that reach an autocall
+        level after a large move carry the variance state of that move, which is how the sign at
+        one barrier differs between states (module docstring of :mod:`volsto.products.gap`)."""
+        assert self.gap is not None and self.gap.smart
+        gap = self.gap
+        stats0, _legs0, _total0, extra = self._evaluate_levels(paths, idx, None, None)
+        cash = extra["cash"]
+        obs = self.observation_times
+        n = self.n_dates
+        n_paths = paths.n_paths
+        f_fixed = 1.0 + gap.fixed_shift
+        cols = idx.indices(obs)
+        ln_spots = paths.log_spot_at(cols)  # (n_paths, N)
+        df = np.asarray(self.df(obs), dtype=np.float64)
+        ac_index = stats0["ac_index"].astype(np.int64)
+        life = stats0["life"]
+        ki_state = self._ki_state_by_date(paths, idx)  # breached at a fixing ≤ T_i (0/1)
+        memory_state = self._memory_state_by_date(extra["coupons"])  # in memory after T_i
+        ac_levels = np.broadcast_to(self.autocall_levels * f_fixed, (n_paths, n)).copy()
+        gap_stats: dict[str, FloatArray] = {}
+        report = GapReport()
+        if "autocall" in gap.apply_to:
+            for i in range(n):
+                level = float(self.autocall_levels[i])
+                if i < self.non_call_periods or not np.isfinite(level):
+                    continue
+                alive = ac_index > i  # not called at an earlier date (1-based dates ≤ i)
+                cont = alive & (ac_index != i + 1)  # continuing at T_i
+                # the continuing liability: cash flows from T_i on, in T_i money
+                y = (cash[:, i:] * (df[None, i:] / df[i])).sum(axis=1)
+                feats = np.column_stack(
+                    [
+                        ln_spots[:, i] - np.log(level),
+                        paths.factors_at(int(cols[i])),
+                        ki_state[:, i],
+                        memory_state[:, i],
+                    ]
+                )
+                v_cont, n_fit, se_cont = regress_at_level(gap, y, feats, cont, alive)
+                called = 1.0 + self._called_coupon_at_level(i, memory_state)
+                dv = np.full(n_paths, np.nan)
+                shift = np.full(n_paths, gap.fixed_shift)
+                if n_fit > 0:
+                    dv_alive = called[alive] - v_cont
+                    dv[alive] = dv_alive
+                    shift[alive] = gap.shift(dv_alive, "up", se_cont)
+                    ac_levels[:, i] = level * (1.0 + shift)
+                gap_stats[f"gap_dv_ac_{i + 1}"] = dv
+                gap_stats[f"gap_shift_ac_{i + 1}"] = shift
+                near = alive & (np.abs(feats[:, 0]) <= gap.report_band)
+                report.add(f"autocall_{i + 1}", float(obs[i]), dv, shift, n_fit, near=near)
+        ki_levels = LevelFactors(fixed=f_fixed)
+        if "ki" in gap.apply_to:
+            b = self.ki_barrier
+            if self.ki_type == "european":
+                grid = np.array([obs[-1]])
+            else:
+                assert self.ki_fixing_times is not None
+                grid = month_grid(self.ki_fixing_times, gap.ki_grid_months)
+            gcols = idx.indices(grid)
+            ln_grid = paths.log_spot_at(gcols)
+            fac = np.full((n_paths, grid.size), f_fixed)
+            for j, t in enumerate(grid):
+                # the liabilities from the grid date on (a settlement at the date included: at
+                # T_N the knock-in decides the redemption), in date money
+                after = obs >= t - _TOL
+                dfg = float(np.asarray(self.df(np.array([t])), dtype=np.float64)[0])
+                y = (cash[:, after] * (df[None, after] / dfg)).sum(axis=1)
+                alive = life >= t - _TOL  # not settled before the grid date
+                breached = self._breached_by(paths, idx, float(t))
+                feats = np.column_stack(
+                    [
+                        ln_grid[:, j] - np.log(b),
+                        paths.factors_at(int(gcols[j])),
+                        self._memory_at(memory_state, obs, float(t)),
+                    ]
+                )
+                v_in, n_in, se_in = regress_at_level(gap, y, feats, alive & breached, alive)
+                v_out, n_out, se_out = regress_at_level(gap, y, feats, alive & ~breached, alive)
+                n_fit = min(n_in, n_out)
+                dv = np.full(n_paths, np.nan)
+                shift = np.full(n_paths, gap.fixed_shift)
+                if n_fit > 0:
+                    dv_alive = v_in - v_out  # knocked-in minus alive liability
+                    dv[alive] = dv_alive
+                    shift[alive] = gap.shift(dv_alive, "down", np.hypot(se_in, se_out))
+                    fac[:, j] = 1.0 + shift
+                gap_stats[f"gap_dv_ki_{j + 1}"] = dv
+                gap_stats[f"gap_shift_ki_{j + 1}"] = shift
+                near = alive & (np.abs(feats[:, 0]) <= gap.report_band)
+                report.add("ki", float(t), dv, shift, n_fit, near=near)
+            ki_levels = LevelFactors(fixed=f_fixed, grid=grid, factors=fac)
+        stats, legs, total, _extra = self._evaluate_levels(paths, idx, ac_levels, ki_levels)
+        stats.update(gap_stats)
+        self._last_gap_report = report
+        return stats, legs, total
+
+    def gap_report(self, paths: PathSet, idx: FixingIndex) -> GapReport:
+        """The per-barrier, per-date smart-gap summary on these paths (:class:`GapReport`;
+        evaluates the note)."""
+        if self.gap is None or not self.gap.smart:
+            raise ValueError("gap_report needs a smart gap")
+        self._evaluate_smart(paths, idx)
+        return self._last_gap_report
+
+    def _called_coupon_at_level(self, i: int, memory_state: FloatArray) -> FloatArray:
+        """Coupon paid with the autocall redemption at ``T_i`` when the spot sits at the level:
+        the growing / scheduled coupon (plain autocall, guaranteed coupons); for a Phoenix the
+        period coupon plus the coupons in memory before the date when ``AC_i ≥ CB``, else 0."""
+        n_paths = memory_state.shape[0]
+        c_i = float(self.coupon_schedule[i])
+        if not self.is_phoenix:
+            return np.full(n_paths, c_i)
+        assert self.coupon_barrier is not None
+        if self.autocall_barriers[i] < self.coupon_barrier - _TOL:
+            return np.zeros(n_paths)
+        before = memory_state[:, i - 1] if i > 0 else np.zeros(n_paths)
+        return np.asarray(c_i + before, dtype=np.float64)
+
+    def _ki_state_by_date(self, paths: PathSet, idx: FixingIndex) -> FloatArray:
+        """Knock-in level breached at a monitoring date ``≤ T_i`` (0/1 per path and date; the
+        European type has no status before its single date)."""
+        obs = self.observation_times
+        n = self.n_dates
+        out = np.zeros((paths.n_paths, n))
+        if self.ki_type == "european":
+            return out
+        assert self.ki_fixing_times is not None
+        hit = paths.spot_at(idx.indices(self.ki_fixing_times)) < self.ki_barrier
+        for i in range(n):
+            upto = self.ki_fixing_times <= obs[i] + _TOL
+            if upto.any():
+                out[:, i] = hit[:, upto].any(axis=1)
+        return out
+
+    def _breached_by(self, paths: PathSet, idx: FixingIndex, t: float) -> BoolArray:
+        """Knock-in status at ``t``: a fixing ``≤ t`` below the level (European: ``S_T < B``
+        when ``t`` is the maturity)."""
+        if self.ki_type == "european":
+            if t < self.maturity_date - _TOL:
+                return np.zeros(paths.n_paths, dtype=bool)
+            return np.asarray(paths.spot_at(idx[self.maturity_date]) < self.ki_barrier, dtype=bool)
+        assert self.ki_fixing_times is not None
+        upto = self.ki_fixing_times <= t + _TOL
+        if not upto.any():
+            return np.zeros(paths.n_paths, dtype=bool)
+        spots = paths.spot_at(idx.indices(self.ki_fixing_times[upto]))
+        return np.asarray((spots < self.ki_barrier).any(axis=1), dtype=bool)
+
+    def _memory_state_by_date(self, coupons: FloatArray) -> FloatArray:
+        """Coupons missed and still recoverable just after each observation date (Phoenix with
+        memory; zeros otherwise): the scheduled coupons to date less the coupons paid to date
+        (``coupons``: the per-date coupon amounts of the evaluation, ``(n_paths, N)``)."""
+        n_paths, n = coupons.shape
+        if not (self.is_phoenix and self.memory):
+            return np.zeros((n_paths, n))
+        cum_sched = np.cumsum(self.coupon_schedule)
+        state = cum_sched[None, :] - np.cumsum(coupons, axis=1)
+        return np.asarray(np.maximum(state, 0.0), dtype=np.float64)
+
+    @staticmethod
+    def _memory_at(memory_state: FloatArray, obs: FloatArray, t: float) -> FloatArray:
+        """Memory state at ``t``: the state after the last observation date ``≤ t``."""
+        before = np.flatnonzero(obs <= t + _TOL)
+        if before.size == 0:
+            return np.zeros(memory_state.shape[0])
+        return np.asarray(memory_state[:, before[-1]], dtype=np.float64)
 
     def statistics(self, paths: PathSet, idx: FixingIndex) -> dict[str, FloatArray]:
         """Per-path undiscounted statistics: ``ac_index`` (first autocall date, 1-based, ``N + 1``
@@ -539,11 +816,14 @@ class Autocall(Product):
         else:
             ki = f"American KI {self.ki_level:.4g} continuous (Brownian bridge)"
         ncp = f", first {self.non_call_periods} dates non-call" if self.non_call_periods else ""
-        return (
+        text = (
             f"{kind}; observation dates [{dates}]y, autocall barriers [{ac}]{ncp}; {ki}; "
             f"put strike 100% geared 1:1; levels x spot_reference {self.spot_reference:g}; "
             f"notional {self.notional:g}"
         )
+        if self.gap is not None:
+            text += f"; {self.gap!r}"
+        return text
 
 
 def Phoenix(

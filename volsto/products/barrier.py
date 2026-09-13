@@ -83,6 +83,13 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 from volsto.products.base import CashFlow, Product, daily_schedule, parse_cp, shift_times
+from volsto.products.gap import (
+    GapReport,
+    GapSpec,
+    LevelFactors,
+    month_grid,
+    regress_at_level,
+)
 from volsto.products.vanilla import EuropeanOption
 
 if TYPE_CHECKING:
@@ -110,10 +117,12 @@ _TOL = 1e-9
 
 
 def first_hit_index(
-    log_spots: ArrayLike, ln_barrier: float, direction: str, *, strict: bool
+    log_spots: ArrayLike, ln_barrier: float | FloatArray, direction: str, *, strict: bool
 ) -> IntArray:
     """Index of the first observation at or beyond the barrier along axis 1 of ``log_spots``
-    (``(n_paths, n_obs)``), ``n_obs`` when the barrier is never breached.
+    (``(n_paths, n_obs)``), ``n_obs`` when the barrier is never breached.  ``ln_barrier`` is a
+    scalar or an array broadcastable to ``log_spots`` (per-path, per-date effective levels of
+    the smart gap).
 
     ``direction = "up"`` breaches when ``x ≥ ln_barrier`` (``>`` if ``strict``), ``"down"`` when
     ``x ≤ ln_barrier`` (``<`` if ``strict``).  With the closes ``S_0..S_N`` this is the ``j`` of
@@ -276,10 +285,28 @@ class _BarrierBase(Product):
         strict: bool | None,
         seed: int,
         notional: float,
+        gap: GapSpec | None = None,
     ) -> None:
         super().__init__(discount, notional)
         if not np.isfinite(barrier) or barrier <= 0 or not np.isfinite(maturity) or maturity <= 0:
             raise ValueError("barrier and maturity must be positive")
+        # gap conventions (owner addendum at the M6 review): ``barrier_shift`` is the fixed
+        # gap; ``gap=GapSpec(mode="fixed", fixed_shift=s)`` is the same thing spelled through
+        # the spec (the two must agree when both are given); ``mode="smart"`` is the signed
+        # state-dependent gap of volsto.products.gap with ``barrier_shift`` as its fallback
+        if gap is not None:
+            if not isinstance(gap, GapSpec):
+                raise TypeError("gap must be a GapSpec or None")
+            if gap.fixed_shift != 0.0 and barrier_shift != 0.0 and gap.fixed_shift != barrier_shift:
+                raise ValueError("gap.fixed_shift and barrier_shift disagree: give one of them")
+            if gap.fixed_shift != 0.0:
+                barrier_shift = gap.fixed_shift
+            if gap.smart and monitoring != "discrete":
+                raise NotImplementedError(
+                    "the smart gap is implemented for discrete monitoring (the Brownian bridge "
+                    "has no per-date level to regress at)"
+                )
+        self.gap = gap
         if direction not in DIRECTIONS:
             raise ValueError(f"direction must be one of {DIRECTIONS}, got {direction!r}")
         if monitoring not in MONITORINGS:
@@ -365,6 +392,7 @@ class _BarrierBase(Product):
             "monitoring": self.monitoring,
             "fixing_times": self.schedule,
             "barrier_shift": self.barrier_shift,
+            "gap": self.gap,
         }
         if self.monitoring == "discrete":
             kw["strict"] = self.strict
@@ -396,14 +424,10 @@ class _BarrierBase(Product):
         crossing step, module docstring).  Checked by
         ``tests/test_barrier.py::test_rebate_timing_and_european_barrier``."""
         if self.monitoring == "discrete":
-            assert self.strict is not None
-            ls = paths.log_spot_at(idx.indices(self.schedule))
-            j = first_hit_index(ls, self.ln_barrier, self.direction, strict=self.strict)
-            n_obs = self.schedule.size
-            alive = (j == n_obs).astype(np.float64)
-            dfs = self.df(self.schedule)
-            hit_df = np.where(j < n_obs, dfs[np.minimum(j, n_obs - 1)], 0.0)
-            return alive, np.asarray(hit_df, dtype=np.float64)
+            if self.gap is not None and self.gap.smart:
+                return self._monitor_smart(paths, idx)
+            alive, hit_df, _ = self._monitor_discrete(paths, idx, self.ln_barrier)
+            return alive, hit_df
         t0, t1 = float(self.schedule[0]), float(self.schedule[1])
         c0, c1 = _window_columns(paths, idx, t0, t1)
         times = idx.times
@@ -436,6 +460,100 @@ class _BarrierBase(Product):
         hit_df = np.where(knocked, df_mid, 0.0)
         return alive, np.asarray(hit_df, dtype=np.float64)
 
+    def _monitor_discrete(
+        self, paths: PathSet, idx: FixingIndex, ln_levels: float | FloatArray
+    ) -> tuple[FloatArray, FloatArray, IntArray]:
+        """Discrete monitoring on the log-levels ``ln_levels`` (a scalar, or ``(n_paths, n_obs)``
+        per-path effective levels): survival indicator, discount factor to the hit, hit index."""
+        assert self.strict is not None
+        ls = paths.log_spot_at(idx.indices(self.schedule))
+        j = first_hit_index(ls, ln_levels, self.direction, strict=self.strict)
+        n_obs = self.schedule.size
+        alive = (j == n_obs).astype(np.float64)
+        dfs = self.df(self.schedule)
+        hit_df = np.where(j < n_obs, dfs[np.minimum(j, n_obs - 1)], 0.0)
+        return alive, np.asarray(hit_df, dtype=np.float64), j
+
+    def _knocked_liability(
+        self, paths: PathSet, idx: FixingIndex, t: float
+    ) -> tuple[FloatArray, bool]:
+        """Seller's liability per path once the barrier has been breached at ``t``, in ``t``
+        money per unit notional and per unit of the barrier level, and whether it depends on
+        the path (then it is regressed on the state like the continuing liability)."""
+        raise NotImplementedError
+
+    def _payoff_given(
+        self, alive: FloatArray, hit_df: FloatArray, paths: PathSet, idx: FixingIndex
+    ) -> FloatArray:
+        """The discounted payoff (notional included) from a monitoring result."""
+        raise NotImplementedError
+
+    def payoff(self, paths: PathSet, idx: FixingIndex) -> FloatArray:
+        alive, hit_df = self.monitor(paths, idx)
+        return self._payoff_given(alive, hit_df, paths, idx)
+
+    def _monitor_smart(self, paths: PathSet, idx: FixingIndex) -> tuple[FloatArray, FloatArray]:
+        """Two-pass smart gap (:mod:`volsto.products.gap`) for a discretely monitored barrier:
+        pass 1 monitors the fixed level (``barrier_shift``) and gives every path's discounted
+        payoff; on the regression grid dates (:func:`~volsto.products.gap.month_grid` of the
+        schedule, spacing ``ki_grid_months``) the continuing liability is the §7.11 regression
+        of the payoff (date money, per unit notional and per unit of the barrier level) over the
+        paths not knocked at or before the date on ``(ln S − ln B, X)``, evaluated at the level
+        for the paths not knocked before the date; the knocked liability is the subclass's
+        (rebate / payout — analytic — or the vanilla, regressed the same way); ``ΔV = L_knocked
+        − L_continuing`` per path, the shift per path from :func:`conservative_shift` and the
+        spec's sizing function, held until the next grid date.  Pass 2 monitors the per-path,
+        per-date effective levels ``B (1 + shift)`` on the same paths."""
+        assert self.gap is not None and self.gap.smart
+        gap = self.gap
+        n = paths.n_paths
+        alive0, hit_df0, j0 = self._monitor_discrete(paths, idx, self.ln_barrier)
+        pay0 = self._payoff_given(alive0, hit_df0, paths, idx) / (self.notional * self.barrier)
+        sched = self.schedule
+        grid = month_grid(sched, gap.ki_grid_months)
+        g_index = np.searchsorted(sched, grid - _TOL)
+        gcols = idx.indices(grid)
+        ln_grid = paths.log_spot_at(gcols)
+        dfs = np.asarray(self.df(grid), dtype=np.float64)
+        fac = np.full((n, grid.size), 1.0 + self.barrier_shift)
+        ln_b = float(np.log(self.barrier))
+        report = GapReport()
+        for k, t in enumerate(grid):
+            g = int(g_index[k])
+            alive = j0 >= g  # not knocked before the grid date
+            cont = j0 > g  # not knocked at or before it
+            y = pay0 / dfs[k]
+            feats = np.column_stack([ln_grid[:, k] - ln_b, paths.factors_at(int(gcols[k]))])
+            v_cont, n_c, se_c = regress_at_level(gap, y, feats, cont, alive)
+            knocked, path_dependent = self._knocked_liability(paths, idx, float(t))
+            if path_dependent:
+                v_kn, n_k, se_k = regress_at_level(gap, knocked, feats, alive, alive)
+            else:
+                v_kn, n_k, se_k = knocked[alive], n_c, np.zeros(int(alive.sum()))
+            n_fit = min(n_c, n_k)
+            dv = np.full(n, np.nan)
+            shift = np.full(n, self.barrier_shift)
+            if n_fit > 0:
+                dv_alive = v_kn - v_cont
+                dv[alive] = dv_alive
+                shift[alive] = gap.shift(dv_alive, self.direction, np.hypot(se_c, se_k))
+                fac[:, k] = 1.0 + shift
+            near = alive & (np.abs(feats[:, 0]) <= gap.report_band)
+            report.add("barrier", float(t), dv, shift, n_fit, near=near)
+        levels = LevelFactors(fixed=1.0 + self.barrier_shift, grid=grid, factors=fac)
+        ln_levels = ln_b + np.log(levels.at(sched, n))
+        alive_eff, hit_df_eff, _ = self._monitor_discrete(paths, idx, ln_levels)
+        self._last_gap_report = report
+        return alive_eff, hit_df_eff
+
+    def gap_report(self, paths: PathSet, idx: FixingIndex) -> GapReport:
+        """The per-date smart-gap summary on these paths (:class:`GapReport`; ``ΔV`` per unit
+        of the barrier level; monitors the product)."""
+        if self.gap is None or not self.gap.smart:
+            raise ValueError("gap_report needs a smart gap")
+        self._monitor_smart(paths, idx)
+        return self._last_gap_report
+
     def _monitoring_repr(self) -> str:
         if self.monitoring == "discrete":
             op = {"up": ">" if self.strict else ">=", "down": "<" if self.strict else "<="}
@@ -454,10 +572,13 @@ class _BarrierBase(Product):
         )
 
     def _barrier_repr(self) -> str:
-        return (
+        text = (
             f"barrier {self.barrier:g} (monitored {self.barrier_eff:g}, shift "
             f"{self.barrier_shift * 100:+g}%)"
         )
+        if self.gap is not None and self.gap.smart:
+            text += f" with {self.gap!r} (fixed shift is the fallback)"
+        return text
 
 
 def _validate_rebate(rebate: float, rebate_timing: str | None, knock: str) -> str | None:
@@ -495,6 +616,7 @@ class _BarrierOption(_BarrierBase):
         strict: bool | None = None,
         seed: int = 0,
         notional: float = 1.0,
+        gap: GapSpec | None = None,
     ) -> None:
         super().__init__(
             barrier,
@@ -508,6 +630,7 @@ class _BarrierOption(_BarrierBase):
             strict=strict,
             seed=seed,
             notional=notional,
+            gap=gap,
         )
         if not np.isfinite(strike) or strike <= 0:
             raise ValueError("strike must be positive")
@@ -566,14 +689,26 @@ class KnockOutOption(_BarrierOption):
 
     knock = "out"
 
-    def payoff(self, paths: PathSet, idx: FixingIndex) -> FloatArray:
-        alive, hit_df = self.monitor(paths, idx)
+    def _payoff_given(
+        self, alive: FloatArray, hit_df: FloatArray, paths: PathSet, idx: FixingIndex
+    ) -> FloatArray:
         df_T = float(self.df(self.T))
         cf = df_T * alive * self.vanilla_payoff(paths, idx)
         if self.rebate != 0.0:
             timing = hit_df if self.rebate_timing == "hit" else df_T * (1.0 - alive)
             cf = cf + self.rebate * timing
         return np.asarray(self.notional * cf, dtype=np.float64)
+
+    def _knocked_liability(
+        self, paths: PathSet, idx: FixingIndex, t: float
+    ) -> tuple[FloatArray, bool]:
+        # the rebate: at the hit (date money) or at maturity (discounted to the date)
+        value = 0.0
+        if self.rebate != 0.0:
+            value = self.rebate * (
+                1.0 if self.rebate_timing == "hit" else float(self.df(self.T) / self.df(t))
+            )
+        return np.full(paths.n_paths, value / self.barrier), False
 
     def __repr__(self) -> str:
         return self._repr("out")
@@ -586,11 +721,20 @@ class KnockInOption(_BarrierOption):
 
     knock = "in"
 
-    def payoff(self, paths: PathSet, idx: FixingIndex) -> FloatArray:
-        alive, _ = self.monitor(paths, idx)
+    def _payoff_given(
+        self, alive: FloatArray, hit_df: FloatArray, paths: PathSet, idx: FixingIndex
+    ) -> FloatArray:
         df_T = float(self.df(self.T))
         cf = df_T * ((1.0 - alive) * self.vanilla_payoff(paths, idx) + self.rebate * alive)
         return np.asarray(self.notional * cf, dtype=np.float64)
+
+    def _knocked_liability(
+        self, paths: PathSet, idx: FixingIndex, t: float
+    ) -> tuple[FloatArray, bool]:
+        # once knocked in the seller owes the vanilla: its terminal payoff, discounted to the
+        # date, regressed on the state at the date
+        scale = float(self.df(self.T) / self.df(t)) / self.barrier
+        return np.asarray(scale * self.vanilla_payoff(paths, idx), dtype=np.float64), True
 
     def decompose(self) -> list[Product]:
         kw = self._kwargs()
@@ -631,6 +775,7 @@ class _Touch(_BarrierBase):
         strict: bool | None = None,
         seed: int = 0,
         notional: float = 1.0,
+        gap: GapSpec | None = None,
     ) -> None:
         super().__init__(
             barrier,
@@ -644,6 +789,7 @@ class _Touch(_BarrierBase):
             strict=strict,
             seed=seed,
             notional=notional,
+            gap=gap,
         )
         if not np.isfinite(payout):
             raise ValueError("payout must be finite")
@@ -675,11 +821,18 @@ class OneTouch(_Touch):
     Black–Scholes: :func:`volsto.market.barrier_bs.bs_one_touch_price`; checked by
     ``tests/test_barrier.py::test_closed_forms_vs_bridge_monte_carlo``."""
 
-    def payoff(self, paths: PathSet, idx: FixingIndex) -> FloatArray:
-        alive, _ = self.monitor(paths, idx)
+    def _payoff_given(
+        self, alive: FloatArray, hit_df: FloatArray, paths: PathSet, idx: FixingIndex
+    ) -> FloatArray:
         return np.asarray(
             self.notional * self.payout * float(self.df(self.T)) * (1.0 - alive), dtype=np.float64
         )
+
+    def _knocked_liability(
+        self, paths: PathSet, idx: FixingIndex, t: float
+    ) -> tuple[FloatArray, bool]:
+        value = self.payout * float(self.df(self.T) / self.df(t)) / self.barrier
+        return np.full(paths.n_paths, value), False
 
     def __repr__(self) -> str:
         return self._repr("One-touch")
@@ -689,11 +842,17 @@ class NoTouch(_Touch):
     """Pays ``notional · payout`` at ``T`` if the barrier was never touched: ``DF(T) survival``
     (one-touch + no-touch = ``payout DF(T)`` path by path)."""
 
-    def payoff(self, paths: PathSet, idx: FixingIndex) -> FloatArray:
-        alive, _ = self.monitor(paths, idx)
+    def _payoff_given(
+        self, alive: FloatArray, hit_df: FloatArray, paths: PathSet, idx: FixingIndex
+    ) -> FloatArray:
         return np.asarray(
             self.notional * self.payout * float(self.df(self.T)) * alive, dtype=np.float64
         )
+
+    def _knocked_liability(
+        self, paths: PathSet, idx: FixingIndex, t: float
+    ) -> tuple[FloatArray, bool]:
+        return np.zeros(paths.n_paths), False
 
     def __repr__(self) -> str:
         return self._repr("No-touch")

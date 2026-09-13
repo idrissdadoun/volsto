@@ -44,12 +44,22 @@ from volsto.products.forward_start import (
     ForwardStartStraddle,
     forward_start_strip,
 )
+from volsto.products.gap import (
+    GAP_FUNCTIONS,
+    GapReport,
+    GapSpec,
+    LevelFactors,
+    conditional_value_at_level,
+    conservative_shift,
+    month_grid,
+)
 from volsto.products.vanilla import DigitalOption, EuropeanOption
 from volsto.products.variance import FVA, ForwardVarianceSwap, VarianceSwap, VolSwap
 from volsto.products.vko import VolKnockOutPut
 
 __all__ = [
     "FVA",
+    "GAP_FUNCTIONS",
     "AccumulatedSumOption",
     "AdditiveCliquet",
     "Autocall",
@@ -67,10 +77,13 @@ __all__ = [
     "ForwardStartOption",
     "ForwardStartStraddle",
     "ForwardVarianceSwap",
+    "GapReport",
+    "GapSpec",
     "KIPutLeg",
     "KnockInOption",
     "KnockOutOption",
     "KnockOutVarianceSwap",
+    "LevelFactors",
     "Napoleon",
     "NoTouch",
     "OneTouch",
@@ -84,10 +97,13 @@ __all__ = [
     "VolKnockOutPut",
     "VolSwap",
     "bridge_step_survival",
+    "conditional_value_at_level",
+    "conservative_shift",
     "continuous_survival_weight",
     "daily_schedule",
     "first_hit_index",
     "forward_start_strip",
+    "month_grid",
     "parse_cp",
     "shift_times",
     "uniform_schedule",

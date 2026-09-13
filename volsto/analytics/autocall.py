@@ -99,6 +99,9 @@ class AutocallReport:
     breach_probability_stderr: float
     legs: dict[str, tuple[float, float]]
     n_paths: int
+    #: smart-gap summary per barrier and date (``GapReport.as_frame()`` on the first simulated
+    #: chunk of the pricing paths; ``None`` without a smart gap) — SPEC §6.9
+    gap: pd.DataFrame | None = None
 
     @property
     def legs_total(self) -> float:
@@ -168,7 +171,18 @@ def autocall_report(
         *[AutocallStatistic(product, "autocall_at", i) for i in range(1, n + 2)],
     ]
     products: list[Product] = [product, *legs, *extra, *stats]
-    res = MonteCarlo(sim).price_many(products, model, grid=grid, draws=draws, keep_payoffs=True)
+    mc = MonteCarlo(sim)
+    gap_frame: pd.DataFrame | None = None
+    if product.gap is not None and product.gap.smart:
+        # the per-barrier, per-date ΔV / sign / effective shift on the first chunk of the
+        # pricing paths (the pricing itself regresses chunk by chunk: same grid, same draws)
+        grid = grid or mc.build_grid(products, model)
+        draws = draws or mc.draws_for(grid, model)
+        n_chunk = min(sim.n_paths, sim.chunk_size)
+        paths = model.simulate_chunk(grid, draws, 0, n_chunk, sim.scheme)
+        gap_frame = product.gap_report(paths, grid.fixing_index).as_frame()
+        gap_frame.attrs["n_paths"] = n_chunk
+    res = mc.price_many(products, model, grid=grid, draws=draws, keep_payoffs=True)
     pairs = [pair_average(np.asarray(r.payoffs), sim.antithetic) for r in res]
     k = 1 + len(legs)
     leg_prices = {_leg_name(leg): (r.mean, r.stderr) for leg, r in zip(legs, res[1:k])}
@@ -193,6 +207,7 @@ def autocall_report(
         breach_probability_stderr=p_breach_se,
         legs=leg_prices,
         n_paths=sim.n_paths,
+        gap=gap_frame,
     )
 
 

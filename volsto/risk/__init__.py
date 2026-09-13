@@ -76,7 +76,7 @@ from volsto.risk.profiles import (
     cliquet_gamma_profile,
     spot_profile,
 )
-from volsto.risk.report import SECTIONS, RiskReport, risk_report
+from volsto.risk.report import SECTIONS, RiskReport, risk_report, smart_gap_table
 from volsto.risk.volsto_sens import PARAMS, parameter_sensitivities, parameter_sensitivity
 
 __all__ = [
@@ -140,6 +140,7 @@ __all__ = [
     "risk_report",
     "shifted_levels",
     "skew_T",
+    "smart_gap_table",
     "spot_profile",
     "structure_vega_skew",
     "surface_of",

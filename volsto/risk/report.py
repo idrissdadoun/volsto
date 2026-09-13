@@ -39,6 +39,7 @@ from typing import Any
 
 import pandas as pd
 
+from volsto.engine import MonteCarlo
 from volsto.products.base import Product
 from volsto.products.cliquet import AdditiveCliquet
 from volsto.products.conditional_variance import KnockOutVarianceSwap, RealisedVarianceSchedule
@@ -145,6 +146,29 @@ class RiskReport:
             f"({b.get('cache_misses', 0):.0f} cache misses), {b.get('pricings', 0):.0f} pricings, "
             f"{b.get('wall_clock_s', 0):.0f} s wall clock"
         )
+
+
+def smart_gap_table(engine: RiskEngine, product: Product, state: RiskState) -> pd.DataFrame:
+    """The smart-gap summary of a product carrying ``GapSpec(mode="smart")`` (an autocall or a
+    discretely monitored barrier option): ``GapReport.as_frame()`` on the first simulated chunk
+    of the engine's pricing paths under the base-state model (same grid, same draws as the
+    pricing, which regresses chunk by chunk).  Columns: ``barrier``, ``date``, ``n_paths``,
+    ``n_fit``, ``dv_mean`` / ``dv_std`` / ``share_dv_positive`` (over the paths alive at the
+    date), ``shift_mean`` / ``abs_shift_mean`` / ``shift_min`` / ``shift_max`` /
+    ``share_shifted``, and the same over the paths within ``report_band`` of the level
+    (``*_near``, ``sign_near``).  ``ΔV`` is in fractions of notional (autocall) or of the barrier
+    level (barrier options); shifts are fractions of the level."""
+    model = engine.builder.build(state, "recalibrate")
+    sim = engine.sim
+    mc = MonteCarlo(sim)
+    grid = mc.build_grid([product], model)
+    draws = mc.draws_for(grid, model)
+    n_chunk = min(sim.n_paths, sim.chunk_size)
+    paths = model.simulate_chunk(grid, draws, 0, n_chunk, sim.scheme)
+    frame: pd.DataFrame = product.gap_report(paths, grid.fixing_index).as_frame()  # type: ignore[attr-defined]
+    frame.attrs["n_paths"] = n_chunk
+    frame.attrs["state"] = state.label
+    return frame
 
 
 def risk_report(
@@ -270,6 +294,11 @@ def risk_report(
             rep.tables["realised_variance_exposure"] = realised_variance_exposure(
                 product, model, engine.sim
             )
+        gap = getattr(product, "gap", None)
+        if gap is not None and gap.smart:
+            # smart gap (SPEC §6.9): ΔV, sign and effective shift per barrier and date on the
+            # first chunk of the pricing paths at the base state
+            rep.tables["gap"] = smart_gap_table(engine, product, state)
     rep.budget = {
         **engine.budget(),
         "report_recalibrations": float(engine.n_calibrations - n_cal0),
