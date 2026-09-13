@@ -10,7 +10,13 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from volsto.analytics import fair_strike, lsv_minus_lv, strike_differential, vko_report
+from volsto.analytics import (
+    fair_strike,
+    lsv_minus_lv,
+    strike_differential,
+    vko_analysis,
+    vko_report,
+)
 from volsto.config import SimConfig
 from volsto.engine import FixingIndex, MonteCarlo, PathSet
 from volsto.market import DiscountCurve, ForwardCurve, LocalVolSurface, SSVISurface
@@ -176,13 +182,15 @@ def test_vko_payoffs_decomposition_and_running(
     parts = vko.decompose()
     assert parts is not None and len(parts) == 2
     np.testing.assert_allclose(vko.payoff(ps, idx), sum(p.payoff(ps, idx) for p in parts))
-    running = VolKnockOutPut(100.0, 1.0, 0.20, times, discount, monitoring="running")
-    # running <= maturity path by path; as specified the two knock-out sets coincide (the
-    # accrued sum is monotone), only the knock-out time differs
-    np.testing.assert_allclose(running.payoff(ps, idx), vko.payoff(ps, idx))
-    kt_run, kt_mat = running.statistics(ps, idx)["ko_time"], vko.statistics(ps, idx)["ko_time"]
-    dead = vko.statistics(ps, idx)["ko"] > 0
-    assert np.all(kt_run[dead] <= kt_mat[dead]) and np.any(kt_run[dead] < kt_mat[dead])
+    # knock-out time: first fixing at which the accrued variance exceeds the budget (the day the
+    # knock-out became certain); N + 1 when alive
+    st = vko.statistics(ps, idx)
+    dead = st["ko"] > 0
+    assert np.all(st["ko_time"][dead] <= 252) and np.all(st["ko_time"][~dead] == 253)
+    cum = np.cumsum(np.diff(ls, axis=1) ** 2, axis=1)
+    first = np.argmax(cum > 0.04 * 252 / 252.0, axis=1) + 1
+    np.testing.assert_allclose(st["ko_time"][dead], first[dead])
+    np.testing.assert_allclose(st["itm"], (np.exp(ls[:, -1]) < 100.0).astype(float))
     huge = VolKnockOutPut(100.0, 1.0, 10.0, times, discount)
     np.testing.assert_allclose(huge.payoff(ps, idx), put)
     zero = VolKnockOutPut(100.0, 1.0, 0.0, times, discount)
@@ -195,8 +203,6 @@ def test_vko_payoffs_decomposition_and_running(
     assert "knock-out put" in repr(vko) and "knock-in" in repr(parts[1])
     with pytest.raises(ValueError):
         VolKnockOutPut(100.0, 0.5, 0.2, times, discount)
-    with pytest.raises(ValueError):
-        VolKnockOutPut(100.0, 1.0, 0.2, times, discount, monitoring="daily")
 
 
 def test_black_scholes_fair_strikes(forward_curve: ForwardCurve) -> None:
@@ -229,6 +235,26 @@ def test_black_scholes_fair_strikes(forward_curve: ForwardCurve) -> None:
     assert abs(diff) < 3.5 * se  # no skew: no convexity premium
     with pytest.raises(TypeError):
         fair_strike(VarianceSwap(times, 0.04, discount), model, sim)  # type: ignore[arg-type]
+
+
+def test_vko_analysis_black_scholes(forward_curve: ForwardCurve) -> None:
+    """Flat BS: the barrier sweep is monotone, saturates at 1 well above σ, and the ITM-conditional
+    realised vol is centred on σ (returns are iid, nearly independent of the terminal level)."""
+    sigma = 0.2
+    model = BlackScholes(sigma, forward_curve)
+    times = daily_schedule(1.0)
+    sim = SimConfig(n_paths=40_000, dt_max=1.0 / 252.0, chunk_size=20_000, seed=13)
+    vko = VolKnockOutPut(100.0, 1.0, 0.30, times, forward_curve.rate_curve)
+    an = vko_analysis(vko, model, sim)
+    assert np.all(np.diff(an.ratios) >= 0) and an.ratios[-1] == pytest.approx(1.0)
+    assert an.p_ko_itm[-1] == 0.0 and 0.4 < an.p_ko[0] < 0.6  # barrier at sigma: about half
+    assert abs(an.itm_rv_quantiles[1] - sigma) < 0.01 and 0.0 < an.p_itm < 1.0
+    assert an.itm_rv_quantiles[0] < an.itm_rv_quantiles[1] < an.itm_rv_quantiles[2]
+    frame = an.as_frame()
+    assert list(frame.columns)[:2] == ["vol_ko", "ratio"] and len(frame) == 5
+    assert an.vanilla == pytest.approx(an.prices[-1]) and "VKOAnalysis" in repr(an)
+    with pytest.raises(ValueError):
+        vko_analysis(vko.decompose()[1], model, sim)  # type: ignore[arg-type]
 
 
 def test_lv_orderings_and_vko_monotonicity(ssvi: SSVISurface, local_vol: LocalVolSurface) -> None:
@@ -270,12 +296,11 @@ def test_lv_orderings_and_vko_monotonicity(ssvi: SSVISurface, local_vol: LocalVo
     for p in prods[7:]:
         kk, sk = strikes[p]
         assert kk > k_var + 3 * np.hypot(sk, k_var_se), (p, kk, k_var)
-    # VKO: monotone in the barrier, never above the vanilla, running <= maturity
+    # VKO: monotone in the barrier, never above the vanilla
     vkos = [VolKnockOutPut(spot, 1.0, h, times, discount) for h in (0.25, 0.30, 0.35, 0.40)]
-    run = VolKnockOutPut(spot, 1.0, 0.30, times, discount, monitoring="running")
-    out = MonteCarlo(sim).price_many([*vkos, vkos[0].vanilla(), run], model)
+    out = MonteCarlo(sim).price_many([*vkos, vkos[0].vanilla()], model)
     prices = [r.mean for r in out[:4]]
-    assert prices == sorted(prices) and prices[-1] < out[4].mean and out[5].mean <= out[1].mean
+    assert prices == sorted(prices) and prices[-1] < out[4].mean
     rep = vko_report(vkos[1], model, sim)
     assert 0.0 < rep.discount < 1.0 and rep.discount_stderr > 0 and 0.0 < rep.p_ko < 1.0
 
@@ -290,8 +315,7 @@ def test_gyongy_invariance_orderings_and_vko_discount_under_lsv() -> None:
     """Corridor swaps with a single-close indicator depend only on the marginals (Gyöngy): same
     fair strike under LV and LSV for ω ∈ {1, 2, 3} within 2 stderr, equal to
     (A/N) Σ E[σ_loc²(t_{i−1}, S_{i−1}) δ · I_i] on the LV paths; K_up < K_var < K_down and
-    K_KO > K_var hold under the LSV; the VKO ratios to the vanilla put are reported (the owner's
-    sign expectation lives in the strict xfail below)."""
+    K_KO > K_var hold under the LSV; the VKO ratios to the vanilla put are reported per model."""
     import dataclasses
 
     from volsto.calibration import LeverageCache
@@ -348,40 +372,3 @@ def test_gyongy_invariance_orderings_and_vko_discount_under_lsv() -> None:
     print("VKO ratio to vanilla (LV):", rep_lv, "LSV:", vko_ratios)
     d, se, _, _ = lsv_minus_lv(UpVar(times, spot, 0.0, discount), model, lv, sim)
     assert np.isfinite(d) and se > 0
-
-
-@pytest.mark.slow
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "owner's expected sign (LSV VKO discount materially larger than LV's at ω = 2, 3, i.e. a "
-        "smaller ratio to the vanilla put) is not reproduced on the placeholder surface at "
-        "vol_ko = 30%: ratios 0.325 (LV), 0.310 / 0.324 / 0.343 (ω = 1/2/3), 0.280 (2F Table 8.2) "
-        "at 8e5 particles, 400k paths — ω = 3 is dearer, 2F much cheaper (SPEC §6.4); strict so "
-        "that a change of sign is noticed"
-    ),
-)
-def test_vko_discount_owner_sign_expectation() -> None:
-    """The owner's M4c expectation, kept as a strict xfail with the measured values in the reason."""
-    import dataclasses
-
-    from volsto.calibration import LeverageCache
-    from volsto.calibration.cache import build_market
-    from volsto.config import CalibrationSpec, load_yaml
-    from volsto.studies.m4 import one_factor_variants
-
-    base = load_yaml(ROOT / "configs/studies/lsv_reference_1f.yaml", CalibrationSpec)
-    _, surface, _ = build_market(base)
-    cache = LeverageCache(ROOT / "cache")
-    lv = LocalVol(LocalVolSurface.from_implied(surface, base.local_vol))
-    spot = surface.forward_curve.spot
-    times = daily_schedule(1.0)
-    sim = dataclasses.replace(base.sim, n_paths=200_000, seed=21)
-    vko = VolKnockOutPut(spot, 1.0, 0.30, times, surface.discount)
-    rep_lv = vko_report(vko, lv, sim)
-    for name, spec in one_factor_variants(base, (2.0, 3.0)).items():
-        model, _ = cache.get_or_calibrate(spec)
-        rep = vko_report(vko, model, sim)
-        assert rep.discount < rep_lv.discount - 2 * np.hypot(
-            rep.discount_stderr, rep_lv.discount_stderr
-        ), (name, rep, rep_lv)

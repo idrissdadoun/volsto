@@ -139,8 +139,8 @@ below a barrier on the previous, current or both closes; conditional or corridor
 `ConvexitySpread`, `KnockOutVarianceSwap` (up-and-out, close-to-close, variant b) and
 `VolKnockOutPut` (put alive only if the life realised vol ends below the vol barrier) reuse the
 fixing-date realised variance; `volsto.analytics.conditional_variance` gives their fair strikes
-with delta-method errors, the LSV-minus-LV differential and the VKO report (price, discount to
-the vanilla put, P(KO)).
+with delta-method errors, the LSV-minus-LV differential and the VKO analysis (barrier sweep of
+the ratio to the vanilla put, P(KO), and the realised vol of the paths ending in the money).
 
 `volsto.analytics.forward_smile` inverts out-of-the-money forward-start prices with the model's
 own forward ratio `F(T2)/F(T1)` (`forward_smile`, `forward_atm_vol`), prices the forward ATM

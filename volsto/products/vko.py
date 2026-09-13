@@ -1,28 +1,23 @@
-"""Volatility knock-out put (SPEC §16 / v2 §6.2).
+"""Volatility knock-out put (SPEC v2 §6.2).
 
 Realised volatility over the life on the fixing schedule, ``σ_real² = (A/N) Σ_{i=1}^N r_i²``
-(``r_i²`` capped at ``c²`` with ``daily_cap``); payoff ``(K − S_T)⁺ · 1{σ_real < vol_ko}``.
-``monitoring = "maturity"`` (default, the traded form) checks the condition once at ``T`` on the
-full-life realised vol; ``"running"`` knocks the option out on the first day the accrued variance
-``Σ_{i≤m} r_i²`` exceeds ``vol_ko² N / A`` — the option is dead as soon as the full-life realised
-vol can no longer end below the barrier.  **The running form is not the traded convention**; it
-is a flag for the study only.  Because the accrued sum is non-decreasing, exceeding the
-full-life budget at some ``m ≤ N`` is the same event as exceeding it at ``N``: the running and
-maturity forms have identical terminal payoffs path by path (``tests/test_conditional_variance``
-asserts the equality), and the flag only changes *when* the option dies (the ``ko_time``
-statistic, the index of the first breach), which matters for risk and hedging, not for price.
-A running rule on the annualised realised vol to date, ``sqrt((A/m) Σ_{i≤m} r_i²) > vol_ko``,
-would be a different (and cheaper) product; it is not implemented (M4c report).
-``decompose()`` = vanilla put − the "vol-knock-in" put ``(K − S_T)⁺ 1{σ_real ≥ vol_ko}``
+(``r_i²`` capped at ``c²`` with ``daily_cap``); payoff ``(K − S_T)⁺ · 1{σ_real < vol_ko}``, the
+condition checked once at maturity (the traded form; a "running" flag was dropped at the M4c
+review because the accrued sum is monotone, so any running check on the full-life budget is the
+same event).  The ``ko_time`` statistic — the first fixing at which the accrued variance exceeds
+the budget ``vol_ko² N/A``, i.e. the day the knock-out becomes certain — is kept for risk and
+hedging.  ``decompose()`` = vanilla put − the "vol-knock-in" put ``(K − S_T)⁺ 1{σ_real ≥ vol_ko}``
 (``knock_in=True``), exact path by path.
 
 Why it is in the study: the price is ``E[(K − S_T)⁺ 1{RV < H²}]``, the joint law of terminal spot
 and realised variance.  Under local vol the realised variance is nearly a deterministic function
-of the path's spot levels, so the LV price is close to a hard threshold on ``S_T``; stochastic
-vol spreads ``RV`` conditional on ``S_T`` and the spread is governed by ``ν`` and ``ρ`` — the
-largest model dependence of any product in the library.  Reported through
-:func:`volsto.analytics.conditional_variance.vko_report`: price, ratio to the vanilla put (the
-"VKO discount") and ``P(knock-out)``.  Checked by ``tests/test_conditional_variance.py``.
+of the path's spot levels; stochastic vol spreads ``RV`` conditional on ``S_T`` around that level,
+which is sign-indefinite for the price: the LSV-versus-LV direction depends on where the barrier
+sits relative to the ITM-conditional realised-vol distribution (owner, M4c review).  Hence
+:func:`volsto.analytics.conditional_variance.vko_analysis` reports, on one path set, the
+``vol_ko`` sweep of the ratio to the vanilla put and the distribution of ``σ_real`` conditional on
+``S_T < K`` (10/50/90 percentiles and ``P(σ_real > vol_ko | ITM)``).  Checked by
+``tests/test_conditional_variance.py``.
 """
 
 from __future__ import annotations
@@ -43,8 +38,6 @@ if TYPE_CHECKING:
 
 FloatArray = NDArray[np.float64]
 
-MONITORING = ("maturity", "running")
-
 
 class VolKnockOutPut(RealisedVarianceSchedule):
     """``notional · (K − S_T)⁺ · 1{alive}``, ``alive = {σ_real < vol_ko}`` (module docstring)."""
@@ -58,7 +51,6 @@ class VolKnockOutPut(RealisedVarianceSchedule):
         discount: DiscountCurve,
         *,
         daily_cap: float | None = None,
-        monitoring: str = "maturity",
         annualisation: float = 252.0,
         notional: float = 1.0,
         knock_in: bool = False,
@@ -68,12 +60,9 @@ class VolKnockOutPut(RealisedVarianceSchedule):
             raise ValueError("strike must be positive and vol_ko non-negative")
         if abs(self._fixings[-1] - maturity) > 1e-9:
             raise ValueError("the fixing schedule must end at the maturity")
-        if monitoring not in MONITORING:
-            raise ValueError(f"monitoring in {MONITORING}")
         self.strike = float(strike)
         self.T = float(maturity)
         self.vol_ko = float(vol_ko)
-        self.monitoring = monitoring
         self.knock_in = bool(knock_in)
 
     def statistics(self, paths: PathSet, idx: FixingIndex) -> dict[str, FloatArray]:
@@ -82,21 +71,18 @@ class VolKnockOutPut(RealisedVarianceSchedule):
         n = self.n_returns
         budget = self.vol_ko**2 * n / self.annualisation
         cum = np.cumsum(r2, axis=1)
-        if self.monitoring == "maturity":
-            alive = cum[:, -1] < budget
-            ko_time = np.where(alive, n + 1, n).astype(np.float64)
-        else:
-            breach = cum > budget
-            alive = ~np.any(breach, axis=1)
-            ko_time = np.where(alive, n + 1, np.argmax(breach, axis=1) + 1).astype(np.float64)
+        alive = cum[:, -1] < budget
+        breach = cum > budget
+        ko_time = np.where(alive, n + 1, np.argmax(breach, axis=1) + 1).astype(np.float64)
         alive_f = alive.astype(np.float64)
-        intrinsic = np.maximum(self.strike - np.exp(ls[:, -1]), 0.0)
+        s_t = np.exp(ls[:, -1])
         return {
             "alive": alive_f,
             "ko": 1.0 - alive_f,
-            "ko_time": ko_time,  # 1-based fixing index of the first breach; n + 1 if alive
-            "rv": self.annualisation / n * np.sum(r2, axis=1),
-            "put": intrinsic,
+            "ko_time": ko_time,  # 1-based fixing index at which the knock-out became certain
+            "rv": self.annualisation / n * cum[:, -1],
+            "put": np.maximum(self.strike - s_t, 0.0),
+            "itm": (s_t < self.strike).astype(np.float64),
         }
 
     def payoff(self, paths: PathSet, idx: FixingIndex) -> FloatArray:
@@ -121,7 +107,6 @@ class VolKnockOutPut(RealisedVarianceSchedule):
                 self._fixings,
                 self.discount,
                 daily_cap=self.daily_cap,
-                monitoring=self.monitoring,
                 annualisation=self.annualisation,
                 notional=-self.notional,
                 knock_in=True,
@@ -133,6 +118,6 @@ class VolKnockOutPut(RealisedVarianceSchedule):
         cap = "" if self.daily_cap is None else f", daily cap {self.daily_cap:g}"
         return (
             f"Vol {kind} put: strike {self.strike:g}, expiry {self.T:g}y, vol barrier "
-            f"{self.vol_ko * 100:.4g}% ({self.monitoring} monitoring, {self.n_returns} fixings, "
+            f"{self.vol_ko * 100:.4g}% checked at maturity ({self.n_returns} fixings, "
             f"A = {self.annualisation:g}{cap}), notional {self.notional:g}"
         )

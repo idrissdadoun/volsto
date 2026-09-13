@@ -22,6 +22,7 @@ from volsto.analytics.bergomi import (
 )
 from volsto.analytics.conditional_variance import (
     FairStrike,
+    VKOAnalysis,
     VKOReport,
     fair_strike,
     lsv_minus_lv,
@@ -29,6 +30,7 @@ from volsto.analytics.conditional_variance import (
     pair_average,
     ratio_of_means,
     strike_differential,
+    vko_analysis,
     vko_report,
 )
 from volsto.analytics.forward_smile import (
@@ -46,6 +48,7 @@ __all__ = [
     "FairStrike",
     "ForwardSmile",
     "ForwardVolComparison",
+    "VKOAnalysis",
     "VKOReport",
     "alpha_theta",
     "atmf_skew_order1",
@@ -70,6 +73,7 @@ __all__ = [
     "ssr_order1_flat",
     "strike_differential",
     "var_integrated_variance",
+    "vko_analysis",
     "vko_report",
     "vs_vol_of_vol",
     "vs_vol_of_vol_flat",

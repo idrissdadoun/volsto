@@ -15,10 +15,12 @@ fair strike on the same surface and seed, as a function of the model parameters.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import numpy as np
+import pandas as pd
 from numpy.typing import NDArray
 
 from volsto.engine.mc import MonteCarlo
@@ -203,5 +205,105 @@ def vko_report(vko: VolKnockOutPut, model: Model, sim: SimConfig) -> VKOReport:
         float(g.std(ddof=1) / np.sqrt(g.size)),
         p_ko,
         p_ko_se,
+        sim.n_paths,
+    )
+
+
+@dataclass(frozen=True)
+class VKOAnalysis:
+    """``vol_ko`` sweep of the VKO put and the ITM-conditional realised-vol distribution, one path
+    set.  ``ratios`` are VKO / vanilla per barrier (delta-method stderr), ``prices`` in the
+    product's notional units, ``p_ko`` unconditional ``P(σ_real ≥ h)``, ``p_ko_itm``
+    ``P(σ_real > h | S_T < K)``, ``itm_rv_quantiles`` the 10/50/90 percentiles of ``σ_real`` given
+    ``S_T < K`` and ``p_itm = P(S_T < K)``."""
+
+    barriers: FloatArray
+    ratios: FloatArray
+    ratio_stderr: FloatArray
+    prices: FloatArray
+    price_stderr: FloatArray
+    p_ko: FloatArray
+    p_ko_itm: FloatArray
+    itm_rv_quantiles: tuple[float, float, float]
+    p_itm: float
+    vanilla: float
+    vanilla_stderr: float
+    n_paths: int
+
+    def as_frame(self) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "vol_ko": self.barriers,
+                "ratio": self.ratios,
+                "ratio_stderr": self.ratio_stderr,
+                "price": self.prices,
+                "price_stderr": self.price_stderr,
+                "p_ko": self.p_ko,
+                "p_ko_itm": self.p_ko_itm,
+            }
+        )
+
+    def __repr__(self) -> str:
+        cells = ", ".join(
+            f"{h:.0%}: {r:.3f}±{s:.3f}"
+            for h, r, s in zip(self.barriers, self.ratios, self.ratio_stderr)
+        )
+        q = self.itm_rv_quantiles
+        return (
+            f"VKOAnalysis(ratio to vanilla [{cells}]; sigma_real | ITM p10/50/90 = "
+            f"{q[0]:.3f}/{q[1]:.3f}/{q[2]:.3f}, P(ITM) = {self.p_itm:.3f}, n_paths={self.n_paths})"
+        )
+
+
+def vko_analysis(
+    vko: VolKnockOutPut,
+    model: Model,
+    sim: SimConfig,
+    barriers: Sequence[float] = (0.20, 0.25, 0.30, 0.35, 0.40),
+) -> VKOAnalysis:
+    """The two outputs of SPEC v2 §6.2 from one simulation: the barrier sweep of the ratio to the
+    vanilla put and the distribution of the full-life realised vol on the paths ending in the
+    money."""
+    if vko.knock_in:
+        raise ValueError("vko_analysis expects the knock-out put")
+    hs = np.asarray(barriers, dtype=np.float64)
+    res = MonteCarlo(sim).price_many(
+        [vko.leg("put"), vko.leg("rv"), vko.leg("itm")], model, keep_payoffs=True
+    )
+    put_raw = np.asarray(res[0].payoffs)
+    rv_raw = np.asarray(res[1].payoffs)
+    itm_raw = np.asarray(res[2].payoffs) > 0.5
+    scale = vko.notional * float(vko.df(vko.T))
+    put = pair_average(put_raw, sim.antithetic)
+    vbar = float(put.mean())
+    vanilla, vanilla_se = (scale * x for x in mean_and_stderr(put))
+    ratios, ratio_se, prices, price_se, p_ko, p_ko_itm = ([] for _ in range(6))
+    n_itm = max(int(itm_raw.sum()), 1)
+    for h in hs:
+        alive = rv_raw < h * h
+        pa = pair_average(put_raw * alive, sim.antithetic)
+        m, se = mean_and_stderr(pa)
+        prices.append(scale * m)
+        price_se.append(scale * se)
+        r = m / vbar
+        g = pa / vbar - r * put / vbar
+        ratios.append(r)
+        ratio_se.append(float(g.std(ddof=1) / np.sqrt(g.size)))
+        p_ko.append(float(np.mean(~alive)))
+        p_ko_itm.append(float(np.sum((rv_raw > h * h) & itm_raw) / n_itm))
+    sig_itm = np.sqrt(rv_raw[itm_raw]) if itm_raw.any() else np.array([np.nan])
+    q10, q50, q90 = (float(x) for x in np.percentile(sig_itm, [10, 50, 90]))
+    return VKOAnalysis(
+        hs,
+        np.array(ratios),
+        np.array(ratio_se),
+        np.array(prices),
+        np.array(price_se),
+        np.array(p_ko),
+        np.array(p_ko_itm),
+        (q10, q50, q90),
+        float(itm_raw.mean()),
+        vanilla,
+        vanilla_se,
         sim.n_paths,
     )

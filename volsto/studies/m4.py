@@ -137,8 +137,8 @@ class HeadlineResult:
             lines += [
                 "",
                 "| model | up-var B=100% (fair vol) | down-var B=100% | KO var B=110% | P(KO) | "
-                "VKO 12m 100% put @30% (% notional) | VKO discount | P(KO) |",
-                "|---|---|---|---|---|---|---|---|",
+                "VKO 12m 100% put @30% (% notional) | P(KO) |",
+                "|---|---|---|---|---|---|---|",
             ]
             for _, r in t.iterrows():
                 lines.append(
@@ -148,9 +148,33 @@ class HeadlineResult:
                     f" | {r['kovar_110'] * 100:.2f} ± {r['kovar_110_stderr'] * 100:.2f}"
                     f" | {r['kovar_110_p_ko']:.3f} ± {r['kovar_110_p_ko_stderr']:.3f}"
                     f" | {r['vko_30']:.3f} ± {r['vko_30_stderr']:.3f}"
-                    f" | {r['vko_30_discount']:.3f} ± {r['vko_30_discount_stderr']:.3f}"
                     f" | {r['vko_30_p_ko']:.3f} ± {r['vko_30_p_ko_stderr']:.3f} |"
                 )
+            hs = sorted(
+                int(c[len("vko_ratio_") :])
+                for c in t.columns
+                if c.startswith("vko_ratio_") and not c.endswith("_stderr")
+            )
+            lines += [
+                "",
+                "| model | "
+                + " | ".join(f"VKO/vanilla @{h}%" for h in hs)
+                + " | sigma_real given ITM: p10 / p50 / p90 | P(ITM) | "
+                + " | ".join(f"P(sigma_real > {h}% given ITM)" for h in hs)
+                + " |",
+                "|---" * (2 + 2 * len(hs) + 2) + "|",
+            ]
+            for _, r in t.iterrows():
+                cells = [
+                    f"{r[f'vko_ratio_{h}']:.3f} ± {r[f'vko_ratio_{h}_stderr']:.3f}" for h in hs
+                ]
+                cells.append(
+                    f"{r['itm_rv_p10'] * 100:.1f} / {r['itm_rv_p50'] * 100:.1f} / "
+                    f"{r['itm_rv_p90'] * 100:.1f}"
+                )
+                cells.append(f"{r['p_itm']:.3f}")
+                cells += [f"{r[f'p_ko_itm_{h}']:.3f}" for h in hs]
+                lines.append(f"| {r['model']} | " + " | ".join(cells) + " |")
         w = self.wing
         names = [c[:-4] for c in w.columns if c.endswith("_vol")]
         lines += [
@@ -178,13 +202,15 @@ def run_headline(
     cliquet_maturities: Sequence[float] = (1.0, 2.0),
     per_year: int = 252,
     conditional: bool = True,
-    vko_barrier: float = 0.30,
+    vko_barriers: Sequence[float] = (0.20, 0.25, 0.30, 0.35, 0.40),
 ) -> HeadlineResult:
     """Price the headline set for every model on one path set each (same seed across models).
 
     With ``conditional`` (M4c) the set also carries the 1y daily up-var and down-var swaps at
     B = 100% of spot, the 1y up-and-out KO variance swap at B = 110% (fair vols, P(KO)) and the
-    12m 100% VKO put at ``vko_barrier`` (price in % of notional, ratio to the vanilla put, P(KO)).
+    12m 100% VKO put over the ``vko_barriers`` sweep (ratio to the vanilla put per barrier, the
+    30% price in % of notional and P(KO), and the ITM-conditional realised-vol distribution:
+    10/50/90 percentiles and P(σ_real > h | ITM)).
     """
     rows = []
     smiles: dict[str, ForwardSmile] = {}
@@ -209,7 +235,7 @@ def run_headline(
             down = DownVar(times_d, spot, 0.0, discount)
             ko = KnockOutVarianceSwap(times_d, 1.1 * spot, 0.0, discount)
             # notional 1/spot: prices as a fraction of the (spot) notional, reported in %
-            vko = VolKnockOutPut(spot, 1.0, vko_barrier, times_d, discount, notional=1.0 / spot)
+            vko = VolKnockOutPut(spot, 1.0, 0.30, times_d, discount, notional=1.0 / spot)
             cond = {
                 "up_acc": up.leg("accrued"),
                 "up_cnt": up.leg("count"),
@@ -218,9 +244,9 @@ def run_headline(
                 "ko_acc": ko.leg("accrued"),
                 "ko_cnt": ko.leg("count"),
                 "ko_ko": ko.leg("ko"),
-                "vko": vko,
-                "vko_van": vko.vanilla(),
-                "vko_ko": vko.leg("ko"),
+                "vko_put": vko.leg("put"),
+                "vko_rv": vko.leg("rv"),
+                "vko_itm": vko.leg("itm"),
             }
             products += list(cond.values())
         res = MonteCarlo(sim).price_many(products, model, keep_payoffs=conditional)
@@ -258,11 +284,34 @@ def run_headline(
                 row[tag] = float(np.sqrt(k2))
                 row[tag + "_stderr"] = se2 / (2.0 * float(np.sqrt(k2)))
             row["kovar_110_p_ko"], row["kovar_110_p_ko_stderr"] = mean_and_stderr(pay["ko_ko"])
-            price, van = pay["vko"], pay["vko_van"]
-            row["vko_30"], row["vko_30_stderr"] = (100.0 * x for x in mean_and_stderr(price))
-            ratio, se_ratio = ratio_of_means(price, van)
-            row["vko_30_discount"], row["vko_30_discount_stderr"] = ratio, se_ratio
-            row["vko_30_p_ko"], row["vko_30_p_ko_stderr"] = mean_and_stderr(pay["vko_ko"])
+            # VKO sweep and ITM-conditional realised vol from the raw per-path statistics
+            put_raw = np.asarray(res[n_base + list(cond).index("vko_put")].payoffs)
+            rv_raw = np.asarray(res[n_base + list(cond).index("vko_rv")].payoffs)
+            itm_raw = np.asarray(res[n_base + list(cond).index("vko_itm")].payoffs) > 0.5
+            scale = 100.0 * vko.notional * float(discount.df(1.0))  # % of notional
+            put = pair_average(put_raw, sim.antithetic)
+            vbar = float(put.mean())
+            n_itm = max(int(itm_raw.sum()), 1)
+            for h in vko_barriers:
+                alive = rv_raw < h * h
+                pa = pair_average(put_raw * alive, sim.antithetic)
+                tag = f"vko_ratio_{round(h * 100):d}"
+                ratio = float(pa.mean()) / vbar
+                g = pa / vbar - ratio * put / vbar
+                row[tag] = ratio
+                row[tag + "_stderr"] = float(g.std(ddof=1) / np.sqrt(g.size))
+                row[f"p_ko_itm_{round(h * 100):d}"] = float(
+                    np.sum((rv_raw > h * h) & itm_raw) / n_itm
+                )
+                if abs(h - 0.30) < 1e-12:
+                    row["vko_30"], row["vko_30_stderr"] = (scale * x for x in mean_and_stderr(pa))
+                    row["vko_30_p_ko"] = float(np.mean(~alive))
+                    row["vko_30_p_ko_stderr"] = float(np.std(~alive, ddof=1) / np.sqrt(alive.size))
+            sig_itm = np.sqrt(rv_raw[itm_raw]) if itm_raw.any() else np.array([np.nan])
+            row["itm_rv_p10"], row["itm_rv_p50"], row["itm_rv_p90"] = (
+                float(x) for x in np.percentile(sig_itm, [10, 50, 90])
+            )
+            row["p_itm"] = float(itm_raw.mean())
         row["wall_s"] = time.perf_counter() - t0
         rows.append(row)
         log.info("%s: %s", name, row)

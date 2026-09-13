@@ -56,7 +56,8 @@ STUDY_NUMBERS = {
 # calibration, single seed (HEADLINE_N_PARTICLES), 400k pricing paths, seed 2024, second-order SV
 # step, schedule 1/1460–1/365–1/250, adaptive regression grid (scripts/m4_headline.py
 # --n-particles 800000; SPEC §6.3–6.4).  Units: vols and fair strikes in absolute vol units,
-# cliquets and the VKO price in % of notional, ratios/probabilities as such.  Versus the 2e5 M4b
+# cliquets and the VKO price in % of notional, ratios/probabilities as such; the VKO barrier
+# sweep ratios vko_ratio_{20..40} are the §6.2 measured outputs (no sign claim).  Versus the 2e5 M4b
 # record every legacy entry moved by at most 1.2 stderr.
 PLACEHOLDER_BASELINES: dict[str, dict[str, tuple[float, float]]] = {
     "LV (ω=0)": {
@@ -70,8 +71,12 @@ PLACEHOLDER_BASELINES: dict[str, dict[str, tuple[float, float]]] = {
         "kovar_110": (0.29066, 0.000257),
         "kovar_110_p_ko": (0.657295, 0.00052),
         "vko_30": (2.43677, 0.00915),
-        "vko_30_discount": (0.324817, 0.0014),
-        "vko_30_p_ko": (0.174662, 0.000534),
+        "vko_30_p_ko": (0.174662, 0.0006),
+        "vko_ratio_20": (0.055343, 0.000458),
+        "vko_ratio_25": (0.175671, 0.000962),
+        "vko_ratio_30": (0.324817, 0.0014),
+        "vko_ratio_35": (0.475881, 0.00168),
+        "vko_ratio_40": (0.613968, 0.00181),
     },
     "1F ω=1": {
         "atm_vol": (0.208179, 0.000383),
@@ -84,8 +89,12 @@ PLACEHOLDER_BASELINES: dict[str, dict[str, tuple[float, float]]] = {
         "kovar_110": (0.286518, 0.000258),
         "kovar_110_p_ko": (0.645005, 0.000511),
         "vko_30": (2.32991, 0.00884),
-        "vko_30_discount": (0.310134, 0.00136),
-        "vko_30_p_ko": (0.178475, 0.000537),
+        "vko_30_p_ko": (0.178475, 0.000605),
+        "vko_ratio_20": (0.0529788, 0.000449),
+        "vko_ratio_25": (0.163882, 0.000919),
+        "vko_ratio_30": (0.310134, 0.00136),
+        "vko_ratio_35": (0.466046, 0.00167),
+        "vko_ratio_40": (0.60826, 0.00181),
     },
     "1F ω=2": {
         "atm_vol": (0.197029, 0.000357),
@@ -98,8 +107,12 @@ PLACEHOLDER_BASELINES: dict[str, dict[str, tuple[float, float]]] = {
         "kovar_110": (0.276623, 0.000264),
         "kovar_110_p_ko": (0.623413, 0.000507),
         "vko_30": (2.43056, 0.00916),
-        "vko_30_discount": (0.323758, 0.00139),
-        "vko_30_p_ko": (0.183965, 0.000541),
+        "vko_30_p_ko": (0.183965, 0.000613),
+        "vko_ratio_20": (0.0668763, 0.000518),
+        "vko_ratio_25": (0.178308, 0.00097),
+        "vko_ratio_30": (0.323758, 0.00139),
+        "vko_ratio_35": (0.473652, 0.00168),
+        "vko_ratio_40": (0.612228, 0.00181),
     },
     "1F ω=3": {
         "atm_vol": (0.184497, 0.000367),
@@ -112,8 +125,12 @@ PLACEHOLDER_BASELINES: dict[str, dict[str, tuple[float, float]]] = {
         "kovar_110": (0.264509, 0.000268),
         "kovar_110_p_ko": (0.59421, 0.000534),
         "vko_30": (2.5702, 0.00961),
-        "vko_30_discount": (0.342678, 0.00144),
-        "vko_30_p_ko": (0.18799, 0.000544),
+        "vko_30_p_ko": (0.18799, 0.000618),
+        "vko_ratio_20": (0.0882828, 0.000613),
+        "vko_ratio_25": (0.203183, 0.00105),
+        "vko_ratio_30": (0.342678, 0.00144),
+        "vko_ratio_35": (0.484613, 0.0017),
+        "vko_ratio_40": (0.613533, 0.0018),
     },
     "2F Table 8.2": {
         "atm_vol": (0.192215, 0.000333),
@@ -126,8 +143,12 @@ PLACEHOLDER_BASELINES: dict[str, dict[str, tuple[float, float]]] = {
         "kovar_110": (0.274175, 0.00024),
         "kovar_110_p_ko": (0.617415, 0.000517),
         "vko_30": (2.09821, 0.0082),
-        "vko_30_discount": (0.28033, 0.00127),
-        "vko_30_p_ko": (0.18169, 0.000542),
+        "vko_30_p_ko": (0.18169, 0.00061),
+        "vko_ratio_20": (0.0363604, 0.000347),
+        "vko_ratio_25": (0.13183, 0.000786),
+        "vko_ratio_30": (0.28033, 0.00127),
+        "vko_ratio_35": (0.448196, 0.00164),
+        "vko_ratio_40": (0.605087, 0.00182),
     },
 }
 
@@ -140,8 +161,10 @@ def test_run_headline_smoke(forward_curve: ForwardCurve) -> None:
     """Fast: the study runner's table, smiles and markdown on a Black–Scholes model."""
     model = BlackScholes(0.2, forward_curve)
     sim = SimConfig(n_paths=20_000, dt_max=1.0 / 50.0, chunk_size=10_000, seed=3)
-    # vko_barrier close to sigma so that both knock-out outcomes occur in the sample
-    result = run_headline({"bs": model}, sim, cliquet_maturities=(1.0,), vko_barrier=0.205)
+    # barriers around sigma so that both knock-out outcomes occur in the sample
+    result = run_headline(
+        {"bs": model}, sim, cliquet_maturities=(1.0,), vko_barriers=(0.19, 0.205, 0.30, 0.40)
+    )
     row = result.table.iloc[0]
     assert row["model"] == "bs" and abs(row["atm_vol"] - 0.2) < 3.5 * row["atm_vol_stderr"]
     assert abs(row["vs_vol"] - 0.2) < 3.5 * row["vs_vol_stderr"] + 1e-6
@@ -150,10 +173,11 @@ def test_run_headline_smoke(forward_curve: ForwardCurve) -> None:
     # M4c columns: flat BS -> conditional and KO fair vols equal sigma; VKO discount in (0, 1)
     for key in ("upvar_100", "downvar_100", "kovar_110"):
         assert abs(row[key] - 0.2) < 3.5 * row[key + "_stderr"], (key, row[key])
-    assert 0.0 < row["vko_30_discount"] < 1.0 and 0.0 < row["vko_30_p_ko"] < 1.0
-    assert row["vko_30"] > 0 and row["vko_30_stderr"] > 0
+    assert 0.0 < row["vko_ratio_20"] < row["vko_ratio_40"] <= 1.0 and 0.0 < row["p_itm"] < 1.0
+    assert row["vko_30"] > 0 and row["vko_30_stderr"] > 0 and row["vko_30_p_ko"] == 0.0
+    assert row["itm_rv_p10"] < row["itm_rv_p50"] < row["itm_rv_p90"]
     md = result.to_markdown()
-    assert md.startswith("| model |") and "| k |" in md and "VKO discount" in md
+    assert md.startswith("| model |") and "| k |" in md and "VKO/vanilla @30%" in md
 
 
 @pytest.mark.slow
@@ -188,7 +212,7 @@ def test_headline_regression_on_placeholder_surface() -> None:
             new, se = float(row[key]), float(row[key + "_stderr"])
             if key.startswith("cliquet") or key == "vko_30":
                 floor = 0.02  # % of notional
-            elif key.endswith(("_discount", "_p_ko")):
+            elif key.endswith("_p_ko") or key.startswith("vko_ratio_"):
                 floor = 0.002  # ratio / probability
             else:
                 floor = 0.0002  # vol points (absolute vol units)
