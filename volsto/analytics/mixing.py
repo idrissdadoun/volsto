@@ -79,7 +79,13 @@ def mixing_integrals(
     antithetic: bool = True,
     chunk_size: int = 50_000,
 ) -> tuple[FloatArray, FloatArray]:
-    """Per-path ``(∫₀ᵀ ξ_t^t dt, λ ∫₀ᵀ √ξ_t^t dW^∥_t)`` on a uniform grid of step ``≤ dt``."""
+    """Per-path ``(∫₀ᵀ ξ_t^t dt, λ ∫₀ᵀ √ξ_t^t dW^∥_t)`` on a uniform grid of step ``≤ dt``.
+
+    Left-point Riemann / Itô sums with the exact factor increments: the quadrature error is
+    O(dt) (at dt = 1/365 and ω ≈ 3.5 about 0.05–0.1 vol points on a 3m smile), so use
+    ``dt ≤ 1/2920`` when the mixing smile serves as the reference for the second-order spot step
+    (M4b), or match the allowance.
+    """
     n_steps = max(1, int(np.ceil(T / dt - 1e-9)))
     h = T / n_steps
     nf = model.n_factors

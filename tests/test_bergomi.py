@@ -150,7 +150,16 @@ def test_exact_step_covariance_matches_formula_and_fine_euler(
     # (a) kernel one-step output: dX from the factors, dW^S from the log-spot increment
     model = BergomiSV(p82, xi_flat, fc0)
     n = 200_000
-    cfg = SimConfig(n_paths=n, dt_max=dt, chunk_size=50_000, seed=8, local_var_time_average=False)
+    # frozen-variance spot step: the log return is an exact linear image of δW^S (the
+    # second-order step adds the spot/variance cross terms, see test_second_order_sv_step)
+    cfg = SimConfig(
+        n_paths=n,
+        dt_max=dt,
+        chunk_size=50_000,
+        seed=8,
+        local_var_time_average=False,
+        sv_order2=False,
+    )
     grid = TimeGrid.build([dt], dt)
     paths = MonteCarlo(cfg).simulate(model, grid)
     v0 = float(xi_flat.xi0(0.0))
@@ -237,7 +246,12 @@ def test_theta_zero_reproduces_reference_1f_path_by_path(xi_flat: ForwardVarianc
     assert model.n_factors == 1 and model.n_brownians == 2
     fixings = [0.25, 0.5, 1.0]
     cfg = SimConfig(
-        n_paths=2_000, dt_max=1 / 52, chunk_size=2_000, seed=17, local_var_time_average=False
+        n_paths=2_000,
+        dt_max=1 / 52,
+        chunk_size=2_000,
+        seed=17,
+        local_var_time_average=False,
+        sv_order2=False,
     )
     grid = TimeGrid.build(fixings, cfg.dt_max)
     draws = GaussianDraws(cfg.seed, cfg.n_paths, grid.n_steps, 2, cfg.antithetic)
@@ -265,6 +279,46 @@ def test_theta_zero_reproduces_reference_1f_path_by_path(xi_flat: ForwardVarianc
     for col in range(1, grid.n_records):
         np.testing.assert_allclose(paths.log_spot_at(col), ref_ls[col], rtol=1e-11, atol=1e-11)
         np.testing.assert_allclose(paths.factors_at(col)[:, 0], ref_x[col], rtol=1e-11, atol=1e-11)
+    # second-order SV step (M4b): independent numpy transcription of the increment in
+    # bergomi_block's docstring — exact factors first, trapezoid drift, cross term, L⁰ term
+    cfg2 = SimConfig(n_paths=2_000, dt_max=1 / 52, chunk_size=2_000, seed=17)
+    assert cfg2.sv_order2
+    paths2 = model.simulate_chunk(grid, draws, 0, cfg2.n_paths, cfg2.scheme)
+    ls = np.full(cfg.n_paths, np.log(100.0))
+    x = np.zeros(cfg.n_paths)
+
+    def g(t: float) -> float:
+        return float(xi0 * np.exp(-0.5 * omega**2 * (1 - np.exp(-2 * kappa * t)) / (2 * kappa)))
+
+    for j in range(grid.n_steps):
+        t, dt = grid.times[j], grid.dts[j]
+        dec = np.exp(-kappa * dt)
+        c11 = np.sqrt(dt)
+        c21 = rho * (1 - dec) / kappa / c11
+        c22 = np.sqrt((1 - np.exp(-2 * kappa * dt)) / (2 * kappa) - c21**2)
+        dws = c11 * z[:, j, 0]
+        dx = c21 * z[:, j, 0] + c22 * z[:, j, 1]
+        x_new = dec * x + dx
+        dwt = dx  # Brownian part of the exact OU increment
+        v0 = g(t) * np.exp(omega * x)
+        v1 = g(t + dt) * np.exp(omega * x_new)
+        b0 = np.sqrt(v0)
+        dlng = (np.log(g(t + dt)) - np.log(g(t))) / dt
+        cross = omega * (dwt * dws - rho * dt)
+        lterm = 0.5 * dlng - 0.5 * omega * kappa * x + omega**2 / 8.0
+        ls = (
+            ls
+            + (lnF[j + 1] - lnF[j])
+            - 0.25 * (v0 + v1) * dt
+            + b0 * dws
+            + 0.25 * b0 * cross
+            + 0.5 * dt * b0 * lterm * dws
+        )
+        x = x_new
+        col = grid.step_record[j]
+        if col >= 0:
+            np.testing.assert_allclose(paths2.log_spot_at(col), ls, rtol=1e-11, atol=1e-11)
+            np.testing.assert_allclose(paths2.factors_at(col)[:, 0], x, rtol=1e-11, atol=1e-11)
 
 
 def test_vs_vol_of_vol(model_2f: BergomiSV, p82: BergomiParams) -> None:
@@ -313,11 +367,12 @@ def test_mixing_smile_matches_spot_simulation(
     model_2f: BergomiSV, fc0: ForwardCurve, T: float
 ) -> None:
     """Mixing-solution smile vs spot-simulation MC smile within 2 combined stderr (+0.03 vp
-    discretisation allowance for the frozen-variance spot step)."""
+    allowance).  The mixing quadrature is left-point (O(dt)), so it runs at dt = 1/2920 to serve
+    as the reference for the second-order spot step at dt = 1/365."""
     F = float(fc0.forward(T))
     ks = np.array([-0.1, -0.05, 0.0, 0.05, 0.1])
     K = F * np.exp(ks)
-    mix = mixing_smile(model_2f, T, K, n_paths=200_000, seed=11)
+    mix = mixing_smile(model_2f, T, K, n_paths=100_000, seed=11, dt=1 / 2920)
     cps = np.where(K >= F, 1, -1)
     prods = [EuropeanOption(k, T, int(c), fc0.rate_curve) for k, c in zip(K, cps)]
     cfg = SimConfig(n_paths=200_000, dt_max=1 / 365, chunk_size=50_000, seed=12)

@@ -3,7 +3,7 @@
 Measured on the reference surface (ATM, uniform dt = 1/365, 200k paths, bias in vol points):
 1m: log-Euler +0.36, time-averaged variance +0.29, predictor-corrector θ=η=½ +0.78, Platen weak
 order 2 +0.03; 3m: +0.15 / +0.11 / +0.41 / +0.01.  The default is weak order 2 with the default
-step schedule (1/2920 below 3m, 1/730 to 2y, 1/500 after since the pre-M4 amendment).
+step schedule (1/1460 below 3m, 1/365 to 2y, 1/250 after; M4b restored it with the second-order SV step).
 """
 
 from __future__ import annotations
@@ -152,20 +152,20 @@ def test_weak_order2_residual_is_small_and_higher_order(
 
 def test_step_schedule() -> None:
     sch = StepSchedule()
-    assert sch.dt_at(0.1) == pytest.approx(1 / 2920)
-    assert sch.dt_at(0.25) == pytest.approx(1 / 730)
-    assert sch.dt_at(1.99) == pytest.approx(1 / 730)
-    assert sch.dt_at(2.0) == pytest.approx(1 / 500)
+    assert sch.dt_at(0.1) == pytest.approx(1 / 1460)
+    assert sch.dt_at(0.25) == pytest.approx(1 / 365)
+    assert sch.dt_at(1.99) == pytest.approx(1 / 365)
+    assert sch.dt_at(2.0) == pytest.approx(1 / 250)
     assert sch.knots(1.0) == (0.25,) and sch.knots(3.0) == (0.25, 2.0)
     assert StepSchedule.uniform(0.01).dt_at(5.0) == 0.01
     with pytest.raises(ValueError):
         StepSchedule(breaks=(1.0,), dts=(0.1,))
     grid = TimeGrid.build([0.5, 1.0, 2.5], sch)
     t, dts = grid.times[:-1], grid.dts
-    assert np.all(dts[t < 0.25] <= 1 / 2920 + 1e-12)
-    assert np.all(dts[(t >= 0.25) & (t < 2.0)] <= 1 / 730 + 1e-12)
-    assert np.all(dts[t >= 2.0] <= 1 / 500 + 1e-12)
-    assert np.max(dts[t >= 2.0]) > 1 / 730  # the coarse segment is really used
+    assert np.all(dts[t < 0.25] <= 1 / 1460 + 1e-12)
+    assert np.all(dts[(t >= 0.25) & (t < 2.0)] <= 1 / 365 + 1e-12)
+    assert np.all(dts[t >= 2.0] <= 1 / 250 + 1e-12)
+    assert np.max(dts[t >= 2.0]) > 1 / 365  # the coarse segment is really used
     for b in (0.25, 2.0):
         assert np.any(np.abs(grid.times - b) < 1e-12)
     np.testing.assert_allclose(grid.record_times, [0.0, 0.5, 1.0, 2.5])
@@ -229,3 +229,56 @@ def test_scheme_config_validation() -> None:
         SchemeConfig(pc_eta=1.5)
     with pytest.raises(ValueError, match="local_var_time_eval"):
         SimConfig(local_var_time_eval="end")
+
+
+def test_second_order_sv_step() -> None:
+    """M4b: pure 1F Bergomi SV (ω = 3, κ = 1.5, ρ = −0.7, flat ξ₀ = 4%) at dt = 1/365 for 1m.
+
+    The second-order SV step matches the mixing solution (eqs. 8.58–8.62) on the smile within
+    noise and reproduces the flat variance-swap level; the frozen-variance step (``sv_order2 =
+    False``) is 0.06 vol points low on the 1m variance swap (time-averaged prefactor paired with
+    start-of-step factors, −¼ ω² δ χ'(t) in variance) and 0.2 vol points flatter across
+    k = ±0.1 (missing within-step spot/variance covariance).  Measured at 400k paths in the M4b
+    report: frozen 24.05 / 19.17 / 15.47 / VS 19.94, second order 24.20 / 19.18 / 15.38 / VS
+    20.00, mixing 24.23 / 19.20 / 15.43 / exact 20.00.
+    """
+    from volsto.analytics.mixing import mixing_smile
+    from volsto.config import BergomiParams
+    from volsto.market import ForwardVarianceCurve
+    from volsto.models import BergomiSV
+    from volsto.products import VarianceSwap
+
+    fc = ForwardCurve.flat(100.0, 0.0, 0.0)
+    model = BergomiSV(BergomiParams.one_factor(3.0, 1.5, -0.7), ForwardVarianceCurve.flat(0.04), fc)
+    T = 1.0 / 12.0
+    ks = np.array([-0.1, 0.0, 0.1])
+    strikes = 100.0 * np.exp(ks)
+    prods: list[Product] = [
+        EuropeanOption(float(K), T, 1 if k >= 0 else -1, fc.rate_curve) for K, k in zip(strikes, ks)
+    ]
+    prods.append(VarianceSwap([0.0, T], 0.0, fc.rate_curve, use_simulation_grid=True))
+    out = {}
+    for sv2 in (True, False):
+        cfg = SimConfig(n_paths=200_000, dt_max=1 / 365, chunk_size=50_000, seed=5, sv_order2=sv2)
+        res = MonteCarlo(cfg).price_many(prods, model)
+        ivs = np.array(
+            [
+                implied_vol(r.mean, 100.0, K, T, 1 if k >= 0 else -1)
+                for r, K, k in zip(res, strikes, ks)
+            ]
+        )
+        ses = np.array(
+            [r.stderr / black_vega(100.0, K, T, iv) for r, K, iv in zip(res, strikes, ivs)]
+        )
+        vs = float(np.sqrt(res[-1].mean))
+        out[sv2] = (ivs, ses, vs, res[-1].stderr / (2 * vs))
+    mix = mixing_smile(model, T, strikes, n_paths=100_000, seed=1, dt=1 / 2920)
+    ivs2, ses2, vs2, vs2_se = out[True]
+    ivs1, _ses1, vs1, _ = out[False]
+    tol = 3.5 * np.hypot(ses2, mix.implied_vol_stderr)
+    assert np.all(np.abs(ivs2 - mix.implied_vols) < tol), (ivs2, mix.implied_vols, tol)
+    assert abs(vs2 - 0.20) < 3.5 * vs2_se + 1e-4, (vs2, vs2_se)
+    # the frozen step's documented biases
+    assert vs1 < 0.20 - 0.0004, vs1
+    skew2, skew1 = ivs2[0] - ivs2[2], ivs1[0] - ivs1[2]
+    assert skew1 < skew2 - 2.0 * np.hypot(ses2[0], ses2[2]), (skew1, skew2)

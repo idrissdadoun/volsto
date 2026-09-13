@@ -4,9 +4,14 @@ Frozen-leverage rule (owner amendment before M3): within a step ``[t_n, t_{n+1}]
 lookup — start point, predictor / weak order-2 supporting values — uses the ``t_n`` slice
 ``L(t_n, ·)``.  During particle calibration ``L(t_{n+1}, ·)`` is not yet known when stepping to
 ``t_{n+1}``, and pricing applies the identical rule so that a calibrated leverage reprices the
-surface with the pricing kernel.  The time dependence of ``L`` is therefore left-point; the
-calibration absorbs the corresponding discretisation.  The SV kernel keeps its exact factor step
-and its (optionally time-averaged) deterministic prefactor.  :func:`step_lsv_block` is the single
+surface with the pricing kernel.  The time dependence of ``L`` is therefore left-point; at M4b
+two second-order alternatives (the step average of ``σ_loc²`` in the calibration target, and a
+linear-in-time end-of-step predictor of the next slice fed to the supporting values) were
+measured on the coarse schedule at ω = 3 and changed the repricing by less than 0.01 vol points,
+so the rule stands.  The SV kernel keeps its exact factor
+step; the SV variance over the step is handled by the second-order SV step
+(``SchemeConfig.sv_order2``, M4b) with the leverage still frozen at ``t_n``.
+:func:`step_lsv_block` is the single
 stepping routine used by both :class:`LSV.simulate_chunk` and
 :func:`volsto.calibration.particle.calibrate_leverage`.  Checked by ``tests/test_lsv.py``.
 """
@@ -63,7 +68,7 @@ def step_lsv_block(
     under the frozen-leverage rule ``lev_a[j] = lev_b[j] = L²(t_j, ·)`` and ``lev_rec[j] =
     L²(t_{j+1}, ·)`` (the recorded instantaneous variance at the new time).
     """
-    chol, decay, g_step, g_node = kernel.step_tables(t_nodes, scheme)
+    chol, decay, g_step, g_node, dlng = kernel.step_tables(t_nodes, scheme)
     bergomi_block(
         log_spot,
         factors,
@@ -78,7 +83,12 @@ def step_lsv_block(
         decay,
         g_step,
         g_node,
+        dlng,
         kernel.coef,
+        kernel.ks,
+        kernel.rho_s,
+        kernel.corr_x,
+        int(scheme.sv_order2),
         1,
         k0,
         dk,
@@ -125,10 +135,9 @@ class LSV(Model):
         return LSV(kernel, lev)
 
     def leverage_tables(self, t_nodes: FloatArray) -> tuple[FloatArray, FloatArray, FloatArray]:
-        """``(lev_a, lev_b, lev_rec)`` for the steps between ``t_nodes`` under the frozen rule."""
-        rows = self.leverage.l2_rows(t_nodes)
-        start = np.ascontiguousarray(rows[:-1])
-        return start, start, np.ascontiguousarray(rows[1:])
+        """``(lev_a, lev_b, lev_rec)`` for the steps between ``t_nodes`` under the frozen rule
+        (:meth:`LeverageFunction.step_tables`)."""
+        return self.leverage.step_tables(t_nodes)
 
     def simulate_chunk(
         self,

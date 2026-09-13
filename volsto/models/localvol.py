@@ -85,19 +85,30 @@ def spot_step(
     row_a: FloatArray,
     row_b: FloatArray,
     scale: float,
+    scale_b: float,
     ln_f_a: float,
     ln_f_b: float,
     mode: int,
     eta: float,
-) -> tuple[float, float]:  # pragma: no cover - numba
-    """One spot step with variance ``v(x) = scale · row(x − ln F)``; returns ``(Δ ln S, v_used)``.
+) -> tuple[float, float, float, float]:  # pragma: no cover - numba
+    """One spot step with variance ``v(x) = scale · row(x − ln F)``.
 
-    ``row_a`` is the start-point table, ``row_b`` the end/predictor table (see module docstring);
-    ``scale`` is 1 for local vol and the frozen SV variance ``ξ_t^t`` for LSV (rows then hold
-    ``L²``).  ``mode``: 0 plain log-Euler, 1 weak predictor–corrector, 2 Platen weak order 2.
+    Returns ``(Δ ln S, v_used, b0, b0·b_x)`` with ``b0 = sqrt(v(x_n))`` the start-point diffusion
+    coefficient and ``b0 b_x = ½ scale · d row/dx`` (needed by the second-order SV terms of
+    :func:`~volsto.models.bergomi.bergomi_block`).  ``row_a`` is the start-point table, ``row_b``
+    the end/predictor table (see module docstring); ``scale`` is 1 for local vol and the SV
+    variance ``ξ_{t_n}`` for LSV (rows then hold ``L²``); ``scale_b`` is the SV variance used
+    for the end-of-step *drift* evaluations (``ξ_{t_{n+1}}`` under the second-order SV step,
+    equal to ``scale`` otherwise, which reproduces the frozen-variance step exactly).  The
+    diffusion supporting values always use ``scale`` (deterministic offsets, Platen's device);
+    the end-of-step variance enters them through the explicit weak order-2 cross terms in the
+    caller.  ``mode``: 0 plain log-Euler, 1 weak predictor–corrector, 2 Platen weak order 2.
     """
     k = ls - ln_f_a
-    v = scale * interp_uniform(k0, dk, row_a, k)
+    row_k = interp_uniform(k0, dk, row_a, k)
+    v = scale * row_k
+    b0 = np.sqrt(v)
+    bbx = 0.5 * scale * slope_uniform(k0, dk, row_a, k)
     if mode == 1:
         # weak predictor-corrector (Kloeden-Platen 15.5.4): drift averaged with theta = 1/2
         # between (t_n, x_n) and (t_{n+1}, x_pred), diffusion variance weighted (1-eta, eta);
@@ -111,7 +122,7 @@ def spot_step(
         )
         v_diff = (1.0 - eta) * v + eta * v_pred
         a_avg = -0.25 * (v + v_pred) - 0.5 * eta * slope
-        return drift + a_avg * dt + np.sqrt(v_diff * dt) * zj, v_diff
+        return drift + a_avg * dt + np.sqrt(v_diff * dt) * zj, v_diff, b0, bbx
     if mode == 2:
         # Platen explicit weak order-2 scheme (Kloeden-Platen 15.1.3) for
         # dx = a dt + b dW, a = mu - v/2, b = sqrt(v); supporting values at t_{n+1}
@@ -121,7 +132,7 @@ def spot_step(
         x_bar = ls + a0 + b0 * sdt * zj
         x_up = ls + a0 + b0 * sdt
         x_dn = ls + a0 - b0 * sdt
-        v_bar = scale * interp_uniform(k0, dk, row_b, x_bar - ln_f_b)
+        v_bar = scale_b * interp_uniform(k0, dk, row_b, x_bar - ln_f_b)
         b_up = np.sqrt(scale * interp_uniform(k0, dk, row_b, x_up - ln_f_b))
         b_dn = np.sqrt(scale * interp_uniform(k0, dk, row_b, x_dn - ln_f_b))
         a1 = drift - 0.5 * v_bar * dt  # a * dt at (t_{n+1}, x_bar)
@@ -130,8 +141,9 @@ def spot_step(
             + 0.25 * (b_up + b_dn + 2.0 * b0) * sdt * zj
             + 0.25 * (b_up - b_dn) * sdt * (zj * zj - 1.0)
         )
-        return dls, 0.5 * (v + v_bar)
-    return drift - 0.5 * v * dt + np.sqrt(v * dt) * zj, v
+        return dls, 0.5 * (v + v_bar), b0, bbx
+    v1 = scale_b * row_k
+    return drift - 0.25 * (v + v1) * dt + b0 * np.sqrt(dt) * zj, 0.5 * (v + v1), b0, bbx
 
 
 @njit(parallel=True, cache=True)
@@ -174,7 +186,7 @@ def diffuse_block(
         for j in range(nb):
             dt = t_nodes[j + 1] - t_nodes[j]
             zj = z[p, j, 0]
-            dls, v = spot_step(
+            dls, v, _b0, _bbx = spot_step(
                 ls,
                 dt,
                 drifts[j],
@@ -183,6 +195,7 @@ def diffuse_block(
                 dk,
                 var_a[j],
                 var_b[j],
+                1.0,
                 1.0,
                 ln_f_nodes[j],
                 ln_f_nodes[j + 1],

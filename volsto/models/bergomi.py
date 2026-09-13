@@ -10,9 +10,12 @@ Exact simulation (§7.3.1, eqs. 7.15–7.18) over a step ``δτ``:
 ``X^i_{τ+δτ} = e^{−k_i δτ} X^i_τ + δX^i``, ``E[δX^i δX^j] = ρ_ij (1−e^{−(k_i+k_j)δτ})/(k_i+k_j)``,
 ``E[δW^S δX^i] = ρ_iS (1−e^{−k_i δτ})/k_i``, ``E[(δW^S)²] = δτ``; the joint Gaussian
 ``(δW^S, δX¹, δX²)`` is drawn from the Cholesky factor of that covariance, computed once per
-distinct step size.  The spot is log-Euler with ``ξ_t^t`` frozen over the step (§7.3.1); with
-``local_var_time_average`` the deterministic prefactor ``g(u) = ξ_0^u e^{−½ω²χ(u,u)}`` is averaged
-over the step with the factors frozen (owner amendment).  ``θ = 0`` is the 1F model
+distinct step size.  The spot step is the second-order SV step of M4b by default
+(``SchemeConfig.sv_order2``: factors advanced first, trapezoidal variance in the drift, explicit
+weak order-2 spot/variance cross terms; see :func:`bergomi_block`); with ``sv_order2=False`` it
+is log-Euler with ``ξ_t^t`` frozen over the step (§7.3.1) and, under ``local_var_time_average``,
+the deterministic prefactor ``g(u) = ξ_0^u e^{−½ω²χ(u,u)}`` averaged over the step with the
+factors frozen (owner amendment, M1→M2).  ``θ = 0`` is the 1F model
 (``α_0 = 1``, ``x_t^T = e^{−k1(T−t)} X¹_t``); the factor count is then 1.
 Checked by ``tests/test_bergomi.py``.
 """
@@ -106,7 +109,12 @@ def bergomi_block(
     decay: FloatArray,
     g_step: FloatArray,
     g_node: FloatArray,
+    dlng: FloatArray,
     coef: FloatArray,
+    ks: FloatArray,
+    rho_s: FloatArray,
+    corr_x: FloatArray,
+    sv2: int,
     use_lev: int,
     k0: float,
     dk: float,
@@ -121,30 +129,74 @@ def bergomi_block(
     out_int_var: FloatArray,
     out_sum_sq: FloatArray,
 ) -> None:  # pragma: no cover - numba
-    """Advance paths over a block of steps: exact OU factors (7.15–7.18), log-Euler spot.
+    """Advance paths over a block of steps: exact OU factors (7.15–7.18), then the spot step.
 
     ``z`` is ``(n_paths, n_block, 1 + n_factors)``; ``chol[j]`` the ``(1+nf)×(1+nf)`` factor of the
-    step covariance; ``decay[j, i] = e^{−k_i δτ_j}``; ``g_step[j]`` the (time-averaged)
-    deterministic prefactor of ``ξ_t^t`` for the step and ``g_node`` its value at the nodes;
-    ``coef[i] = ω α_θ w_i`` so that ``ξ_t^t = g exp(Σ coef_i X^i)``.  With ``use_lev`` the spot
+    step covariance (spot Brownian first, so ``δW^S = chol[j,0,0] z_0``); ``decay[j, i] =
+    e^{−k_i δτ_j}``; ``g_node`` the deterministic prefactor of ``ξ_t^t`` at the nodes, ``g_step``
+    its time average over the step (frozen-variance step only) and ``dlng[j] = Δ ln g / δτ``;
+    ``coef[i] = ω α_θ w_i`` so that ``ξ_t^t = g exp(Σ coef_i X^i)``; ``ks``, ``rho_s = corr(W^S,
+    W^i)`` and ``corr_x`` the factor mean reversions and correlations.  With ``use_lev`` the spot
     variance is ``L²(t, x) ξ_t^t`` from the ``lev_*`` tables (LSV, M3) and the spot step uses the
     shared :func:`~volsto.models.localvol.spot_step` in ``mode``.
+
+    ``sv2 = 0``: the variance is frozen at the step start (``ξ_{t_n}`` with the time-averaged
+    prefactor), the original M2/M3 step.  ``sv2 = 1`` (M4b, second-order SV step): the factors are
+    advanced first, so ``ξ_{t_{n+1}}`` is known exactly; the drift uses the trapezoid of the
+    variance, and the weak order-2 Itô–Taylor terms of the spot increment that involve the
+    variance factors are added explicitly (Kloeden–Platen 14.2, correlated drivers written in
+    terms of ``δW^S`` and ``δW̃_i = ΔX_i − (e^{−k_i δ} − 1) X_i ≈ δW^i``)::
+
+        Δx += ¼ b0 Σ_i c_i (δW̃_i δW^S − ρ_Si δ)                    (spot/variance cross term)
+            + ½ δ b0 [½ ∂_t ln g − ½ Σ_i c_i k_i X_i + ⅛ Σ_ij c_i c_j ρ_ij
+                      + ½ (b_x/b0) Σ_i ρ_Si c_i] δW^S
+
+    with ``b0 = L(x_n) sqrt(ξ_{t_n})`` and ``b0 b_x`` from the leverage slope; the end-of-step
+    variance also enters the drift ``a_{n+1}`` (which supplies the ``−¼ c δ b0² δW^i`` term).  The
+    zero-mean Lévy areas are dropped.  Checked against the mixing solution and a fine grid by
+    ``tests/test_scheme.py::test_second_order_sv_step``.
     """
     n = log_spot.shape[0]
     nb = z.shape[1]
     nf = factors.shape[1]
+    cc = 0.0
+    for i in range(nf):
+        for l in range(nf):
+            cc += coef[i] * coef[l] * corr_x[i, l]
+    cc *= 0.125
+    rs = 0.0
+    for i in range(nf):
+        rs += rho_s[i] * coef[i]
     for p in prange(n):
         ls = log_spot[p]
         iv = int_var[p]
         sq = sum_sq[p]
+        x0 = np.empty(nf)
+        dwt = np.empty(nf)
         for j in range(nb):
             dt = t_nodes[j + 1] - t_nodes[j]
-            e = 0.0
+            e0 = 0.0
             for i in range(nf):
-                e += coef[i] * factors[p, i]
-            vsv = g_step[j] * np.exp(e)
+                x0[i] = factors[p, i]
+                e0 += coef[i] * x0[i]
+            # exact factor step: X^i <- e^{-k_i dt} X^i + delta X^i, delta X = chol rows 1.. of z
+            e1 = 0.0
+            for i in range(nf):
+                dx = 0.0
+                for l in range(i + 2):
+                    dx += chol[j, 1 + i, l] * z[p, j, l]
+                factors[p, i] = decay[j, i] * x0[i] + dx
+                dwt[i] = dx  # = ΔX_i − (e^{−k_i δ} − 1) X_i = ∫ e^{−k_i(δ−u)} dW_i ≈ δW_i
+                e1 += coef[i] * factors[p, i]
+            if sv2:
+                vsv0 = g_node[j] * np.exp(e0)
+                vsv1 = g_node[j + 1] * np.exp(e1)
+            else:
+                vsv0 = g_step[j] * np.exp(e0)
+                vsv1 = vsv0
+            dws = chol[j, 0, 0] * z[p, j, 0]
             if use_lev:
-                dls, v = spot_step(
+                dls, v, b0, bbx = spot_step(
                     ls,
                     dt,
                     drifts[j],
@@ -153,31 +205,34 @@ def bergomi_block(
                     dk,
                     lev_a[j],
                     lev_b[j],
-                    vsv,
+                    vsv0,
+                    vsv1,
                     ln_f_nodes[j],
                     ln_f_nodes[j + 1],
                     mode,
                     eta,
                 )
             else:
-                v = vsv
-                dls = drifts[j] - 0.5 * v * dt + np.sqrt(v * dt) * z[p, j, 0]
-            # exact factor step: X^i <- e^{-k_i dt} X^i + delta X^i, delta X = chol rows 1.. of z
-            for i in range(nf):
-                dx = 0.0
-                for l in range(i + 2):
-                    dx += chol[j, 1 + i, l] * z[p, j, l]
-                factors[p, i] = decay[j, i] * factors[p, i] + dx
+                b0 = np.sqrt(vsv0)
+                bbx = 0.0
+                v = 0.5 * (vsv0 + vsv1)
+                dls = drifts[j] - 0.5 * v * dt + b0 * dws
+            if sv2:
+                cross = 0.0
+                lin = 0.0
+                for i in range(nf):
+                    cross += coef[i] * (dwt[i] * dws - rho_s[i] * dt)
+                    lin += coef[i] * ks[i] * x0[i]
+                lterm = 0.5 * dlng[j] - 0.5 * lin + cc + 0.5 * (bbx / b0) * rs
+                dls += 0.25 * b0 * cross + 0.5 * dt * b0 * lterm * dws
             ls += dls
             iv += v * dt
             sq += dls * dls
             col = step_record[j]
             if col >= 0:
-                e = 0.0
                 for i in range(nf):
-                    e += coef[i] * factors[p, i]
                     out_factors[p, col, i] = factors[p, i]
-                vnew = g_node[j + 1] * np.exp(e)
+                vnew = g_node[j + 1] * np.exp(e1)
                 if use_lev:
                     vnew *= interp_uniform(k0, dk, lev_rec[j], ls - ln_f_nodes[j + 1])
                 out_log_spot[p, col] = ls
@@ -209,6 +264,9 @@ class BergomiSV(Model):
         self.weights = np.array([1.0 - params.theta, params.theta][: self.n_factors])
         self.ks = np.array([params.k1, params.k2][: self.n_factors])
         self.coef = params.omega * self.alpha * self.weights
+        corr = params.correlation_matrix
+        self.rho_s = np.ascontiguousarray(corr[0, 1 : 1 + self.n_factors])
+        self.corr_x = np.ascontiguousarray(corr[1 : 1 + self.n_factors, 1 : 1 + self.n_factors])
 
     # -- deterministic pieces ------------------------------------------------------------------
 
@@ -269,7 +327,7 @@ class BergomiSV(Model):
         if idx.size == 0:
             raise ValueError("no steps inside [T1, T2]")
         t_nodes = t[idx[0] : idx[-1] + 2]
-        _, _, g_step, _ = self.step_tables(t_nodes, scheme)
+        _, _, g_step, _, _ = self.step_tables(t_nodes, scheme)
         tn = t_nodes[:-1]
         dts = np.diff(t_nodes)
         w = self.params.omega
@@ -320,19 +378,24 @@ class BergomiSV(Model):
 
     def step_tables(
         self, t_nodes: FloatArray, scheme: SchemeConfig
-    ) -> tuple[FloatArray, FloatArray, FloatArray, FloatArray]:
-        """``(chol, decay, g_step, g_node)`` for the steps between ``t_nodes``."""
+    ) -> tuple[FloatArray, FloatArray, FloatArray, FloatArray, FloatArray]:
+        """``(chol, decay, g_step, g_node, dlng)`` for the steps between ``t_nodes``;
+        ``dlng = Δ ln g / δτ`` feeds the second-order SV step."""
         dts = np.diff(t_nodes)
         chol = sqrt_covariance(factor_step_covariance(self.params, dts, self.n_factors))
         decay = np.exp(-dts[:, None] * self.ks[None, :])
         g_node = self.g(t_nodes)
-        if scheme.local_var_time_average:
-            # Simpson on the smooth prefactor g over each step
+        if scheme.local_var_time_average and not scheme.sv_order2:
+            # Simpson on the smooth prefactor g over each step (frozen-variance step only: with
+            # the second-order step the time dependence of g enters through ½ ∂_t ln g and the
+            # end-of-step variance; averaging g with the factors frozen at t_n biases E[ξ] by
+            # −¼ ω² δ χ'(t), 0.6% at 1m for ω = 3 and δ = 1/365)
             g_mid = self.g(0.5 * (t_nodes[:-1] + t_nodes[1:]))
             g_step = (g_node[:-1] + 4.0 * g_mid + g_node[1:]) / 6.0
         else:
             g_step = g_node[:-1].copy()
-        return chol, decay, np.ascontiguousarray(g_step), g_node
+        dlng = np.diff(np.log(g_node)) / dts
+        return chol, decay, np.ascontiguousarray(g_step), g_node, np.ascontiguousarray(dlng)
 
     def simulate_chunk(
         self,
@@ -363,7 +426,7 @@ class BergomiSV(Model):
         for s0 in range(0, grid.n_steps, step_block):
             s1 = min(s0 + step_block, grid.n_steps)
             t_nodes = grid.times[s0 : s1 + 1]
-            chol, decay, g_step, g_node = self.step_tables(t_nodes, scheme)
+            chol, decay, g_step, g_node, dlng = self.step_tables(t_nodes, scheme)
             z = draws.block(s0, s1, p0, p1)
             bergomi_block(
                 ls,
@@ -379,7 +442,12 @@ class BergomiSV(Model):
                 decay,
                 g_step,
                 g_node,
+                dlng,
                 self.coef,
+                self.ks,
+                self.rho_s,
+                self.corr_x,
+                int(scheme.sv_order2),
                 0,
                 0.0,
                 1.0,

@@ -181,16 +181,19 @@ class StepSchedule:
     """Piecewise-constant maximum simulation step ``dt_max(t)``.
 
     ``dt_max = dts[i]`` for ``t ∈ [breaks[i-1], breaks[i])`` with ``breaks[-1] = ∞``.  The default
-    is 1/2920 below 3m, 1/730 up to 2y and 1/500 beyond (pre-M4 amendment: the LSV step is first
-    order in time — leverage and SV variance frozen over the step — and at 1/1460–1/365–1/250 the
-    1y–2y put wing was 0.10–0.15 vp cheap and the 1y variance swap 0.14 vp low; halving the steps
-    brought both within 0.05 vp, see SPEC §4.2).  The Monte Carlo engine and the particle
-    calibration use the same schedule so that a calibrated leverage function reprices the surface
-    on the grid it is used on.
+    is 1/1460 below 3m, 1/365 up to 2y and 1/250 beyond (M4b).  History: the schedule was halved
+    before M4 because the frozen-variance LSV step showed a −0.14 vp 1y variance-swap error on
+    this schedule; M4b traced most of that to one particle seed and to the regression grid, made
+    the SV spot step second order and the regression grid adaptive, and measured (1F ω = 3,
+    three particle seeds, N = 2·10⁵) that this schedule reprices as well as the halved one on
+    average — the halved one even carries a +0.06–0.08 vp ATM bias at 1y–3y with the
+    second-order step — at half the cost (calibration ≈ 33 s for 3y); see SPEC §4.2.  The Monte
+    Carlo engine and the particle calibration use the same schedule so that a calibrated leverage
+    function reprices the surface on the grid it is used on.
     """
 
     breaks: tuple[float, ...] = (0.25, 2.0)
-    dts: tuple[float, ...] = (1.0 / 2920.0, 1.0 / 730.0, 1.0 / 500.0)
+    dts: tuple[float, ...] = (1.0 / 1460.0, 1.0 / 365.0, 1.0 / 250.0)
 
     def __post_init__(self) -> None:
         if len(self.dts) != len(self.breaks) + 1:
@@ -254,6 +257,11 @@ class SchemeConfig:
             time averaging.  Three extra variance lookups per step.
         local_var_time_eval: when ``local_var_time_average`` is off, evaluate the variance at the
             step ``"start"`` (plain log-Euler) or at the ``"midpoint"`` in time (diagnostic).
+        sv_order2: second-order SV step for the Bergomi / LSV kernels (M4b): exact factor
+            increments first, trapezoidal variance in the drift and the explicit weak order-2
+            spot/variance cross terms (see :func:`volsto.models.bergomi.bergomi_block`).  Off:
+            the variance is frozen at the step start (the M2/M3 step).  Independent of the spot
+            ``mode`` (applies to log-Euler and Platen; ignored by the predictor–corrector).
     """
 
     local_var_time_average: bool = True
@@ -261,6 +269,7 @@ class SchemeConfig:
     pc_eta: float = 0.5
     weak_order2: bool = True
     local_var_time_eval: str = "start"
+    sv_order2: bool = True
 
     def __post_init__(self) -> None:
         if self.local_var_time_eval not in ("start", "midpoint"):
@@ -277,14 +286,14 @@ class SimConfig:
 
     Attributes:
         n_paths: number of paths (SPEC default 2·10⁵).  Must be even when antithetic.
-        dt_max: maximum simulation step — a :class:`StepSchedule` (default: 1/2920 below 3m,
-            1/730 to 2y, 1/500 after) or a float for a uniform step.
+        dt_max: maximum simulation step — a :class:`StepSchedule` (default: 1/1460 below 3m,
+            1/365 to 2y, 1/250 after) or a float for a uniform step.
         chunk_size: paths simulated per block to bound memory (SPEC default 5·10⁴); further
             capped by ``chunk_memory_mb`` when the path container is large.
         antithetic: use antithetic pairs (path 2i+1 uses the negated normals of path 2i).
         seed: base seed of the CRN-keyed PCG64 stream (SPEC §5).
-        local_var_time_average, predictor_corrector, pc_eta, weak_order2, local_var_time_eval:
-            see :class:`SchemeConfig`.
+        local_var_time_average, predictor_corrector, pc_eta, weak_order2, local_var_time_eval,
+        sv_order2: see :class:`SchemeConfig`.
         record_all_steps: record the state at every grid step, not only at fixing times.
         chunk_memory_mb: budget for one chunk's path container (all recorded arrays).
     """
@@ -299,6 +308,7 @@ class SimConfig:
     pc_eta: float = 0.5
     weak_order2: bool = True
     local_var_time_eval: str = "start"
+    sv_order2: bool = True
     record_all_steps: bool = False
     chunk_memory_mb: int = 512
 
@@ -333,6 +343,7 @@ class SimConfig:
             pc_eta=self.pc_eta,
             weak_order2=self.weak_order2,
             local_var_time_eval=self.local_var_time_eval,
+            sv_order2=self.sv_order2,
         )
 
     def effective_chunk_size(self, n_cols: int, n_factors: int) -> int:
@@ -635,9 +646,8 @@ class ParticleConfig:
             slope, which over-extrapolates the decaying right tail of the 2F model (E[V|S] at 3m
             +20% under-estimated by 11%, calls +0.3 vp rich); the saturating quadratic follows the
             observed flattening of ``ln E[V|S]``.
-        n_regression_points: grid on which ``E[V|S]`` is estimated (SPEC: 201 points spanning
-            ``±leverage_std_span`` ATM standard deviations at the horizon); it is then interpolated
-            onto the finer leverage grid where ``σ_loc²`` is resolved.
+        n_regression_points: dense grid on which ``E[V|S]`` is regressed, spanning the particle
+            cloud's trusted quantile range at each slice (M4b; interpolated onto the leverage grid).
         leverage_std_span: half-width of the leverage grid in ATM standard deviations.
         leverage_dk: spacing of the leverage log-moneyness grid (same as the Dupire grid).
         l_min, l_max: clip bounds on ``L``.

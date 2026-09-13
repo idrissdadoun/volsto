@@ -5,7 +5,7 @@ Part A — the original study's numbers (its SSVI surface and seeds) can only be
 
 Part B — the same headline set measured on the **placeholder** reference surface at M4 with
 :func:`volsto.studies.m4.run_headline` (400k paths, seed 2024, the default schedule and scheme
-shared with calibration).  Tolerance ``max(2 stderr, 0.02% of notional)`` for prices and
+shared with calibration; baselines re-recorded at M4b).  Tolerance ``max(2 stderr, 0.02% of notional)`` for prices and
 ``max(2 stderr, 0.02 vol points)`` for volatilities; with the same seed the run is
 deterministic, so this guards the numerics (scheme, calibration, products) rather than the noise.
 Slow: it needs the four leverage calibrations (cache hits after the first run).
@@ -49,43 +49,46 @@ STUDY_NUMBERS = {
     "cliquet_2y": {0.0: 0.639, 3.0: 1.718},
 }
 
-# Placeholder-surface baselines measured at M4 (scripts/m4_headline.py, 400k paths, seed 2024;
-# SPEC §6 notes): value, stderr — vols in absolute units, cliquets in % of notional.
+# Placeholder-surface baselines re-measured at M4b (scripts/m4_headline.py, 400k paths, seed 2024,
+# second-order SV step, schedule 1/1460–1/365–1/250, adaptive regression grid; SPEC §6 notes): value,
+# stderr — vols in absolute units, cliquets in % of notional.  Versus the M4 numbers every entry
+# moved by less than 2 stderr except the 2y cliquet at ω ≥ 2 and the 2F set (+0.017–0.025% of
+# notional, 2.1–2.9 σ) and the ω = 3 forward vol swap (−0.05 vp, 2.3 σ).
 PLACEHOLDER_BASELINES: dict[str, dict[str, tuple[float, float]]] = {
     "LV (ω=0)": {
-        "atm_vol": (0.215121, 0.000447),
-        "vs_vol": (0.252111, 0.000196),
-        "volswap_vol": (0.225172, 0.000121),
-        "cliquet_1y": (1.19772, 0.00407),
-        "cliquet_2y": (0.74375, 0.00394),
+        "atm_vol": (0.214421, 0.000447),
+        "vs_vol": (0.252494, 0.000197),
+        "volswap_vol": (0.225337, 0.000121),
+        "cliquet_1y": (1.19298, 0.00407),
+        "cliquet_2y": (0.75363, 0.00397),
     },
     "1F ω=1": {
-        "atm_vol": (0.208359, 0.000384),
-        "vs_vol": (0.25237, 0.000211),
-        "volswap_vol": (0.22315, 0.00012),
-        "cliquet_1y": (1.31741, 0.00425),
-        "cliquet_2y": (0.940793, 0.00452),
+        "atm_vol": (0.20764, 0.000382),
+        "vs_vol": (0.252275, 0.000208),
+        "volswap_vol": (0.223108, 0.000119),
+        "cliquet_1y": (1.31364, 0.00425),
+        "cliquet_2y": (0.951068, 0.00452),
     },
     "1F ω=2": {
-        "atm_vol": (0.197386, 0.000362),
-        "vs_vol": (0.252391, 0.000263),
-        "volswap_vol": (0.21411, 0.000128),
-        "cliquet_1y": (1.62409, 0.00456),
-        "cliquet_2y": (1.44226, 0.00553),
+        "atm_vol": (0.196867, 0.00036),
+        "vs_vol": (0.251875, 0.000257),
+        "volswap_vol": (0.213791, 0.000127),
+        "cliquet_1y": (1.62394, 0.00456),
+        "cliquet_2y": (1.45881, 0.00555),
     },
     "1F ω=3": {
-        "atm_vol": (0.184944, 0.000374),
-        "vs_vol": (0.251793, 0.000335),
-        "volswap_vol": (0.201011, 0.000152),
-        "cliquet_1y": (1.96646, 0.00465),
-        "cliquet_2y": (2.00505, 0.0061),
+        "atm_vol": (0.184484, 0.000372),
+        "vs_vol": (0.250936, 0.000313),
+        "volswap_vol": (0.200509, 0.00015),
+        "cliquet_1y": (1.96815, 0.00466),
+        "cliquet_2y": (2.02393, 0.00611),
     },
     "2F Table 8.2": {
-        "atm_vol": (0.192008, 0.000336),
-        "vs_vol": (0.251856, 0.000268),
-        "volswap_vol": (0.210247, 0.000132),
-        "cliquet_1y": (1.73973, 0.00482),
-        "cliquet_2y": (1.77974, 0.00612),
+        "atm_vol": (0.191663, 0.000332),
+        "vs_vol": (0.251585, 0.000264),
+        "volswap_vol": (0.209976, 0.000131),
+        "cliquet_1y": (1.74167, 0.00483),
+        "cliquet_2y": (1.80473, 0.00614),
     },
 }
 

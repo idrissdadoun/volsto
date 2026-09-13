@@ -10,7 +10,9 @@ two-factor lognormal Bergomi forward-variance model with exact factor stepping, 
 and the mixing-solution smile (M2); particle-method leverage calibration, the LSV model, §4.2
 repricing diagnostics and the content-addressed leverage cache (M3); the HistoricalData.net
 option-chain importer and SSVI/eSSVI fitter (M3b); forward-start options, the FVA, the cliquet
-family with exact decompositions, forward-smile analytics and the headline study runner (M4).
+family with exact decompositions, forward-smile analytics and the headline study runner (M4);
+the second-order SV spot step, the adaptive particle-regression grid and the restored
+1/1460–1/365–1/250 schedule (M4b).
 
 ## Install
 
@@ -35,7 +37,7 @@ from volsto.products import AdditiveCliquet, EuropeanOption, VarianceSwap
 # Bergomi kernel, particle settings, step schedule and scheme all come from one YAML spec
 spec = load_yaml("configs/studies/lsv_reference_1f.yaml", CalibrationSpec)
 cache = LeverageCache("cache")                      # content-addressed; the only entry point
-model, _ = cache.get_or_calibrate(spec)             # ~30 s on a miss (2e5 particles, 3y), instant on a hit
+model, _ = cache.get_or_calibrate(spec)             # ~33 s on a miss (2e5 particles, 3y), instant on a hit
 _, surface, _ = build_market(spec)
 
 mc = MonteCarlo(SimConfig(n_paths=200_000, seed=1))  # default schedule + scheme, as in calibration
@@ -67,11 +69,16 @@ model = LocalVol(LocalVolSurface.from_implied(surface))              # Dupire (G
 Every Monte Carlo number is a `PriceResult(mean ± stderr)`; the library never returns a bare
 float for a simulated quantity.
 
-Discretisation defaults (`SimConfig`): step schedule 1/2920 below 3m, 1/730 to 2y, 1/500 after,
-and Platen's explicit weak order-2 spot step (`weak_order2=True`).  On the reference surface the
-1m ATM local-vol repricing bias is 0.03 vol points at dt = 1/365 versus 0.36 for plain log-Euler;
-`volsto.engine.refinement_study` reproduces this under common random numbers.  Plain log-Euler,
-time-averaged variance and a weak predictor-corrector remain available as options.
+Discretisation defaults (`SimConfig`): step schedule 1/1460 below 3m, 1/365 to 2y, 1/250 after,
+Platen's explicit weak order-2 spot step (`weak_order2=True`) and, for the Bergomi / LSV kernels,
+the second-order SV step (`sv_order2=True`, M4b: exact factor increments first, trapezoidal
+variance in the drift, explicit spot/variance cross terms).  On the reference surface the 1m ATM
+local-vol repricing bias is 0.03 vol points at dt = 1/365 versus 0.36 for plain log-Euler, and the
+pure 1F Bergomi model at dt = 1/365 matches the mixing solution within 0.03 vol points at 1m where
+the frozen-variance step was 0.06 low on the variance swap and 0.14 flatter in the smile;
+`volsto.engine.refinement_study` measures such biases under common random numbers.  Plain
+log-Euler, the frozen-variance step, time-averaged variance and a weak predictor-corrector remain
+available as options.
 
 ## Bergomi two-factor model (M2)
 
@@ -107,10 +114,14 @@ chain from Yahoo in the same layout (`pip install -e ".[data]"`).
 
 `ParticleConfig` defaults were chosen by measurement on the reference surface: local-linear
 kernel regression of E[ξ|S] (Nadaraya–Watson carries an h² m′f′/f design bias that skewed the
-±10% repricing by 0.3 vol points), a plug-in ½h²m″ bias correction, a 2000-particle window floor
-in the tails, and a saturating log-quadratic tail extrapolation (the flat rule mis-priced the 3m
-+30% call by 1 vol point and variance swaps by 0.3).  Calibration and pricing share the kernel
-step for step: every leverage lookup inside a step uses the slice at the step start.
+±10% repricing by 0.3 vol points) on a grid that follows the particle cloud (M4b: a fixed grid
+biased the 1m ATM vol 0.09 vol points low at ω = 3), a plug-in ½h²m″ bias correction differenced
+on a bandwidth-wide stencil, a 2000-particle window floor in the tails, and a saturating
+log-quadratic tail extrapolation (the flat rule mis-priced the 3m +30% call by 1 vol point and
+variance swaps by 0.3).  Calibration and pricing share the kernel step for step: every leverage
+lookup inside a step uses the slice at the step start.  A single calibration with 2·10⁵
+particles carries ±0.035 vol points of seed noise per variance-swap pillar; use seed averages or
+8·10⁵ particles for production figures (SPEC §4.2, M4b notes).
 
 ## Forward-start products and forward-smile analytics (M4)
 

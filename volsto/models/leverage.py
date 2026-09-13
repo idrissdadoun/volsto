@@ -84,6 +84,16 @@ class LeverageFunction:
         """``L²`` rows (what the kernels consume)."""
         return np.asarray(self.rows(times) ** 2, dtype=np.float64)
 
+    def step_tables(self, t_nodes: ArrayLike) -> tuple[FloatArray, FloatArray, FloatArray]:
+        """``(lev_a, lev_b, lev_rec)`` ``L²`` tables for the steps between ``t_nodes`` under the
+        frozen-leverage rule: ``lev_a = lev_b`` = the slice at the step start (every lookup inside
+        the step, weak order-2 supporting values included), ``lev_rec`` = the slice at the step
+        end (recorded instantaneous variance).  The particle calibration uses the same tables.
+        """
+        rows = self.l2_rows(t_nodes)
+        start = np.ascontiguousarray(rows[:-1])
+        return start, start, np.ascontiguousarray(rows[1:])
+
     def __call__(self, t: ArrayLike, S: ArrayLike) -> FloatArray:
         """``L(t, S)`` with ``k = ln S − ln F(t)``, flat in ``k`` outside the grid."""
         t_, S_ = np.broadcast_arrays(
