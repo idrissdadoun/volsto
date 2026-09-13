@@ -5,9 +5,11 @@ studies: Black–Scholes, Dupire local vol, two-factor lognormal Bergomi forward
 LSV with particle-calibrated leverage, Monte Carlo with common random numbers, and viewers over a
 precomputed parameter cache.  The full design is in [SPEC.md](SPEC.md).
 
-Status: **M1** (market layer, BS, local vol, MC engine, vanilla / variance products).  The
-quickstart below prices with local vol; the LSV calibration (M3) and cliquet (M4) steps land with
-their milestones.
+Status: **M2** — market layer, BS, local vol, MC engine, vanilla / variance products (M1) and
+the two-factor lognormal Bergomi forward-variance model with exact factor stepping, its closed
+forms (vol of VS vol, order-one ATMF skew and SSR, diagonal covariances) and the mixing-solution
+smile (M2).  The quickstart below prices with local vol; the LSV calibration (M3) and cliquet
+(M4) steps land with their milestones.
 
 ## Install
 
@@ -56,6 +58,23 @@ and Platen's explicit weak order-2 spot step (`weak_order2=True`).  On the refer
 1m ATM local-vol repricing bias is 0.03 vol points at dt = 1/365 versus 0.36 for plain log-Euler;
 `volsto.engine.refinement_study` reproduces this under common random numbers.  Plain log-Euler,
 time-averaged variance and a weak predictor-corrector remain available as options.
+
+## Bergomi two-factor model (M2)
+
+```python
+from volsto.analytics import atmf_skew_order1_flat, ssr_order1_flat, vs_vol_of_vol_flat
+from volsto.analytics.mixing import mixing_atmf_skew, mixing_smile
+from volsto.config import BergomiParams, load_yaml
+from volsto.market import ForwardCurve, ForwardVarianceCurve
+from volsto.models import BergomiSV
+
+params = load_yaml("configs/models/bergomi_table_8_2.yaml", BergomiParams)   # book Table 8.2
+model = BergomiSV(params, ForwardVarianceCurve.flat(0.04), ForwardCurve.flat(100.0, 0.0, 0.0))
+skew, atmf_vol, err = mixing_atmf_skew(model, 1.0, h=0.02, n_paths=400_000)  # naked 2F smile
+print(skew, atmf_skew_order1_flat(params, 1.0), ssr_order1_flat(params, 1.0), vs_vol_of_vol_flat(params, 1.0))
+```
+
+`BergomiParams.one_factor(omega, kappa, rho)` is the 1F model of the earlier studies (θ = 0).
 
 ## Development
 

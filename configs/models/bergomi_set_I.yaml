@@ -1,0 +1,6 @@
+# Bergomi Table 7.1, Set I: variance dynamics only (spot correlations must be supplied).
+nu: 1.50
+theta: 0.312
+k1: 2.63
+k2: 0.42
+rho12: -0.70

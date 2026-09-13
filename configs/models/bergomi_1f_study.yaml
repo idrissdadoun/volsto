@@ -1,0 +1,10 @@
+# One-factor degenerate case as used in the earlier forward-start / cliquet studies:
+# omega = 2 nu is the lognormal vol of vol of xi_t^t, kappa = k1, rho = rho_SX1 (theta = 0).
+# omega = 3, kappa = 1.5, rho = -0.7 (SPEC §10 regression case).
+nu: 1.5
+theta: 0.0
+k1: 1.5
+k2: 1.5
+rho12: 0.0
+rho_SX1: -0.7
+rho_SX2: 0.0

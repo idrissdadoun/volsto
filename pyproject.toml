@@ -48,6 +48,7 @@ ignore = [
     "N803",  # argument names: we use S0, K, T, F on purpose (finance notation)
     "N806",  # variable names in function: same
     "N802",  # function names: same
+    "N815",  # class attributes: rho_SX1 etc. follow the book notation
     "E741",  # ambiguous variable name (l for leverage)
     "RUF002", "RUF003", # unicode in docstrings/comments (Greek letters)
     "B905",  # zip strict: fine

@@ -20,6 +20,7 @@ from typing import Any, get_args, get_origin, get_type_hints
 
 import numpy as np
 import yaml
+from numpy.typing import NDArray
 
 
 class ConfigError(ValueError):
@@ -464,3 +465,116 @@ class LocalVolModelConfig:
     """Dupire local vol built from a surface config (SPEC §2.3)."""
 
     grid: LocalVolConfig = field(default_factory=LocalVolConfig)
+
+
+# --------------------------------------------------------------------------------------------
+# Bergomi two-factor lognormal forward-variance model (SPEC §3.3; Bergomi ch. 7–8)
+# --------------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class BergomiVarianceDynamics:
+    """Variance-curve dynamics only: ``(ν, θ, k1, k2, ρ12)`` — book Table 7.1 Sets I–III."""
+
+    nu: float
+    theta: float
+    k1: float
+    k2: float
+    rho12: float
+
+    def __post_init__(self) -> None:
+        if self.nu < 0:
+            raise ValueError("nu must be non-negative")
+        if not 0.0 <= self.theta <= 1.0:
+            raise ValueError("theta must lie in [0, 1]")
+        if self.k1 <= 0 or self.k2 <= 0:
+            raise ValueError("mean reversions k1, k2 must be positive")
+        if not -1.0 <= self.rho12 <= 1.0:
+            raise ValueError("rho12 must lie in [-1, 1]")
+
+
+@dataclass(frozen=True)
+class BergomiParams:
+    """Two-factor lognormal Bergomi parameters (book notation, SPEC §3.3).
+
+    ``ν`` is the lognormal volatility of a VS volatility of vanishing maturity; ``ω = 2ν`` is the
+    lognormal vol of vol of ``ξ_t^t`` (eq. 7.12a).  ``k1 > k2``: ``X¹`` is the short factor.
+    ``ρ12 = corr(dW¹, dW²)``, ``ρ_SX1 = corr(dW^S, dW¹)``, ``ρ_SX2 = corr(dW^S, dW²)``; the 3×3
+    correlation matrix of ``(W^S, W¹, W²)`` must be positive semi-definite (checked here).
+    ``θ = 0`` is the one-factor model of the earlier studies with ``κ = k1`` and ``ρ = ρ_SX1``.
+    """
+
+    nu: float
+    theta: float
+    k1: float
+    k2: float
+    rho12: float
+    rho_SX1: float
+    rho_SX2: float
+
+    def __post_init__(self) -> None:
+        BergomiVarianceDynamics(self.nu, self.theta, self.k1, self.k2, self.rho12)
+        for name in ("rho_SX1", "rho_SX2"):
+            if not -1.0 <= getattr(self, name) <= 1.0:
+                raise ValueError(f"{name} must lie in [-1, 1]")
+        eig = np.linalg.eigvalsh(self.correlation_matrix)
+        if eig.min() < -1e-12:
+            raise ValueError(
+                f"correlation matrix of (W^S, W1, W2) is not PSD (min eigenvalue {eig.min():.3e})"
+            )
+
+    @property
+    def omega(self) -> float:
+        """``ω = 2ν`` (eq. 7.12a): lognormal vol of vol of the instantaneous variance."""
+        return 2.0 * self.nu
+
+    @property
+    def is_one_factor(self) -> bool:
+        return self.theta == 0.0
+
+    @property
+    def correlation_matrix(self) -> NDArray[np.float64]:
+        """Correlation of ``(W^S, W¹, W²)``."""
+        return np.array(
+            [
+                [1.0, self.rho_SX1, self.rho_SX2],
+                [self.rho_SX1, 1.0, self.rho12],
+                [self.rho_SX2, self.rho12, 1.0],
+            ]
+        )
+
+    @property
+    def dynamics(self) -> BergomiVarianceDynamics:
+        return BergomiVarianceDynamics(self.nu, self.theta, self.k1, self.k2, self.rho12)
+
+    @classmethod
+    def one_factor(cls, omega: float, kappa: float, rho: float) -> BergomiParams:
+        """The 1F model of the earlier studies: ``ω = 2ν``, ``κ = k1``, ``ρ = ρ_SX1``, ``θ = 0``."""
+        return cls(0.5 * omega, 0.0, kappa, kappa, 0.0, rho, 0.0)
+
+    @classmethod
+    def from_chi(
+        cls,
+        nu: float,
+        theta: float,
+        k1: float,
+        k2: float,
+        rho12: float,
+        rho_SX1: float,
+        chi: float,
+    ) -> BergomiParams:
+        """Admissible parametrisation, book eq. 8.56:
+        ``ρ_SX2 = ρ12 ρ_SX1 + χ sqrt(1 − ρ12²) sqrt(1 − ρ_SX1²)``, ``χ ∈ [−1, 1]``."""
+        if not -1.0 <= chi <= 1.0:
+            raise ValueError("chi must lie in [-1, 1]")
+        rho_sx2 = rho12 * rho_SX1 + chi * math.sqrt(1.0 - rho12**2) * math.sqrt(1.0 - rho_SX1**2)
+        return cls(nu, theta, k1, k2, rho12, rho_SX1, rho_sx2)
+
+    @classmethod
+    def from_dynamics(
+        cls, dyn: BergomiVarianceDynamics, rho_SX1: float, rho_SX2: float
+    ) -> BergomiParams:
+        return cls(dyn.nu, dyn.theta, dyn.k1, dyn.k2, dyn.rho12, rho_SX1, rho_SX2)
+
+    def replace(self, **changes: float) -> BergomiParams:
+        return dataclasses.replace(self, **changes)

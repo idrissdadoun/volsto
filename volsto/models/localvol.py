@@ -74,6 +74,66 @@ def slope_uniform(k0: float, dk: float, row: FloatArray, k: float) -> float:  # 
     return float((row[i + 1] - row[i]) / dk)
 
 
+@njit(inline="always")
+def spot_step(
+    ls: float,
+    dt: float,
+    drift: float,
+    zj: float,
+    k0: float,
+    dk: float,
+    row_a: FloatArray,
+    row_b: FloatArray,
+    scale: float,
+    ln_f_a: float,
+    ln_f_b: float,
+    mode: int,
+    eta: float,
+) -> tuple[float, float]:  # pragma: no cover - numba
+    """One spot step with variance ``v(x) = scale · row(x − ln F)``; returns ``(Δ ln S, v_used)``.
+
+    ``row_a`` is the start-point table, ``row_b`` the end/predictor table (see module docstring);
+    ``scale`` is 1 for local vol and the frozen SV variance ``ξ_t^t`` for LSV (rows then hold
+    ``L²``).  ``mode``: 0 plain log-Euler, 1 weak predictor–corrector, 2 Platen weak order 2.
+    """
+    k = ls - ln_f_a
+    v = scale * interp_uniform(k0, dk, row_a, k)
+    if mode == 1:
+        # weak predictor-corrector (Kloeden-Platen 15.5.4): drift averaged with theta = 1/2
+        # between (t_n, x_n) and (t_{n+1}, x_pred), diffusion variance weighted (1-eta, eta);
+        # the drift carries the Ito correction -eta b b' = -(eta/2) dv/dx because the
+        # corrector's diffusion depends on the predictor and hence on Z
+        x_pred = ls + drift - 0.5 * v * dt + np.sqrt(v * dt) * zj
+        k_pred = x_pred - ln_f_b
+        v_pred = scale * interp_uniform(k0, dk, row_b, k_pred)
+        slope = (
+            0.5 * scale * (slope_uniform(k0, dk, row_a, k) + slope_uniform(k0, dk, row_b, k_pred))
+        )
+        v_diff = (1.0 - eta) * v + eta * v_pred
+        a_avg = -0.25 * (v + v_pred) - 0.5 * eta * slope
+        return drift + a_avg * dt + np.sqrt(v_diff * dt) * zj, v_diff
+    if mode == 2:
+        # Platen explicit weak order-2 scheme (Kloeden-Platen 15.1.3) for
+        # dx = a dt + b dW, a = mu - v/2, b = sqrt(v); supporting values at t_{n+1}
+        sdt = np.sqrt(dt)
+        b0 = np.sqrt(v)
+        a0 = drift - 0.5 * v * dt  # a * dt at (t_n, x_n)
+        x_bar = ls + a0 + b0 * sdt * zj
+        x_up = ls + a0 + b0 * sdt
+        x_dn = ls + a0 - b0 * sdt
+        v_bar = scale * interp_uniform(k0, dk, row_b, x_bar - ln_f_b)
+        b_up = np.sqrt(scale * interp_uniform(k0, dk, row_b, x_up - ln_f_b))
+        b_dn = np.sqrt(scale * interp_uniform(k0, dk, row_b, x_dn - ln_f_b))
+        a1 = drift - 0.5 * v_bar * dt  # a * dt at (t_{n+1}, x_bar)
+        dls = (
+            0.5 * (a0 + a1)
+            + 0.25 * (b_up + b_dn + 2.0 * b0) * sdt * zj
+            + 0.25 * (b_up - b_dn) * sdt * (zj * zj - 1.0)
+        )
+        return dls, 0.5 * (v + v_bar)
+    return drift - 0.5 * v * dt + np.sqrt(v * dt) * zj, v
+
+
 @njit(parallel=True, cache=True)
 def diffuse_block(
     log_spot: FloatArray,
@@ -114,45 +174,21 @@ def diffuse_block(
         for j in range(nb):
             dt = t_nodes[j + 1] - t_nodes[j]
             zj = z[p, j, 0]
-            k = ls - ln_f_nodes[j]
-            v = interp_uniform(k0, dk, var_a[j], k)
-            if mode == 1:
-                # weak predictor-corrector (Kloeden-Platen 15.5.4): drift averaged with theta = 1/2
-                # between (t_n, x_n) and (t_{n+1}, x_pred), diffusion variance weighted
-                # (1-eta, eta);
-                # the drift carries the Ito correction -eta b b' = -(eta/2) dv/dx because the
-                # corrector's diffusion depends on the predictor and hence on Z
-                x_pred = ls + drifts[j] - 0.5 * v * dt + np.sqrt(v * dt) * zj
-                k_pred = x_pred - ln_f_nodes[j + 1]
-                v_pred = interp_uniform(k0, dk, var_b[j], k_pred)
-                slope = 0.5 * (
-                    slope_uniform(k0, dk, var_a[j], k) + slope_uniform(k0, dk, var_b[j], k_pred)
-                )
-                v_diff = (1.0 - eta) * v + eta * v_pred
-                a_avg = -0.25 * (v + v_pred) - 0.5 * eta * slope
-                dls = drifts[j] + a_avg * dt + np.sqrt(v_diff * dt) * zj
-                v = v_diff
-            elif mode == 2:
-                # Platen explicit weak order-2 scheme (Kloeden-Platen 15.1.3) for
-                # dx = a dt + b dW, a = mu - v/2, b = sqrt(v); supporting values at t_{n+1}
-                sdt = np.sqrt(dt)
-                b0 = np.sqrt(v)
-                a0 = drifts[j] - 0.5 * v * dt  # a * dt at (t_n, x_n)
-                x_bar = ls + a0 + b0 * sdt * zj
-                x_up = ls + a0 + b0 * sdt
-                x_dn = ls + a0 - b0 * sdt
-                v_bar = interp_uniform(k0, dk, var_b[j], x_bar - ln_f_nodes[j + 1])
-                b_up = np.sqrt(interp_uniform(k0, dk, var_b[j], x_up - ln_f_nodes[j + 1]))
-                b_dn = np.sqrt(interp_uniform(k0, dk, var_b[j], x_dn - ln_f_nodes[j + 1]))
-                a1 = drifts[j] - 0.5 * v_bar * dt  # a * dt at (t_{n+1}, x_bar)
-                dls = (
-                    0.5 * (a0 + a1)
-                    + 0.25 * (b_up + b_dn + 2.0 * b0) * sdt * zj
-                    + 0.25 * (b_up - b_dn) * sdt * (zj * zj - 1.0)
-                )
-                v = 0.5 * (v + v_bar)
-            else:
-                dls = drifts[j] - 0.5 * v * dt + np.sqrt(v * dt) * zj
+            dls, v = spot_step(
+                ls,
+                dt,
+                drifts[j],
+                zj,
+                k0,
+                dk,
+                var_a[j],
+                var_b[j],
+                1.0,
+                ln_f_nodes[j],
+                ln_f_nodes[j + 1],
+                mode,
+                eta,
+            )
             ls += dls
             iv += v * dt
             sq += dls * dls

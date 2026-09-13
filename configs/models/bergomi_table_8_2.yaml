@@ -1,0 +1,9 @@
+# Bergomi, Stochastic Volatility Modeling, Table 8.2 (two-factor model, full parameter set).
+# nu is the lognormal volatility of a VS volatility of vanishing maturity (omega = 2 nu).
+nu: 1.74
+theta: 0.245
+k1: 5.35
+k2: 0.28
+rho12: 0.0
+rho_SX1: -0.759
+rho_SX2: -0.487
