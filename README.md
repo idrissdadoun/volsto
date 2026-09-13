@@ -5,11 +5,12 @@ studies: Black–Scholes, Dupire local vol, two-factor lognormal Bergomi forward
 LSV with particle-calibrated leverage, Monte Carlo with common random numbers, and viewers over a
 precomputed parameter cache.  The full design is in [SPEC.md](SPEC.md).
 
-Status: **M2** — market layer, BS, local vol, MC engine, vanilla / variance products (M1) and
-the two-factor lognormal Bergomi forward-variance model with exact factor stepping, its closed
-forms (vol of VS vol, order-one ATMF skew and SSR, diagonal covariances) and the mixing-solution
-smile (M2).  The quickstart below prices with local vol; the LSV calibration (M3) and cliquet
-(M4) steps land with their milestones.
+Status: **M3** — market layer, BS, local vol, MC engine, vanilla / variance products (M1); the
+two-factor lognormal Bergomi forward-variance model with exact factor stepping, its closed forms
+and the mixing-solution smile (M2); particle-method leverage calibration, the LSV model, §4.2
+repricing diagnostics and the content-addressed leverage cache (M3).  The cliquet of the SPEC §11
+quickstart lands with M4; the quickstart below calibrates the 1F LSV and prices a vanilla and a
+variance swap with it.
 
 ## Install
 
@@ -19,35 +20,43 @@ Python 3.12 or later is required (numpy ≥ 2.5 dropped 3.11; mypy strict runs a
 uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python -e ".[dev]"
 ```
 
-## Quickstart (M1)
+## Quickstart
 
 ```python
-import numpy as np
-from volsto.config import SimConfig
-from volsto.engine import MonteCarlo, VanillaControl
-from volsto.market import LocalVolSurface, implied_vol, varswap_strike, xi0_curve
-from volsto.market.loaders import load_ssvi_surface
-from volsto.models import LocalVol
+from volsto.calibration import LeverageCache, reprice_surface
+from volsto.calibration.cache import build_market
+from volsto.config import CalibrationSpec, SimConfig, load_yaml
+from volsto.engine import MonteCarlo
+from volsto.market import implied_vol
 from volsto.products import EuropeanOption, VarianceSwap
 
-surface = load_ssvi_surface("configs/surfaces/reference_ssvi.yaml")   # SSVI + curves
-local_vol = LocalVolSurface.from_implied(surface)                      # Dupire (Gatheral 1.10)
-print(local_vol.check_positive())
+# 1F LSV (omega = 3, kappa = 1.5, rho = -0.7) on the reference SSVI surface: surface, curves,
+# Bergomi kernel, particle settings, step schedule and scheme all come from one YAML spec
+spec = load_yaml("configs/studies/lsv_reference_1f.yaml", CalibrationSpec)
+cache = LeverageCache("cache")                      # content-addressed; the only entry point
+model, _ = cache.get_or_calibrate(spec)             # ~30 s on a miss (2e5 particles, 3y), instant on a hit
+_, surface, _ = build_market(spec)
 
-model = LocalVol(local_vol)
-mc = MonteCarlo(SimConfig(n_paths=100_000, seed=1))  # default step schedule and scheme
-
+mc = MonteCarlo(SimConfig(n_paths=200_000, seed=1))  # default schedule + scheme, as in calibration
 T, K = 1.0, float(surface.forward(1.0))
-call = EuropeanOption(K, T, "call", surface.discount)
-ctrl = VanillaControl.from_surface(surface, 0.95 * K, T)               # analytic control
-res = mc.price(call, model, controls=[ctrl])
-iv = implied_vol(res.mean, surface.forward(T), K, T, 1, surface.discount.df(T))
-print(res, f"implied {iv:.4%} vs surface {surface.implied_vol(K, T):.4%}", res.cv)
+call = mc.price(EuropeanOption(K, T, "call", surface.discount), model)
+iv = implied_vol(call.mean, K, K, T, 1, surface.discount.df(T))
+print(call, f"LSV implied {iv:.4%} vs surface {surface.implied_vol(K, T):.4%}")
+print(mc.price(VarianceSwap.daily(T, 0.0, surface.discount), model))  # fair variance strike
 
-vs = VarianceSwap.daily(T, strike=0.0, discount=surface.discount)       # floating leg
-fair = mc.price(vs, model)
-print("MC fair var strike", fair, "replication", varswap_strike(surface, T))
-print("xi0(1y)", xi0_curve(surface, 3.0)(1.0))
+report = reprice_surface(model, surface, SimConfig(n_paths=400_000, seed=2))  # §4.2 table
+print(report.summary())
+```
+
+Local vol only (no calibration):
+
+```python
+from volsto.market import LocalVolSurface
+from volsto.market.loaders import load_ssvi_surface
+from volsto.models import LocalVol
+
+surface = load_ssvi_surface("configs/surfaces/reference_ssvi.yaml")
+model = LocalVol(LocalVolSurface.from_implied(surface))              # Dupire (Gatheral 1.10)
 ```
 
 Every Monte Carlo number is a `PriceResult(mean ± stderr)`; the library never returns a bare
@@ -75,6 +84,15 @@ print(skew, atmf_skew_order1_flat(params, 1.0), ssr_order1_flat(params, 1.0), vs
 ```
 
 `BergomiParams.one_factor(omega, kappa, rho)` is the 1F model of the earlier studies (θ = 0).
+
+## Calibration notes (M3)
+
+`ParticleConfig` defaults were chosen by measurement on the reference surface: local-linear
+kernel regression of E[ξ|S] (Nadaraya–Watson carries an h² m′f′/f design bias that skewed the
+±10% repricing by 0.3 vol points), a plug-in ½h²m″ bias correction, a 2000-particle window floor
+in the tails, and a saturating log-quadratic tail extrapolation (the flat rule mis-priced the 3m
++30% call by 1 vol point and variance swaps by 0.3).  Calibration and pricing share the kernel
+step for step: every leverage lookup inside a step uses the slice at the step start.
 
 ## Development
 

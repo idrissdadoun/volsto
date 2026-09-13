@@ -1,0 +1,349 @@
+"""Particle-method calibration of the leverage function (SPEC §4.1).
+
+Target (Guyon & Henry-Labordère 2012; Bergomi §12.2.5):
+``L(t, S)² = σ_loc²(t, S) / E[ξ_t^t | S_t = S]``
+with ``σ_loc`` the Dupire local volatility of the target surface and ``ξ_t^t`` the SV kernel's
+instantaneous variance.  Algorithm, on the simulation time grid of the shared
+:class:`~volsto.config.StepSchedule`:
+
+1. ``t_0``: ``L(0, S) = σ_loc(0, S) / sqrt(ξ_0^0)``.
+2. Step all ``N`` particles from ``t_i`` to ``t_{i+1}`` with the current ``L(t_i, ·)`` — using the
+   pricing kernel itself (:func:`volsto.models.lsv.step_lsv_block`, frozen-leverage rule, same
+   :class:`~volsto.config.SchemeConfig`), so pricing reproduces the calibration step for step.
+3. At ``t_{i+1}`` estimate ``E[ξ | S]`` by kernel regression in ``k = ln(S/F)`` (local-linear by
+   default, Nadaraya–Watson optional; Gaussian kernel truncated at ``4h`` or quartic), bandwidth
+   ``h_i = c σ_ATM(t_{i+1}) sqrt(t_{i+1}) N^{−1/5}``
+   floored at ``h_min``, on a 201-point grid; outside the cloud's ``[q, 1−q]`` quantiles the
+   estimate is held flat.  The (smooth) estimate is interpolated onto the fine leverage grid where
+   ``σ_loc²`` is resolved (dk = 0.0025, as in the Dupire grid), and ``L(t_{i+1}, ·)`` is set.
+4. Continue.  Optional second pass: repeat with a fresh seed and average the two ``L`` surfaces.
+
+The regression kernel is a ``numba`` ``prange`` loop over grid points with a truncated window on
+the sorted particles: ``O(N log N)`` for the sort plus ``O(N × window fraction × n_grid)``.
+Checked by ``tests/test_lsv.py`` (§4.2 acceptance with the pricing kernel, calibration / pricing
+path identity, variance-swap invariance across ω).
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from dataclasses import dataclass
+
+import numpy as np
+from numpy.typing import NDArray
+
+from volsto._numba import njit, prange
+from volsto.config import LocalVolConfig, ParticleConfig, SimConfig
+from volsto.engine.grid import TimeGrid
+from volsto.engine.rng import GaussianDraws
+from volsto.market.dupire import LocalVolSurface
+from volsto.market.surface import ImpliedSurface
+from volsto.models.bergomi import BergomiSV
+from volsto.models.leverage import LeverageFunction
+from volsto.models.lsv import step_lsv_block
+
+FloatArray = NDArray[np.float64]
+log = logging.getLogger(__name__)
+
+#: Bumped whenever the calibration numerics change; part of the cache key (SPEC §4.3).
+CALIBRATION_CODE_TAG = "m3.1"
+
+
+@njit(parallel=True, cache=True)
+def kernel_regression(
+    ks: FloatArray,
+    vs: FloatArray,
+    grid: FloatArray,
+    h: float,
+    gaussian: bool,
+    local_linear: bool,
+    min_window: int,
+) -> tuple[FloatArray, FloatArray, NDArray[np.int64]]:  # pragma: no cover - numba
+    """``E[v | k]`` on ``grid`` from particles sorted by ``k`` with a truncated window (``4h``
+    Gaussian, ``h`` quartic): Nadaraya–Watson or local-linear (weighted least squares with a
+    slope, which cancels the design bias ``h² m' f'/f``).  Returns the estimate (``nan`` where the
+    window is empty or degenerate), its slope ``dm/dk`` (local-linear only, else 0) and the
+    window counts."""
+    ng = grid.shape[0]
+    out = np.empty(ng)
+    slope = np.zeros(ng)
+    cnt = np.empty(ng, dtype=np.int64)
+    w = 4.0 if gaussian else 1.0
+    n = ks.shape[0]
+    for g in prange(ng):
+        hg = h
+        lo = np.searchsorted(ks, grid[g] - w * hg)
+        hi = np.searchsorted(ks, grid[g] + w * hg)
+        if hi - lo < min_window and n >= min_window:
+            # k-NN floor: widen to the nearest min_window particles and rescale the bandwidth
+            c = np.searchsorted(ks, grid[g])
+            lo = max(0, c - min_window // 2)
+            hi = min(n, lo + min_window)
+            lo = max(0, hi - min_window)
+            span = max(abs(ks[lo] - grid[g]), abs(ks[hi - 1] - grid[g]))
+            hg = max(h, span / w)
+        s0 = 0.0
+        s1 = 0.0
+        s2 = 0.0
+        t0 = 0.0
+        t1 = 0.0
+        for i in range(lo, hi):
+            u = (ks[i] - grid[g]) / hg
+            if gaussian:
+                wt = np.exp(-0.5 * u * u)
+            else:
+                d = 1.0 - u * u
+                wt = d * d if d > 0.0 else 0.0
+            s0 += wt
+            s1 += wt * u
+            s2 += wt * u * u
+            t0 += wt * vs[i]
+            t1 += wt * u * vs[i]
+        cnt[g] = hi - lo
+        if s0 <= 0.0:
+            out[g] = np.nan
+        elif local_linear:
+            det = s0 * s2 - s1 * s1
+            if det > 1e-12 * s0 * s2:
+                out[g] = (s2 * t0 - s1 * t1) / det
+                slope[g] = (s0 * t1 - s1 * t0) / det / hg
+            else:
+                out[g] = t0 / s0
+        else:
+            out[g] = t0 / s0
+    return out, slope, cnt
+
+
+def conditional_variance_estimate(
+    k: FloatArray, v: FloatArray, grid: FloatArray, h: float, cfg: ParticleConfig
+) -> FloatArray:
+    """``E[v | k]`` on ``grid``, trusted inside the cloud's ``[q, 1−q]`` quantiles and extended
+    into the tails flat or log-linearly (SPEC §4.1 and :class:`~volsto.config.ParticleConfig`)."""
+    order = np.argsort(k, kind="stable")
+    ks = np.ascontiguousarray(k[order])
+    vs = np.ascontiguousarray(v[order])
+    m, slope, _ = kernel_regression(
+        ks, vs, grid, h, cfg.kernel == "gaussian", cfg.regression == "local_linear", cfg.min_window
+    )
+    n = ks.size
+    q_lo = ks[min(int(cfg.quantile_clip * n), n - 1)]
+    q_hi = ks[max(int((1.0 - cfg.quantile_clip) * n) - 1, 0)]
+    valid = np.isfinite(m) & (m > 0) & (grid >= q_lo) & (grid <= q_hi)
+    if not np.any(valid):
+        # degenerate cloud (e.g. all particles at one point): use the plain mean everywhere
+        return np.full(grid.shape, float(v.mean()))
+    idx = np.flatnonzero(valid)
+    first, last = idx[0], idx[-1]
+    out = m.copy()
+    inner = np.arange(first, last + 1)
+    bad = inner[~(np.isfinite(out[inner]) & (out[inner] > 0))]
+    if bad.size:
+        good = inner[np.isfinite(out[inner]) & (out[inner] > 0)]
+        out[bad] = np.interp(grid[bad], grid[good], out[good])
+    if cfg.bias_correction and cfg.regression == "local_linear" and last - first >= 4:
+        # plug-in correction of the local-linear bias 1/2 h^2 kappa_2 m'' (kappa_2 = 1 Gaussian,
+        # 1/7 quartic); m'' by central second differences on the regression grid
+        kappa2 = 1.0 if cfg.kernel == "gaussian" else 1.0 / 7.0
+        seg = out[first : last + 1]
+        d = grid[1] - grid[0]
+        m2 = np.zeros_like(seg)
+        m2[1:-1] = (seg[2:] - 2.0 * seg[1:-1] + seg[:-2]) / (d * d)
+        m2[0], m2[-1] = m2[1], m2[-2]
+        corr = 0.5 * h * h * kappa2 * m2
+        out[first : last + 1] = np.maximum(seg - corr, 0.5 * seg)
+    if cfg.tail_extrapolation in ("log_linear", "log_quadratic", "adaptive"):
+        # ln m over the outer 10% of the trusted points (at least 5): linear fit for the edge
+        # slope, or a quadratic whose slope is only allowed to decay towards zero (then flat)
+        n_fit = max(5, (last - first + 1) // 10)
+        for edge, sl, pts, sign in (
+            (first, slice(0, first), slice(first, min(first + n_fit, last + 1)), -1.0),
+            (last, slice(last + 1, grid.size), slice(max(last - n_fit + 1, first), last + 1), 1.0),
+        ):
+            x = grid[pts] - grid[edge]
+            y = np.log(out[pts])
+            d = sign * (grid[sl] - grid[edge])  # distance into the tail (>= 0)
+            if x.size >= 3 and np.ptp(x) > 0:
+                b = float(np.polyfit(x, y, 1)[0])  # d ln m / dk at the edge
+            else:
+                b = float(slope[edge] / out[edge])
+            b = float(np.clip(b, -50.0, 50.0))
+            expo = sign * b * d
+            # adaptive: saturating quadratic only where ln m falls into the tail
+            quadratic = cfg.tail_extrapolation == "log_quadratic" or (
+                cfg.tail_extrapolation == "adaptive" and sign * b < 0
+            )
+            if quadratic and x.size >= 4 and np.ptp(x) > 0:
+                c2, b2, _ = np.polyfit(x, y, 2)
+                b2 = float(np.clip(b2, -50.0, 50.0))
+                curv = float(c2)
+                # keep the quadratic only if it makes |slope| decay into the tail
+                if sign * b2 * curv < 0 and abs(b2) > 0:
+                    d_flat = abs(b2) / (2.0 * abs(curv))  # slope vanishes here
+                    dd = np.minimum(d, d_flat)
+                    expo = sign * b2 * dd + curv * dd * dd
+                else:
+                    expo = sign * b2 * d
+            out[sl] = out[edge] * np.exp(np.clip(expo, -3.0, 3.0))
+    else:
+        out[:first] = out[first]
+        out[last + 1 :] = out[last]
+    return out
+
+
+@dataclass
+class CalibrationResult:
+    """Output of :func:`calibrate_leverage`."""
+
+    leverage: LeverageFunction
+    grid: TimeGrid
+    final_log_spot: FloatArray
+    final_factors: FloatArray
+    bandwidths: FloatArray
+    wall_time: float
+    passes: int
+
+    def __repr__(self) -> str:
+        return (
+            f"CalibrationResult({self.leverage!r}, n_steps={self.grid.n_steps}, "
+            f"passes={self.passes}, wall_time={self.wall_time:.1f}s)"
+        )
+
+
+def leverage_grid_config(
+    surface: ImpliedSurface, cfg: ParticleConfig, base: LocalVolConfig | None = None
+) -> LocalVolConfig:
+    """Leverage ``k`` grid: ``±leverage_std_span · σ_ATM(T) √T`` with step ``leverage_dk``."""
+    if base is not None:
+        return base
+    T = cfg.horizon
+    half = float(cfg.leverage_std_span * surface.atm_vol(T) * np.sqrt(T))
+    n_half = int(np.ceil(half / cfg.leverage_dk))
+    n_k = 2 * n_half + 1
+    return LocalVolConfig(
+        t_max=min(max(T, 2.0 / 365.0), surface.max_maturity),
+        k_min=-n_half * cfg.leverage_dk,
+        k_max=n_half * cfg.leverage_dk,
+        n_k=n_k,
+    )
+
+
+def calibrate_leverage(
+    surface: ImpliedSurface,
+    kernel: BergomiSV,
+    cfg: ParticleConfig,
+    sim: SimConfig,
+    *,
+    local_vol_cfg: LocalVolConfig | None = None,
+    local_vol: LocalVolSurface | None = None,
+) -> CalibrationResult:
+    """Calibrate ``L(t, S)`` so that the LSV model reprices ``surface`` (SPEC §4.1).
+
+    ``sim`` supplies the step schedule and scheme shared with pricing; ``cfg`` the particle
+    settings.  ``local_vol`` may be passed to reuse a Dupire surface (its ``k`` grid becomes the
+    leverage grid).
+    """
+    t_start = time.perf_counter()
+    if kernel.forward_curve is not surface.forward_curve and not np.isclose(
+        kernel.forward_curve.spot, surface.forward_curve.spot
+    ):
+        raise ValueError("kernel and surface must share the forward curve")
+    lv_cfg = leverage_grid_config(surface, cfg, local_vol_cfg)
+    lv = local_vol or LocalVolSurface.from_implied(surface, lv_cfg)
+    if lv.t_grid[-1] < cfg.horizon - 1e-9:
+        raise ValueError("local vol grid must extend to the calibration horizon")
+    T = cfg.horizon
+    grid = TimeGrid.build([T], sim.dt_max)
+    scheme = sim.scheme
+    times = grid.times
+    n_steps = grid.n_steps
+    nf = kernel.n_factors
+    N = cfg.n_particles
+    fc = kernel.forward_curve
+    ln_f = np.asarray(fc.log_forward(times), dtype=np.float64)
+    drifts = np.diff(ln_f)
+    k_grid = lv.k_grid
+    k0, dk = lv.k0, lv.dk
+    kreg = np.linspace(k_grid[0], k_grid[-1], cfg.n_regression_points)
+    xi00 = float(kernel.xi0.xi0(0.0))
+    sig_atm = np.asarray(surface.atm_vol(np.maximum(times, 1.0 / 365.0)), dtype=np.float64)
+    n_exp = float(N) ** (-0.2)
+    no_record = np.array([-1], dtype=np.int64)
+    dummy = np.empty((N, 1))
+    dummy_f = np.empty((N, 1, nf))
+
+    results: list[LeverageFunction] = []
+    bandwidths = np.empty(n_steps)
+    final_ls = final_fac = None
+    n_pass = 2 if cfg.second_pass else 1
+    for p in range(n_pass):
+        seed = cfg.seed + p
+        draws = GaussianDraws(seed, N, n_steps, kernel.n_brownians, cfg.antithetic)
+        ls = np.full(N, np.log(fc.spot))
+        fac = np.zeros((N, nf))
+        iv = np.zeros(N)
+        sq = np.zeros(N)
+        L = np.empty((n_steps + 1, k_grid.size))
+        L[0] = np.clip(np.sqrt(lv.var_at_times([0.0])[0] / xi00), cfg.l_min, cfg.l_max)
+        for j in range(n_steps):
+            t_nodes = times[j : j + 2]
+            row = np.ascontiguousarray((L[j] * L[j])[None, :])
+            step_lsv_block(
+                kernel,
+                scheme,
+                ls,
+                fac,
+                iv,
+                sq,
+                draws.block(j, j + 1, 0, N),
+                t_nodes,
+                ln_f[j : j + 2],
+                drifts[j : j + 1],
+                no_record,
+                k0,
+                dk,
+                row,
+                row,
+                row,
+                dummy,
+                dummy,
+                dummy_f,
+                dummy,
+                dummy,
+            )
+            t1 = float(times[j + 1])
+            v = kernel.variance_from_factors(t1, fac)
+            k = ls - ln_f[j + 1]
+            h = max(
+                cfg.bandwidth_factor * float(sig_atm[j + 1]) * np.sqrt(t1) * n_exp,
+                cfg.bandwidth_min,
+            )
+            bandwidths[j] = h
+            ev_reg = conditional_variance_estimate(k, v, kreg, h, cfg)
+            ev = np.interp(k_grid, kreg, ev_reg)
+            L[j + 1] = np.clip(np.sqrt(lv.var_at_times([t1])[0] / ev), cfg.l_min, cfg.l_max)
+        final_ls, final_fac = ls, fac
+        results.append(
+            LeverageFunction(
+                times,
+                k_grid,
+                L,
+                fc,
+                {
+                    "seed": seed,
+                    "n_particles": N,
+                    "horizon": T,
+                    "kernel": cfg.kernel,
+                    "bandwidth_factor": cfg.bandwidth_factor,
+                    "code_tag": CALIBRATION_CODE_TAG,
+                    "scheme": scheme.__dict__.copy(),
+                    "schedule": repr(sim.step_schedule),
+                },
+            )
+        )
+        log.info("particle pass %d/%d done (%d steps, N=%d)", p + 1, n_pass, n_steps, N)
+    lev = results[0] if n_pass == 1 else LeverageFunction.average(results[0], results[1])
+    assert final_ls is not None and final_fac is not None
+    wall = time.perf_counter() - t_start
+    lev.metadata["wall_time"] = wall
+    return CalibrationResult(lev, grid, final_ls, final_fac, bandwidths, wall, n_pass)

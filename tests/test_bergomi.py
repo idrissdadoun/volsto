@@ -25,7 +25,7 @@ from volsto.analytics import (
 )
 from volsto.analytics.mixing import mixing_atmf_skew, mixing_smile
 from volsto.config import BergomiParams, SimConfig, load_yaml
-from volsto.engine import GaussianDraws, MonteCarlo, TimeGrid
+from volsto.engine import GaussianDraws, MonteCarlo, TimeGrid, batch_means
 from volsto.market import ForwardCurve, ForwardVarianceCurve, black_vega, implied_vol
 from volsto.models import BergomiSV
 from volsto.models.bergomi import factor_step_covariance, sqrt_covariance
@@ -190,36 +190,42 @@ def test_chi_matches_sample_variance(model_2f: BergomiSV, p82: BergomiParams) ->
             assert abs(x.mean()) < 4 * x.std() / np.sqrt(x.size)
 
 
+@pytest.mark.parametrize("nu", [0.5, 1.74])
 def test_diagonal_covariances(
-    model_2f: BergomiSV, p82: BergomiParams, xi_flat: ForwardVarianceCurve
+    p82: BergomiParams, xi_flat: ForwardVarianceCurve, fc0: ForwardCurve, nu: float
 ) -> None:
-    """Cov(xi_u^u, xi_v^v) and Var(int xi) closed forms (SPEC §3.3, derived) vs MC."""
-    paths, _ = _simulate(model_2f, [0.5, 1.0, 2.0], 200_000, seed=6)
+    """Cov(xi_u^u, xi_v^v) and Var(int xi) closed forms (SPEC §3.3, derived) vs MC, with
+    batch-means standard errors and a 2 SE criterion; run at nu = 50% (tame lognormal moments)
+    and at the Table 8.2 value (owner request after M2)."""
+    p = p82.replace(nu=nu)
+    model = BergomiSV(p, xi_flat, fc0)
+    paths, _ = _simulate(model, [0.5, 1.0, 2.0], 400_000, seed=6)
     vu, vv = paths.variance_at(1), paths.variance_at(2)
-    cov_mc = np.cov(vu, vv)[0, 1]
-    # se of the sample covariance via the delta method on centred products
-    prod = (vu - vu.mean()) * (vv - vv.mean())
-    se = prod.std(ddof=1) / np.sqrt(prod.size)
-    assert abs(cov_mc - float(cov_xi_diag(p82, xi_flat, 0.5, 1.0))) < 3.5 * se
-    var_mc = vu.var(ddof=1)
-    c = (vu - vu.mean()) ** 2
-    assert abs(var_mc - float(cov_xi_diag(p82, xi_flat, 0.5, 0.5))) < 3.5 * c.std(ddof=1) / np.sqrt(
-        c.size
+    cov = batch_means(lambda a, b: float(np.cov(a, b)[0, 1]), vu, vv)
+    assert abs(cov.z(float(cov_xi_diag(p, xi_flat, 0.5, 1.0)))) < 2.0, (
+        nu,
+        cov,
+        cov_xi_diag(p, xi_flat, 0.5, 1.0),
     )
-    # variance of the integrated variance over [0, 1] and [1, 2] (int_var accumulator)
+    var = batch_means(lambda a: float(np.var(a, ddof=1)), vu)
+    assert abs(var.z(float(cov_xi_diag(p, xi_flat, 0.5, 0.5)))) < 2.0, (nu, var)
+    # variance of the integrated variance over [0, 1] and [1, 2]: the int_var accumulator is a
+    # left-point Riemann sum, so compare with its exact discrete moments (2 SE) and check that the
+    # continuous closed form differs only by the O(dt) quadrature term
+    paths_grid = TimeGrid.build([0.5, 1.0, 2.0], 1 / 365)
     for c0, c1, T1, T2 in ((0, 2, 0.0, 1.0), (2, 3, 1.0, 2.0)):
         iv = paths.integrated_variance(c0, c1)
-        s = (iv - iv.mean()) ** 2
-        se_var = s.std(ddof=1) / np.sqrt(s.size)
-        closed = var_integrated_variance(p82, xi_flat, T1, T2)
-        assert abs(iv.var(ddof=1) - closed) < 3.5 * se_var + 0.02 * closed, (
-            T1,
-            T2,
-            iv.var(ddof=1),
-            closed,
-            se_var,
+        est = batch_means(lambda a: float(np.var(a, ddof=1)), iv)
+        mean_disc, var_disc = model.integrated_variance_moments(
+            paths_grid.times, SimConfig().scheme, T1, T2
         )
-        assert iv.mean() == pytest.approx(0.04 * (T2 - T1), rel=0.01)
+        closed = var_integrated_variance(p, xi_flat, T1, T2)
+        assert abs(est.z(var_disc)) < 2.0, (nu, T1, T2, est, var_disc, closed)
+        assert abs(var_disc / closed - 1.0) < 0.006, (nu, T1, T2, var_disc, closed)
+        # the mean of a fat-tailed lognormal sum: batch-means SE is itself noisy, allow 2.5 SE
+        mean = batch_means(lambda a: float(np.mean(a)), iv)
+        assert abs(mean.z(mean_disc)) < 2.5, (nu, T1, T2, mean, mean_disc)
+        assert abs(mean_disc / (0.04 * (T2 - T1)) - 1.0) < 0.003
 
 
 def test_theta_zero_reproduces_reference_1f_path_by_path(xi_flat: ForwardVarianceCurve) -> None:

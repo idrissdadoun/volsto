@@ -239,7 +239,12 @@ class SchemeConfig:
         predictor_corrector: weak predictor–corrector (Kloeden–Platen §15.5) — Euler predictor
             for ``x_{n+1}``, drift averaged with θ = ½ between ``(t_n, x_n)`` and
             ``(t_{n+1}, x_pred)`` and carrying the Itô correction ``−η b b'``, diffusion variance
-            weighted ``(1 − η, η)`` between the two points.
+            weighted ``(1 − η, η)`` between the two points.  The correction is required because
+            the corrector's diffusion coefficient depends on the predictor and hence on the
+            Brownian increment (without it the forward is not preserved; the original
+            specification omitted it).  With θ = η = ½ the scheme over-corrects the curvature
+            of the local variance in ``ln S`` (coefficient 1.5 η against the exact ¼), so it is
+            kept as an option, not the default.
         pc_eta: the diffusion weight ``η`` of the predictor–corrector.
         weak_order2: Platen's explicit weak order-2 scheme (Kloeden–Platen eq. 15.1.3) with the
             coefficients at ``t_n`` and ``t_{n+1}``; excludes ``predictor_corrector`` and ignores
@@ -578,3 +583,134 @@ class BergomiParams:
 
     def replace(self, **changes: float) -> BergomiParams:
         return dataclasses.replace(self, **changes)
+
+
+# --------------------------------------------------------------------------------------------
+# Particle calibration and calibration specification (SPEC §4.1–4.3)
+# --------------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ParticleConfig:
+    """Particle-method settings (SPEC §4.1, Guyon–Henry-Labordère; Bergomi §12.2.5).
+
+    Attributes:
+        n_particles: ``N`` (SPEC default 2·10⁵).
+        horizon: calibration horizon ``T_cal`` in years; ``L`` is held at its last slice beyond.
+        bandwidth_factor: ``c`` in ``h_i = c · σ_ref · sqrt(t_{i+1}) · N^{−1/5}`` (default 1.5).
+        bandwidth_min: floor ``h_min`` on the bandwidth (log-moneyness units).
+        kernel: regression kernel, ``"gaussian"`` (truncated at 4h) or ``"quartic"``.
+        regression: ``"local_linear"`` (default) or ``"nadaraya_watson"``.  Local-linear removes
+            the design bias ``h² m'(k) f'(k)/f(k)`` of Nadaraya–Watson, which with a steeply
+            sloped ``E[V|S]`` and ``c = 1.5`` biased the ±10% repricing by ~0.3 vol points.
+        quantile_clip: the regression is trusted inside the ``[q, 1−q]`` quantiles of the cloud.
+        min_window: minimum number of particles in a regression window; where the ``4h`` window
+            holds fewer (the tails), it is widened to the nearest ``min_window`` particles (k-NN
+            floor).  Tail noise in ``E[V|S]`` feeds ``1/E[V|S]`` into ``L`` and showed up as
+            variance-swap strikes 0.1–0.3 vp above replication, falling with ``N``.
+        bias_correction: subtract the plug-in local-linear curvature bias ``½ h² m''(k)`` (Gaussian
+            kernel second moment 1; ``m''`` by second differences on the regression grid).  The
+            uncorrected estimate over-states the convex ``E[V|S]`` by ``O(h²)``, a level bias in
+            the repriced vols growing with ``c²`` (−0.10 vp at 1y ATM for ``c = 1.5``).
+        tail_extrapolation: outside those quantiles hold ``E[V|S]`` ``"flat"`` (SPEC §4.1
+            wording), continue ``ln E[V|S]`` linearly with the slope fitted over the outer trusted
+            points (``"log_linear"``), or continue it with a quadratic fitted there whose slope is
+            only allowed to decay, going flat where it would vanish (``"log_quadratic"``,
+            default), or choose per tail (``"adaptive"``: log-linear where ``E[V|S]`` rises into
+            the tail, saturating quadratic where it falls).  By repricing error on the reference
+            surface (200k particles, 1y horizon, 3m–1y, |k| ≤ 0.2) the quadratic rule is the most
+            robust: 1F 0.11 vp, 2F 0.09 vp, against 0.13 / 0.37 vp for log-linear (which
+            over-extrapolates the 2F's decaying right tail: 3m +20% calls 0.37 vp rich).
+            Measured on the reference surface: the flat rule understates ``E[V|S]`` in both tails
+            (+0.2 vp at 3m ±20%, +0.2–0.3 vp on variance swaps); the linear rule keeps the edge
+            slope, which over-extrapolates the decaying right tail of the 2F model (E[V|S] at 3m
+            +20% under-estimated by 11%, calls +0.3 vp rich); the saturating quadratic follows the
+            observed flattening of ``ln E[V|S]``.
+        n_regression_points: grid on which ``E[V|S]`` is estimated (SPEC: 201 points spanning
+            ``±leverage_std_span`` ATM standard deviations at the horizon); it is then interpolated
+            onto the finer leverage grid where ``σ_loc²`` is resolved.
+        leverage_std_span: half-width of the leverage grid in ATM standard deviations.
+        leverage_dk: spacing of the leverage log-moneyness grid (same as the Dupire grid).
+        l_min, l_max: clip bounds on ``L``.
+        second_pass: re-run with the calibrated ``L`` and a fresh seed and average the two.
+        seed: seed of the particle draws (CRN key).
+        antithetic: antithetic particle pairs.
+    """
+
+    n_particles: int = 200_000
+    horizon: float = 3.0
+    bandwidth_factor: float = 1.5
+    bandwidth_min: float = 5e-4
+    kernel: str = "gaussian"
+    regression: str = "local_linear"
+    min_window: int = 2000
+    bias_correction: bool = True
+    quantile_clip: float = 0.005
+    tail_extrapolation: str = "log_quadratic"
+    n_regression_points: int = 201
+    leverage_std_span: float = 6.0
+    leverage_dk: float = 0.0025
+    l_min: float = 0.05
+    l_max: float = 20.0
+    second_pass: bool = False
+    seed: int = 12345
+    antithetic: bool = True
+
+    def __post_init__(self) -> None:
+        if self.n_particles < 100:
+            raise ValueError("n_particles too small")
+        if self.antithetic and self.n_particles % 2:
+            raise ValueError("n_particles must be even when antithetic")
+        if self.horizon <= 0:
+            raise ValueError("horizon must be positive")
+        if self.bandwidth_factor <= 0 or self.bandwidth_min <= 0:
+            raise ValueError("bandwidths must be positive")
+        if self.kernel not in ("gaussian", "quartic"):
+            raise ValueError("kernel must be 'gaussian' or 'quartic'")
+        if self.regression not in ("local_linear", "nadaraya_watson"):
+            raise ValueError("regression must be 'local_linear' or 'nadaraya_watson'")
+        if self.tail_extrapolation not in ("flat", "log_linear", "log_quadratic", "adaptive"):
+            raise ValueError(
+                "tail_extrapolation must be 'flat', 'log_linear', 'log_quadratic' or 'adaptive'"
+            )
+        if self.min_window < 0:
+            raise ValueError("min_window must be non-negative")
+        if not 0 <= self.quantile_clip < 0.5:
+            raise ValueError("quantile_clip must lie in [0, 0.5)")
+        if self.n_regression_points < 11:
+            raise ValueError("n_regression_points too small")
+        if self.leverage_std_span <= 0 or self.leverage_dk <= 0:
+            raise ValueError("leverage grid settings must be positive")
+        if not 0 < self.l_min < self.l_max:
+            raise ValueError("need 0 < l_min < l_max")
+        if self.seed < 0:
+            raise ValueError("seed must be non-negative")
+
+
+@dataclass(frozen=True)
+class CalibrationSpec:
+    """Everything that determines a calibrated leverage function (SPEC §4.3 cache key).
+
+    The cache key hashes ``key_payload()``: market, surface, model parameters, particle settings,
+    the local-vol grid, and the parts of :class:`SimConfig` the kernel depends on (step schedule
+    and scheme).  Pricing-only settings (``n_paths``, pricing seed, chunking) are excluded.
+    """
+
+    market: MarketConfig
+    surface: SSVIConfig
+    model: BergomiParams
+    particle: ParticleConfig = field(default_factory=ParticleConfig)
+    sim: SimConfig = field(default_factory=SimConfig)
+    local_vol: LocalVolConfig | None = None
+
+    def key_payload(self) -> dict[str, Any]:
+        sim = self.sim
+        return {
+            "market": to_mapping(self.market),
+            "surface": to_mapping(self.surface),
+            "model": to_mapping(self.model),
+            "particle": to_mapping(self.particle),
+            "local_vol": to_mapping(self.local_vol) if self.local_vol is not None else None,
+            "schedule": to_mapping(sim.step_schedule),
+            "scheme": to_mapping(sim.scheme),
+        }

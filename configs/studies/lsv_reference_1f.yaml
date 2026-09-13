@@ -1,0 +1,41 @@
+# Calibration spec: 1F LSV (omega = 3, kappa = 1.5, rho = -0.7, the SPEC §10 regression case) on
+# the placeholder reference SSVI surface.  Loaded as volsto.config.CalibrationSpec.
+market:
+  spot: 100.0
+  rate_curve: {times: [1.0], rates: [0.02]}
+  dividend_curve: {times: [1.0], rates: [0.01]}
+surface:
+  atm_maturities: [0.0833333, 0.25, 0.5, 1.0, 2.0, 3.0]
+  atm_vols:       [0.22,      0.21, 0.205, 0.20, 0.20, 0.205]
+  rho: -0.7
+  eta: 1.0
+  gamma: 0.5
+  max_maturity: 10.0
+model:            # BergomiParams; theta = 0 -> one factor, nu = omega / 2
+  nu: 1.5
+  theta: 0.0
+  k1: 1.5
+  k2: 1.5
+  rho12: 0.0
+  rho_SX1: -0.7
+  rho_SX2: 0.0
+particle:
+  n_particles: 200000
+  horizon: 3.0
+  bandwidth_factor: 1.5
+  bandwidth_min: 0.0005
+  kernel: gaussian
+  regression: local_linear
+  min_window: 2000
+  bias_correction: true
+  quantile_clip: 0.005
+  tail_extrapolation: log_quadratic
+  n_regression_points: 201
+  leverage_std_span: 6.0
+  leverage_dk: 0.0025
+  l_min: 0.05
+  l_max: 20.0
+  second_pass: false
+  seed: 12345
+  antithetic: true
+sim: {}           # default StepSchedule and scheme (shared with pricing)

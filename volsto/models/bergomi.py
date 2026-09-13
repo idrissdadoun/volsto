@@ -25,7 +25,7 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 from volsto._numba import njit, prange
-from volsto.analytics.bergomi import alpha_theta, chi
+from volsto.analytics.bergomi import alpha_theta, chi, cov_x_diag
 from volsto.config import BergomiParams, SchemeConfig
 from volsto.engine.grid import TimeGrid
 from volsto.engine.paths import PathSet
@@ -247,6 +247,36 @@ class BergomiSV(Model):
         tau = 0.5 * (T2 - T1) * x + 0.5 * (T1 + T2)
         wt = 0.5 * (T2 - T1) * w / (T2 - T1)
         return np.asarray(self.forward_variance(t, factors, tau) @ wt, dtype=np.float64)
+
+    def integrated_variance_moments(
+        self, times: FloatArray, scheme: SchemeConfig, T1: float, T2: float
+    ) -> tuple[float, float]:
+        """Exact mean and variance of the accumulator ``Σ_n v_n Δ_n`` over the steps of ``times``
+        inside ``[T1, T2]``, where ``v_n = g_step_n exp(ω x_{t_n}^{t_n})`` is the step variance the
+        kernel uses (factors frozen at the step start, prefactor time-averaged under ``scheme``):
+
+        ``E = Σ_n Δ_n g_step_n e^{½ω²χ(t_n)}``,
+        ``Var = Σ_{n,m} Δ_n Δ_m g_n g_m e^{½ω²(χ(t_n)+χ(t_m))} (e^{ω² Cov(x_n, x_m)} − 1)``
+        with ``g_n = g_step_n``.
+
+        Discrete counterpart of :func:`volsto.analytics.bergomi.var_integrated_variance`;
+        the two differ by the O(Δ) left-point quadrature of the pathwise integral (−0.3% on [0, 1y]
+        at Δ = 1/365 for Table 8.2, checked in ``tests/test_bergomi.py``).
+        """
+        t = np.asarray(times, dtype=np.float64)
+        sel = (t[:-1] >= T1 - 1e-12) & (t[1:] <= T2 + 1e-12)
+        idx = np.flatnonzero(sel)
+        if idx.size == 0:
+            raise ValueError("no steps inside [T1, T2]")
+        t_nodes = t[idx[0] : idx[-1] + 2]
+        _, _, g_step, _ = self.step_tables(t_nodes, scheme)
+        tn = t_nodes[:-1]
+        dts = np.diff(t_nodes)
+        w = self.params.omega
+        a = dts * g_step * np.exp(0.5 * w * w * chi(self.params, tn, tn))
+        cov = cov_x_diag(self.params, tn[:, None], tn[None, :])
+        var = float(a @ np.expm1(w * w * cov) @ a)
+        return float(a.sum()), var
 
     def factor_covariance(self, t: float) -> FloatArray:
         """``Cov(X^i_t, X^j_t) = ρ_ij (1−e^{−(k_i+k_j)t})/(k_i+k_j)`` (analytic, for tests)."""

@@ -8,8 +8,10 @@ from volsto.engine.mc import MonteCarlo, PriceResult, summarize
 from volsto.engine.paths import PathSet
 from volsto.engine.richardson import RefinementResult, refinement_study
 from volsto.engine.rng import CoarsenedDraws, GaussianDraws
+from volsto.engine.stats import BatchEstimate, batch_means
 
 __all__ = [
+    "BatchEstimate",
     "CVReport",
     "CoarsenedDraws",
     "ControlVariate",
@@ -22,6 +24,7 @@ __all__ = [
     "TimeGrid",
     "VanillaControl",
     "VarianceControl",
+    "batch_means",
     "refinement_study",
     "summarize",
 ]
