@@ -34,7 +34,7 @@ from volsto.studies.m4 import (
     headline_models,
     one_factor_variants,
 )
-from volsto.studies.m6 import M6HeadlineResult, run_m6_headline
+from volsto.studies.m6 import M6HeadlineResult, run_m6_headline, run_m6_headline_seeds
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -96,6 +96,14 @@ def main(argv: list[str] | None = None) -> int:
         help="particles per calibration (production convention 8e5, owner decision at M4b)",
     )
     ap.add_argument("--seed", type=int, default=2024)
+    ap.add_argument(
+        "--price-seeds",
+        type=int,
+        nargs="*",
+        default=None,
+        help="average the table over these pricing seeds (owner decision, M6 review: the\n"
+        "regression baseline uses six); the default prices the single --seed",
+    )
     ap.add_argument("--cache", default=str(ROOT / "cache"))
     ap.add_argument("--out", default=str(ROOT / "outputs" / "m6" / "headline"))
     ap.add_argument("--spec-1f", default=str(ROOT / "configs/studies/lsv_reference_1f.yaml"))
@@ -111,7 +119,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     logging.info("models ready in %.0f s", time.perf_counter() - t0)
     sim = dataclasses.replace(base.sim, n_paths=args.n_paths, seed=args.seed)
-    result = run_m6_headline(models, sim, reference=LV_NAME)
+    if args.price_seeds:
+        result = run_m6_headline_seeds(models, sim, args.price_seeds, reference=LV_NAME)
+    else:
+        result = run_m6_headline(models, sim, reference=LV_NAME)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     result.table.to_csv(out / "headline.csv", index=False)

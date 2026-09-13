@@ -35,6 +35,13 @@ numbers) and the standard error is that of the per-path difference; a perturbati
 surface's arbitrage checks is halved and retried (``max_halvings``), the achieved size is
 reported and the exposure is per requested unit (``tests/test_autocall.py::
 test_forward_skew_exposure``).
+
+
+Sign conventions worth keeping (measured at M6 under local vol on the reference surface, 3y
+annual autocall, owner-confirmed): the funded par note has a **negative rho** (−9.4e-5 ± 0.4e-5
+per bp: the discounting of the par redemption, duration ≈ E[life], outweighs the equity legs'
++1.2e-4); "long forward" holds for the delta (+0.0070 per unit spot), the repo delta (negative,
+−5.9e-5 per bp) and the equity legs, not for the note's rho.  Do not "fix" the rho sign.
 """
 
 from __future__ import annotations

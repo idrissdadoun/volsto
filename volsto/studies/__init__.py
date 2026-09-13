@@ -8,6 +8,7 @@ from volsto.studies.m6 import (
     regression_columns,
     regression_keys,
     run_m6_headline,
+    run_m6_headline_seeds,
 )
 
 __all__ = [
@@ -18,4 +19,5 @@ __all__ = [
     "regression_columns",
     "regression_keys",
     "run_m6_headline",
+    "run_m6_headline_seeds",
 ]

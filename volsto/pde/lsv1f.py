@@ -25,7 +25,8 @@ Heston model with correlation*, Int. J. Numer. Anal. Model. 7 (2010) 303–320):
 
 * **Grids.** ``x`` on ``[x_lo, x_hi] = [min(ln S0, ln F_T) − w sd, max(ln S0, ln F_T) + w sd]``
   with ``sd² = ∫_0^T ξ_0`` (``σ² T`` for Black–Scholes, ``∫ σ_loc²(t, 0) dt`` for local vol) and
-  ``w = x_width_sd`` (owner: 4), clustered around a chosen spot level by the sinh map
+  ``w = x_width_sd`` (owner: 4 for BS / LV, 6 for factor models since the M6 review),
+  clustered around a chosen spot level by the sinh map
   ``x = x_c + c sinh(ξ)``, ``ξ`` uniform, ``c = x_cluster · (x_hi − x_lo)/2`` (their eq. 3.1
   in log-spot); a continuous barrier replaces the corresponding end of the domain so that a
   node sits exactly at ``ln B``.  ``X`` uniform on ``±X_width_sd · sqrt(1/(2 k1))`` (the OU's
@@ -442,7 +443,7 @@ class LSV1FPDE:
         *,
         n_x: int = 400,
         n_X: int = 121,
-        x_width_sd: float = 4.0,
+        x_width_sd: float | None = None,
         X_width_sd: float = 4.0,
         schedule: StepSchedule | float = DEFAULT_STEP_SCHEDULE,
         scheme: str = "hv",
@@ -456,6 +457,10 @@ class LSV1FPDE:
             raise ValueError("n_x must be an integer >= 16")
         if int(n_X) != n_X or n_X < 5 or n_X % 2 == 0:
             raise ValueError("n_X must be an odd integer >= 5 (X = 0 must be a grid node)")
+        if x_width_sd is None:
+            # owner decision (M6 review): ±6 ATM sd for factor models (the fat-tailed SV states
+            # truncate at ±4: 2.4e-4 relative on 1y vanillas at ω = 3, 3e-5 at ±6), ±4 for BS / LV
+            x_width_sd = 6.0 if self.dyn.factor_var is not None else 4.0
         if not (np.isfinite(x_width_sd) and x_width_sd > 0):
             raise ValueError("x_width_sd must be positive")
         if not (np.isfinite(X_width_sd) and X_width_sd > 0):

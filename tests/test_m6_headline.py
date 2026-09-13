@@ -9,6 +9,7 @@ at 20k paths and ``scripts/m6_headline.py`` end to end on monkeypatched Black–
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import json
 import logging
@@ -391,3 +392,41 @@ def test_daily_phoenix_runtime_budget(result: M6HeadlineResult) -> None:
     about 2 s under Black–Scholes on the development machine)."""
     wall = result.table.set_index(["model", "product"])["wall_s"]
     assert wall[("bs20", PHOENIX_NAME)] < 30.0, dict(wall)
+
+
+def test_seed_average_matches_single_runs() -> None:
+    """``run_m6_headline_seeds``: every cell is the mean of the single-seed runs and its stderr the
+    standard error across seeds; the reference rows' differences stay an exact zero; the legs
+    still sum to the price (means of sums)."""
+    from volsto.market.curves import ForwardCurve
+    from volsto.models.bs import BlackScholes
+    from volsto.studies.m6 import run_m6_headline, run_m6_headline_seeds
+
+    fc = ForwardCurve.flat(100.0, 0.02, 0.01)
+    models = {"bs20": BlackScholes(0.20, fc), "bs25": BlackScholes(0.25, fc)}
+    sim = SimConfig(n_paths=4_000, dt_max=1.0 / 12.0, chunk_size=4_000, seed=1)
+    seeds = [1, 2, 3]
+    avg = run_m6_headline_seeds(models, sim, seeds, reference="bs20")
+    singles = [
+        run_m6_headline(models, dataclasses.replace(sim, seed=s), reference="bs20") for s in seeds
+    ]
+    for col in ("price", "p_ki", "expected_life", "leg:bond"):
+        stack = np.stack([r.table[col].to_numpy(dtype=float) for r in singles])
+        np.testing.assert_allclose(
+            avg.table[col].to_numpy(dtype=float), stack.mean(axis=0), rtol=0, atol=1e-12
+        )
+        np.testing.assert_allclose(
+            avg.table[col + "_stderr"].to_numpy(dtype=float),
+            stack.std(axis=0, ddof=1) / np.sqrt(3),
+            rtol=1e-12,
+            atol=1e-15,
+        )
+    ref = avg.table[avg.table["model"] == "bs20"]
+    assert np.all(ref["price_minus_ref"] == 0.0) and np.all(ref["price_minus_ref_stderr"] == 0.0)
+    other = avg.table[avg.table["model"] == "bs25"]
+    np.testing.assert_allclose(
+        other["price_minus_ref"].to_numpy(),
+        other["price"].to_numpy() - ref["price"].to_numpy(),
+        atol=1e-12,
+    )
+    assert avg.table.attrs["pricing_seeds"] == seeds and avg.seed == 1

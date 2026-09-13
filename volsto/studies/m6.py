@@ -48,6 +48,7 @@ models of ``tests/test_m6_headline.py``, the production table comes from
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import time
 from collections.abc import Mapping, Sequence
@@ -395,3 +396,84 @@ def baseline_values(result: M6HeadlineResult) -> dict[tuple[str, str], tuple[flo
         for col in regression_columns(rep.product):
             out[(name, f"{pname}:{col}")] = (float(r[col]), float(r[f"{col}_stderr"]))
     return out
+
+
+def run_m6_headline_seeds(
+    models: Mapping[str, Model],
+    sim: SimConfig,
+    pricing_seeds: Sequence[int],
+    products: Mapping[str, Autocall] | None = None,
+    *,
+    reference: str | None = None,
+    allow_spot_mismatch: bool = False,
+) -> M6HeadlineResult:
+    """:func:`run_m6_headline` averaged over pricing seeds (owner decision at the M6 review: the
+    regression baseline is the six-pricing-seed estimate).  Every ``<x>`` cell is the mean over
+    seeds and ``<x>_stderr`` the standard error of that mean across seeds (the empirical spread,
+    which includes the grid-realisation noise; with fewer than three seeds the quoted single-run
+    MC errors combined in quadrature / n); the ``_minus_ref`` cells are recomputed from the
+    averaged cells with root-sum-square errors (models run on their own grids: not paired);
+    ``seed`` holds the first seed and ``term_sheet`` / ``n_paths`` / ``wall_s`` (summed) are
+    carried; ``reports`` are those of the first seed.  Checked by
+    ``tests/test_m6_headline.py::test_seed_average_matches_single_runs``."""
+    if len(pricing_seeds) < 1:
+        raise ValueError("at least one pricing seed")
+    runs = [
+        run_m6_headline(
+            models,
+            dataclasses.replace(sim, seed=int(seed)),
+            products,
+            reference=reference,
+            allow_spot_mismatch=allow_spot_mismatch,
+        )
+        for seed in pricing_seeds
+    ]
+    n = len(runs)
+    base = runs[0].table.copy()
+    value_cols = [
+        c
+        for c in base.columns
+        if c not in ROW_META_COLUMNS
+        and not c.endswith("_stderr")
+        and not c.endswith("_minus_ref")
+        and pd.api.types.is_numeric_dtype(base[c])
+    ]
+    stack = np.stack([r.table[value_cols].to_numpy(dtype=np.float64) for r in runs])
+    mean = stack.mean(axis=0)
+    if n >= 3:
+        se = stack.std(axis=0, ddof=1) / np.sqrt(n)
+    else:
+        se = np.sqrt(
+            np.mean(
+                np.stack(
+                    [
+                        r.table[[c + "_stderr" for c in value_cols]].to_numpy(dtype=np.float64)
+                        for r in runs
+                    ]
+                )
+                ** 2,
+                axis=0,
+            )
+        ) / np.sqrt(n)
+    out = base.copy()
+    out[value_cols] = mean
+    out[[c + "_stderr" for c in value_cols]] = se
+    if reference is not None:
+        for pname in dict.fromkeys(out["product"]):
+            sel = out["product"] == pname
+            ref_row = out[sel & (out["model"] == reference)]
+            if ref_row.empty:
+                continue
+            for c in value_cols:
+                if c + "_minus_ref" not in out.columns:
+                    continue
+                rv = float(ref_row[c].iloc[0])
+                rse = float(ref_row[c + "_stderr"].iloc[0])
+                out.loc[sel, c + "_minus_ref"] = out.loc[sel, c] - rv
+                out.loc[sel, c + "_minus_ref_stderr"] = np.hypot(out.loc[sel, c + "_stderr"], rse)
+                is_ref = sel & (out["model"] == reference)
+                out.loc[is_ref, c + "_minus_ref"] = 0.0
+                out.loc[is_ref, c + "_minus_ref_stderr"] = 0.0
+    out["wall_s"] = sum(r.table["wall_s"].to_numpy(dtype=np.float64) for r in runs)
+    out.attrs["pricing_seeds"] = [int(x) for x in pricing_seeds]
+    return M6HeadlineResult(out, runs[0].reports, reference, sim.n_paths, int(pricing_seeds[0]))
