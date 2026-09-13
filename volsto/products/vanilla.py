@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 from numpy.typing import NDArray
 
-from volsto.products.base import Product, parse_cp
+from volsto.products.base import Product, parse_cp, shift_times
 
 if TYPE_CHECKING:
     from volsto.engine.grid import FixingIndex
@@ -43,6 +43,11 @@ class EuropeanOption(Product):
         S = paths.spot_at(idx[self.T])
         cf = np.maximum(self.cp * (S - self.strike), 0.0)
         return np.asarray(self.notional * float(self.df(self.T)) * cf, dtype=np.float64)
+
+    def aged(self, dt: float) -> Product:
+        return EuropeanOption(
+            self.strike, float(shift_times([self.T], dt)[0]), self.cp, self.discount, self.notional
+        )
 
     def __repr__(self) -> str:
         kind = "Call" if self.cp > 0 else "Put"
@@ -81,6 +86,16 @@ class DigitalOption(Product):
         hit = (self.cp * (S - self.strike) > 0.0).astype(np.float64)
         return np.asarray(
             self.notional * self.payout * float(self.df(self.T)) * hit, dtype=np.float64
+        )
+
+    def aged(self, dt: float) -> Product:
+        return DigitalOption(
+            self.strike,
+            float(shift_times([self.T], dt)[0]),
+            self.cp,
+            self.discount,
+            self.payout,
+            self.notional,
         )
 
     def __repr__(self) -> str:

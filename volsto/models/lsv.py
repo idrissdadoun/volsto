@@ -129,9 +129,13 @@ class LSV(Model):
         return np.asarray(lev * lev * self.kernel.variance_from_factors(state.t, state.factors))
 
     def bump(self, **kwargs: Any) -> LSV:
-        """``leverage=`` replaces ``L``; any other key is passed to the kernel (sticky leverage)."""
+        """``leverage=`` replaces ``L``; ``spot=`` bumps the spot with ``L`` re-anchored so it
+        stays fixed in spot (the "model" regime); any other key is passed to the kernel (sticky
+        leverage)."""
         lev = kwargs.pop("leverage", self.leverage)
         kernel = self.kernel.bump(**kwargs) if kwargs else self.kernel
+        if "spot" in kwargs:
+            lev = lev.reanchored(kernel.forward_curve)
         return LSV(kernel, lev)
 
     def leverage_tables(self, t_nodes: FloatArray) -> tuple[FloatArray, FloatArray, FloatArray]:
@@ -155,11 +159,11 @@ class LSV(Model):
         state = self.initial_state(n)
         out.log_spot[:, 0] = state.log_spot
         out.variance[:, 0] = state.variance
-        out.factors[:, 0, :] = 0.0
+        out.factors[:, 0, :] = state.factors
         out.int_var[:, 0] = 0.0
         out.sum_sq[:, 0] = 0.0
         ls = state.log_spot.copy()
-        fac = np.zeros((n, nf))
+        fac = np.ascontiguousarray(state.factors.copy())
         iv = np.zeros(n)
         sq = np.zeros(n)
         ln_f = np.asarray(self.forward_curve.log_forward(grid.times), dtype=np.float64)

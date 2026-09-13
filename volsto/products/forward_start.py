@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 from numpy.typing import NDArray
 
-from volsto.products.base import Product, parse_cp
+from volsto.products.base import Product, parse_cp, shift_times
 
 if TYPE_CHECKING:
     from volsto.engine.grid import FixingIndex
@@ -90,6 +90,18 @@ class ForwardStartOption(Product):
         cf = np.maximum(self.cp * (r - self.strike), 0.0)
         return np.asarray(self.notional * float(self.df(self.pay_time)) * cf, dtype=np.float64)
 
+    def aged(self, dt: float) -> Product:
+        t = shift_times([self.T1, self.T2, self.pay_time], dt)
+        return ForwardStartOption(
+            float(t[0]),
+            float(t[1]),
+            self.strike,
+            self.cp,
+            self.discount,
+            self.notional,
+            float(t[2]),
+        )
+
     def __repr__(self) -> str:
         kind = "Call" if self.cp > 0 else "Put"
         pay = "" if self.pay_time == self.T2 else f", paid at {self.pay_time:g}y"
@@ -146,6 +158,12 @@ class ForwardStartStraddle(Product):
             )
             for cp in (1, -1)
         ]
+
+    def aged(self, dt: float) -> Product:
+        t = shift_times([self.T1, self.T2, self.pay_time], dt)
+        return ForwardStartStraddle(
+            float(t[0]), float(t[1]), self.strike, self.discount, self.notional, float(t[2])
+        )
 
     def __repr__(self) -> str:
         pay = "" if self.pay_time == self.T2 else f", paid at {self.pay_time:g}y"

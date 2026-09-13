@@ -25,7 +25,7 @@ from volsto.calibration.diagnostics import CalibrationReport, reprice_surface
 from volsto.calibration.particle import CALIBRATION_CODE_TAG, calibrate_leverage
 from volsto.config import CalibrationSpec, SimConfig, to_mapping
 from volsto.market.curves import ForwardCurve
-from volsto.market.surface import SSVISurface
+from volsto.market.surface import ImpliedSurface, SSVISurface, perturbed_surface
 from volsto.market.varswap import xi0_curve
 from volsto.models.bergomi import BergomiSV
 from volsto.models.leverage import LeverageFunction
@@ -62,10 +62,12 @@ def spec_key(spec: CalibrationSpec, code_tag: str = CALIBRATION_CODE_TAG) -> str
     return hashlib.sha256(blob).hexdigest()
 
 
-def build_market(spec: CalibrationSpec) -> tuple[ForwardCurve, SSVISurface, BergomiSV]:
-    """Forward curve, SSVI surface and pure SV kernel (ξ₀ from the variance-swap strip)."""
+def build_market(spec: CalibrationSpec) -> tuple[ForwardCurve, ImpliedSurface, BergomiSV]:
+    """Forward curve, (possibly perturbed) SSVI surface and pure SV kernel (ξ₀ from the
+    variance-swap strip of that surface)."""
     fc = ForwardCurve.from_config(spec.market)
-    surface = SSVISurface.from_config(spec.surface, fc, fc.rate_curve)
+    base = SSVISurface.from_config(spec.surface, fc, fc.rate_curve)
+    surface = perturbed_surface(spec.perturbation, base)
     t_max = min(surface.max_maturity, max(spec.particle.horizon + 1.0, 5.0))
     xi0 = xi0_curve(surface, t_max)
     return fc, surface, BergomiSV(spec.model, xi0, fc)

@@ -15,7 +15,7 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 from volsto.market.bs import black_price
-from volsto.products.base import CashFlow, Product, daily_schedule
+from volsto.products.base import CashFlow, Product, daily_schedule, shift_times
 from volsto.products.forward_start import ForwardStartStraddle
 
 if TYPE_CHECKING:
@@ -123,6 +123,16 @@ class VarianceSwap(_RealisedVarianceProduct):
             self.notional * float(self.df(self.maturity)) * (rv - self.strike), dtype=np.float64
         )
 
+    def aged(self, dt: float) -> Product:
+        return VarianceSwap(
+            shift_times(self._fixings, dt),
+            self.strike,
+            self.discount,
+            self.notional,
+            self.annualisation,
+            self.use_simulation_grid,
+        )
+
     def __repr__(self) -> str:
         kind = "Forward variance swap" if self.start > 0 else "Variance swap"
         return (
@@ -206,6 +216,16 @@ class VolSwap(_RealisedVarianceProduct):
             dtype=np.float64,
         )
 
+    def aged(self, dt: float) -> Product:
+        return VolSwap(
+            shift_times(self._fixings, dt),
+            self.strike_vol,
+            self.discount,
+            self.notional,
+            self.annualisation,
+            self.use_simulation_grid,
+        )
+
     def __repr__(self) -> str:
         kind = "Forward vol swap" if self.start > 0 else "Vol swap"
         return (
@@ -284,6 +304,17 @@ class FVA(Product):
             ForwardStartStraddle(self.T1, self.T2, self.moneyness, self.discount, self.notional),
             CashFlow(-self.straddle_premium, self.T2, self.discount, self.notional),
         ]
+
+    def aged(self, dt: float) -> Product:
+        t = shift_times([self.T1, self.T2], dt)
+        return FVA(
+            float(t[0]),
+            float(t[1]),
+            self.strike_vol,
+            self.discount,
+            moneyness=self.moneyness,
+            notional=self.notional,
+        )
 
     def __repr__(self) -> str:
         return (

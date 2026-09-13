@@ -35,7 +35,7 @@ from volsto.calibration.cache import LeverageCache, build_market
 from volsto.config import BergomiParams, CalibrationSpec, SimConfig
 from volsto.engine.mc import MonteCarlo
 from volsto.market.dupire import LocalVolSurface
-from volsto.market.surface import SSVISurface
+from volsto.market.surface import ImpliedSurface
 from volsto.models.base import Model
 from volsto.models.localvol import LocalVol
 from volsto.products.base import Product, daily_schedule
@@ -77,7 +77,7 @@ def headline_models(
     *,
     omegas: Sequence[float] = HEADLINE_OMEGAS,
     n_particles: int | None = None,
-) -> tuple[dict[str, Model], SSVISurface]:
+) -> tuple[dict[str, Model], ImpliedSurface]:
     """Pure LV plus the calibrated LSV models (cache hits or fresh calibrations).
 
     ``n_particles`` overrides the specs' particle count: production numbers (headline tables,

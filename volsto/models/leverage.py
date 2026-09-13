@@ -94,6 +94,26 @@ class LeverageFunction:
         start = np.ascontiguousarray(rows[:-1])
         return start, start, np.ascontiguousarray(rows[1:])
 
+    def reanchored(self, forward_curve: ForwardCurve) -> LeverageFunction:
+        """The same ``L(t, S)`` re-expressed on the ``k`` grid of a new forward curve (the
+        "model" delta regime: bump the spot, keep ``L`` fixed in spot).  The shift
+        ``ln F_new(t) − ln F_old(t)`` is applied slice by slice by linear interpolation in ``k``,
+        flat outside the grid."""
+        t = self.times
+        shift = np.asarray(forward_curve.log_forward(t)) - np.asarray(
+            self.forward_curve.log_forward(t)
+        )
+        out = np.empty_like(self.values)
+        for j in range(t.size):
+            out[j] = np.interp(self.k_grid + shift[j], self.k_grid, self.values[j])
+        return LeverageFunction(
+            t,
+            self.k_grid,
+            out,
+            forward_curve,
+            {**self.metadata, "reanchored_shift": float(shift[0])},
+        )
+
     def __call__(self, t: ArrayLike, S: ArrayLike) -> FloatArray:
         """``L(t, S)`` with ``k = ln S − ln F(t)``, flat in ``k`` outside the grid."""
         t_, S_ = np.broadcast_arrays(

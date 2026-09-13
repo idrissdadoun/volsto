@@ -36,7 +36,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
-from volsto.products.base import Product
+from volsto.products.base import Product, shift_times
 from volsto.products.variance import VarianceSwap
 
 if TYPE_CHECKING:
@@ -125,6 +125,16 @@ class StatisticLeg(Product):
     def payoff(self, paths: PathSet, idx: FixingIndex) -> FloatArray:
         return self.parent.statistics(paths, idx)[self.name]
 
+    def aged(self, dt: float) -> Product:
+        parent = self.parent.aged(dt)
+        assert isinstance(parent, RealisedVarianceSchedule)
+        return StatisticLeg(parent, self.name)
+
+    def with_discount(self, discount: DiscountCurve) -> Product:
+        parent = self.parent.with_discount(discount)
+        assert isinstance(parent, RealisedVarianceSchedule)
+        return StatisticLeg(parent, self.name)
+
     def __repr__(self) -> str:
         return f"Statistic '{self.name}' of [{self.parent!r}]"
 
@@ -195,6 +205,21 @@ class ConditionalVarianceSwap(RealisedVarianceSchedule):
         else:
             cf = st["accrued"] - k2
         return np.asarray(self.notional * float(self.df(self.maturity)) * cf, dtype=np.float64)
+
+    def aged(self, dt: float) -> Product:
+        return ConditionalVarianceSwap(
+            shift_times(self._fixings, dt),
+            self.barrier,
+            self.side,
+            self.indicator,
+            self.convention,
+            self.strike_vol,
+            self.discount,
+            strict=self.strict,
+            daily_cap=self.daily_cap,
+            annualisation=self.annualisation,
+            notional=self.notional,
+        )
 
     def __repr__(self) -> str:
         op = {"up": ">" if self.strict else ">=", "down": "<" if self.strict else "<="}[self.side]
@@ -280,6 +305,18 @@ class ConvexitySpread(Product):
         )
         return [self.upvar, short]
 
+    def aged(self, dt: float) -> Product:
+        up = self.upvar.aged(dt)
+        vs = self.varswap.aged(dt)
+        assert isinstance(up, ConditionalVarianceSwap) and isinstance(vs, VarianceSwap)
+        return ConvexitySpread(up, vs, self.notional_ratio)
+
+    def with_discount(self, discount: DiscountCurve) -> Product:
+        up = self.upvar.with_discount(discount)
+        vs = self.varswap.with_discount(discount)
+        assert isinstance(up, ConditionalVarianceSwap) and isinstance(vs, VarianceSwap)
+        return ConvexitySpread(up, vs, self.notional_ratio)
+
     def __repr__(self) -> str:
         return (
             f"Convexity spread: long [{self.upvar!r}] short {self.notional_ratio:g} x "
@@ -347,6 +384,19 @@ class KnockOutVarianceSwap(RealisedVarianceSchedule):
         st = self.statistics(paths, idx)
         cf = st["accrued"] - self.strike_vol**2 * st["count"]
         return np.asarray(self.notional * float(self.df(self.maturity)) * cf, dtype=np.float64)
+
+    def aged(self, dt: float) -> Product:
+        return KnockOutVarianceSwap(
+            shift_times(self._fixings, dt),
+            self.barrier,
+            self.strike_vol,
+            self.discount,
+            direction=self.direction,
+            strict=self.strict,
+            daily_cap=self.daily_cap,
+            annualisation=self.annualisation,
+            notional=self.notional,
+        )
 
     def __repr__(self) -> str:
         op = {"up": ">" if self.strict else ">=", "down": "<" if self.strict else "<="}[

@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
-from volsto.products.base import CashFlow, Product, parse_cp, uniform_schedule
+from volsto.products.base import CashFlow, Product, parse_cp, shift_times, uniform_schedule
 from volsto.products.forward_start import ForwardStartOption
 
 if TYPE_CHECKING:
@@ -181,6 +181,17 @@ class AdditiveCliquet(_PeriodReturnProduct):
             parts.append(AccumulatedSumOption(self, self.global_cap, 1, -self.notional))
         return parts
 
+    def aged(self, dt: float) -> Product:
+        return AdditiveCliquet(
+            shift_times(self._fixings, dt),
+            self.discount,
+            local_floor=None if not np.isfinite(self.local_floor) else self.local_floor,
+            local_cap=None if not np.isfinite(self.local_cap) else self.local_cap,
+            global_floor=None if not np.isfinite(self.global_floor) else self.global_floor,
+            global_cap=None if not np.isfinite(self.global_cap) else self.global_cap,
+            notional=self.notional,
+        )
+
     def __repr__(self) -> str:
         return (
             f"Additive cliquet: {self.n_periods} periods to {self.maturity:g}y, local floor "
@@ -212,6 +223,16 @@ class AccumulatedSumOption(Product):
         return np.asarray(
             self.notional * float(self.df(self.cliquet.maturity)) * cf, dtype=np.float64
         )
+
+    def aged(self, dt: float) -> Product:
+        inner = self.cliquet.aged(dt)
+        assert isinstance(inner, AdditiveCliquet)
+        return AccumulatedSumOption(inner, self.strike, self.cp, self.notional)
+
+    def with_discount(self, discount: DiscountCurve) -> Product:
+        inner = self.cliquet.with_discount(discount)
+        assert isinstance(inner, AdditiveCliquet)
+        return AccumulatedSumOption(inner, self.strike, self.cp, self.notional)
 
     def __repr__(self) -> str:
         kind = "call" if self.cp > 0 else "put"
@@ -272,6 +293,16 @@ class ReverseCliquet(_PeriodReturnProduct):
             *self._inner().decompose(),
         ]
 
+    def aged(self, dt: float) -> Product:
+        return ReverseCliquet(
+            shift_times(self._fixings, dt),
+            self.coupon,
+            self.discount,
+            local_floor=None if not np.isfinite(self.local_floor) else self.local_floor,
+            global_floor=None if not np.isfinite(self.global_floor) else self.global_floor,
+            notional=self.notional,
+        )
+
     def __repr__(self) -> str:
         return (
             f"Reverse cliquet: coupon {self.coupon * 100:g}% less negative returns over "
@@ -311,6 +342,17 @@ class Napoleon(_PeriodReturnProduct):
         r = np.clip(self.period_returns(paths, idx), self.local_floor, self.local_cap)
         total = np.maximum(self.coupon + np.min(r, axis=1), self.global_floor)
         return np.asarray(self.notional * float(self.df(self.maturity)) * total, dtype=np.float64)
+
+    def aged(self, dt: float) -> Product:
+        return Napoleon(
+            shift_times(self._fixings, dt),
+            self.coupon,
+            self.discount,
+            local_floor=None if not np.isfinite(self.local_floor) else self.local_floor,
+            local_cap=None if not np.isfinite(self.local_cap) else self.local_cap,
+            global_floor=None if not np.isfinite(self.global_floor) else self.global_floor,
+            notional=self.notional,
+        )
 
     def __repr__(self) -> str:
         return (

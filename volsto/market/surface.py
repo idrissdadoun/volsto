@@ -7,7 +7,7 @@ Checked by ``tests/test_surface.py``.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -16,7 +16,7 @@ from numpy.typing import ArrayLike, NDArray
 from volsto.market.bs import black_price, strike_from_delta
 
 if TYPE_CHECKING:
-    from volsto.config import SSVIConfig
+    from volsto.config import SSVIConfig, SurfacePerturbation
     from volsto.market.curves import DiscountCurve, ForwardCurve
 
 FloatArray = NDArray[np.float64]
@@ -471,3 +471,222 @@ class ESSVISurface(SSVISurface):
             f"ESSVISurface(atm_maturities={self._t[1:].tolist()}, "
             f"rhos={np.round(self._rhos, 4).tolist()}, eta={self.eta}, gamma={self.gamma})"
         )
+
+
+# --------------------------------------------------------------------------------------------
+# additive perturbation layer (SPEC v2 §7.1, M5)
+# --------------------------------------------------------------------------------------------
+
+
+class ArbitrageError(ValueError):
+    """A perturbed surface failed the butterfly or calendar check."""
+
+
+def tent(T: ArrayLike, pillars: Sequence[float], i: int) -> FloatArray:
+    """``tent_i(T)``: 0 at ``T_{i−1}``, 1 at ``T_i``, 0 at ``T_{i+1}``, flat (1) beyond the last
+    pillar for the last tent and before the first pillar for the first (SPEC v2 §7.4)."""
+    t = np.asarray(T, dtype=np.float64)
+    ps = np.asarray(pillars, dtype=np.float64)
+    n = ps.size
+    if not 0 <= i < n:
+        raise ValueError("tent index out of range")
+    out = np.zeros_like(t)
+    lo = ps[i - 1] if i > 0 else -np.inf
+    hi = ps[i + 1] if i < n - 1 else np.inf
+    left = (t <= ps[i]) & (t > lo)
+    right = (t > ps[i]) & (t < hi)
+    up = (t - lo) / (ps[i] - lo) if i > 0 else np.ones_like(t)
+    down = (hi - t) / (hi - ps[i]) if i < n - 1 else np.ones_like(t)
+    out = np.where(left, up, out)
+    out = np.where(right, down, out)
+    return np.asarray(np.clip(out, 0.0, 1.0), dtype=np.float64)
+
+
+class PerturbedSurface(ImpliedSurface):
+    """``σ(k, T) = σ_base(k, T) + δσ(k, T)`` (floored at 1e-4); everything else from the base."""
+
+    def __init__(
+        self,
+        base: ImpliedSurface,
+        delta_sigma: Callable[[FloatArray, FloatArray], FloatArray],
+        name: str = "perturbed",
+        *,
+        check: bool = True,
+    ) -> None:
+        super().__init__(base.forward_curve, base.discount, base.max_maturity)
+        self.base = base
+        self.delta_sigma = delta_sigma
+        self.name = name
+        self.min_maturity = getattr(base, "min_maturity", 1.0 / 365.0)
+        if check:
+            self.check_no_arbitrage()
+
+    def implied_vol_k(self, k: ArrayLike, T: ArrayLike) -> FloatArray:
+        k_, T_ = np.broadcast_arrays(
+            np.asarray(k, dtype=np.float64), np.asarray(T, dtype=np.float64)
+        )
+        sig = self.base.implied_vol_k(k_, T_) + self.delta_sigma(k_, T_)
+        return np.asarray(np.maximum(sig, 1e-4), dtype=np.float64)
+
+    def total_variance(self, k: ArrayLike, T: ArrayLike) -> FloatArray:
+        T_ = np.asarray(T, dtype=np.float64)
+        v = self.implied_vol_k(k, T_)
+        return np.asarray(v * v * T_, dtype=np.float64)
+
+    def atm_skew(self, T: ArrayLike, h: float = 1e-3) -> FloatArray:
+        """``∂σ/∂k`` at ``k = 0`` by central differences."""
+        return (self.implied_vol_k(h, T) - self.implied_vol_k(-h, T)) / (2.0 * h)
+
+    def check_no_arbitrage(
+        self,
+        k_range: float = 1.0,
+        n_k: int = 201,
+        maturities: Sequence[float] | None = None,
+        tol: float = 1e-6,
+    ) -> None:
+        """Butterfly (Gatheral's density condition, finite differences) and calendar (``w`` non-
+        decreasing in ``T`` at fixed ``k``) checks on a ``|k| ≤ k_range`` grid at the risk pillars;
+        raise :class:`ArbitrageError` (the risk engine then halves the bump and retries).  The
+        skew/curvature bumps saturate beyond ``k_cap`` (0.5) because a rotation extended linearly
+        into the far wings breaks the calendar condition where the base surface is nearly
+        calendar-flat."""
+        ks = np.linspace(-k_range, k_range, n_k)
+        ts = (
+            np.asarray(maturities, dtype=np.float64)
+            if maturities is not None
+            else np.array([1 / 12, 2 / 12, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0])
+        )
+        ts = ts[(ts >= self.min_maturity) & (ts <= self.max_maturity)]
+        dk = ks[1] - ks[0]
+        prev = None
+        for T in ts:
+            w = self.total_variance(ks, T)
+            wk = np.gradient(w, dk)
+            wkk = np.gradient(wk, dk)
+            g = (1.0 - ks * wk / (2.0 * w)) ** 2 - 0.25 * wk * wk * (1.0 / w + 0.25) + 0.5 * wkk
+            inner = slice(2, -2)
+            if np.any(g[inner] < -tol):
+                raise ArbitrageError(
+                    f"{self.name}: butterfly condition violated at T={T:g} "
+                    f"(min g = {g[inner].min():.2e})"
+                )
+            if prev is not None and np.any(w - prev < -tol):
+                raise ArbitrageError(f"{self.name}: calendar condition violated at T={T:g}")
+            prev = w
+
+    def __repr__(self) -> str:
+        return f"PerturbedSurface({self.name} on {self.base!r})"
+
+
+def saturated_k(k: ArrayLike, k_cap: float) -> FloatArray:
+    """``k_cap · tanh(k / k_cap)``: the log-moneyness profile of the skew and curvature bumps —
+    linear (unit slope) at the money, saturating smoothly at ``±k_cap`` in the wings (a kink
+    would spike the butterfly density check)."""
+    return np.asarray(k_cap * np.tanh(np.asarray(k, dtype=np.float64) / k_cap), dtype=np.float64)
+
+
+def atm_skew_numeric(surface: ImpliedSurface, T: ArrayLike, h: float = 1e-3) -> FloatArray:
+    """``∂σ/∂k`` at ``k = 0`` by central differences (any surface)."""
+    return np.asarray(
+        (surface.implied_vol_k(h, T) - surface.implied_vol_k(-h, T)) / (2.0 * h), dtype=np.float64
+    )
+
+
+def _bilinear(
+    ks: FloatArray, ts: FloatArray, values: FloatArray, k: FloatArray, t: FloatArray
+) -> FloatArray:
+    """Bilinear interpolation of ``values[t, k]`` (flat outside the grid)."""
+    ki = np.clip(np.searchsorted(ks, k) - 1, 0, max(ks.size - 2, 0))
+    ti = np.clip(np.searchsorted(ts, t) - 1, 0, max(ts.size - 2, 0))
+    if ks.size == 1:
+        wk = np.zeros_like(k)
+    else:
+        wk = np.clip((k - ks[ki]) / (ks[ki + 1] - ks[ki]), 0.0, 1.0)
+    if ts.size == 1:
+        wt = np.zeros_like(t)
+    else:
+        wt = np.clip((t - ts[ti]) / (ts[ti + 1] - ts[ti]), 0.0, 1.0)
+    ki1 = np.minimum(ki + 1, ks.size - 1)
+    ti1 = np.minimum(ti + 1, ts.size - 1)
+    v = (1 - wt) * ((1 - wk) * values[ti, ki] + wk * values[ti, ki1]) + wt * (
+        (1 - wk) * values[ti1, ki] + wk * values[ti1, ki1]
+    )
+    return np.asarray(v, dtype=np.float64)
+
+
+def delta_sigma_from_config(
+    cfg: SurfacePerturbation, base: ImpliedSurface
+) -> Callable[[FloatArray, FloatArray], FloatArray]:
+    """The ``δσ(k, T)`` function of a perturbation config (kinds: :class:`SurfacePerturbation`)."""
+    kind, p = cfg.kind, cfg.params
+    if kind == "parallel":
+        size = float(p["size"])
+        return lambda k, T: np.full(np.broadcast(k, T).shape, size)
+    if kind == "tent":
+        pillars, i, size = tuple(p["pillars"]), int(p["index"]), float(p["size"])
+        return lambda k, T: size * tent(T, pillars, i) * np.ones_like(k)
+    if kind == "skew_tent":
+        pillars, i, slope = tuple(p["pillars"]), int(p["index"]), float(p["slope"])
+        k_cap = float(p.get("k_cap", 0.5))  # rotation around the money, saturating in the wings
+        return lambda k, T: slope * saturated_k(k, k_cap) * tent(T, pillars, i)
+    if kind == "curvature_tent":
+        pillars, i, curv = tuple(p["pillars"]), int(p["index"]), float(p["curv"])
+        k_cap = float(p.get("k_cap", 0.5))
+        return lambda k, T: curv * saturated_k(k, k_cap) ** 2 * tent(T, pillars, i)
+    if kind == "shift_k":
+        delta = float(p["delta"])
+        return lambda k, T: base.implied_vol_k(k + delta, T) - base.implied_vol_k(k, T)
+    if kind == "atm_shift":
+        delta, factor = float(p["delta"]), float(p.get("factor", 1.0))
+        return lambda k, T: factor * delta * atm_skew_numeric(base, T) * np.ones_like(k)
+    if kind == "total_variance":
+        from volsto.market.varswap import xi0_curve
+
+        eps, t_lo, t_hi = float(p["eps"]), float(p["t_lo"]), float(p["t_hi"])
+        xi0 = xi0_curve(base, min(base.max_maturity, max(t_hi + 1.0, 5.0)))
+
+        def ds(k: FloatArray, T: FloatArray) -> FloatArray:
+            T_ = np.asarray(T, dtype=np.float64)
+            hi = np.minimum(T_, t_hi)
+            dw = eps * np.where(hi > t_lo, xi0.integral(t_lo, np.maximum(hi, t_lo)), 0.0)
+            w = base.total_variance(k, T_)
+            return np.asarray(
+                np.sqrt(np.maximum(w + dw, 1e-12) / T_) - np.sqrt(w / T_), dtype=np.float64
+            )
+
+        return ds
+    if kind == "roll":
+        dt = float(p["dt"])
+        fc = base.forward_curve
+
+        def ds_roll(k: FloatArray, T: FloatArray) -> FloatArray:
+            T_ = np.asarray(T, dtype=np.float64)
+            shift = np.asarray(fc.drift(T_, T_ + dt))  # ln F(T+dt) − ln F(T)
+            return base.implied_vol_k(k - shift, T_ + dt) - base.implied_vol_k(k, T_)
+
+        return ds_roll
+    if kind == "table":
+        ks = np.asarray(p["ks"], dtype=np.float64)
+        ts = np.asarray(p["ts"], dtype=np.float64)
+        values = np.asarray(p["values"], dtype=np.float64).reshape(ts.size, ks.size)
+        return lambda k, T: _bilinear(
+            ks, ts, values, np.asarray(k, dtype=np.float64), np.asarray(T, dtype=np.float64)
+        )
+    if kind == "composite":
+        from volsto.config import SurfacePerturbation
+
+        parts = [
+            delta_sigma_from_config(SurfacePerturbation(**it) if isinstance(it, dict) else it, base)
+            for it in p["items"]
+        ]
+        return lambda k, T: sum((f(k, T) for f in parts), np.zeros(np.broadcast(k, T).shape))
+    raise ValueError(f"unknown perturbation kind {kind!r}")
+
+
+def perturbed_surface(
+    cfg: SurfacePerturbation | None, base: ImpliedSurface, *, check: bool = True
+) -> ImpliedSurface:
+    """``base`` itself when ``cfg`` is None, else the checked :class:`PerturbedSurface`."""
+    if cfg is None:
+        return base
+    return PerturbedSurface(base, delta_sigma_from_config(cfg, base), cfg.kind, check=check)

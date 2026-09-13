@@ -209,6 +209,18 @@ class LocalVolSurface:
         w = np.clip((t - tg[i]) / (tg[i + 1] - tg[i]), 0.0, 1.0)
         return i.astype(np.int64), np.asarray(w, dtype=np.float64)
 
+    def reanchored(self, forward_curve: ForwardCurve) -> LocalVolSurface:
+        """The same ``σ_loc(t, S)`` re-expressed on the ``k`` grid of a new forward curve (a spot
+        bump with the local vol held fixed in spot, the "model" regime for pure LV): each slice is
+        shifted by ``ln F_new(t) − ln F_old(t)`` by linear interpolation in ``k``, flat outside."""
+        shift = np.asarray(forward_curve.log_forward(self.t_grid)) - np.asarray(
+            self.forward_curve.log_forward(self.t_grid)
+        )
+        out = np.empty_like(self.local_var)
+        for j in range(self.t_grid.size):
+            out[j] = np.interp(self.k_grid + shift[j], self.k_grid, self.local_var[j])
+        return LocalVolSurface(self.t_grid, self.k_grid, out, forward_curve, self.diagnostics)
+
     def var_at_times(self, times: ArrayLike) -> FloatArray:
         """``σ_loc²(t_j, k)`` for every ``t_j`` on the ``k`` grid: shape ``(len(times), n_k)``."""
         t = np.atleast_1d(np.asarray(times, dtype=np.float64))

@@ -253,7 +253,11 @@ class BergomiSV(Model):
     """Pure two-factor (or 1F when ``θ = 0``) lognormal Bergomi model with ``L ≡ 1``."""
 
     def __init__(
-        self, params: BergomiParams, xi0: ForwardVarianceCurve, forward_curve: ForwardCurve
+        self,
+        params: BergomiParams,
+        xi0: ForwardVarianceCurve,
+        forward_curve: ForwardCurve,
+        x0: ArrayLike | None = None,
     ) -> None:
         self.params = params
         self.xi0 = xi0
@@ -267,6 +271,11 @@ class BergomiSV(Model):
         corr = params.correlation_matrix
         self.rho_s = np.ascontiguousarray(corr[0, 1 : 1 + self.n_factors])
         self.corr_x = np.ascontiguousarray(corr[1 : 1 + self.n_factors, 1 : 1 + self.n_factors])
+        # initial factor state (zero unless bumped: attribution and SSR state bumps, M5/M7); the
+        # t = 0 forward variance curve is then ξ₀^T exp(ω x_0^T) with x_0^T the decayed x0
+        self.x0 = np.zeros(self.n_factors) if x0 is None else np.asarray(x0, dtype=np.float64)
+        if self.x0.shape != (self.n_factors,):
+            raise ValueError("x0 must have one entry per factor")
 
     # -- deterministic pieces ------------------------------------------------------------------
 
@@ -343,25 +352,30 @@ class BergomiSV(Model):
     # -- Model interface -----------------------------------------------------------------------
 
     def initial_state(self, n_paths: int) -> ModelState:
+        fac = np.tile(self.x0, (n_paths, 1))
         return ModelState(
             0.0,
             np.full(n_paths, np.log(self.spot)),
-            np.full(n_paths, float(self.xi0.xi0(0.0))),
-            np.zeros((n_paths, self.n_factors)),
+            self.variance_from_factors(0.0, fac),
+            fac,
         )
 
     def instantaneous_variance(self, state: ModelState) -> FloatArray:
         return self.variance_from_factors(state.t, state.factors)
 
     def bump(self, **kwargs: Any) -> BergomiSV:
-        """Supported: any :class:`BergomiParams` field, ``xi0`` (curve), ``xi0_scale``, ``spot``."""
+        """Supported: any :class:`BergomiParams` field, ``xi0`` (curve), ``xi0_scale``, ``spot``,
+        ``x0`` (initial factor state)."""
         params = self.params
         xi0 = self.xi0
         fc = self.forward_curve
+        x0 = self.x0
         changes: dict[str, float] = {}
         for key, val in kwargs.items():
             if key in BergomiParams.__dataclass_fields__:
                 changes[key] = float(val)
+            elif key == "x0":
+                x0 = np.asarray(val, dtype=np.float64)
             elif key == "xi0":
                 xi0 = val
             elif key == "xi0_scale":
@@ -374,7 +388,7 @@ class BergomiSV(Model):
                 raise ValueError(f"BergomiSV.bump: unknown parameter {key!r}")
         if changes:
             params = params.replace(**changes)
-        return BergomiSV(params, xi0, fc)
+        return BergomiSV(params, xi0, fc, x0)
 
     def step_tables(
         self, t_nodes: FloatArray, scheme: SchemeConfig
@@ -413,11 +427,11 @@ class BergomiSV(Model):
         state = self.initial_state(n)
         out.log_spot[:, 0] = state.log_spot
         out.variance[:, 0] = state.variance
-        out.factors[:, 0, :] = 0.0
+        out.factors[:, 0, :] = state.factors
         out.int_var[:, 0] = 0.0
         out.sum_sq[:, 0] = 0.0
         ls = state.log_spot.copy()
-        fac = np.zeros((n, nf))
+        fac = np.ascontiguousarray(state.factors.copy())
         iv = np.zeros(n)
         sq = np.zeros(n)
         ln_f = np.asarray(self.forward_curve.log_forward(grid.times), dtype=np.float64)

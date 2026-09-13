@@ -8,7 +8,9 @@ products whose prices sum to the product's price.  ``__repr__`` reads like a ter
 
 from __future__ import annotations
 
+import copy
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -87,8 +89,74 @@ class Product(ABC):
     def df(self, t: ArrayLike) -> FloatArray:
         return self.discount.df(t)
 
+    def with_discount(self, discount: DiscountCurve) -> Product:
+        """A copy of the product discounting with ``discount`` (the risk engine rebinds products
+        to the priced state's rate curve, so rate bumps move forwards and discounting alike);
+        composite products propagate to their legs."""
+        new = copy.copy(self)
+        new.discount = discount
+        return new
+
+    def aged(self, dt: float) -> Product:
+        """The same contract seen ``dt`` years later with the state held (theta, fixing risk):
+        every fixing after ``dt`` moves earlier by ``dt``; a fixing inside ``(0, dt]`` raises
+        because the product would have fixed in the roll window (SPEC v2 §7.3)."""
+        raise NotImplementedError(f"{type(self).__name__} cannot be aged")
+
     @abstractmethod
     def __repr__(self) -> str: ...
+
+
+class Portfolio(Product):
+    """Weighted sum of products (each leg discounts itself); the risk layer's composite for
+    after-fixing structures and test portfolios (straddles, risk reversals)."""
+
+    def __init__(self, legs: Sequence[Product], weights: Sequence[float] | None = None) -> None:
+        if not legs:
+            raise ValueError("a portfolio needs at least one leg")
+        super().__init__(legs[0].discount, 1.0)
+        self.legs = list(legs)
+        self.weights = [1.0] * len(self.legs) if weights is None else [float(w) for w in weights]
+        if len(self.weights) != len(self.legs):
+            raise ValueError("one weight per leg")
+
+    @property
+    def fixing_times(self) -> FloatArray:
+        return np.unique(np.concatenate([leg.fixing_times for leg in self.legs]))
+
+    @property
+    def pay_times(self) -> FloatArray:
+        return np.unique(np.concatenate([leg.pay_times for leg in self.legs]))
+
+    def payoff(self, paths: PathSet, idx: FixingIndex) -> FloatArray:
+        total = np.zeros(paths.n_paths)
+        for w, leg in zip(self.weights, self.legs, strict=True):
+            total += w * leg.payoff(paths, idx)
+        return total
+
+    def decompose(self) -> list[Product]:
+        return list(self.legs)
+
+    def with_discount(self, discount: DiscountCurve) -> Product:
+        return Portfolio([leg.with_discount(discount) for leg in self.legs], self.weights)
+
+    def aged(self, dt: float) -> Product:
+        return Portfolio([leg.aged(dt) for leg in self.legs], self.weights)
+
+    def __repr__(self) -> str:
+        parts = ", ".join(f"{w:g} x [{leg!r}]" for w, leg in zip(self.weights, self.legs))
+        return f"Portfolio({parts})"
+
+
+def shift_times(times: ArrayLike, dt: float) -> FloatArray:
+    """Fixings moved earlier by ``dt``; ``t = 0`` (already fixed at the spot) stays; a fixing in
+    ``(0, dt]`` raises."""
+    t = np.atleast_1d(np.asarray(times, dtype=np.float64))
+    if dt <= 0:
+        raise ValueError("dt must be positive")
+    if np.any((t > 0) & (t <= dt + 1e-12)):
+        raise ValueError(f"a fixing lies inside the roll window (0, {dt:g}]")
+    return np.asarray(np.where(t > 0, t - dt, 0.0), dtype=np.float64)
 
 
 class CashFlow(Product):
@@ -111,6 +179,11 @@ class CashFlow(Product):
 
     def payoff(self, paths: PathSet, idx: FixingIndex) -> FloatArray:
         return np.full(paths.n_paths, self.notional * self.amount * float(self.df(self.T)))
+
+    def aged(self, dt: float) -> Product:
+        return CashFlow(
+            self.amount, float(shift_times([self.T], dt)[0]), self.discount, self.notional
+        )
 
     def __repr__(self) -> str:
         return f"Cash flow: {self.amount:g} x notional {self.notional:g} paid at {self.T:g}y"

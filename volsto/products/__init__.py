@@ -2,7 +2,15 @@
 
 from __future__ import annotations
 
-from volsto.products.base import CashFlow, Product, daily_schedule, parse_cp, uniform_schedule
+from volsto.products.base import (
+    CashFlow,
+    Portfolio,
+    Product,
+    daily_schedule,
+    parse_cp,
+    shift_times,
+    uniform_schedule,
+)
 from volsto.products.cliquet import AccumulatedSumOption, AdditiveCliquet, Napoleon, ReverseCliquet
 from volsto.products.conditional_variance import (
     ConditionalVarianceSwap,
@@ -36,6 +44,7 @@ __all__ = [
     "ForwardVarianceSwap",
     "KnockOutVarianceSwap",
     "Napoleon",
+    "Portfolio",
     "Product",
     "ReverseCliquet",
     "StatisticLeg",
@@ -46,5 +55,6 @@ __all__ = [
     "daily_schedule",
     "forward_start_strip",
     "parse_cp",
+    "shift_times",
     "uniform_schedule",
 ]

@@ -5,7 +5,7 @@ studies: Black–Scholes, Dupire local vol, two-factor lognormal Bergomi forward
 LSV with particle-calibrated leverage, Monte Carlo with common random numbers, and viewers over a
 precomputed parameter cache.  The full design is in [SPEC.md](SPEC.md).
 
-Status: **M4** — market layer, BS, local vol, MC engine, vanilla / variance products (M1); the
+Status: **M5** — market layer, BS, local vol, MC engine, vanilla / variance products (M1); the
 two-factor lognormal Bergomi forward-variance model with exact factor stepping, its closed forms
 and the mixing-solution smile (M2); particle-method leverage calibration, the LSV model, §4.2
 repricing diagnostics and the content-addressed leverage cache (M3); the HistoricalData.net
@@ -13,7 +13,10 @@ option-chain importer and SSVI/eSSVI fitter (M3b); forward-start options, the FV
 family with exact decompositions, forward-smile analytics and the headline study runner (M4);
 the second-order SV spot step, the adaptive particle-regression grid and the restored
 1/1460–1/365–1/250 schedule (M4b); conditional / corridor / knock-out variance swaps and the
-volatility knock-out put with production-count (8e5-particle) headline baselines (M4c).
+volatility knock-out put with production-count (8e5-particle) headline baselines (M4c). Risk layer (M5): CRN bump-and-reprice engine with recalibration through the
+leverage cache, five delta regimes, vega variants, theta split, vega-T waves, forward-variance /
+skew / curvature ladders, spot and cliquet gamma profiles, parameter sensitivities, product risks,
+likelihood-ratio / conditional / control-variate estimators, P&L attribution and `RiskReport`.
 
 ## Install
 
@@ -148,6 +151,35 @@ vol, the forward variance swap and the forward vol swap on one path set
 (`forward_vol_comparison`) and lays forward smiles of several models side by side
 (`put_wing_table`).  `scripts/m4_headline.py` (`volsto.studies.m4`) reproduces the M4 headline
 table: LV and the 1F LSV for ω = 1, 2, 3 and the 2F Table 8.2 set on the reference surface.
+
+## Risk layer (M5)
+
+```python
+from volsto.calibration import LeverageCache
+from volsto.config import CalibrationSpec, SimConfig, load_yaml
+from volsto.products import EuropeanOption
+from volsto.risk import LSVBuilder, RiskEngine, RiskState, delta_table, explain, risk_report
+from volsto.risk.engine import surface_of
+
+state = RiskState(load_yaml("configs/studies/lsv_reference_1f.yaml", CalibrationSpec))
+engine = RiskEngine(LSVBuilder(LeverageCache("cache"), state), SimConfig(n_paths=200_000))
+call = EuropeanOption(100.0, 1.0, 1, surface_of(state).discount)
+print(delta_table(engine, call, state))          # model / sticky-strike / -moneyness / -skew / -local-vol
+report = risk_report(engine, call, state)         # every sensitivity with stderr, bump specs, cache keys
+print(report.summary()); report.to_excel("outputs/call_risk.xlsx")
+pnl = explain(engine, call, state, state.with_spot(102.0), dt=1 / 252)   # sequential CRN attribution
+```
+
+Every bump is a `SurfacePerturbation` layer on the implied surface (arbitrage checks re-run,
+halve-and-retry with the achieved size reported) or a state change (`with_spot`, `with_params`,
+`with_rate_shift`, `with_x0`); surface and parameter bumps recalibrate the leverage through the
+cache (each bumped state is a cache entry), spot and factor bumps do not (`"model"` regime).
+Sensitivities are per-path CRN differences with the standard error of the difference.
+Conventions and measured findings: SPEC §7 and §7.15 (forward-variance buckets are sized on the
+log-contract strip; skew / curvature bumps use a saturating profile; the cliquet Bachelier
+cross-check is an approximation even under Black–Scholes — the exact independent-legs reference
+is `bs_cliquet_value_mc`).  `scripts/m5_budget.py` runs the full report under the reference LSV
+and prints the recalibration count and wall clock (the viewer precompute budget).
 
 ## Development
 

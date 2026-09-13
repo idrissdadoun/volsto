@@ -708,12 +708,38 @@ class ParticleConfig:
 
 
 @dataclass(frozen=True)
+class SurfacePerturbation:
+    """Additive perturbation layer on the implied surface (SPEC v2 §7.1): ``δσ(k, T)`` added to
+    the implied vol of the base SSVI surface, reused by every risk bump and delta regime.
+
+    ``kind`` and the YAML-safe ``params`` are hashed into the leverage cache key, so every
+    recalibrating bump is a cache entry.  Kinds (built in :func:`volsto.market.surface.
+    perturbed_surface`): ``parallel`` (size), ``tent`` (pillars, index, size), ``skew_tent``
+    (pillars, index, slope: ``slope · k · tent``), ``curvature_tent`` (pillars, index, curv:
+    ``curv · k² · tent``), ``shift_k`` (delta: ``σ(k + delta, T) − σ(k, T)``, the sticky-strike
+    regime), ``atm_shift`` (delta, factor: ``factor · s_T · delta`` with ``s_T`` the base ATM skew,
+    the sticky-skew / sticky-local-vol regimes), ``total_variance`` (eps, t_lo, t_hi: the
+    forward-variance bucket bump ``w → w + eps ∫_{bucket ∩ [0,T]} ξ₀``), ``roll`` (dt: the surface
+    held in (K, absolute expiry) seen ``dt`` later), ``table`` (ks, ts, values: bilinear ``δσ``),
+    ``composite`` (items: list of perturbation mappings, summed).
+    """
+
+    kind: str
+    params: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.kind:
+            raise ValueError("perturbation kind must be a non-empty string")
+
+
+@dataclass(frozen=True)
 class CalibrationSpec:
     """Everything that determines a calibrated leverage function (SPEC §4.3 cache key).
 
-    The cache key hashes ``key_payload()``: market, surface, model parameters, particle settings,
-    the local-vol grid, and the parts of :class:`SimConfig` the kernel depends on (step schedule
-    and scheme).  Pricing-only settings (``n_paths``, pricing seed, chunking) are excluded.
+    The cache key hashes ``key_payload()``: market, surface, its perturbation layer (M5), model
+    parameters, particle settings, the local-vol grid, and the parts of :class:`SimConfig` the
+    kernel depends on (step schedule and scheme).  Pricing-only settings (``n_paths``, pricing
+    seed, chunking) are excluded.
     """
 
     market: MarketConfig
@@ -722,10 +748,11 @@ class CalibrationSpec:
     particle: ParticleConfig = field(default_factory=ParticleConfig)
     sim: SimConfig = field(default_factory=SimConfig)
     local_vol: LocalVolConfig | None = None
+    perturbation: SurfacePerturbation | None = None
 
     def key_payload(self) -> dict[str, Any]:
         sim = self.sim
-        return {
+        payload = {
             "market": to_mapping(self.market),
             "surface": to_mapping(self.surface),
             "model": to_mapping(self.model),
@@ -734,3 +761,6 @@ class CalibrationSpec:
             "schedule": to_mapping(sim.step_schedule),
             "scheme": to_mapping(sim.scheme),
         }
+        if self.perturbation is not None:
+            payload["perturbation"] = to_mapping(self.perturbation)
+        return payload

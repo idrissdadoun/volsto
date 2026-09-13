@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
-from volsto.products.base import Product
+from volsto.products.base import Product, shift_times
 from volsto.products.conditional_variance import RealisedVarianceSchedule
 from volsto.products.vanilla import EuropeanOption
 
@@ -112,6 +112,20 @@ class VolKnockOutPut(RealisedVarianceSchedule):
                 knock_in=True,
             ),
         ]
+
+    def aged(self, dt: float) -> Product:
+        t = shift_times(self._fixings, dt)
+        return VolKnockOutPut(
+            self.strike,
+            float(t[-1]),
+            self.vol_ko,
+            t,
+            self.discount,
+            daily_cap=self.daily_cap,
+            annualisation=self.annualisation,
+            notional=self.notional,
+            knock_in=self.knock_in,
+        )
 
     def __repr__(self) -> str:
         kind = "knock-in" if self.knock_in else "knock-out"
