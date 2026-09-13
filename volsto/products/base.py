@@ -52,6 +52,10 @@ def daily_schedule(maturity: float, per_year: int = 252, start: float = 0.0) -> 
 class Product(ABC):
     """Abstract single-underlying product."""
 
+    #: Set to ``True`` when the payoff needs the spot at every simulation step between fixings
+    #: (e.g. Brownian-bridge barrier corrections); the engine then records all grid steps.
+    requires_all_steps: bool = False
+
     def __init__(self, discount: DiscountCurve, notional: float = 1.0) -> None:
         if not np.isfinite(notional):
             raise ValueError("notional must be finite")

@@ -39,7 +39,7 @@ def _dollar_gamma_identity(
     drift = np.asarray(ssvi.forward_curve.drift(t, T))
     nums, dens = [], []
     for p0 in range(0, n_paths, cfg.chunk_size):
-        paths = model.simulate_chunk(grid, draws, p0, min(p0 + cfg.chunk_size, n_paths))
+        paths = model.simulate_chunk(grid, draws, p0, min(p0 + cfg.chunk_size, n_paths), cfg.scheme)
         S = paths.spot_at(cols)
         var_loc = paths.variance_at(cols)
         d1 = (np.log(S) + drift - np.log(K)) / (sig * np.sqrt(tau)) + 0.5 * sig * np.sqrt(tau)

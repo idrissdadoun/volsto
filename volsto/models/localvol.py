@@ -1,12 +1,32 @@
-"""Dupire local-volatility model and the shared log-Euler spot kernel (SPEC §3.2).
+"""Dupire local-volatility model and the shared spot-step kernel (SPEC §3.1–3.2, owner
+amendment after M1).
 
-Step (SPEC §3.1, variance frozen over the step):
+Step over ``[t_n, t_{n+1}]`` (log-Euler with the variance frozen over the step):
 
-    ln S_{i+1} = ln S_i + ∫_{t_i}^{t_{i+1}} (r − q) du − ½ σ²(t_i, S_i) Δt_i + σ(t_i, S_i) √Δt_i Z_i
+    ln S_{n+1} = ln S_n + ∫ (r − q) du − ½ v_n Δt_n + √(v_n Δt_n) Z_n
 
-with ``σ = σ_loc(t, S)`` interpolated bilinearly on the ``(t, k = ln S/F(t))`` grid.  The kernel
-also accumulates ``∫ σ² dt`` and ``Σ (Δ ln S)²``.  Black–Scholes uses the same kernel with a flat
-grid.  Checked by ``tests/test_surface.py::test_local_vol_mc_reprices_ssvi``.
+where the step variance ``v_n`` is chosen by :class:`~volsto.config.SchemeConfig`:
+
+* plain: ``v_n = σ²(t_n, S_n)`` (``local_var_time_average=False``, ``time_eval="start"``);
+* midpoint diagnostic: ``v_n = σ²(t_n + Δt/2, S_n)``;
+* time average (default): ``v_n = (1/Δt) ∫_{t_n}^{t_{n+1}} σ²(u, S_n) du``, exact for the
+  piecewise-linear-in-``t`` local-variance grid, evaluated at ``k_n = ln S_n − ln F(t_n)``;
+* predictor–corrector (default; weak predictor–corrector of Kloeden–Platen §15.5 with
+  θ = η = ½, the local-vol analogue of Andersen's θ = ½ step): Euler predictor ``x̄`` with
+  ``v_n``, then
+
+      x_{n+1} = x_n + [μ − ½ v̂ − ¼ ∂ₓv̂] Δt + √(v̂ Δt) Z,   v̂ = ½ [v_n(x_n) + v_n'(x̄)],
+
+  where ``v_n'`` is the end-of-step (or, with time averaging, the same step-averaged) variance
+  at ``x̄`` and ``∂ₓv̂`` averages the ``k``-slopes at ``x_n`` and ``x̄``.  The drift term
+  ``−¼ ∂ₓv̂`` is the Itô correction ``−η b b'`` required because the corrector's diffusion
+  coefficient depends on the predictor (and hence on ``Z``); without it ``E[√v̂ Z] ≠ 0`` and the
+  forward is not preserved.  One extra lookup per step.
+
+The kernel also accumulates ``∫ v dt`` and ``Σ (Δ ln S)²`` and records the state at fixing
+columns.  Variance tables are per-step rows on the uniform ``k`` grid, so a lookup is O(1).
+Black–Scholes uses the same kernel with a flat table.  Checked by ``tests/test_surface.py``
+(local-vol MC reprices SSVI) and ``tests/test_scheme.py`` (bias vs scheme options and dt).
 """
 
 from __future__ import annotations
@@ -17,15 +37,41 @@ import numpy as np
 from numpy.typing import NDArray
 
 from volsto._numba import njit, prange
+from volsto.config import SchemeConfig
 from volsto.engine.grid import TimeGrid
 from volsto.engine.paths import PathSet
 from volsto.engine.rng import GaussianDraws
 from volsto.market.curves import ForwardCurve
-from volsto.market.dupire import LocalVolSurface, bilinear_flat
+from volsto.market.dupire import LocalVolSurface
 from volsto.models.base import Model, ModelState
 
 FloatArray = NDArray[np.float64]
 IntArray = NDArray[np.int64]
+
+
+@njit(cache=True)
+def interp_uniform(k0: float, dk: float, row: FloatArray, k: float) -> float:  # pragma: no cover
+    """Linear interpolation on a uniform grid ``k0 + i dk`` with flat extrapolation."""
+    n = row.shape[0]
+    x = (k - k0) / dk
+    if x <= 0.0:
+        return float(row[0])
+    if x >= n - 1:
+        return float(row[n - 1])
+    i = int(x)
+    w = x - i
+    return float((1.0 - w) * row[i] + w * row[i + 1])
+
+
+@njit(cache=True)
+def slope_uniform(k0: float, dk: float, row: FloatArray, k: float) -> float:  # pragma: no cover
+    """Slope ``∂row/∂k`` of the linear interpolant in the cell containing ``k`` (0 outside)."""
+    n = row.shape[0]
+    x = (k - k0) / dk
+    if x <= 0.0 or x >= n - 1:
+        return 0.0
+    i = int(x)
+    return float((row[i + 1] - row[i]) / dk)
 
 
 @njit(parallel=True, cache=True)
@@ -38,9 +84,13 @@ def diffuse_block(
     ln_f_nodes: FloatArray,
     drifts: FloatArray,
     step_record: IntArray,
-    tg: FloatArray,
-    kg: FloatArray,
-    local_var: FloatArray,
+    k0: float,
+    dk: float,
+    var_a: FloatArray,
+    var_b: FloatArray,
+    var_rec: FloatArray,
+    mode: int,
+    eta: float,
     out_log_spot: FloatArray,
     out_var: FloatArray,
     out_int_var: FloatArray,
@@ -49,8 +99,11 @@ def diffuse_block(
     """Advance all paths over a block of steps (pure array function; see module docstring).
 
     ``z`` is ``(n_paths, n_block, ≥1)``; ``t_nodes``/``ln_f_nodes`` have ``n_block + 1`` entries;
-    ``drifts[j] = ∫ (r − q)`` over step ``j``; ``step_record[j] ≥ 0`` is the output column to fill
-    after step ``j``.  State arrays are updated in place.
+    ``drifts[j] = ∫ (r − q)`` over step ``j``; ``var_a[j]``/``var_b[j]`` are the start-point and
+    corrector variance rows for step ``j`` on the uniform ``k`` grid ``(k0, dk)``; ``var_rec[j]``
+    is the instantaneous variance at ``t_{j+1}`` used when ``step_record[j] ≥ 0`` selects an
+    output column; ``mode`` is 0 (plain), 1 (predictor–corrector with diffusion weight ``eta``)
+    or 2 (Platen weak order 2).  State arrays are updated in place.
     """
     n = log_spot.shape[0]
     nb = z.shape[1]
@@ -60,22 +113,77 @@ def diffuse_block(
         sq = sum_sq[p]
         for j in range(nb):
             dt = t_nodes[j + 1] - t_nodes[j]
-            var = bilinear_flat(tg, kg, local_var, t_nodes[j], ls - ln_f_nodes[j])
-            dls = drifts[j] - 0.5 * var * dt + np.sqrt(var * dt) * z[p, j, 0]
+            zj = z[p, j, 0]
+            k = ls - ln_f_nodes[j]
+            v = interp_uniform(k0, dk, var_a[j], k)
+            if mode == 1:
+                # weak predictor-corrector (Kloeden-Platen 15.5.4): drift averaged with theta = 1/2
+                # between (t_n, x_n) and (t_{n+1}, x_pred), diffusion variance weighted
+                # (1-eta, eta);
+                # the drift carries the Ito correction -eta b b' = -(eta/2) dv/dx because the
+                # corrector's diffusion depends on the predictor and hence on Z
+                x_pred = ls + drifts[j] - 0.5 * v * dt + np.sqrt(v * dt) * zj
+                k_pred = x_pred - ln_f_nodes[j + 1]
+                v_pred = interp_uniform(k0, dk, var_b[j], k_pred)
+                slope = 0.5 * (
+                    slope_uniform(k0, dk, var_a[j], k) + slope_uniform(k0, dk, var_b[j], k_pred)
+                )
+                v_diff = (1.0 - eta) * v + eta * v_pred
+                a_avg = -0.25 * (v + v_pred) - 0.5 * eta * slope
+                dls = drifts[j] + a_avg * dt + np.sqrt(v_diff * dt) * zj
+                v = v_diff
+            elif mode == 2:
+                # Platen explicit weak order-2 scheme (Kloeden-Platen 15.1.3) for
+                # dx = a dt + b dW, a = mu - v/2, b = sqrt(v); supporting values at t_{n+1}
+                sdt = np.sqrt(dt)
+                b0 = np.sqrt(v)
+                a0 = drifts[j] - 0.5 * v * dt  # a * dt at (t_n, x_n)
+                x_bar = ls + a0 + b0 * sdt * zj
+                x_up = ls + a0 + b0 * sdt
+                x_dn = ls + a0 - b0 * sdt
+                v_bar = interp_uniform(k0, dk, var_b[j], x_bar - ln_f_nodes[j + 1])
+                b_up = np.sqrt(interp_uniform(k0, dk, var_b[j], x_up - ln_f_nodes[j + 1]))
+                b_dn = np.sqrt(interp_uniform(k0, dk, var_b[j], x_dn - ln_f_nodes[j + 1]))
+                a1 = drifts[j] - 0.5 * v_bar * dt  # a * dt at (t_{n+1}, x_bar)
+                dls = (
+                    0.5 * (a0 + a1)
+                    + 0.25 * (b_up + b_dn + 2.0 * b0) * sdt * zj
+                    + 0.25 * (b_up - b_dn) * sdt * (zj * zj - 1.0)
+                )
+                v = 0.5 * (v + v_bar)
+            else:
+                dls = drifts[j] - 0.5 * v * dt + np.sqrt(v * dt) * zj
             ls += dls
-            iv += var * dt
+            iv += v * dt
             sq += dls * dls
             col = step_record[j]
             if col >= 0:
                 out_log_spot[p, col] = ls
-                out_var[p, col] = bilinear_flat(
-                    tg, kg, local_var, t_nodes[j + 1], ls - ln_f_nodes[j + 1]
-                )
+                out_var[p, col] = interp_uniform(k0, dk, var_rec[j], ls - ln_f_nodes[j + 1])
                 out_int_var[p, col] = iv
                 out_sum_sq[p, col] = sq
         log_spot[p] = ls
         int_var[p] = iv
         sum_sq[p] = sq
+
+
+def step_variance_tables(
+    lv: LocalVolSurface, t_nodes: FloatArray, scheme: SchemeConfig
+) -> tuple[FloatArray, FloatArray]:
+    """``(var_a, var_b)`` rows for the steps between ``t_nodes`` under ``scheme``.
+
+    ``var_a`` is looked up at ``(t_n, x_n)``, ``var_b`` at the predictor/supporting points.  The
+    weak order-2 scheme always uses start/end-of-step values (its trapezoidal time treatment
+    replaces time averaging).
+    """
+    if scheme.local_var_time_average and not scheme.weak_order2:
+        va = lv.var_time_average(t_nodes)
+        return va, va
+    if scheme.local_var_time_eval == "midpoint":
+        vm = lv.var_at_times(0.5 * (t_nodes[:-1] + t_nodes[1:]))
+        return vm, vm
+    vs = lv.var_at_times(t_nodes)
+    return np.ascontiguousarray(vs[:-1]), np.ascontiguousarray(vs[1:])
 
 
 class LocalVol(Model):
@@ -113,7 +221,14 @@ class LocalVol(Model):
         return LocalVol(lv, fc)
 
     def simulate_chunk(
-        self, grid: TimeGrid, draws: GaussianDraws, p0: int, p1: int, *, step_block: int = 64
+        self,
+        grid: TimeGrid,
+        draws: GaussianDraws,
+        p0: int,
+        p1: int,
+        scheme: SchemeConfig,
+        *,
+        step_block: int = 64,
     ) -> PathSet:
         n = p1 - p0
         out = PathSet.empty(n, grid.record_times, 0)
@@ -128,21 +243,30 @@ class LocalVol(Model):
         ln_f = np.asarray(self.forward_curve.log_forward(grid.times), dtype=np.float64)
         drifts = np.diff(ln_f)
         lv = self.local_vol
+        mode = 2 if scheme.weak_order2 else (1 if scheme.predictor_corrector else 0)
         for s0 in range(0, grid.n_steps, step_block):
             s1 = min(s0 + step_block, grid.n_steps)
+            t_nodes = grid.times[s0 : s1 + 1]
+            rec = grid.step_record[s0:s1]
+            var_a, var_b = step_variance_tables(lv, t_nodes, scheme)
+            var_rec = lv.var_at_times(t_nodes[1:]) if np.any(rec >= 0) else var_a
             z = draws.block(s0, s1, p0, p1)
             diffuse_block(
                 ls,
                 iv,
                 sq,
                 z,
-                grid.times[s0 : s1 + 1],
+                t_nodes,
                 ln_f[s0 : s1 + 1],
                 drifts[s0:s1],
-                grid.step_record[s0:s1],
-                lv.t_grid,
-                lv.k_grid,
-                lv.local_var,
+                rec,
+                lv.k0,
+                lv.dk,
+                var_a,
+                var_b,
+                var_rec,
+                mode,
+                scheme.pc_eta,
                 out.log_spot,
                 out.variance,
                 out.int_var,

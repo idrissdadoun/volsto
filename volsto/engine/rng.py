@@ -111,3 +111,34 @@ class GaussianDraws:
             f"GaussianDraws(seed={self.seed}, n_paths={self.n_paths}, n_steps={self.n_steps}, "
             f"n_brownians={self.n_brownians}, antithetic={self.antithetic})"
         )
+
+
+class CoarsenedDraws(GaussianDraws):
+    """Brownian-consistent coarsening of a finer draw stream for refinement studies.
+
+    Coarse step ``s`` aggregates fine steps ``[m s, m s + m)`` as ``Σ z_i / √m``, so the coarse
+    and fine simulations see the *same* Brownian path at the coarse times.  Differences such as
+    ``P(dt) − P(dt/2)`` are then common-random-number exact, which is what Talay–Tubaro Richardson
+    extrapolation and the order diagnostics in :mod:`volsto.engine.richardson` need.
+    """
+
+    def __init__(self, fine: GaussianDraws, factor: int) -> None:
+        if factor < 1 or fine.n_steps % factor:
+            raise ValueError("factor must divide the fine number of steps")
+        self.fine = fine
+        self.factor = int(factor)
+        self.seed = fine.seed
+        self.n_paths = fine.n_paths
+        self.n_steps = fine.n_steps // self.factor
+        self.n_brownians = fine.n_brownians
+        self.antithetic = fine.antithetic
+
+    def normals(self, step: int, p0: int, p1: int) -> FloatArray:
+        if not 0 <= step < self.n_steps:
+            raise ValueError("step out of range")
+        m = self.factor
+        z = self.fine.block(step * m, (step + 1) * m, p0, p1)
+        return np.asarray(z.sum(axis=1) / np.sqrt(m), dtype=np.float64)
+
+    def __repr__(self) -> str:
+        return f"CoarsenedDraws(factor={self.factor}, fine={self.fine!r})"

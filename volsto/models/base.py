@@ -15,7 +15,7 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
-from volsto.config import SimConfig
+from volsto.config import SchemeConfig, SimConfig
 from volsto.engine.grid import TimeGrid
 from volsto.engine.paths import PathSet
 from volsto.engine.rng import GaussianDraws
@@ -63,9 +63,16 @@ class Model(ABC):
 
     @abstractmethod
     def simulate_chunk(
-        self, grid: TimeGrid, draws: GaussianDraws, p0: int, p1: int, *, step_block: int = 64
+        self,
+        grid: TimeGrid,
+        draws: GaussianDraws,
+        p0: int,
+        p1: int,
+        scheme: SchemeConfig,
+        *,
+        step_block: int = 64,
     ) -> PathSet:
-        """Simulate paths ``[p0, p1)`` on ``grid`` and record them at the grid's columns."""
+        """Simulate paths ``[p0, p1)`` on ``grid`` under ``scheme``, recording at the columns."""
 
     def required_times(self) -> FloatArray:
         """Extra times the grid must contain (e.g. leverage slices).  Default: none."""
@@ -76,7 +83,7 @@ class Model(ABC):
         if rng.n_paths != cfg.n_paths or rng.n_steps != grid.n_steps:
             raise ValueError("draws do not match cfg / grid")
         parts = [
-            self.simulate_chunk(grid, rng, p0, min(p0 + cfg.chunk_size, cfg.n_paths))
-            for p0 in range(0, cfg.n_paths, cfg.chunk_size)
+            self.simulate_chunk(grid, rng, p0, p1, cfg.scheme)
+            for p0, p1 in cfg.chunk_ranges(grid.n_records, self.n_factors)
         ]
         return PathSet.concat(parts)

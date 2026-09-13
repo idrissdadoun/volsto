@@ -137,7 +137,7 @@ class Model(ABC):
 ```
 `PathSet` holds arrays of shape `(n_paths, n_times)` for `log_spot`, `V` (instantaneous variance), `factors` `(n_paths, n_times, n_factors)`, plus accumulated realised variance `∫V dt` and realised log-return sum-of-squares between consecutive fixing indices. Products access only `PathSet` and a `fixing_index` map from dates to columns. `PathSet` is written so that a second underlying can later be added as an extra leading axis without touching products.
 
-All simulation is log-Euler in the spot with the variance frozen over each step; factors are stepped exactly (§3.3). Step size from `SimConfig.dt_max` (default 1/365) with the union of fixing dates always included.
+All simulation is log-Euler in the spot with the variance frozen over each step; factors are stepped exactly (§3.3). The spot step's variance is chosen by `SchemeConfig` (owner amendment after M1): time-averaged local/forward variance over the step (`local_var_time_average`), an optional weak predictor–corrector (`predictor_corrector`, drift θ = ½ with the Itô correction, diffusion weight `pc_eta`), or — the default — Platen's explicit weak order-2 step (`weak_order2`). Step sizes come from `SimConfig.dt_max`, a `StepSchedule` (default 1/1460 below 3m, 1/365 to 2y, 1/250 after) shared by pricing and calibration, with the union of fixing dates always included; `record_all_steps` records every grid step when a product needs the path between fixings.
 
 ### 3.2 Black–Scholes and local vol
 Trivial. Local vol uses `σ_loc(t, S_t)` interpolated on the grid.
@@ -227,7 +227,19 @@ Numba `@njit(parallel=True)` for the kernel regression (O(N × n_grid); use sort
 Optional second pass: re-run with the calibrated `L` and a fresh seed and average the two `L` surfaces (reduces particle noise).
 
 ### 4.2 Diagnostics
-`calibration/diagnostics.py`: reprice the target surface on a pillar grid (T ∈ {1m, 3m, 6m, 1y, 18m, 2y, 3y}, k ∈ ±{0, 0.05, 0.1, 0.2, 0.3}) with the calibrated LSV via MC (CRN, `n_paths ≥ 4·10⁵`), report implied-vol error in vol points with MC standard error, plus variance-swap strikes vs the replication values. Acceptance: max abs error ≤ 0.15 vol points inside ±20% moneyness for T ≤ 2y (this matches the accuracy achieved in the original study; tighten if cheap).
+`calibration/diagnostics.py`: reprice the target surface on a pillar grid (T ∈ {1m, 3m, 6m, 1y, 18m, 2y, 3y}, k ∈ ±{0, 0.05, 0.1, 0.2, 0.3}) with the calibrated LSV via MC (CRN, `n_paths ≥ 4·10⁵`), report implied-vol error in vol points with MC standard error, plus variance-swap strikes vs the replication values.
+
+Acceptance table (updated after M1; pure local vol measured with the default scheme — Platen weak order 2 — and the default step schedule 1/1460 below 3m, 1/365 to 2y, 1/250 after; 800k paths; `tests/test_scheme.py`, `tests/test_surface.py`):
+
+| Maturity | Pure LV vs SSVI, ATM | Pure LV, ±10% | Pure LV, ±20% | LSV (M3), ±20% |
+|---|---|---|---|---|
+| 1m | ≤ 0.10 vp (measured 0.02) | ≤ 0.20 vp | — | ≤ 0.15 vp |
+| 3m | ≤ 0.10 vp (measured 0.05) | ≤ 0.20 vp | ≤ 0.10 vp | ≤ 0.15 vp |
+| 6m | ≤ 0.10 vp (measured 0.04) | ≤ 0.20 vp | ≤ 0.10 vp | ≤ 0.15 vp |
+| 1y–2y | ≤ 0.10 vp (measured 0.01–0.05) | ≤ 0.10 vp | ≤ 0.10 vp | ≤ 0.15 vp |
+| 3y | — | — | ≤ 0.15 vp | ≤ 0.20 vp |
+
+Variance swaps: MC fair strike vs log-contract replication within 0.05 vol points at 6m–1y. The particle calibration uses exactly the pricing kernel, scheme options and step schedule (`SimConfig`), so the LSV column is a repricing-on-the-same-grid criterion; the original study's 0.15 vp is kept for LSV until M3 measures it (tighten if cheap). For reference, plain log-Euler at uniform dt = 1/365 biased the 1m ATM vol by +0.36 vp and the θ = η = ½ predictor–corrector by +0.78 vp (curvature over-correction); the weak order-2 scheme gives +0.03 vp.
 
 ### 4.3 Cache
 Content-addressed: key = SHA-256 of (surface params, curves, model params, particle config, seed, code version tag). Store leverage `.npz` + diagnostics `.json` + a `manifest.parquet` row. `get_or_calibrate(cfg)` is the only entry point studies and viewers use. Calibration must never run silently inside a viewer; the viewer reads the cache and reports what is missing.

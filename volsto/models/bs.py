@@ -7,6 +7,7 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
+from volsto.config import SchemeConfig
 from volsto.engine.grid import TimeGrid
 from volsto.engine.paths import PathSet
 from volsto.engine.rng import GaussianDraws
@@ -56,9 +57,16 @@ class BlackScholes(Model):
         return BlackScholes(vol, fc)
 
     def simulate_chunk(
-        self, grid: TimeGrid, draws: GaussianDraws, p0: int, p1: int, *, step_block: int = 64
+        self,
+        grid: TimeGrid,
+        draws: GaussianDraws,
+        p0: int,
+        p1: int,
+        scheme: SchemeConfig,
+        *,
+        step_block: int = 64,
     ) -> PathSet:
-        return self._lv.simulate_chunk(grid, draws, p0, p1, step_block=step_block)
+        return self._lv.simulate_chunk(grid, draws, p0, p1, scheme, step_block=step_block)
 
     def __repr__(self) -> str:
         return f"BlackScholes(vol={self.vol}, spot={self.spot})"

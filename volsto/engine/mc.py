@@ -99,8 +99,19 @@ class MonteCarlo:
     # -- helpers -----------------------------------------------------------------------------
 
     def build_grid(self, products: Sequence[Product], model: Model) -> TimeGrid:
+        """Grid from the products' fixings, the model's required times and the step schedule.
+
+        Every grid step is recorded when ``cfg.record_all_steps`` is set or when any product
+        declares ``requires_all_steps`` (e.g. Brownian-bridge barrier corrections).
+        """
         fixings = np.unique(np.concatenate([p.fixing_times for p in products]))
-        return TimeGrid.build(fixings, self.cfg.dt_max, calibration_grid=model.required_times())
+        record_all = self.cfg.record_all_steps or any(p.requires_all_steps for p in products)
+        return TimeGrid.build(
+            fixings,
+            self.cfg.dt_max,
+            calibration_grid=model.required_times(),
+            record_all_steps=record_all,
+        )
 
     def draws_for(self, grid: TimeGrid, model: Model, seed: int | None = None) -> GaussianDraws:
         return GaussianDraws(
@@ -111,16 +122,19 @@ class MonteCarlo:
             self.cfg.antithetic,
         )
 
-    def _chunks(self) -> list[tuple[int, int]]:
-        n, c = self.cfg.n_paths, self.cfg.chunk_size
-        return [(p0, min(p0 + c, n)) for p0 in range(0, n, c)]
+    def _chunks(self, grid: TimeGrid, model: Model) -> list[tuple[int, int]]:
+        return self.cfg.chunk_ranges(grid.n_records, model.n_factors)
 
     # -- simulation --------------------------------------------------------------------------
 
     def simulate(self, model: Model, grid: TimeGrid, draws: GaussianDraws | None = None) -> PathSet:
         """Full :class:`PathSet` (all chunks concatenated) for analytics with modest ``n_paths``."""
         draws = draws or self.draws_for(grid, model)
-        parts = [model.simulate_chunk(grid, draws, p0, p1) for p0, p1 in self._chunks()]
+        scheme = self.cfg.scheme
+        parts = [
+            model.simulate_chunk(grid, draws, p0, p1, scheme)
+            for p0, p1 in self._chunks(grid, model)
+        ]
         return PathSet.concat(parts)
 
     # -- pricing -----------------------------------------------------------------------------
@@ -147,8 +161,9 @@ class MonteCarlo:
         payoffs = np.empty((n, len(products)))
         cpay = np.empty((n, len(controls)))
         idx = grid.fixing_index
-        for p0, p1 in self._chunks():
-            paths = model.simulate_chunk(grid, draws, p0, p1)
+        scheme = self.cfg.scheme
+        for p0, p1 in self._chunks(grid, model):
+            paths = model.simulate_chunk(grid, draws, p0, p1, scheme)
             for j, prod in enumerate(products):
                 payoffs[p0:p1, j] = prod.payoff(paths, idx)
             for j, ctrl in enumerate(controls):

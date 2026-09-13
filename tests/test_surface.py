@@ -134,30 +134,25 @@ def _reprice_pillars(
     return iv - ssvi.implied_vol_k(ks, T), iv_err
 
 
-# Log-Euler weak error measured on the reference surface: ~60 vol points × dt at 3m ATM
-# (0.17 vp at dt = 1/365, 0.06 vp at 1/1000), a few times smaller at 1y.  Tolerances below allow
-# for it; the LSV calibration (M3) absorbs it in the leverage function by construction.
-@pytest.mark.parametrize(("T", "tol_vp"), [(0.25, 0.30), (1.0, 0.20)])
+# Default scheme (Platen weak order 2) and default step schedule: pure local vol reprices the
+# SSVI within noise at all maturities (see tests/test_scheme.py for the scheme comparison).
+@pytest.mark.parametrize("T", [0.25, 1.0])
 def test_local_vol_mc_reprices_ssvi(
-    ssvi: SSVISurface, local_vol: LocalVolSurface, T: float, tol_vp: float
+    ssvi: SSVISurface, local_vol: LocalVolSurface, T: float
 ) -> None:
     ks = np.array([-0.2, -0.1, 0.0, 0.1, 0.2])
-    cfg = SimConfig(n_paths=100_000, dt_max=1.0 / 365.0, chunk_size=50_000, seed=11)
+    cfg = SimConfig(n_paths=100_000, chunk_size=50_000, seed=11)
     diff, err = _reprice_pillars(ssvi, local_vol, cfg, T=T, ks=ks)
-    assert np.all(np.abs(diff) < np.maximum(tol_vp / 100, 3 * err)), (diff * 100, err * 100)
+    assert np.all(np.abs(diff) < np.maximum(0.001, 3 * err)), (diff * 100, err * 100)
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize(
-    ("T", "tol_vp"),
-    [(1 / 12, 0.60), (0.25, 0.30), (0.5, 0.20), (1.0, 0.15), (1.5, 0.15), (2.0, 0.15)],
-)
+@pytest.mark.parametrize("T", [1 / 12, 0.25, 0.5, 1.0, 1.5, 2.0])
 def test_local_vol_mc_reprices_ssvi_full(
-    ssvi: SSVISurface, local_vol: LocalVolSurface, T: float, tol_vp: float
+    ssvi: SSVISurface, local_vol: LocalVolSurface, T: float
 ) -> None:
-    """§4.2 accuracy (0.15 vp inside ±20% moneyness) for pure local vol at dt = 1/365 from 1y;
-    shorter maturities carry the measured log-Euler bias (see the fast test)."""
+    """§4.2 accuracy for pure local vol: ≤ 0.1 vol points inside ±20% moneyness, 1m to 2y."""
     ks = np.log(np.array([0.8, 0.9, 0.95, 1.0, 1.05, 1.1, 1.2]))
-    cfg = SimConfig(n_paths=400_000, dt_max=1.0 / 365.0, chunk_size=50_000, seed=12)
+    cfg = SimConfig(n_paths=400_000, chunk_size=50_000, seed=12)
     diff, err = _reprice_pillars(ssvi, local_vol, cfg, T=T, ks=ks)
-    assert np.all(np.abs(diff) < np.maximum(tol_vp / 100, 3 * err)), (diff * 100, err * 100)
+    assert np.all(np.abs(diff) < np.maximum(0.001, 3 * err)), (diff * 100, err * 100)

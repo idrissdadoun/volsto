@@ -11,6 +11,8 @@ their milestones.
 
 ## Install
 
+Python 3.12 or later is required (numpy ≥ 2.5 dropped 3.11; mypy strict runs against 3.12).
+
 ```bash
 uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python -e ".[dev]"
 ```
@@ -31,7 +33,7 @@ local_vol = LocalVolSurface.from_implied(surface)                      # Dupire 
 print(local_vol.check_positive())
 
 model = LocalVol(local_vol)
-mc = MonteCarlo(SimConfig(n_paths=100_000, dt_max=1 / 365, seed=1))
+mc = MonteCarlo(SimConfig(n_paths=100_000, seed=1))  # default step schedule and scheme
 
 T, K = 1.0, float(surface.forward(1.0))
 call = EuropeanOption(K, T, "call", surface.discount)
@@ -48,6 +50,12 @@ print("xi0(1y)", xi0_curve(surface, 3.0)(1.0))
 
 Every Monte Carlo number is a `PriceResult(mean ± stderr)`; the library never returns a bare
 float for a simulated quantity.
+
+Discretisation defaults (`SimConfig`): step schedule 1/1460 below 3m, 1/365 to 2y, 1/250 after,
+and Platen's explicit weak order-2 spot step (`weak_order2=True`).  On the reference surface the
+1m ATM local-vol repricing bias is 0.03 vol points at dt = 1/365 versus 0.36 for plain log-Euler;
+`volsto.engine.refinement_study` reproduces this under common random numbers.  Plain log-Euler,
+time-averaged variance and a weak predictor-corrector remain available as options.
 
 ## Development
 

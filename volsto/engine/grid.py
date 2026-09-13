@@ -1,8 +1,9 @@
 """Simulation time grid: union of product fixings and discretisation steps (SPEC §5).
 
 ``TimeGrid.build(fixing_times, dt_max, calibration_grid=None)`` returns the sorted union of
-``{0}``, the fixing times and any extra times (e.g. leverage calibration slices), each interval
-subdivided evenly so that every step is ``≤ dt_max``.  Path containers record the state at the
+``{0}``, the fixing times, the step schedule's break times and any extra times (e.g. leverage
+calibration slices), each interval subdivided evenly so that every step is ``≤ dt_max(t)``.
+Path containers record the state at the
 *columns* ``[0] + fixing times``; :class:`FixingIndex` maps a fixing time to its column.
 Checked by ``tests/test_engine.py``.
 """
@@ -15,6 +16,8 @@ from collections.abc import Iterable
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
+
+from volsto.config import StepSchedule
 
 FloatArray = NDArray[np.float64]
 IntArray = NDArray[np.int64]
@@ -110,32 +113,43 @@ class TimeGrid:
     def build(
         cls,
         fixing_times: ArrayLike,
-        dt_max: float,
+        dt_max: float | StepSchedule,
         calibration_grid: ArrayLike | None = None,
         extra_times: ArrayLike | None = None,
+        *,
+        record_all_steps: bool = False,
     ) -> TimeGrid:
-        """Union of ``{0}``, fixings, calibration slices and extras, refined to ``dt ≤ dt_max``."""
-        if dt_max <= 0:
-            raise ValueError("dt_max must be positive")
+        """Union of ``{0}``, fixings, calibration slices, extras and the schedule's break times,
+        each interval refined evenly to ``dt ≤ dt_max(t)``.
+
+        ``dt_max`` is a :class:`~volsto.config.StepSchedule` or a float (uniform step).  With
+        ``record_all_steps`` every grid time becomes a record column (needed by products that
+        look between fixings, e.g. Brownian-bridge barrier corrections).
+        """
+        schedule = (
+            dt_max if isinstance(dt_max, StepSchedule) else StepSchedule.uniform(float(dt_max))
+        )
         fix = _clean_times(fixing_times)
         if fix.size == 0 or fix[-1] <= 0:
             raise ValueError("at least one positive fixing time is required")
         record = _clean_times(np.concatenate(([0.0], fix)))
-        anchors = [record]
+        horizon = float(record[-1])
+        anchors = [record, np.asarray(schedule.knots(horizon), dtype=np.float64)]
         for extra in (calibration_grid, extra_times):
             if extra is not None:
                 e = _clean_times(extra)
-                anchors.append(e[e <= record[-1]])
+                anchors.append(e[e <= horizon])
         knots = _clean_times(np.concatenate(anchors))
         pieces = [np.array([0.0])]
         for a, b in itertools.pairwise(knots):
-            n_sub = max(1, math.ceil((b - a) / dt_max * (1.0 - 1e-9)))
+            dt = schedule.dt_at(0.5 * (a + b))
+            n_sub = max(1, math.ceil((b - a) / dt * (1.0 - 1e-9)))
             pieces.append(np.linspace(a, b, n_sub + 1)[1:])
         times = np.concatenate(pieces)
         # snap to record times exactly (avoid 1e-16 drift from linspace)
         idx = np.searchsorted(times, record)
         times[idx] = record
-        return cls(times, record)
+        return cls(times, times.copy() if record_all_steps else record)
 
     @property
     def n_steps(self) -> int:

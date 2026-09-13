@@ -113,13 +113,25 @@ class LocalVolSurface:
             raise ValueError("grids need at least two points")
         if np.any(np.diff(t_grid) <= 0) or np.any(np.diff(k_grid) <= 0):
             raise ValueError("grids must be strictly increasing")
+        dk = float(k_grid[1] - k_grid[0])
+        if not np.allclose(np.diff(k_grid), dk, rtol=1e-8, atol=1e-14):
+            raise ValueError("k_grid must be uniformly spaced (the step kernel uses O(1) lookups)")
         if np.any(local_var <= 0) or not np.all(np.isfinite(local_var)):
             raise ValueError("local variance must be positive and finite")
         self.t_grid = t_grid
         self.k_grid = k_grid
+        self.k0 = float(k_grid[0])
+        self.dk = dk
         self.local_var = np.ascontiguousarray(local_var)
         self.forward_curve = forward_curve
         self.diagnostics = diagnostics
+        # cumulative time integral of the (piecewise-linear in t, flat outside) interpolant
+        w = np.empty_like(self.local_var)
+        w[0] = t_grid[0] * self.local_var[0]
+        w[1:] = w[0] + np.cumsum(
+            0.5 * np.diff(t_grid)[:, None] * (self.local_var[1:] + self.local_var[:-1]), axis=0
+        )
+        self._cum_var = w
 
     @classmethod
     def from_implied(
@@ -188,6 +200,47 @@ class LocalVolSurface:
                 int(self.local_var.size),
             )
         return self.diagnostics
+
+    # -- per-step tables for the spot kernel ---------------------------------------------------
+
+    def _t_weights(self, t: FloatArray) -> tuple[NDArray[np.int64], FloatArray]:
+        tg = self.t_grid
+        i = np.clip(np.searchsorted(tg, t, side="right") - 1, 0, tg.size - 2)
+        w = np.clip((t - tg[i]) / (tg[i + 1] - tg[i]), 0.0, 1.0)
+        return i.astype(np.int64), np.asarray(w, dtype=np.float64)
+
+    def var_at_times(self, times: ArrayLike) -> FloatArray:
+        """``σ_loc²(t_j, k)`` for every ``t_j`` on the ``k`` grid: shape ``(len(times), n_k)``."""
+        t = np.atleast_1d(np.asarray(times, dtype=np.float64))
+        i, w = self._t_weights(t)
+        v = self.local_var
+        return np.asarray((1.0 - w)[:, None] * v[i] + w[:, None] * v[i + 1], dtype=np.float64)
+
+    def cumulative_var(self, times: ArrayLike) -> FloatArray:
+        """``W(t, k) = ∫₀ᵗ σ_loc²(s, k) ds`` of the interpolant (exact), ``(len(times), n_k)``."""
+        t = np.atleast_1d(np.asarray(times, dtype=np.float64))
+        tg = self.t_grid
+        v = self.local_var
+        i, w = self._t_weights(t)
+        v_t = (1.0 - w)[:, None] * v[i] + w[:, None] * v[i + 1]
+        inside = self._cum_var[i] + 0.5 * (t - tg[i])[:, None] * (v[i] + v_t)
+        below = t[:, None] * v[0][None, :]
+        above = self._cum_var[-1][None, :] + (t - tg[-1])[:, None] * v[-1][None, :]
+        out = np.where(
+            (t <= tg[0])[:, None], below, np.where((t >= tg[-1])[:, None], above, inside)
+        )
+        return np.asarray(out, dtype=np.float64)
+
+    def var_time_average(self, t_nodes: ArrayLike) -> FloatArray:
+        """Exact time average of ``σ_loc²(·, k)`` over each ``[t_j, t_{j+1}]``: ``(len - 1, n_k)``.
+
+        Used by the ``local_var_time_average`` scheme option (owner amendment after M1).
+        """
+        t = np.atleast_1d(np.asarray(t_nodes, dtype=np.float64))
+        if t.size < 2 or np.any(np.diff(t) <= 0):
+            raise ValueError("t_nodes must be strictly increasing with ≥ 2 entries")
+        W = self.cumulative_var(t)
+        return np.asarray(np.diff(W, axis=0) / np.diff(t)[:, None], dtype=np.float64)
 
     def local_var_k(self, t: ArrayLike, k: ArrayLike) -> FloatArray:
         """``σ_loc²(t, k)`` by bilinear interpolation (flat outside the grid)."""
