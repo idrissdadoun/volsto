@@ -1,0 +1,74 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "volsto"
+version = "0.1.0"
+description = "Stochastic-volatility pricing library for light-exotic and exotic parameter studies"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+authors = [{ name = "Idriss" }]
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "numba>=0.59",
+    "pandas>=2.1",
+    "pyarrow>=14",
+    "pyyaml>=6",
+]
+
+[project.optional-dependencies]
+viewers = ["plotly>=5.18", "streamlit>=1.30", "openpyxl>=3.1"]
+dev = [
+    "pytest>=7.4",
+    "black>=24.1",
+    "ruff>=0.4",
+    "mypy>=1.8",
+    "types-PyYAML",
+    "pandas-stubs",
+    "scipy-stubs",
+]
+
+[tool.setuptools.packages.find]
+include = ["volsto*"]
+
+[tool.black]
+line-length = 100
+target-version = ["py311", "py312"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "N", "SIM", "RUF"]
+ignore = [
+    "N803",  # argument names: we use S0, K, T, F on purpose (finance notation)
+    "N806",  # variable names in function: same
+    "N802",  # function names: same
+    "E741",  # ambiguous variable name (l for leverage)
+    "RUF002", "RUF003", # unicode in docstrings/comments (Greek letters)
+    "B905",  # zip strict: fine
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["volsto"]
+warn_unreachable = true
+show_error_codes = true
+
+[[tool.mypy.overrides]]
+module = ["numba", "numba.*", "plotly", "plotly.*", "streamlit", "streamlit.*", "pyarrow", "pyarrow.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["slow: full-size tests (deselect with -m 'not slow')"]
+addopts = "-ra"
+filterwarnings = ["ignore::numba.NumbaPerformanceWarning"]

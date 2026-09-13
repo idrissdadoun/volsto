@@ -360,3 +360,37 @@ M9. Precompute CLI + Streamlit viewers + Excel export.
 M10. Study runner with LaTeX output; regenerate the original paper's tables from the library.
 
 Open items for the owner (do not block M1–M3): the study archive (zip with SSVI parameters, seeds, tables) for the regression tests; the 2F target parameterisation (SSR target, which maturities); whether hedging transaction-cost assumptions should follow the original study or be re-specified.
+
+---
+
+## 13. Addendum — market data import (milestone M3b, after M3)
+
+Added by the owner during M1 (13 September 2026).
+
+Add `volsto/market/import_hdn.py`: importer for the HistoricalData.net EOD option-chain CSV format (34 columns, one file per trading day; schema at https://historicaldata.net/options.html). The free sample `options_sample_2022H2.zip` is in `./data/hdn_sample/` (git-ignored). Pipeline, one function per step, each testable:
+
+1. `load_day(path, underlying) -> DataFrame`. Keep only SPX and SPXW roots for the index surface; drop rows with missing bid or ask; record `settlement_time` (AM/PM) and use it in the time-to-expiry convention. Use the rate curve shipped in the ZIP manifest.
+2. `implied_forward(chain, expiry) -> F`: from put-call parity on the mid prices near ATM (regression of C − P on K), with the discount factor from the rate curve. Do not use the vendor's iv or Greeks as inputs; they are cross-checks only (the vendor documents that quotes across contracts are not synchronized snapshots).
+3. `to_grid_surface(chain, forwards) -> GridSurface`: OTM options only, mid implied vols against the implied forward, liquidity filter (min bid, max relative bid/ask spread in vol terms, using `iv_bid`/`iv_ask` where present), and butterfly/calendar arbitrage checks on the retained points.
+4. `fit_ssvi(grid_surface) -> SSVISurface`: `theta_T` from ATM total variance, global `(rho, eta, gamma)` by least squares in vol space with the no-arbitrage constraints enforced; report residuals per expiry. Add an eSSVI option (slice-dependent rho) behind a flag for later single-stock use.
+5. `snapshot_config(date) -> YAML` market config (surface params, forward curve, rate curve, provenance: vendor, file checksum, filters used) so a dated market snapshot runs through calibration exactly like the synthetic configs.
+
+Tests: on one sample day, implied forwards agree with the vendor's parity-based forward (`iv_flag == 0` rows) to within a few bp; SSVI residuals inside ±20% moneyness ≤ 0.3 vol points for T ≤ 2y; the fitted surface passes the SSVI no-arbitrage checks; a CLI `volsto-import --vendor hdn --date 2022-09-15 --underlying SPX` writes the config. Also add `scripts/capture_yfinance.py`: saves today's SPX/SPY chain in the same 34-column layout (blank where unavailable) so a daily cron can accumulate history.
+
+Milestone order becomes: M1, M2, M3, **M3b (market data import)**, M4, … M10.
+
+---
+
+## 14. Addendum — smile dynamics for delta and gamma (amends §7 `greeks.py`, milestone M5)
+
+Added by the owner during M1 (13 September 2026).
+
+Delta and gamma take a `smile_dynamics` argument:
+
+- `"model"` — bump `S0`, leverage `L` and factors held fixed, CRN. Default.
+- `"sticky_strike"` — bump `S0`, rebuild the target surface with total variance held fixed per strike `K` (convert SSVI to a strike grid before the bump), recalibrate `L`, reprice. Cached.
+- `"sticky_moneyness"` — bump `S0`, keep the SSVI parameters (surface fixed in `k = ln K/F`), recalibrate `L`, reprice. Cached.
+
+Report all three side by side in risk reports; the hedger uses `"model"` unless the strategy config overrides it.
+
+Test: for a vanilla, the `sticky_strike` delta equals the BS delta at the market vol, the `sticky_moneyness` delta equals BS delta minus vega × ATM skew / `S0` to first order, and the model delta lies between them with the ordering set by the sign of the SSR minus one; the ATM vol shift under `"model"` per unit log-spot move equals SSR × ATM skew (ties §4.4 to the delta).

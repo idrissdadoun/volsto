@@ -16,3 +16,6 @@ study_archive/
 outputs/
 *.npz
 *.parquet
+
+# vendor market data samples (licensed, local only)
+data/

@@ -1,0 +1,23 @@
+# Reference SSVI surface used by the tests and the README quickstart.
+#
+# PLACEHOLDER (M1): the ATM term structure and (rho, eta, gamma) below are a plausible equity
+# index surface, NOT the parameters of the original forward-start / cliquet / FVA study.  They
+# must be replaced by the values from ./study_archive/ when it is available (SPEC §10, M4
+# regression tests), and this file renamed accordingly.
+#
+# Conventions: times in years (ACT/365), rates continuously compounded, vols absolute.
+market:
+  spot: 100.0
+  rate_curve:
+    times: [1.0]
+    rates: [0.02]
+  dividend_curve:
+    times: [1.0]
+    rates: [0.01]
+ssvi:
+  atm_maturities: [0.0833333, 0.25, 0.5, 1.0, 2.0, 3.0]
+  atm_vols:       [0.22,      0.21, 0.205, 0.20, 0.20, 0.205]
+  rho: -0.7
+  eta: 1.0
+  gamma: 0.5
+  max_maturity: 10.0
