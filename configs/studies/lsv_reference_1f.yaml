@@ -27,6 +27,7 @@ particle:
   kernel: gaussian
   regression: local_linear
   min_window: 2000
+  min_window_fraction: 0.01
   bias_correction: true
   quantile_clip: 0.005
   tail_extrapolation: log_quadratic

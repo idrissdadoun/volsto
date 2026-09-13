@@ -3,9 +3,9 @@ grid:
   t_min: 0.00273972602   # 1/365
   t_max: 3.0
   n_t: 400                # square-root spaced in t
-  k_min: -1.5
-  k_max: 1.5
-  n_k: 1201               # dk = 0.0025; coarser grids bias short-dated local skew
+  k_min: -3.0             # +-1.5 truncated the far put wing: 3y variance swaps 0.22 vp low
+  k_max: 3.0
+  n_k: 2401               # dk = 0.0025; coarser grids bias short-dated local skew
   dk: 0.001
   dt: 0.001
   floor: 0.0001          # variance floor: 1% vol

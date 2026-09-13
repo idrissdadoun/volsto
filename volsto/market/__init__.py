@@ -19,13 +19,14 @@ from volsto.market.bs import (
 )
 from volsto.market.curves import Calendar, DiscountCurve, ForwardCurve
 from volsto.market.dupire import DupireDiagnostics, LocalVolSurface
-from volsto.market.surface import GridSurface, ImpliedSurface, SSVISurface
+from volsto.market.surface import ESSVISurface, GridSurface, ImpliedSurface, SSVISurface
 from volsto.market.varswap import ForwardVarianceCurve, varswap_strike, xi0_curve
 
 __all__ = [
     "Calendar",
     "DiscountCurve",
     "DupireDiagnostics",
+    "ESSVISurface",
     "ForwardCurve",
     "ForwardVarianceCurve",
     "GridSurface",

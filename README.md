@@ -5,10 +5,11 @@ studies: Black–Scholes, Dupire local vol, two-factor lognormal Bergomi forward
 LSV with particle-calibrated leverage, Monte Carlo with common random numbers, and viewers over a
 precomputed parameter cache.  The full design is in [SPEC.md](SPEC.md).
 
-Status: **M3** — market layer, BS, local vol, MC engine, vanilla / variance products (M1); the
+Status: **M3b** — market layer, BS, local vol, MC engine, vanilla / variance products (M1); the
 two-factor lognormal Bergomi forward-variance model with exact factor stepping, its closed forms
 and the mixing-solution smile (M2); particle-method leverage calibration, the LSV model, §4.2
-repricing diagnostics and the content-addressed leverage cache (M3).  The cliquet of the SPEC §11
+repricing diagnostics and the content-addressed leverage cache (M3); the HistoricalData.net
+option-chain importer and SSVI/eSSVI fitter (M3b).  The cliquet of the SPEC §11
 quickstart lands with M4; the quickstart below calibrates the 1F LSV and prices a vanilla and a
 variance swap with it.
 
@@ -62,7 +63,7 @@ model = LocalVol(LocalVolSurface.from_implied(surface))              # Dupire (G
 Every Monte Carlo number is a `PriceResult(mean ± stderr)`; the library never returns a bare
 float for a simulated quantity.
 
-Discretisation defaults (`SimConfig`): step schedule 1/1460 below 3m, 1/365 to 2y, 1/250 after,
+Discretisation defaults (`SimConfig`): step schedule 1/2920 below 3m, 1/730 to 2y, 1/500 after,
 and Platen's explicit weak order-2 spot step (`weak_order2=True`).  On the reference surface the
 1m ATM local-vol repricing bias is 0.03 vol points at dt = 1/365 versus 0.36 for plain log-Euler;
 `volsto.engine.refinement_study` reproduces this under common random numbers.  Plain log-Euler,
@@ -84,6 +85,19 @@ print(skew, atmf_skew_order1_flat(params, 1.0), ssr_order1_flat(params, 1.0), vs
 ```
 
 `BergomiParams.one_factor(omega, kappa, rho)` is the 1F model of the earlier studies (θ = 0).
+
+## Market data import (M3b)
+
+```bash
+volsto-import --vendor hdn --date 2022-09-15 --underlying SPX \
+    --root data/hdn_sample/options_sample_2022H2 --out configs/surfaces/snapshots   # add --essvi for a slice-dependent rho
+```
+
+Reads one HistoricalData.net daily CSV (34 columns), keeps the SPX/SPXW roots, derives implied
+forwards by put–call-parity regression, builds an arbitrage-checked `GridSurface` from OTM mid
+quotes, fits SSVI (or eSSVI) and writes a dated market YAML with provenance that runs through
+calibration like the synthetic configs.  `scripts/capture_yfinance.py` saves today's SPX/SPY
+chain from Yahoo in the same layout (`pip install -e ".[data]"`).
 
 ## Calibration notes (M3)
 

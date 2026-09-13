@@ -19,3 +19,6 @@ outputs/
 
 # vendor market data samples (licensed, local only)
 data/
+
+# macOS
+.DS_Store

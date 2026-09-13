@@ -3,7 +3,7 @@
 Measured on the reference surface (ATM, uniform dt = 1/365, 200k paths, bias in vol points):
 1m: log-Euler +0.36, time-averaged variance +0.29, predictor-corrector θ=η=½ +0.78, Platen weak
 order 2 +0.03; 3m: +0.15 / +0.11 / +0.41 / +0.01.  The default is weak order 2 with the default
-step schedule (1/1460 below 3m, 1/365 to 2y, 1/250 after).
+step schedule (1/2920 below 3m, 1/730 to 2y, 1/500 after since the pre-M4 amendment).
 """
 
 from __future__ import annotations
@@ -152,20 +152,20 @@ def test_weak_order2_residual_is_small_and_higher_order(
 
 def test_step_schedule() -> None:
     sch = StepSchedule()
-    assert sch.dt_at(0.1) == pytest.approx(1 / 1460)
-    assert sch.dt_at(0.25) == pytest.approx(1 / 365)
-    assert sch.dt_at(1.99) == pytest.approx(1 / 365)
-    assert sch.dt_at(2.0) == pytest.approx(1 / 250)
+    assert sch.dt_at(0.1) == pytest.approx(1 / 2920)
+    assert sch.dt_at(0.25) == pytest.approx(1 / 730)
+    assert sch.dt_at(1.99) == pytest.approx(1 / 730)
+    assert sch.dt_at(2.0) == pytest.approx(1 / 500)
     assert sch.knots(1.0) == (0.25,) and sch.knots(3.0) == (0.25, 2.0)
     assert StepSchedule.uniform(0.01).dt_at(5.0) == 0.01
     with pytest.raises(ValueError):
         StepSchedule(breaks=(1.0,), dts=(0.1,))
     grid = TimeGrid.build([0.5, 1.0, 2.5], sch)
     t, dts = grid.times[:-1], grid.dts
-    assert np.all(dts[t < 0.25] <= 1 / 1460 + 1e-12)
-    assert np.all(dts[(t >= 0.25) & (t < 2.0)] <= 1 / 365 + 1e-12)
-    assert np.all(dts[t >= 2.0] <= 1 / 250 + 1e-12)
-    assert np.max(dts[t >= 2.0]) > 1 / 365  # the coarse segment is really used
+    assert np.all(dts[t < 0.25] <= 1 / 2920 + 1e-12)
+    assert np.all(dts[(t >= 0.25) & (t < 2.0)] <= 1 / 730 + 1e-12)
+    assert np.all(dts[t >= 2.0] <= 1 / 500 + 1e-12)
+    assert np.max(dts[t >= 2.0]) > 1 / 730  # the coarse segment is really used
     for b in (0.25, 2.0):
         assert np.any(np.abs(grid.times - b) < 1e-12)
     np.testing.assert_allclose(grid.record_times, [0.0, 0.5, 1.0, 2.5])

@@ -255,7 +255,8 @@ class GridSurface(ImpliedSurface):
     Interpolation (SPEC §2.2): linear in ``w`` along ``k`` inside a slice, flat in implied vol
     beyond the wings (``w`` constant at fixed ``T``); linear in ``w`` along ``T`` at fixed ``k``
     between slices, linear from ``w = 0`` at ``T = 0`` before the first slice and flat implied vol
-    (``w ∝ T``) after the last.  Calendar monotonicity in ``T`` is checked at construction.
+    (``w ∝ T``) after the last.  Calendar monotonicity in ``T`` is checked at construction on the
+    common quoted ``k`` range of consecutive slices.
     """
 
     def __init__(
@@ -335,17 +336,23 @@ class GridSurface(ImpliedSurface):
     def _slice_w(self, i: int, k: FloatArray) -> FloatArray:
         return np.interp(k, self._k[i], self._w[i])
 
-    def _check_calendar(self) -> None:
-        k_all = np.unique(np.concatenate(self._k))
-        prev = np.zeros_like(k_all)
-        for i in range(self._t.size):
+    def _check_calendar(self, tol: float = 1e-8) -> None:
+        """``w`` must not decrease in ``T`` where consecutive slices both have quotes (flat
+        extrapolation beyond a slice's wings is a modelling choice and is not compared)."""
+        for i in range(1, self._t.size):
+            lo = max(self._k[i - 1][0], self._k[i][0])
+            hi = min(self._k[i - 1][-1], self._k[i][-1])
+            if lo > hi:
+                continue
+            k_all = np.unique(np.concatenate(self._k[i - 1 : i + 1]))
+            k_all = k_all[(k_all >= lo) & (k_all <= hi)]
+            prev = self._slice_w(i - 1, k_all)
             cur = self._slice_w(i, k_all)
-            if np.any(cur < prev - 1e-12):
+            if np.any(cur < prev - tol):
                 j = int(np.argmin(cur - prev))
                 raise ValueError(
                     f"calendar arbitrage between slices {i - 1} and {i} at k={k_all[j]:.4f}"
                 )
-            prev = cur
 
     def total_variance(self, k: ArrayLike, T: ArrayLike) -> FloatArray:
         k_, T_ = np.broadcast_arrays(
@@ -380,3 +387,87 @@ class GridSurface(ImpliedSurface):
 
     def __repr__(self) -> str:
         return f"GridSurface(maturities={self._t.tolist()}, n_quotes={[k.size for k in self._k]})"
+
+
+# --------------------------------------------------------------------------------------------
+# eSSVI (slice-dependent correlation) — behind the ``essvi`` flag of the importer (SPEC §13)
+# --------------------------------------------------------------------------------------------
+
+
+class ESSVISurface(SSVISurface):
+    """SSVI with a maturity-dependent correlation ``ρ_T`` (Hendriks–Martini eSSVI family).
+
+    ``ρ_T`` is piecewise-linear in ``T`` between the ATM pillars (flat outside).  Butterfly
+    conditions are checked with ``max|ρ|`` (sufficient); calendar-spread absence is checked
+    numerically (``w`` non-decreasing in ``T`` on a ``k`` grid) since the analytic eSSVI
+    conditions couple ``ρ_T`` and ``θ_T``.  Intended for later single-stock use.
+    """
+
+    def __init__(
+        self,
+        atm_maturities: Sequence[float] | FloatArray,
+        atm_total_variances: Sequence[float] | FloatArray,
+        rhos: Sequence[float] | FloatArray,
+        eta: float,
+        gamma: float,
+        forward_curve: ForwardCurve,
+        discount: DiscountCurve,
+        *,
+        max_maturity: float = 10.0,
+        min_maturity: float = 1.0 / 365.0,
+    ) -> None:
+        r = np.asarray(rhos, dtype=np.float64).ravel()
+        t = np.asarray(atm_maturities, dtype=np.float64).ravel()
+        if r.shape != t.shape:
+            raise ValueError("one rho per ATM pillar is required")
+        if np.any(np.abs(r) >= 1.0):
+            raise ValueError("rhos must lie in (-1, 1)")
+        self._rhos = r
+        self._rho_t = t
+        super().__init__(
+            atm_maturities,
+            atm_total_variances,
+            float(r[np.argmax(np.abs(r))]),
+            eta,
+            gamma,
+            forward_curve,
+            discount,
+            max_maturity=max_maturity,
+            min_maturity=min_maturity,
+        )
+        self._check_calendar_numeric()
+
+    def rho_T(self, T: ArrayLike) -> FloatArray:
+        return np.asarray(
+            np.interp(np.asarray(T, dtype=np.float64), self._rho_t, self._rhos), dtype=np.float64
+        )
+
+    def total_variance(self, k: ArrayLike, T: ArrayLike) -> FloatArray:
+        k_ = np.asarray(k, dtype=np.float64)
+        T_ = np.asarray(T, dtype=np.float64)
+        th = self.theta(T_)
+        ph = self.phi(th)
+        rho = self.rho_T(T_)
+        pk = ph * k_
+        w = 0.5 * th * (1.0 + rho * pk + np.sqrt((pk + rho) ** 2 + 1.0 - rho * rho))
+        return np.asarray(w, dtype=np.float64)
+
+    def atm_skew(self, T: ArrayLike) -> FloatArray:
+        T_ = np.asarray(T, dtype=np.float64)
+        th = self.theta(T_)
+        return np.asarray(
+            0.5 * self.rho_T(T_) * self.phi(th) * np.sqrt(th) / np.sqrt(T_), dtype=np.float64
+        )
+
+    def _check_calendar_numeric(self) -> None:
+        ks = np.linspace(-1.0, 1.0, 81)
+        Ts = np.concatenate((np.linspace(self.min_maturity, self._t[-1], 200), [self.max_maturity]))
+        w = self.total_variance(ks[None, :], Ts[:, None])
+        if np.any(np.diff(w, axis=0) < -1e-10):
+            raise ValueError("eSSVI calendar arbitrage: total variance decreases in T for some k")
+
+    def __repr__(self) -> str:
+        return (
+            f"ESSVISurface(atm_maturities={self._t[1:].tolist()}, "
+            f"rhos={np.round(self._rhos, 4).tolist()}, eta={self.eta}, gamma={self.gamma})"
+        )

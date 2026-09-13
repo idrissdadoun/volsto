@@ -296,3 +296,15 @@ def test_particle_config_validation() -> None:
         ).n_factors
         == 1
     )
+
+
+def test_calibration_code_tag_guard() -> None:
+    """The source of the calibration and stepping modules is hashed; a change without a bump of
+    CALIBRATION_CODE_TAG (and a refreshed code_tag_guard.json) fails here."""
+    from volsto.calibration.cache import GUARD_FILE, check_guard, read_guard, source_hash
+    from volsto.calibration.particle import CALIBRATION_CODE_TAG
+
+    assert GUARD_FILE.exists(), "code_tag_guard.json missing: run write_guard()"
+    assert CALIBRATION_CODE_TAG in read_guard()
+    assert len(source_hash()) == 64
+    check_guard()

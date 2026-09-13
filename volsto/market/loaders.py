@@ -4,10 +4,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
+import yaml
+
 from volsto.config import LocalVolModelConfig, MarketConfig, SSVIConfig, load_yaml
 from volsto.market.curves import DiscountCurve, ForwardCurve
 from volsto.market.dupire import LocalVolSurface
-from volsto.market.surface import SSVISurface
+from volsto.market.surface import ESSVISurface, SSVISurface
 
 
 def load_market(path: str | Path, section: str = "market") -> ForwardCurve:
@@ -16,9 +19,19 @@ def load_market(path: str | Path, section: str = "market") -> ForwardCurve:
 
 
 def load_ssvi_surface(path: str | Path) -> SSVISurface:
-    """SSVI surface from a file with ``market`` and ``ssvi`` sections."""
+    """SSVI surface from a file with ``market`` and ``ssvi`` sections; an ``essvi`` section
+    (``rhos`` per ATM pillar, written by the importer's ``--essvi``) gives an ``ESSVISurface``."""
     fc = load_market(path)
     cfg = load_yaml(path, SSVIConfig, section="ssvi")
+    with Path(path).open("r", encoding="utf-8") as fh:
+        raw = yaml.safe_load(fh)
+    if isinstance(raw, dict) and "essvi" in raw:
+        rhos = [float(r) for r in raw["essvi"]["rhos"]]
+        t = np.asarray(cfg.atm_maturities)
+        v = np.asarray(cfg.atm_vols)
+        return ESSVISurface(
+            t, v * v * t, rhos, cfg.eta, cfg.gamma, fc, fc.rate_curve, max_maturity=cfg.max_maturity
+        )
     return SSVISurface.from_config(cfg, fc, fc.rate_curve)
 
 

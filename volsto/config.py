@@ -181,13 +181,16 @@ class StepSchedule:
     """Piecewise-constant maximum simulation step ``dt_max(t)``.
 
     ``dt_max = dts[i]`` for ``t ∈ [breaks[i-1], breaks[i])`` with ``breaks[-1] = ∞``.  The default
-    (owner amendment after M1) is 1/1460 below 3m, 1/365 up to 2y and 1/250 beyond; the Monte
-    Carlo engine and the particle calibration use the same schedule so that a calibrated leverage
-    function reprices the surface on the grid it is used on.
+    is 1/2920 below 3m, 1/730 up to 2y and 1/500 beyond (pre-M4 amendment: the LSV step is first
+    order in time — leverage and SV variance frozen over the step — and at 1/1460–1/365–1/250 the
+    1y–2y put wing was 0.10–0.15 vp cheap and the 1y variance swap 0.14 vp low; halving the steps
+    brought both within 0.05 vp, see SPEC §4.2).  The Monte Carlo engine and the particle
+    calibration use the same schedule so that a calibrated leverage function reprices the surface
+    on the grid it is used on.
     """
 
     breaks: tuple[float, ...] = (0.25, 2.0)
-    dts: tuple[float, ...] = (1.0 / 1460.0, 1.0 / 365.0, 1.0 / 250.0)
+    dts: tuple[float, ...] = (1.0 / 2920.0, 1.0 / 730.0, 1.0 / 500.0)
 
     def __post_init__(self) -> None:
         if len(self.dts) != len(self.breaks) + 1:
@@ -274,8 +277,8 @@ class SimConfig:
 
     Attributes:
         n_paths: number of paths (SPEC default 2·10⁵).  Must be even when antithetic.
-        dt_max: maximum simulation step — a :class:`StepSchedule` (default: 1/1460 below 3m,
-            1/365 to 2y, 1/250 after) or a float for a uniform step.
+        dt_max: maximum simulation step — a :class:`StepSchedule` (default: 1/2920 below 3m,
+            1/730 to 2y, 1/500 after) or a float for a uniform step.
         chunk_size: paths simulated per block to bound memory (SPEC default 5·10⁴); further
             capped by ``chunk_memory_mb`` when the path container is large.
         antithetic: use antithetic pairs (path 2i+1 uses the negated normals of path 2i).
@@ -422,15 +425,17 @@ class LocalVolConfig:
     The ``t`` grid has ``n_t`` points square-root spaced between ``t_min`` and ``t_max``.  The
     ``k`` spacing must resolve the short-dated local skew: variance-swap repricing under local-vol
     MC converged only for ``dk ≤ 0.0025`` on the reference surface (``dk = 0.01`` biased the 1y
-    strike by 0.5% of variance), hence the 1201-point default over ``±1.5``.
+    strike by 0.5% of variance).  The ``k`` range must cover the far put wing of long-dated
+    variance swaps: with ``±1.5`` the 2y / 3y strikes were 0.08 / 0.22 vol points low (flat local
+    vol beyond the grid), with ``±3.0`` within 0.02 — hence 2401 points over ``±3.0``.
     """
 
     t_min: float = 1.0 / 365.0
     t_max: float = 3.0
     n_t: int = 400
-    k_min: float = -1.5
-    k_max: float = 1.5
-    n_k: int = 1201
+    k_min: float = -3.0
+    k_max: float = 3.0
+    n_k: int = 2401
     dk: float = 1e-3
     dt: float = 1e-3
     floor: float = 1e-4  # variance floor (vol 1%)
@@ -604,10 +609,14 @@ class ParticleConfig:
             the design bias ``h² m'(k) f'(k)/f(k)`` of Nadaraya–Watson, which with a steeply
             sloped ``E[V|S]`` and ``c = 1.5`` biased the ±10% repricing by ~0.3 vol points.
         quantile_clip: the regression is trusted inside the ``[q, 1−q]`` quantiles of the cloud.
-        min_window: minimum number of particles in a regression window; where the ``4h`` window
-            holds fewer (the tails), it is widened to the nearest ``min_window`` particles (k-NN
-            floor).  Tail noise in ``E[V|S]`` feeds ``1/E[V|S]`` into ``L`` and showed up as
-            variance-swap strikes 0.1–0.3 vp above replication, falling with ``N``.
+        min_window, min_window_fraction: the regression window is widened to the nearest
+            ``max(min_window, min_window_fraction · N)`` particles wherever the ``4h`` window holds
+            fewer (the tails): a k-NN floor whose *fraction* of the cloud is fixed, so the tail
+            bandwidth is set by the local particle density and does not shrink as ``N`` grows
+            (a fixed count did, and made the variance-swap residual non-monotone in ``N``:
+            −0.14 vp at 2·10⁵, +0.23 vp at 8·10⁵ particles at 1y).  The absolute floor of 2000
+            keeps small clouds (5·10⁴ particles) from tail noise that inflates ``L`` through
+            ``1/E[V|S]`` (a 500-particle floor gave +0.17 vp on the 1y variance swap at 5·10⁴).
         bias_correction: subtract the plug-in local-linear curvature bias ``½ h² m''(k)`` (Gaussian
             kernel second moment 1; ``m''`` by second differences on the regression grid).  The
             uncorrected estimate over-states the convex ``E[V|S]`` by ``O(h²)``, a level bias in
@@ -644,6 +653,7 @@ class ParticleConfig:
     kernel: str = "gaussian"
     regression: str = "local_linear"
     min_window: int = 2000
+    min_window_fraction: float = 0.01
     bias_correction: bool = True
     quantile_clip: float = 0.005
     tail_extrapolation: str = "log_quadratic"
@@ -673,8 +683,8 @@ class ParticleConfig:
             raise ValueError(
                 "tail_extrapolation must be 'flat', 'log_linear', 'log_quadratic' or 'adaptive'"
             )
-        if self.min_window < 0:
-            raise ValueError("min_window must be non-negative")
+        if self.min_window < 0 or not 0.0 <= self.min_window_fraction < 0.5:
+            raise ValueError("need min_window >= 0 and 0 <= min_window_fraction < 0.5")
         if not 0 <= self.quantile_clip < 0.5:
             raise ValueError("quantile_clip must lie in [0, 0.5)")
         if self.n_regression_points < 11:

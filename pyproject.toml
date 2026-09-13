@@ -19,8 +19,12 @@ dependencies = [
     "pyyaml>=6",
 ]
 
+[project.scripts]
+volsto-import = "volsto.market.import_hdn:main"
+
 [project.optional-dependencies]
 viewers = ["plotly>=5.18", "streamlit>=1.30", "openpyxl>=3.1"]
+data = ["yfinance>=0.2"]
 dev = [
     "pytest>=7.4",
     "black>=24.1",

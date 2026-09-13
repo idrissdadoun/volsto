@@ -47,7 +47,9 @@ FloatArray = NDArray[np.float64]
 log = logging.getLogger(__name__)
 
 #: Bumped whenever the calibration numerics change; part of the cache key (SPEC §4.3).
-CALIBRATION_CODE_TAG = "m3.1"
+#: Guarded by ``tests/test_lsv.py::test_calibration_code_tag_guard`` (source hash of the
+#: calibration and stepping modules).
+CALIBRATION_CODE_TAG = "m3.2"
 
 
 @njit(parallel=True, cache=True)
@@ -123,8 +125,9 @@ def conditional_variance_estimate(
     order = np.argsort(k, kind="stable")
     ks = np.ascontiguousarray(k[order])
     vs = np.ascontiguousarray(v[order])
+    window = max(cfg.min_window, int(cfg.min_window_fraction * ks.size))
     m, slope, _ = kernel_regression(
-        ks, vs, grid, h, cfg.kernel == "gaussian", cfg.regression == "local_linear", cfg.min_window
+        ks, vs, grid, h, cfg.kernel == "gaussian", cfg.regression == "local_linear", window
     )
     n = ks.size
     q_lo = ks[min(int(cfg.quantile_clip * n), n - 1)]
@@ -217,7 +220,8 @@ def leverage_grid_config(
     if base is not None:
         return base
     T = cfg.horizon
-    half = float(cfg.leverage_std_span * surface.atm_vol(T) * np.sqrt(T))
+    # at least +-2.5: the far put wing feeds long-dated variance swaps (LocalVolConfig note)
+    half = max(float(cfg.leverage_std_span * surface.atm_vol(T) * np.sqrt(T)), 2.5)
     n_half = int(np.ceil(half / cfg.leverage_dk))
     n_k = 2 * n_half + 1
     return LocalVolConfig(
