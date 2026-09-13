@@ -637,7 +637,13 @@ class ParticleConfig:
             points (``"log_linear"``), or continue it with a quadratic fitted there whose slope is
             only allowed to decay, going flat where it would vanish (``"log_quadratic"``,
             default), or choose per tail (``"adaptive"``: log-linear where ``E[V|S]`` rises into
-            the tail, saturating quadratic where it falls).  By repricing error on the reference
+            the tail, saturating quadratic where it falls), or continue ``ln E[V|S]`` with the
+            pure-SV kernel's own conditional slope (``"sv_slope"``, M6 Part 0 item 4: the
+            model-consistent tail ``β(t) = Σ_i coef_i ρ_Si (1 − e^{−k_i t}) / (k_i σ_ATM(t) t)``,
+            the Gaussian-approximation slope of ``ln E[ξ_t^t | ln S_t]``, which overstates the
+            measured pure-SV slope by 28% at ω = 3, 1y), or with the slope of ``ln V`` on ``k``
+            fitted over the whole particle cloud at the slice (``"cloud_slope"``, the LSV's own
+            conditional slope, measured).  By repricing error on the reference
             surface (200k particles, 1y horizon, 3m–1y, |k| ≤ 0.2) the quadratic rule is the most
             robust: 1F 0.11 vp, 2F 0.09 vp, against 0.13 / 0.37 vp for log-linear (which
             over-extrapolates the 2F's decaying right tail: 3m +20% calls 0.37 vp rich).
@@ -689,9 +695,17 @@ class ParticleConfig:
             raise ValueError("kernel must be 'gaussian' or 'quartic'")
         if self.regression not in ("local_linear", "nadaraya_watson"):
             raise ValueError("regression must be 'local_linear' or 'nadaraya_watson'")
-        if self.tail_extrapolation not in ("flat", "log_linear", "log_quadratic", "adaptive"):
+        if self.tail_extrapolation not in (
+            "flat",
+            "log_linear",
+            "log_quadratic",
+            "adaptive",
+            "sv_slope",
+            "cloud_slope",
+        ):
             raise ValueError(
-                "tail_extrapolation must be 'flat', 'log_linear', 'log_quadratic' or 'adaptive'"
+                "tail_extrapolation must be 'flat', 'log_linear', 'log_quadratic', 'adaptive', "
+                "'sv_slope' or 'cloud_slope'"
             )
         if self.min_window < 0 or not 0.0 <= self.min_window_fraction < 0.5:
             raise ValueError("need min_window >= 0 and 0 <= min_window_fraction < 0.5")

@@ -10,6 +10,7 @@ for T ≤ 2y.  Checked by ``tests/test_lsv.py``.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import time
 from collections.abc import Sequence
@@ -210,3 +211,58 @@ def reprice_surface(
             )
     varswaps = pd.DataFrame(vs_rows)
     return CalibrationReport(vanillas, varswaps, sim.n_paths, sim.seed, time.perf_counter() - t0)
+
+
+def reprice_surface_seeds(
+    model: Model,
+    surface: ImpliedSurface,
+    sim: SimConfig,
+    pricing_seeds: Sequence[int],
+    **kwargs: Any,
+) -> CalibrationReport:
+    """:func:`reprice_surface` averaged over pricing seeds (owner decision, M6 Part 0: the
+    single-seed tables misled the M4b and Part 0 readings — the MC standard error per cell is
+    0.03 vol points ATM and 0.05 in the wings at 4·10⁵ paths).  ``error_vp`` / ``diff_vp`` are the
+    means over seeds; ``stderr_vp`` is the standard error of that mean across seeds when at least
+    three seeds are given (the empirical spread, which includes the grid-realisation noise),
+    otherwise the quoted MC standard error divided by ``sqrt(n)``; ``extra`` records the seeds
+    and the mean quoted MC standard error (``mc_stderr_vp``)."""
+    if len(pricing_seeds) < 1:
+        raise ValueError("at least one pricing seed")
+    reports = [
+        reprice_surface(model, surface, dataclasses.replace(sim, seed=int(seed)), **kwargs)
+        for seed in pricing_seeds
+    ]
+    n = len(reports)
+    van = pd.concat([r.vanillas.assign(_seed=i) for i, r in enumerate(reports)])
+    keys = ["T", "k"]
+    g = van.groupby(keys, sort=False)
+    out = reports[0].vanillas.drop(columns=["error_vp", "stderr_vp"]).copy()
+    out = out.merge(g["error_vp"].mean().rename("error_vp").reset_index(), on=keys, how="left")
+    mc_se = g["stderr_vp"].mean().rename("mc_stderr_vp").reset_index()
+    if n >= 3:
+        se = (g["error_vp"].std(ddof=1) / np.sqrt(n)).rename("stderr_vp").reset_index()
+    else:
+        se = (g["stderr_vp"].mean() / np.sqrt(n)).rename("stderr_vp").reset_index()
+    out = out.merge(se, on=keys, how="left").merge(mc_se, on=keys, how="left")
+    vs = pd.concat([r.varswaps.assign(_seed=i) for i, r in enumerate(reports)])
+    gv = vs.groupby("T", sort=False)
+    vs_out = reports[0].varswaps.copy()
+    vs_out["diff_vp"] = gv["diff_vp"].mean().to_numpy()
+    vs_out["mc_stderr_vp"] = gv["stderr_vp"].mean().to_numpy()
+    vs_out["stderr_vp"] = (
+        (gv["diff_vp"].std(ddof=1) / np.sqrt(n)).to_numpy()
+        if n >= 3
+        else (gv["stderr_vp"].mean() / np.sqrt(n)).to_numpy()
+    )
+    for col in ("mc_strike", "mc_vol"):
+        if col in vs_out.columns:
+            vs_out[col] = gv[col].mean().to_numpy()
+    return CalibrationReport(
+        out,
+        vs_out,
+        reports[0].n_paths,
+        int(pricing_seeds[0]),
+        float(sum(r.wall_time for r in reports)),
+        {"pricing_seeds": [int(x) for x in pricing_seeds], "n_seeds": n},
+    )

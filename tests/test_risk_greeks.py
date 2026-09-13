@@ -17,6 +17,7 @@ from volsto.config import (
     MarketConfig,
     SimConfig,
     SSVIConfig,
+    SurfacePerturbation,
     load_yaml,
 )
 from volsto.market import (
@@ -43,6 +44,7 @@ from volsto.risk import (
     vega,
 )
 from volsto.risk.engine import surface_of
+from volsto.risk.greeks import _spot_state
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC_1F = ROOT / "configs" / "studies" / "lsv_reference_1f.yaml"
@@ -215,3 +217,44 @@ def test_lv_sticky_regimes_relation_on_reference_surface() -> None:
     assert ratios["sticky_local_vol"] == pytest.approx(2.0, abs=0.05)
     assert ratios["sticky_moneyness"] < ratios["sticky_strike"] < ratios["sticky_local_vol"]
     assert engine.n_calibrations >= 5  # four regime states + the base Dupire rebuild
+
+
+def test_sticky_local_vol_state_builds_a_positive_forward_variance_curve() -> None:
+    """Regression of the M5 budget-run failure: the sticky-local-vol +1% state on the reference
+    spec must give a strictly positive forward variance curve when the market is built with
+    the calibration's 1-to-5-day strip points (the unfloored ATM-skew shift, ~1/sqrt(T), drove
+    the short-dated vols to zero); below the 1m floor the shift equals the 1m shift."""
+    from volsto.calibration.cache import build_market
+    from volsto.market.surface import perturbed_surface
+    from volsto.risk.greeks import SKEW_T_MIN
+
+    state = RiskState(load_yaml(SPEC_1F, CalibrationSpec))
+    st, mode = _spot_state(state, "sticky_local_vol", 0.01)
+    assert mode == "recalibrate"
+    _, _surface, kernel = build_market(st.spec)
+    assert float(kernel.xi0.xi0(np.array([1.0 / 365.0, 3.0 / 365.0, 0.02, 1.0])).min()) > 0.0
+    base = build_market(state.spec)[1]
+    pert = perturbed_surface(st.spec.perturbation, base)
+    k0 = np.array([0.0])
+    shift_1d = pert.implied_vol_k(k0, 1.0 / 365.0) - base.implied_vol_k(k0, 1.0 / 365.0)
+    shift_1m = pert.implied_vol_k(k0, SKEW_T_MIN) - base.implied_vol_k(k0, SKEW_T_MIN)
+    np.testing.assert_allclose(shift_1d, shift_1m, rtol=1e-9)
+
+
+def test_model_mode_at_a_perturbed_state_uses_that_state_s_own_calibration() -> None:
+    """Regression of the M5 budget-run failure (vanna dDelta/dsigma under the LSV): the
+    ``"model"`` mode of a vega-bumped state is that state's own local vol / leverage at the base
+    spot, held in spot — at the base spot it prices identically to the recalibrated mode, and a
+    spot move under it reprices without touching the base surface."""
+    state = RiskState(load_yaml(SPEC_1F, CalibrationSpec))
+    sim = SimConfig(n_paths=20_000, chunk_size=20_000, seed=5)
+    engine = RiskEngine(LVBuilder(state), sim)
+    call = EuropeanOption(100.0, 1.0, 1, surface_of(state).discount)
+    vb = state.with_perturbation(SurfacePerturbation("parallel", {"size": 0.01}), label="vb")
+    p_model = engine.price(call, vb, "model")
+    p_recal = engine.price(call, vb, "recalibrate")
+    assert p_model.mean == pytest.approx(p_recal.mean, abs=1e-12)
+    vb_up, mode = _spot_state(vb, "model", 0.01)
+    assert mode == "model"
+    p_up = engine.price(call, vb_up, "model")
+    assert p_up.mean > p_model.mean > engine.price(call, state).mean

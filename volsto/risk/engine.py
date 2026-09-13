@@ -212,6 +212,15 @@ class LSVBuilder:
         self._counter.add(state.key, miss)
         return model
 
+    def _reference(self, state: RiskState) -> LSV:
+        """The recalibrated model of ``state``'s surface and parameters at the base spot."""
+        if state.spot == self.base.spot:
+            return self._recalibrated(state)
+        market = dataclasses.replace(state.spec.market, spot=self.base.spot)
+        return self._recalibrated(
+            RiskState(dataclasses.replace(state.spec, market=market), None, state.label)
+        )
+
     def build(self, state: RiskState, mode: str) -> Model:
         if mode not in MODES:
             raise ValueError(f"mode must be one of {MODES}")
@@ -224,14 +233,16 @@ class LSVBuilder:
             lsv = self._recalibrated(state)
         else:
             if mode == "model":
-                if state.spec.perturbation != self.base.spec.perturbation or (
-                    state.spec.model != self.base.spec.model
-                ):
-                    raise ValueError("the 'model' regime only moves the spot and the factor state")
-                kernel: BergomiSV = base.kernel.bump(spot=state.spot)
+                # the recalibrated model of this surface / parameter state at the BASE spot,
+                # spot moved with L held in spot (the base model when nothing but the spot
+                # differs; the vega-bumped state's own calibration for vanna's dDelta/dsigma)
+                ref = self._reference(state)
+                kernel: BergomiSV = ref.kernel.bump(spot=state.spot)
+                lev = ref.leverage
             else:
                 _, _, kernel = build_market(state.spec)  # ξ₀ and parameters from the state
-            lsv = LSV(kernel, base.leverage.reanchored(kernel.forward_curve))
+                lev = base.leverage
+            lsv = LSV(kernel, lev.reanchored(kernel.forward_curve))
         if state.x0 is not None:
             lsv = LSV(lsv.kernel.bump(x0=np.asarray(state.x0)), lsv.leverage)
         self._models[memo] = lsv
@@ -268,10 +279,18 @@ class LVBuilder:
         if memo in self._models:
             return self._models[memo]
         if mode == "model" and hasattr(self, "base_model"):
-            base = self.base_model
-            assert isinstance(base, LocalVol)
+            # the Dupire local vol of this surface state at the base spot, held in spot
+            if state.spot == self.base.spot:
+                ref = self.build(state, "recalibrate")
+            else:
+                market = dataclasses.replace(state.spec.market, spot=self.base.spot)
+                ref = self.build(
+                    RiskState(dataclasses.replace(state.spec, market=market), None, state.label),
+                    "recalibrate",
+                )
+            assert isinstance(ref, LocalVol)
             fc = ForwardCurve.from_config(state.spec.market)
-            lv: Model = LocalVol(base.local_vol.reanchored(fc), fc)
+            lv: Model = LocalVol(ref.local_vol.reanchored(fc), fc)
         else:
             surface = surface_of(state)
             self._counter.add(state.key, True)

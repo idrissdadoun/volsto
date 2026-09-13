@@ -41,6 +41,9 @@ from volsto.risk.engine import RiskEngine, RiskState, Sensitivity, default_param
 REGIMES = ("model", "sticky_strike", "sticky_moneyness", "sticky_skew", "sticky_local_vol")
 VEGA_VARIANTS = ("recalibrated", "sticky_leverage")
 BUSINESS_DAY = 1.0 / 252.0
+#: the sticky-skew / sticky-local-vol shifts evaluate the ATM skew at max(T, SKEW_T_MIN): the
+#: first vega pillar (1m); below it the SSVI skew diverges like 1/sqrt(T)
+SKEW_T_MIN = 1.0 / 12.0
 
 
 def _spot_state(state: RiskState, regime: str, h: float) -> tuple[RiskState, str]:
@@ -54,9 +57,9 @@ def _spot_state(state: RiskState, regime: str, h: float) -> tuple[RiskState, str
     if regime == "sticky_strike":
         pert = SurfacePerturbation("shift_k", {"delta": h})
     elif regime == "sticky_skew":
-        pert = SurfacePerturbation("atm_shift", {"delta": h, "factor": 1.0})
+        pert = SurfacePerturbation("atm_shift", {"delta": h, "factor": 1.0, "t_min": SKEW_T_MIN})
     elif regime == "sticky_local_vol":
-        pert = SurfacePerturbation("atm_shift", {"delta": h, "factor": 2.0})
+        pert = SurfacePerturbation("atm_shift", {"delta": h, "factor": 2.0, "t_min": SKEW_T_MIN})
     else:
         raise ValueError(f"regime must be one of {REGIMES}")
     return moved.with_perturbation(pert, label=f"{regime} S={spot:.4f}"), "recalibrate"

@@ -304,7 +304,8 @@ def test_theta_zero_reproduces_reference_1f_path_by_path(xi_flat: ForwardVarianc
         v1 = g(t + dt) * np.exp(omega * x_new)
         b0 = np.sqrt(v0)
         dlng = (np.log(g(t + dt)) - np.log(g(t))) / dt
-        cross = omega * (dwt * dws - rho * dt)
+        # compensator = exact cov(dX Brownian part, dW^S) = rho (1 - e^{-kappa dt})/kappa (M6 fix)
+        cross = omega * (dwt * dws - rho * (-np.expm1(-kappa * dt)) / kappa)
         lterm = 0.5 * dlng - 0.5 * omega * kappa * x + omega**2 / 8.0
         ls = (
             ls
@@ -384,3 +385,31 @@ def test_mixing_smile_matches_spot_simulation(
     diff = iv - mix.implied_vols
     tol = 2 * np.hypot(iv_se, mix.implied_vol_stderr) + 0.0003
     assert np.all(np.abs(diff) < tol), (T, diff * 100, tol * 100)
+
+
+def test_conditional_log_variance_slope_matches_cloud_regression(
+    xi_flat: ForwardVarianceCurve,
+) -> None:
+    """The Gaussian-approximation slope of ``ln E[ξ_t^t | ln S_t]`` (the ``"sv_slope"`` tail of
+    the particle regression, M6) against a least-squares regression of ``ln V_t`` on
+    ``k = ln S_t − ln F_t`` over a pure 1F cloud at t = 1 (the ``"cloud_slope"`` tail): within
+    10% at ω = 0.5, where the Gaussian approximation holds; at ω = 3 the formula overstates the
+    measured slope by 28% (−5.44 vs −3.89, recorded, asserted within 35%); ω = 0 gives zero."""
+    fc = ForwardCurve.flat(100.0, 0.02, 0.01)
+    kappa, rho = 1.5, -0.7
+    sigma_ref = float(np.sqrt(xi_flat.xi0(0.0)))
+    sim = SimConfig(n_paths=100_000, dt_max=1.0 / 100.0, chunk_size=50_000, seed=4)
+    for omega, tol in ((0.5, 0.10), (3.0, 0.35)):
+        model = BergomiSV(BergomiParams.one_factor(omega, kappa, rho), xi_flat, fc)
+        mc = MonteCarlo(sim)
+        grid = mc.build_grid([VarianceSwap([0.0, 1.0], 0.0, fc.rate_curve)], model)
+        paths = mc.simulate(model, grid)
+        col = grid.fixing_index[1.0]
+        k = paths.log_spot_at(col) - float(fc.log_forward(1.0))
+        slope_fit = float(np.polyfit(k, np.log(paths.variance_at(col)), 1)[0])
+        beta = model.conditional_log_variance_slope(1.0, sigma_ref)
+        expected = omega * rho * (1 - np.exp(-kappa)) / (kappa * sigma_ref)
+        assert beta == pytest.approx(expected, rel=1e-12)
+        assert beta < 0 and abs(slope_fit - beta) < tol * abs(beta), (omega, slope_fit, beta)
+    flat = BergomiSV(BergomiParams.one_factor(0.0, kappa, rho), xi_flat, fc)
+    assert flat.conditional_log_variance_slope(1.0, sigma_ref) == 0.0

@@ -637,8 +637,23 @@ def delta_sigma_from_config(
         delta = float(p["delta"])
         return lambda k, T: base.implied_vol_k(k + delta, T) - base.implied_vol_k(k, T)
     if kind == "atm_shift":
+        # ``factor · delta · s_T`` for every k, with the ATM skew ``s_T`` evaluated at
+        # ``max(T, t_min)``: the SSVI skew grows like ``1/√T`` towards zero maturity and an
+        # unfloored shift drives the 1–5 day vols of the variance-swap strip to zero (found by
+        # the M5 budget run, sticky-local-vol regime); ``t_min`` is the first vega pillar of the
+        # regime (1m), an explicit parameter of the layer
         delta, factor = float(p["delta"]), float(p.get("factor", 1.0))
-        return lambda k, T: factor * delta * atm_skew_numeric(base, T) * np.ones_like(k)
+        t_min = float(p["t_min"])
+        if t_min <= 0:
+            raise ValueError("atm_shift needs a positive t_min (skew evaluation floor)")
+
+        def ds_atm(k: FloatArray, T: FloatArray) -> FloatArray:
+            T_ = np.maximum(np.asarray(T, dtype=np.float64), t_min)
+            return np.asarray(
+                factor * delta * atm_skew_numeric(base, T_) * np.ones_like(k), dtype=np.float64
+            )
+
+        return ds_atm
     if kind == "total_variance":
         from volsto.market.varswap import xi0_curve
 

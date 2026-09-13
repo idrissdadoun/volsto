@@ -173,7 +173,11 @@ print(pde.vanilla(100.0, 1.0, 1).price, pde.knock_out_call(100.0, 1.0, 90.0, "do
 
 Conventions are explicit arguments (`strict` for discrete barriers, `rebate_timing`, `survival`,
 `final_redemption`); every Monte Carlo number carries its standard error; the decompositions
-reprice path by path. Measured accuracies and the open conventions are in SPEC §6.8.
+reprice path by path. Risk for the digital structures lives in `volsto.risk.digital_risk`
+(autocall spot profiles with smoothing and barrier shift, KI-put barrier risk, per-leg vega-T
+and skew, expected-life sensitivities, likelihood-ratio cross-check); the M6 headline rows in
+`volsto.studies.m6` / `scripts/m6_headline.py`. Measured accuracies and the conventions are in
+SPEC §6.8.
 
 ## Risk layer (M5)
 

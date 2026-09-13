@@ -50,7 +50,7 @@ log = logging.getLogger(__name__)
 #: Bumped whenever the calibration numerics change; part of the cache key (SPEC §4.3).
 #: Guarded by ``tests/test_lsv.py::test_calibration_code_tag_guard`` (source hash of the
 #: calibration and stepping modules).
-CALIBRATION_CODE_TAG = "m4b"
+CALIBRATION_CODE_TAG = "m6"
 
 
 @njit(parallel=True, cache=True)
@@ -119,7 +119,12 @@ def kernel_regression(
 
 
 def conditional_variance_estimate(
-    k: FloatArray, v: FloatArray, grid: FloatArray, h: float, cfg: ParticleConfig
+    k: FloatArray,
+    v: FloatArray,
+    grid: FloatArray,
+    h: float,
+    cfg: ParticleConfig,
+    tail_slope: float | None = None,
 ) -> FloatArray:
     """``E[v | k]`` on the output ``grid`` (the leverage ``k`` grid).
 
@@ -166,7 +171,16 @@ def conditional_variance_estimate(
     out = np.interp(grid, kreg, m)
     lo = grid < q_lo
     hi = grid > q_hi
-    if cfg.tail_extrapolation in ("log_linear", "log_quadratic", "adaptive"):
+    if cfg.tail_extrapolation in ("sv_slope", "cloud_slope"):
+        # model-consistent tail: ln E[V|S] continued with the kernel's conditional slope (the
+        # analytic pure-SV slope or the slope fitted over the whole cloud)
+        if tail_slope is None:
+            raise ValueError("tail_extrapolation='sv_slope'/'cloud_slope' needs tail_slope")
+        for edge, mask in ((0, lo), (kreg.size - 1, hi)):
+            if np.any(mask):
+                expo = tail_slope * (grid[mask] - kreg[edge])
+                out[mask] = m[edge] * np.exp(np.clip(expo, -3.0, 3.0))
+    elif cfg.tail_extrapolation in ("log_linear", "log_quadratic", "adaptive"):
         # ln m over the outer 10% of the trusted points (at least 5): linear fit for the edge
         # slope, or a quadratic whose slope is only allowed to decay towards zero (then flat)
         n_fit = max(5, kreg.size // 10)
@@ -355,7 +369,15 @@ def calibrate_leverage(
                 cfg.bandwidth_min,
             )
             bandwidths[j] = h
-            ev = conditional_variance_estimate(k, v, k_grid, h, cfg)
+            if cfg.tail_extrapolation == "sv_slope":
+                tail_slope: float | None = kernel.conditional_log_variance_slope(
+                    t1, float(sig_atm[j + 1])
+                )
+            elif cfg.tail_extrapolation == "cloud_slope":
+                tail_slope = float(np.polyfit(k, np.log(np.maximum(v, 1e-300)), 1)[0])
+            else:
+                tail_slope = None
+            ev = conditional_variance_estimate(k, v, k_grid, h, cfg, tail_slope)
             L[j + 1] = np.clip(np.sqrt(target_var(j + 1) / ev), cfg.l_min, cfg.l_max)
             if j + 1 in snap_idx:
                 snapshots[snap_idx[j + 1]] = (ls.copy(), fac.copy())
@@ -372,6 +394,7 @@ def calibrate_leverage(
                     "horizon": T,
                     "kernel": cfg.kernel,
                     "bandwidth_factor": cfg.bandwidth_factor,
+                    "tail_extrapolation": cfg.tail_extrapolation,
                     "code_tag": CALIBRATION_CODE_TAG,
                     "scheme": scheme.__dict__.copy(),
                     "schedule": repr(sim.step_schedule),

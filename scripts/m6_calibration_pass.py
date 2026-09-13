@@ -34,6 +34,7 @@ import argparse
 import dataclasses
 import logging
 import time
+from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
@@ -41,7 +42,7 @@ import pandas as pd
 
 from volsto.calibration import LeverageCache
 from volsto.calibration.cache import build_market
-from volsto.calibration.diagnostics import CalibrationReport, reprice_surface
+from volsto.calibration.diagnostics import CalibrationReport, reprice_surface_seeds
 from volsto.config import CalibrationSpec, StepSchedule, load_yaml
 from volsto.models import LSV
 from volsto.models.leverage import LeverageFunction
@@ -68,7 +69,7 @@ def run_variant(
     cal_schedule: StepSchedule,
     price_schedule: StepSchedule,
     n_paths: int,
-    price_seed: int,
+    price_seeds: Sequence[int],
     time_interp: str = "linear",
 ) -> tuple[CalibrationReport, float, bool]:
     spec = dataclasses.replace(
@@ -83,8 +84,8 @@ def run_variant(
     if time_interp == "frozen":
         model = LSV(model.kernel, step_function_leverage(model.leverage))
     _, surface, _ = build_market(spec)
-    sim = dataclasses.replace(spec.sim, dt_max=price_schedule, n_paths=n_paths, seed=price_seed)
-    report = reprice_surface(model, surface, sim)
+    sim = dataclasses.replace(spec.sim, dt_max=price_schedule, n_paths=n_paths)
+    report = reprice_surface_seeds(model, surface, sim, price_seeds)
     return report, t_cal, hit
 
 
@@ -165,9 +166,20 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--n-particles", type=int, default=800_000)
     ap.add_argument("--seeds", type=int, nargs="+", default=[12345, 777, 4242])
     ap.add_argument("--n-paths", type=int, default=400_000)
-    ap.add_argument("--price-seed", type=int, default=2)
+    ap.add_argument(
+        "--price-seeds",
+        type=int,
+        nargs="+",
+        default=[2, 3, 4, 5, 6, 7],
+        help="pricing seeds averaged per report (owner decision at M6 Part 0: never one seed)",
+    )
     ap.add_argument("--specs", nargs="+", default=["1f"])
     ap.add_argument("--variants", nargs="+", default=list(VARIANTS), choices=list(VARIANTS))
+    ap.add_argument(
+        "--tail",
+        default=None,
+        help="override ParticleConfig.tail_extrapolation (e.g. sv_slope, M6 Part 0 item 4)",
+    )
     ap.add_argument("--cache", default=str(ROOT / "cache"))
     ap.add_argument("--out", default=str(ROOT / "outputs" / "m6" / "calibration_pass"))
     args = ap.parse_args(argv)
@@ -177,12 +189,18 @@ def main(argv: list[str] | None = None) -> int:
     cache = LeverageCache(args.cache)
     lines = [
         f"# M6 Part 0 — calibration-side pass ({args.n_particles} particles, "
-        f"seeds {args.seeds}, {args.n_paths} pricing paths)",
+        f"seeds {args.seeds}, {args.n_paths} pricing paths x pricing seeds {args.price_seeds})",
         "",
     ]
     for tag in args.specs:
         base = load_yaml(ROOT / f"configs/studies/lsv_reference_{tag}.yaml", CalibrationSpec)
-        lines.append(f"## {tag.upper()} reference set")
+        if args.tail is not None:
+            base = dataclasses.replace(
+                base, particle=dataclasses.replace(base.particle, tail_extrapolation=args.tail)
+            )
+        lines.append(
+            f"## {tag.upper()} reference set" + (f" (tail {args.tail})" if args.tail else "")
+        )
         lines.append("")
         for name in args.variants:
             cal_s, price_s, interp = VARIANTS[name]
@@ -197,7 +215,7 @@ def main(argv: list[str] | None = None) -> int:
                     cal_s,
                     price_s,
                     args.n_paths,
-                    args.price_seed,
+                    args.price_seeds,
                     interp,
                 )
                 reports.append(rep)

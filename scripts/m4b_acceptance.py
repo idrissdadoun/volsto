@@ -19,6 +19,8 @@ from pathlib import Path
 import pandas as pd
 
 from volsto.calibration import LeverageCache
+from volsto.calibration.cache import build_market
+from volsto.calibration.diagnostics import reprice_surface_seeds
 from volsto.config import CalibrationSpec, StepSchedule, load_yaml
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,7 +32,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--spec", default=str(ROOT / "configs/studies/lsv_reference_1f.yaml"))
     ap.add_argument("--n-particles", type=int, nargs="+", default=[200_000, 800_000])
     ap.add_argument("--diag-paths", type=int, default=400_000)
-    ap.add_argument("--seed", type=int, default=2)
+    ap.add_argument(
+        "--price-seeds",
+        type=int,
+        nargs="+",
+        default=[2, 3, 4, 5, 6, 7],
+        help="pricing seeds averaged in the repricing diagnostics (owner decision, M6 Part 0)",
+    )
     ap.add_argument("--cache", default=str(ROOT / "cache"))
     ap.add_argument("--out", default=str(ROOT / "outputs" / "m4b"))
     ap.add_argument("--fine", action="store_true", help="use the default (fine) schedule instead")
@@ -46,12 +54,13 @@ def main(argv: list[str] | None = None) -> int:
         spec = dataclasses.replace(
             base, particle=dataclasses.replace(base.particle, n_particles=n), sim=sim
         )
-        diag_sim = dataclasses.replace(sim, n_paths=args.diag_paths, seed=args.seed)
+        diag_sim = dataclasses.replace(sim, n_paths=args.diag_paths)
         t0 = time.perf_counter()
         hit = cache.has(spec)
-        model, report = cache.get_or_calibrate(spec, run_diagnostics=True, diagnostics_sim=diag_sim)
+        model, _ = cache.get_or_calibrate(spec)
+        _, surface, _ = build_market(spec)
+        report = reprice_surface_seeds(model, surface, diag_sim, args.price_seeds)
         t_total = time.perf_counter() - t0
-        assert report is not None
         tag = f"N{n}_{'fine' if args.fine else 'coarse'}"
         report.vanillas.to_csv(out / f"vanillas_{tag}.csv", index=False)
         report.varswaps.to_csv(out / f"varswaps_{tag}.csv", index=False)

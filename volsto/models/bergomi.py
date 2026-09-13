@@ -221,7 +221,11 @@ def bergomi_block(
                 cross = 0.0
                 lin = 0.0
                 for i in range(nf):
-                    cross += coef[i] * (dwt[i] * dws - rho_s[i] * dt)
+                    # compensator = the exact step covariance E[dwt_i dW^S] =
+                    # rho_Si (1 - e^{-k_i dt})/k_i = chol[1+i,0] chol[0,0]; rho_Si dt
+                    # over-compensated by rho_Si k_i dt^2/2 per step: a first-order drift
+                    # error growing with k_i (M6 Part 0 finding)
+                    cross += coef[i] * (dwt[i] * dws - chol[j, 1 + i, 0] * chol[j, 0, 0])
                     lin += coef[i] * ks[i] * x0[i]
                 lterm = 0.5 * dlng[j] - 0.5 * lin + cc + 0.5 * (bbx / b0) * rs
                 dls += 0.25 * b0 * cross + 0.5 * dt * b0 * lterm * dws
@@ -292,6 +296,18 @@ class BergomiSV(Model):
         T_ = np.atleast_1d(np.asarray(T, dtype=np.float64))
         decay = np.exp(-self.ks[None, :] * (T_[:, None] - t))  # (nT, nf)
         return np.asarray(self.alpha * (factors @ (self.weights * decay).T), dtype=np.float64)
+
+    def conditional_log_variance_slope(self, t: float, sigma_ref: float) -> float:
+        """``d ln E[ξ_t^t | ln S_t] / d ln S_t`` in the Gaussian approximation of the pure SV
+        model: ``Σ_i coef_i ρ_Si (1 − e^{−k_i t}) / (k_i σ_ref t)`` with ``ln S_t ≈ σ_ref W^S_t``
+        (``Cov(ln ξ, ln S) / Var(ln S)``).  The model-consistent tail of the particle regression
+        (``ParticleConfig.tail_extrapolation = "sv_slope"``); checked by
+        ``tests/test_bergomi.py::test_conditional_log_variance_slope_matches_cloud_regression``.
+        """
+        if t <= 0 or sigma_ref <= 0:
+            raise ValueError("t and sigma_ref must be positive")
+        g = -np.expm1(-self.ks * t) / self.ks
+        return float(np.sum(self.coef * self.rho_s * g) / (sigma_ref * t))
 
     def variance_from_factors(self, t: float, factors: FloatArray) -> FloatArray:
         """``ξ_t^t`` from the factor values."""
