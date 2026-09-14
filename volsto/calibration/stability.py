@@ -1,120 +1,116 @@
-"""Stability of the two-factor fit over time (SPEC §15 Part 4).
+"""Stability of the two-factor break-even fit over time (SPEC §15 Part 4, M7 addendum).
 
-:func:`rolling_fit` refits stage 1 every ``stage1_every`` dates on the trailing ``window_vol``
-window and stage 2 every ``stage2_every`` dates (stage 1 held at its latest refit), returning
-one row per date with the parameters and their standard errors.  :func:`flag_unidentified`
-marks the parameters whose day-to-day changes exceed their standard-error band on more than
-``share`` of the days (a parameter that moves by more than its own uncertainty from one day to
-the next is being driven by noise, not by information — unidentified in the SPEC's sense);
-:func:`degeneracy_profile` is the objective along the ``ν ⟷ correlations`` direction of
-:func:`~volsto.calibration.fit_2f.skew_scale_degeneracy` (re-exported for the backtest
-study).  Checked by ``tests/test_fit_2f.py::test_rolling_fit_and_flags``.
+:func:`rolling_fit` runs :func:`~volsto.calibration.fit_2f.fit_2f_historical` every ``every``
+dates on the trailing ``window_vol`` / ``window_ssr`` windows and returns one row per fitted
+date with the break-even parameters ``(k1, λ1, λ2, ω1, ω2, χ)``, their standard errors (``k1``
+from the curvature of the ``k1`` profile — NaN with the fit's note when it has none —, ``λ``
+from the inner linear least squares, ``ω`` / ``χ`` from the second fit's Jacobian), the book
+parameters ``(ν, θ, ρ_SX1, ρ_SX2, ρ12)`` for reading, both objectives, the active skew
+constraints and the bound flags.  :func:`flag_unidentified` marks the parameters whose
+consecutive changes exceed their standard-error band on more than ``share`` of the fitted dates
+(a parameter that moves by more than its own uncertainty from one fit to the next is driven by
+noise, not by information — unidentified in the SPEC's sense).  Checked by
+``tests/test_fit_2f.py::test_rolling_fit_and_flags``.
 """
 
 from __future__ import annotations
 
+import time
 from collections.abc import Sequence
 
 import numpy as np
 import pandas as pd
 
-from volsto.calibration.fit_2f import (
-    Fit2FConfig,
-    Stage1Report,
-    fit_stage1,
-    fit_stage2,
-    skew_scale_degeneracy,
-)
-from volsto.calibration.history import SurfaceHistory
+from volsto.calibration.fit_2f import BreakEvenFitConfig, fit_2f_historical
+from volsto.calibration.history import WINDOW_SSR, WINDOW_VOL, SurfaceHistory
 
-PARAM_COLUMNS = ("nu", "theta", "k1", "k2", "rho12", "rho_SX1", "rho_SX2", "chi")
+#: the break-even parameters carried by the rolling frame (with ``<name>_se`` columns)
+PARAM_COLUMNS = ("k1", "lambda1", "lambda2", "omega1", "omega2", "chi")
+#: the book parameters carried for reading (no standard errors)
+BOOK_COLUMNS = ("nu", "theta", "rho_SX1", "rho_SX2", "rho12", "k2")
 
 
 def rolling_fit(
     history: SurfaceHistory,
-    cfg: Fit2FConfig | None = None,
+    cfg: BreakEvenFitConfig | None = None,
     *,
-    stage1_every: int = 21,
-    stage2_every: int = 1,
+    every: int = 1,
+    window_vol: int = WINDOW_VOL,
+    window_ssr: int = WINDOW_SSR,
     start: pd.Timestamp | str | None = None,
     end: pd.Timestamp | str | None = None,
-    refine_mixing: bool = False,
 ) -> pd.DataFrame:
-    """Parameter time series: columns ``date, nu, theta, k1, k2, rho12, rho_SX1, rho_SX2, chi,
-    nu_se, theta_se, k1_se, k2_se, rho_SX1_se, chi_se, stage1_objective, stage2_objective,
-    stage1_refit`` (``True`` on the dates stage 1 was refit).  ``start`` defaults to the first
-    date with ``window_vol`` increments behind it; the mixing refinement is off by default
-    (a daily loop over Monte Carlo skews would dominate the cost)."""
-    c = cfg or Fit2FConfig()
-    if refine_mixing != c.refine_mixing:
-        c = Fit2FConfig(**{**c.__dict__, "refine_mixing": refine_mixing})
-    if stage1_every < 1 or stage2_every < 1:
-        raise ValueError("stage1_every and stage2_every must be positive")
-    first = c.window_vol if start is None else history.date_index(start)
+    """Parameter time series in historical mode: columns ``date``, :data:`PARAM_COLUMNS`,
+    their ``_se``, :data:`BOOK_COLUMNS`, ``first_objective, second_objective, n_active,
+    k1_at_bound, bound_flags, wall_seconds``.  ``start`` defaults to the first date with
+    ``window_vol`` increments behind it; ``every`` is the step in dates."""
+    c = cfg or BreakEvenFitConfig()
+    if every < 1:
+        raise ValueError("every must be positive")
+    first = window_vol if start is None else history.date_index(start)
     last = history.date_index(end)
-    if first < c.window_vol:
+    if first < window_vol:
         raise ValueError(
-            f"start must leave {c.window_vol} increments behind it (first possible date "
-            f"{history.dates[c.window_vol].date()})"
+            f"start must leave {window_vol} increments behind it (first possible date "
+            f"{history.dates[window_vol].date()})"
         )
     rows: list[dict[str, object]] = []
-    s1: Stage1Report | None = None
-    for i in range(first, last + 1):
+    for i in range(first, last + 1, every):
         date = history.dates[i]
-        refit = s1 is None or (i - first) % stage1_every == 0
-        if refit:
-            s1 = fit_stage1(history, c, date)
-        assert s1 is not None
-        if (i - first) % stage2_every == 0:
-            s2 = fit_stage2(history, c, s1.best.params, date)
-            p = s2.params
-            rows.append(
-                {
-                    "date": date,
-                    "nu": p.nu,
-                    "theta": p.theta,
-                    "k1": p.k1,
-                    "k2": p.k2,
-                    "rho12": p.rho12,
-                    "rho_SX1": p.rho_SX1,
-                    "rho_SX2": p.rho_SX2,
-                    "chi": s2.chi,
-                    "nu_se": s1.best.stderr["nu"],
-                    "theta_se": s1.best.stderr["theta"],
-                    "k1_se": s1.best.stderr["k1"],
-                    "k2_se": s1.best.stderr["k2"],
-                    "rho_SX1_se": s2.stderr["rho_SX1"],
-                    "chi_se": s2.stderr["chi"],
-                    "stage1_objective": s1.best.objective,
-                    "stage2_objective": s2.objective,
-                    "stage1_refit": refit,
-                    "k2_flag": s1.best.k2_flag,
-                }
-            )
+        t0 = time.perf_counter()
+        r = fit_2f_historical(history, c, end=date, window_vol=window_vol, window_ssr=window_ssr)
+        b, p, f, s = r.breakeven, r.params, r.first, r.second
+        rows.append(
+            {
+                "date": date,
+                "k1": b.k1,
+                "lambda1": b.lambda1,
+                "lambda2": b.lambda2,
+                "omega1": b.omega1,
+                "omega2": b.omega2,
+                "chi": b.chi,
+                "k1_se": f.k1_se,
+                "lambda1_se": f.lambda1_se,
+                "lambda2_se": f.lambda2_se,
+                "omega1_se": s.stderr["omega1"],
+                "omega2_se": s.stderr["omega2"],
+                "chi_se": s.stderr["chi"],
+                "nu": p.nu,
+                "theta": p.theta,
+                "rho_SX1": p.rho_SX1,
+                "rho_SX2": p.rho_SX2,
+                "rho12": p.rho12,
+                "k2": p.k2,
+                "first_objective": f.objective,
+                "second_objective": s.objective,
+                "n_active": len(f.active),
+                "k1_at_bound": f.k1_at_bound,
+                "bound_flags": ";".join(s.bound_flags),
+                "wall_seconds": time.perf_counter() - t0,
+            }
+        )
     return pd.DataFrame(rows)
 
 
 def flag_unidentified(
     frame: pd.DataFrame,
-    params: Sequence[str] = ("nu", "theta", "k1", "k2", "rho_SX1", "chi"),
+    params: Sequence[str] = PARAM_COLUMNS,
     *,
     share: float = 0.5,
     band: float = 1.0,
 ) -> pd.DataFrame:
     """Per parameter: the share of consecutive changes exceeding ``band`` × the (larger of the
-    two dates') standard error, the median absolute change, the median standard error and the
-    flag ``unidentified`` when the share exceeds ``share``.  Stage-1 parameters are compared on
-    the stage-1 refit dates only (between refits they are constant by construction)."""
+    two dates') standard error, the median absolute change, the median standard error, the
+    number of dates without a standard error and the flag ``unidentified`` when the share
+    exceeds ``share`` (NaN share — no usable standard error — is reported, not flagged)."""
     rows = []
     for name in params:
         se_col = f"{name}_se"
         if name not in frame or se_col not in frame:
             raise KeyError(f"frame lacks {name} / {se_col}")
-        sub = frame
-        if name in ("nu", "theta", "k1", "k2") and "stage1_refit" in frame:
-            sub = frame[frame["stage1_refit"].astype(bool)]
-        x = sub[name].to_numpy(dtype=float)
-        se = sub[se_col].to_numpy(dtype=float)
+        x = frame[name].to_numpy(dtype=float)
+        se = frame[se_col].to_numpy(dtype=float)
+        n_no_se = int(np.sum(~np.isfinite(se) | (se <= 0)))
         if x.size < 2:
             rows.append(
                 {
@@ -123,6 +119,7 @@ def flag_unidentified(
                     "share_beyond_se": np.nan,
                     "median_abs_change": np.nan,
                     "median_se": float(np.nanmedian(se)) if se.size else np.nan,
+                    "n_without_se": n_no_se,
                     "unidentified": False,
                 }
             )
@@ -137,13 +134,12 @@ def flag_unidentified(
                 "n_changes": int(ok.sum()),
                 "share_beyond_se": beyond,
                 "median_abs_change": float(np.nanmedian(d)),
-                "median_se": float(np.nanmedian(se)),
+                "median_se": float(np.nanmedian(se)) if np.any(np.isfinite(se)) else np.nan,
+                "n_without_se": n_no_se,
                 "unidentified": bool(np.isfinite(beyond) and beyond > share),
             }
         )
     return pd.DataFrame(rows)
 
 
-degeneracy_profile = skew_scale_degeneracy
-
-__all__ = ["PARAM_COLUMNS", "degeneracy_profile", "flag_unidentified", "rolling_fit"]
+__all__ = ["BOOK_COLUMNS", "PARAM_COLUMNS", "flag_unidentified", "rolling_fit"]

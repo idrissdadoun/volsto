@@ -1,15 +1,25 @@
-"""M7 real-data run: the 2022 H2 SPX history (SPEC §15 Parts 2–4 end to end, no fixed numbers).
+"""M7 real-data run: the 2022 H2 SPX history with the break-even fitter (SPEC §15 Parts 2–4,
+M7 addendum; no fixed numbers).
 
 Input: ``outputs/m7/hdn_history_ssvi.csv`` (``scripts/m7_hdn_history.py --no-essvi``) and the
 snapshot of the pricing date in ``configs/surfaces/snapshots/hdn_2022H2_ssvi``.  Steps: the
 historical estimates at the last date (windows 100 / 60 — the sample has 127 trading days, so
 the SPEC's 250-day vol window is not available and every number is reported with the window it
-was measured on); ``fit_2f`` stages 1–2 (ρ12 from the 3m/2y correlation, mixing refinement);
-stage 3 on the pricing date's surface (2·10⁵ particles — the development count — and 2·10⁵
-pricing paths); the rolling stability run (stage 1 every 21 days, stage 2 every 5 days, from the
-first date with 100 increments behind it) with the identification flags; the ν ⟷ correlations
-degeneracy profile.  Outputs in ``outputs/m7/``: ``fit_2f_hdn.md``, ``fit_2f_hdn.yaml``,
-``hdn_estimates.csv``, ``hdn_stability.csv``.
+was measured on); the **historical-mode** fit (pillars 1m, 3m, 6m, 1y; ``k2`` fixed); the
+**marking-mode** fit on the last snapshot (same pillars, ``ssr_target`` 1.0) with the SSR dial
+table (0.8 / 1.0 / 1.2: fitted parameters and the naked kernel's numerical SSR by
+``ssr_numerical_many`` with 4·10⁴ paths); stage 3 on the marking fit (2·10⁵ particles — the
+development count — and 2·10⁵ pricing paths; **this script calibrates a leverage** and says
+so); the rolling stability run in historical mode every 5 dates with the identification flags.
+Outputs in ``outputs/m7/``: ``fit_2f_hdn.md``, ``fit_2f_hdn.yaml`` (marking),
+``fit_2f_hdn_historical.yaml``, ``hdn_estimates.csv``, ``hdn_stability.csv``.
+
+Data notes carried from the first M7 run: the snapshots quote ATM maturities to 1.5–3y only
+(median 2y), so the 2y / 3y pillars sit on the SSVI extrapolation and their daily changes are
+an artefact — the fit uses the 1m–1y pillars; over H2 2022 the historical SSR read 0.81–0.84
+(60 days) at every pillar to 1y, below the floor ``R ≥ 1`` of a naked or local-vol-type model,
+so the historical-mode ``SpotVolCovar`` target asks for less spot/vol covariance than the
+kernel's own skew implies (the skew guard then binds).
 """
 
 from __future__ import annotations
@@ -20,11 +30,20 @@ from pathlib import Path
 
 import pandas as pd
 
-from volsto.calibration.fit_2f import Fit2FConfig, Stage3Inputs, fit_2f
+from volsto.analytics.smile_dynamics import ssr_numerical_many
+from volsto.calibration.fit_2f import (
+    BreakEvenFitConfig,
+    Stage3Inputs,
+    fit_2f_historical,
+    fit_2f_marking,
+    naked_kernel,
+)
 from volsto.calibration.history import SurfaceHistory, estimate_history
 from volsto.calibration.stability import flag_unidentified, rolling_fit
 from volsto.config import ParticleConfig, SimConfig
 from volsto.market.loaders import load_ssvi_surface
+
+DIALS = (0.8, 1.0, 1.2)
 
 
 def main() -> None:
@@ -34,21 +53,30 @@ def main() -> None:
     ap.add_argument("--out", default="outputs/m7")
     ap.add_argument("--window-vol", type=int, default=100)
     ap.add_argument("--window-ssr", type=int, default=60)
+    ap.add_argument("--k2", type=float, default=0.2)
+    ap.add_argument("--ssr-target", type=float, default=1.0)
+    ap.add_argument(
+        "--prefactor",
+        choices=("market", "model"),
+        default="market",
+        help="sigma_hat prefactor convention of the fit (fit_2f module docstring)",
+    )
     ap.add_argument("--n-particles", type=int, default=200_000)
+    ap.add_argument("--n-paths", type=int, default=200_000)
     ap.add_argument(
         "--max-pillar",
         type=float,
         default=1.0,
-        help="longest pillar used by the fit (the sample quotes ATM maturities to 1.5-3y only)",
+        help="longest pillar used by the fits (the sample quotes ATM maturities to 1.5-3y only)",
     )
-    ap.add_argument("--n-paths", type=int, default=200_000)
+    ap.add_argument("--every", type=int, default=5, help="rolling-fit step in dates")
     ap.add_argument("--no-stage3", action="store_true")
     ap.add_argument("--no-stability", action="store_true")
     args = ap.parse_args()
-    pd.set_option("display.width", 200)
+    pd.set_option("display.width", 220)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    lines: list[str] = ["# M7 real-data run — SPX 2022 H2 (HDN sample, plain SSVI snapshots)", ""]
+    lines: list[str] = ["# M7 real-data run - SPX 2022 H2 (HDN sample, break-even fitter)", ""]
     t_all = time.perf_counter()
     hist = SurfaceHistory(pd.read_csv(args.history))
     lines.append(
@@ -60,86 +88,129 @@ def main() -> None:
     pillars = tuple(float(T) for T in hist.pillars if args.max_pillar + 1e-9 >= T)
     lines += [
         "",
-        f"Pillars used by the fit: {list(pillars)} (the snapshots quote ATM maturities to 1.5-3y "
-        "only, median 2y, so the 2y/3y pillars sit on the SSVI extrapolation and their daily "
-        "changes are an artefact: annualised std of d ln vs_vol 0.46 / 0.62 against 0.24 at 1y, "
-        "cross-pillar correlation with the 1y pillar 0.07 / -0.01).",
+        f"Pillars used by the fits: {list(pillars)} (the snapshots quote ATM maturities to "
+        "1.5-3y only, median 2y, so the 2y/3y pillars sit on the SSVI extrapolation and their "
+        "daily changes are an artefact: annualised std of d ln vs_vol 0.46 / 0.62 against 0.24 "
+        "at 1y, cross-pillar correlation with the 1y pillar 0.07 / -0.01).  SSR_hist < 1 over "
+        "H2 2022 (0.81-0.84 on 60 days): below the floor of a naked kernel, so the historical "
+        "SpotVolCovar target is met only with the skew guard binding.",
+        f"k2 fixed at {args.k2:g}; sigma_hat prefactor convention: {args.prefactor}.",
     ]
-    cfg = Fit2FConfig(
-        pillars=pillars,
-        corr_pillars=(0.25, min(1.0, pillars[-1])),
-        window_vol=args.window_vol,
-        window_ssr=args.window_ssr,
-        rho12_mode="from_correlation",
-    )
-    cfg_skew = Fit2FConfig(**{**cfg.__dict__, "ssr_scale": 1e6})
+    cfg = BreakEvenFitConfig(pillars=pillars, k2=args.k2, sigma_hat_prefactor=args.prefactor)
+    # historical mode
+    t0 = time.perf_counter()
+    r_hist = fit_2f_historical(hist, cfg, window_vol=args.window_vol, window_ssr=args.window_ssr)
+    r_hist.write_yaml(out / "fit_2f_hdn_historical.yaml")
+    lines += [
+        "",
+        f"## Historical-mode fit at {hist.dates[-1].date()} ({time.perf_counter() - t0:.1f} s, "
+        f"recalibrated: no)",
+        "",
+        "```",
+        r_hist.summary(),
+        "",
+        "k1 profile:",
+        r_hist.first.profile.round(5).to_string(index=False),
+        "```",
+    ]
+    # marking mode on the last snapshot, with stage 3
+    date = str(hist.dates[-1].date())
+    surface = load_ssvi_surface(Path(args.snapshots) / f"spx_{date}.yaml")
     stage3 = None
     if not args.no_stage3:
-        date = str(hist.dates[-1].date())
-        surface = load_ssvi_surface(Path(args.snapshots) / f"spx_{date}.yaml")
         stage3 = Stage3Inputs(
             surface=surface,
             particle=ParticleConfig(n_particles=args.n_particles, horizon=3.0),
             sim=SimConfig(),
             pricing_sim=SimConfig(n_paths=args.n_paths, chunk_size=100_000, seed=7),
+            ssr_pillars=pillars,
+            breakeven_pillars=(0.25, 1.0),
             headline=False,
         )
     t0 = time.perf_counter()
-    result = fit_2f(hist, None, cfg, stage3=stage3)
+    r_mark = fit_2f_marking(surface, cfg, ssr_target=args.ssr_target, stage3=stage3)
+    r_mark.write_yaml(out / "fit_2f_hdn.yaml")
     lines += [
         "",
-        f"## fit_2f as specified: skew term structure + SSR (stages 1-3, "
-        f"{time.perf_counter() - t0:.0f} s)",
+        f"## Marking-mode fit on the {date} snapshot, ssr_target {args.ssr_target:g} "
+        f"({time.perf_counter() - t0:.0f} s incl. stage 3; recalibrated: "
+        f"{'yes' if r_mark.recalibrated else 'no'})",
         "",
         "```",
-        result.summary(),
+        r_mark.summary(),
+        "",
+        "policy check:",
+        r_mark.targets.policy_check().round(4).to_string(index=False),
         "```",
     ]
+    if r_mark.stage3 is not None:
+        s3 = r_mark.stage3
+        lines += [
+            "",
+            f"Stage 3: calibration {s3.calibration_seconds:.0f} s at {s3.n_particles} "
+            f"particles, wall clock {s3.wall_seconds:.0f} s, recalibrated: "
+            f"{'yes' if s3.recalibrated else 'no'}.",
+        ]
+    # the SSR dial
     t0 = time.perf_counter()
-    result_skew = fit_2f(hist, None, cfg_skew, stage3=stage3)
+    sim = SimConfig(n_paths=40_000, dt_max=1.0 / 100.0, chunk_size=20_000, seed=7)
+    rows = []
+    for s in DIALS:
+        r = fit_2f_marking(surface, cfg, ssr_target=s)
+        num = ssr_numerical_many(naked_kernel(r, surface.forward_curve), pillars, eps=0.05, sim=sim)
+        row: dict[str, object] = {
+            "ssr_target": s,
+            "nu": r.params.nu,
+            "theta": r.params.theta,
+            "k1": r.params.k1,
+            "rho_SX1": r.params.rho_SX1,
+            "rho_SX2": r.params.rho_SX2,
+            "rho12": r.params.rho12,
+            "chi": r.breakeven.chi,
+            "active": ",".join(r.first.active_labels),
+        }
+        for x in num:
+            row[f"ssr_num_{x.T:g}"] = x.R
+            row[f"se_{x.T:g}"] = x.R_stderr
+        rows.append(row)
     lines += [
         "",
-        f"## fit_2f variant: skew term structure only (SSR reported, not fitted; "
-        f"{time.perf_counter() - t0:.0f} s)",
+        f"## SSR dial (marking fits; naked kernel numerical SSR, {sim.n_paths} paths, "
+        f"dt {sim.dt_max}; {time.perf_counter() - t0:.0f} s, recalibrated: no)",
         "",
         "```",
-        result_skew.summary(),
+        pd.DataFrame(rows).round(4).to_string(index=False),
         "```",
     ]
-    result_skew.write_yaml(out / "fit_2f_hdn_skew_only.yaml")
-    lines += [
-        "",
-        "### nu <-> correlations degeneracy profile",
-        "",
-        "```",
-        result.degeneracy.round(4).to_string(index=False),
-        "```",
-    ]
-    result.write_yaml(out / "fit_2f_hdn.yaml")
     if not args.no_stability:
         t0 = time.perf_counter()
-        frame = rolling_fit(hist, cfg, stage1_every=21, stage2_every=5, refine_mixing=False)
+        frame = rolling_fit(
+            hist, cfg, every=args.every, window_vol=args.window_vol, window_ssr=args.window_ssr
+        )
         frame.to_csv(out / "hdn_stability.csv", index=False)
         flags = flag_unidentified(frame)
-        n_refit = int(frame["stage1_refit"].sum())
         cols = [
             "date",
+            "k1",
+            "lambda1",
+            "lambda2",
+            "omega1",
+            "omega2",
+            "chi",
             "nu",
             "theta",
-            "k1",
-            "k2",
-            "rho12",
             "rho_SX1",
             "rho_SX2",
-            "chi",
-            "stage1_objective",
-            "stage2_objective",
-            "stage1_refit",
+            "rho12",
+            "first_objective",
+            "second_objective",
+            "n_active",
+            "bound_flags",
         ]
         lines += [
             "",
-            f"## Rolling stability ({len(frame)} stage-2 dates, {n_refit} stage-1 refits, "
-            f"{time.perf_counter() - t0:.0f} s; order-one skew, no mixing refinement)",
+            f"## Rolling stability (historical mode every {args.every} dates, {len(frame)} fits, "
+            f"{time.perf_counter() - t0:.0f} s, recalibrated: no)",
             "",
             "```",
             frame[cols].round(4).to_string(index=False),
