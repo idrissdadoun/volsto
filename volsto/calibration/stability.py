@@ -5,8 +5,14 @@ dates on the trailing ``window_vol`` / ``window_ssr`` windows and returns one ro
 date with the break-even parameters ``(k1, λ1, λ2, ω1, ω2, χ)``, their standard errors (``k1``
 from the curvature of the ``k1`` profile — NaN with the fit's note when it has none —, ``λ``
 from the inner linear least squares, ``ω`` / ``χ`` from the second fit's Jacobian), the book
-parameters ``(ν, θ, ρ_SX1, ρ_SX2, ρ12)`` for reading, both objectives, the active skew
-constraints and the bound flags.  :func:`flag_unidentified` marks the parameters whose
+parameters ``(ν, θ, ρ_SX1, ρ_SX2, ρ12)`` for reading, both objectives, the achieved SSR (the
+configured measure) against the historical target, the mean naked-skew gap, whether the ν
+feasibility limit binds, the floor / ceiling message of the soft-skew fitter and the bound
+flags.  A standard error above ``max_se`` (default
+:data:`~volsto.calibration.fit_2f.MAX_FINITE_SE` = 1e3; the second fit reported ``χ`` standard
+errors of about 1e7 on dates where ``ω`` sits on its bounds) is numerically unidentified and is
+stored as NaN, with the raw value in ``<name>_se_raw``.  :func:`flag_unidentified` marks the
+parameters whose
 consecutive changes exceed their standard-error band on more than ``share`` of the fitted dates
 (a parameter that moves by more than its own uncertainty from one fit to the next is driven by
 noise, not by information — unidentified in the SPEC's sense).  Checked by
@@ -21,7 +27,7 @@ from collections.abc import Sequence
 import numpy as np
 import pandas as pd
 
-from volsto.calibration.fit_2f import BreakEvenFitConfig, fit_2f_historical
+from volsto.calibration.fit_2f import MAX_FINITE_SE, BreakEvenFitConfig, fit_2f_historical
 from volsto.calibration.history import WINDOW_SSR, WINDOW_VOL, SurfaceHistory
 
 #: the break-even parameters carried by the rolling frame (with ``<name>_se`` columns)
@@ -39,11 +45,14 @@ def rolling_fit(
     window_ssr: int = WINDOW_SSR,
     start: pd.Timestamp | str | None = None,
     end: pd.Timestamp | str | None = None,
+    max_se: float = MAX_FINITE_SE,
 ) -> pd.DataFrame:
     """Parameter time series in historical mode: columns ``date``, :data:`PARAM_COLUMNS`,
-    their ``_se``, :data:`BOOK_COLUMNS`, ``first_objective, second_objective, n_active,
-    k1_at_bound, bound_flags, wall_seconds``.  ``start`` defaults to the first date with
-    ``window_vol`` increments behind it; ``every`` is the step in dates."""
+    their ``_se``, :data:`BOOK_COLUMNS`, ``first_objective, second_objective, ssr_target,
+    ssr_achieved, mean_skew_gap, n_active`` (ν-limit rows), ``k1_at_bound, message,
+    bound_flags, wall_seconds`` and ``<name>_se_raw``.  ``start`` defaults to the first date with
+    ``window_vol`` increments behind it; ``every`` is the step in dates; standard errors above
+    ``max_se`` are stored as NaN (module docstring)."""
     c = cfg or BreakEvenFitConfig()
     if every < 1:
         raise ValueError("every must be positive")
@@ -60,6 +69,14 @@ def rolling_fit(
         t0 = time.perf_counter()
         r = fit_2f_historical(history, c, end=date, window_vol=window_vol, window_ssr=window_ssr)
         b, p, f, s = r.breakeven, r.params, r.first, r.second
+        raw = {
+            "k1": f.k1_se,
+            "lambda1": f.lambda1_se,
+            "lambda2": f.lambda2_se,
+            "omega1": s.stderr["omega1"],
+            "omega2": s.stderr["omega2"],
+            "chi": s.stderr["chi"],
+        }
         rows.append(
             {
                 "date": date,
@@ -69,12 +86,11 @@ def rolling_fit(
                 "omega1": b.omega1,
                 "omega2": b.omega2,
                 "chi": b.chi,
-                "k1_se": f.k1_se,
-                "lambda1_se": f.lambda1_se,
-                "lambda2_se": f.lambda2_se,
-                "omega1_se": s.stderr["omega1"],
-                "omega2_se": s.stderr["omega2"],
-                "chi_se": s.stderr["chi"],
+                **{
+                    f"{k}_se": (v if np.isfinite(v) and v <= max_se else float("nan"))
+                    for k, v in raw.items()
+                },
+                **{f"{k}_se_raw": v for k, v in raw.items()},
                 "nu": p.nu,
                 "theta": p.theta,
                 "rho_SX1": p.rho_SX1,
@@ -83,8 +99,12 @@ def rolling_fit(
                 "k2": p.k2,
                 "first_objective": f.objective,
                 "second_objective": s.objective,
+                "ssr_target": float(np.mean(r.ssr_requested)),
+                "ssr_achieved": r.ssr_achieved_mean,
+                "mean_skew_gap": r.mean_skew_gap,
                 "n_active": len(f.active),
                 "k1_at_bound": f.k1_at_bound,
+                "message": r.message or "",
                 "bound_flags": ";".join(s.bound_flags),
                 "wall_seconds": time.perf_counter() - t0,
             }

@@ -1,0 +1,160 @@
+spec:
+  market:
+    spot: 100.0
+    rate_curve:
+      times:
+      - 1.0
+      rates:
+      - 0.02
+    dividend_curve:
+      times:
+      - 1.0
+      rates:
+      - 0.01
+  surface:
+    atm_maturities:
+    - 0.0833333
+    - 0.25
+    - 0.5
+    - 1.0
+    - 2.0
+    - 3.0
+    atm_vols:
+    - 0.22
+    - 0.21
+    - 0.205
+    - 0.2
+    - 0.2
+    - 0.205
+    rho: -0.7
+    eta: 1.0
+    gamma: 0.5
+    max_maturity: 10.0
+  model:
+    nu: 2.506711154999891
+    theta: 0.13204385748443173
+    k1: 8.037785361541365
+    k2: 0.2
+    rho12: 0.4656428204556604
+    rho_SX1: -0.9986100079048518
+    rho_SX2: -0.5112002292458954
+  particle:
+    n_particles: 200000
+    horizon: 3.0
+    bandwidth_factor: 1.5
+    bandwidth_min: 0.0005
+    kernel: gaussian
+    regression: local_linear
+    min_window: 2000
+    min_window_fraction: 0.01
+    bias_correction: true
+    quantile_clip: 0.005
+    tail_extrapolation: log_quadratic
+    n_regression_points: 201
+    leverage_std_span: 6.0
+    leverage_dk: 0.0025
+    l_min: 0.05
+    l_max: 20.0
+    second_pass: false
+    seed: 12345
+    antithetic: true
+  sim:
+    n_paths: 200000
+    dt_max:
+      breaks:
+      - 0.25
+      - 2.0
+      dts:
+      - 0.0006849315068493151
+      - 0.0027397260273972603
+      - 0.004
+    chunk_size: 50000
+    antithetic: true
+    seed: 0
+    local_var_time_average: true
+    predictor_corrector: false
+    pc_eta: 0.5
+    weak_order2: true
+    local_var_time_eval: start
+    sv_order2: true
+    record_all_steps: false
+    chunk_memory_mb: 512
+  local_vol: null
+  perturbation: null
+fit:
+  config:
+    pillars:
+    - 0.25
+    - 0.5
+    - 1.0
+    - 2.0
+    - 3.0
+    k2: 0.2
+    k1_bounds:
+    - 0.3
+    - 20.0
+    k1_min_gap: 0.05
+    k1_grid: 25
+    skew_weight: 1.0
+    ssr_measure: lsv
+    ssr_tol: 0.05
+    clamp_to_attainable: false
+    term_structure: atmf
+    lv_ssr: order1
+    weights_ssr: uniform
+    weights_volvar: relative
+    volvar_target: achieved
+    sigma_hat_prefactor: market
+    nu_cap: 2.5
+    nu_flag: 2.5
+    chi_bounds:
+    - -0.99
+    - 0.99
+    omega_max: 20.0
+    n_quad: 64
+    n_inner: 32
+    n_ts: 64
+    n_quad_ts: 32
+    n_inner_ts: 24
+  ssr_target: 1.5
+  ssr_fitted:
+  - 1.5
+  - 1.5
+  - 1.5
+  - 1.5
+  - 1.5
+  anchor_power: 1.0
+  breakeven:
+    k1: 8.037785361541365
+    k2: 0.2
+    omega1: 4.645200108740998
+    omega2: 0.7066833346758201
+    lambda1: -4.6387433173094665
+    lambda2: -0.36125668269053307
+    chi: -0.9899999999999899
+  message: null
+  pillars:
+  - 0.25
+  - 0.5
+  - 1.0
+  - 2.0
+  - 3.0
+  ssr_achieved_lsv:
+  - 2.248402550227604
+  - 1.842242854487657
+  - 1.5959196872587493
+  - 1.5065456155707142
+  - 1.4860501193576297
+  ssr_achieved_naked_vs_market:
+  - 1.6453560812491483
+  - 1.4545826593493756
+  - 1.2535237573069935
+  - 1.1397601602770266
+  - 1.1088704902972537
+  skew_gap_rel:
+  - 0.05891645831526038
+  - 0.056903524972324426
+  - -0.026022411526696043
+  - -0.09883369005554077
+  - -0.1145289285453871
+  leverage_proxy_mean_abs_L_minus_1: 0.1438709088663118

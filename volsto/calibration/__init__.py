@@ -6,8 +6,11 @@ from __future__ import annotations
 from volsto.calibration.cache import CacheMissError, LeverageCache, code_version
 from volsto.calibration.diagnostics import CalibrationReport, reprice_surface
 from volsto.calibration.fit_2f import (
+    AttainableSSR,
     BreakEvenFitConfig,
     FitResult,
+    LeverageProxy,
+    LocalVolSSR,
     Stage3Inputs,
     Stage3Report,
     attainable_ssr,
@@ -15,7 +18,13 @@ from volsto.calibration.fit_2f import (
     fit_2f_historical,
     fit_2f_marking,
     k1_profile,
+    leverage_proxy,
+    load_tradeoff_specs,
+    local_vol_ssr_numerical,
+    mean_abs_leverage_deviation,
+    skew_weight_tradeoff,
     stage3_validation,
+    write_tradeoff_spec,
 )
 from volsto.calibration.history import (
     HistoryEstimates,
@@ -32,6 +41,7 @@ from volsto.calibration.targets import TargetSet, historical_targets, marking_ta
 
 __all__ = [
     "CALIBRATION_CODE_TAG",
+    "AttainableSSR",
     "BreakEvenFitConfig",
     "CacheMissError",
     "CalibrationReport",
@@ -39,6 +49,8 @@ __all__ = [
     "FitResult",
     "HistoryEstimates",
     "LeverageCache",
+    "LeverageProxy",
+    "LocalVolSSR",
     "Stage3Inputs",
     "Stage3Report",
     "SurfaceHistory",
@@ -54,11 +66,17 @@ __all__ = [
     "flag_unidentified",
     "historical_targets",
     "k1_profile",
+    "leverage_proxy",
+    "load_tradeoff_specs",
+    "local_vol_ssr_numerical",
     "marking_targets",
+    "mean_abs_leverage_deviation",
     "reprice_surface",
     "rolling_fit",
     "rolling_ssr",
     "rolling_volvol",
+    "skew_weight_tradeoff",
     "stage3_validation",
     "synthetic_2f_history",
+    "write_tradeoff_spec",
 ]

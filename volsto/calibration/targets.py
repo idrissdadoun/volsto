@@ -71,17 +71,38 @@ ATM vol interpolated across its pillars (flat outside) with a flag naming it, ne
 nearest pillar.  Checked by ``tests/test_breakeven.py`` (``test_sabr_reduction``,
 ``test_marking_targets_and_policy_check``, ``test_marking_targets_sabr_consistency_at_ssr_2``,
 ``test_historical_targets``).
+
+**Correlation target and market term structures** (added for the soft-skew fitter of
+:mod:`volsto.calibration.fit_2f`, M7 Part 3 redesign).  ``correl_target`` is ``ρ_SABR(T)`` per
+pillar in marking mode (the owner's ``correl_target(T) = ρ_SABR(T)``); in historical mode, where
+no SABR reduction exists, it is the value the targets imply in the same normalisation,
+``SpotVolCovar_target · atf · A / (σ_0 · vovol_target)`` (which returns ``ρ_SABR`` exactly on
+marking targets, since ``SpotVolCovar/vovol = σ_0 ρ_SABR / (atf A)``).  The ``lsv`` measure of the
+fitter needs the market ATM skew and ATMF vol on ``(0, T]``, not only at the pillars
+(:meth:`TargetSet.market_skew`, :meth:`TargetSet.atmf_curve`): marking mode reads them from the
+surface (analytic ``atm_skew`` when available, else the ``h`` central difference); historical
+mode interpolates the pillar values — the skew as a **power law in T** between pillars
+(log-log linear) and beyond them with the end segments' exponents clipped to
+:data:`SKEW_EXPONENT_BOUNDS` (:func:`pillar_power_law_skew`; ``term_structure_source`` says
+so and the fitter flags it), the ATMF vol through the pillar total variances with a flat vol
+before the first pillar.  :meth:`TargetSet.with_ssr_target` rebuilds the SSR-dependent targets
+at another dial value (the fitter's floor clamp): ``SpotVolCovar = ssr σ_0 Skew`` in both
+modes, ``vovol = ½ ssr atf ν_SABR A`` in marking mode, the historical ``VolVar`` unchanged (it
+does not depend on the SSR).  Checked by
+``tests/test_fit_2f.py::test_target_term_structures_and_with_ssr``.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import numpy as np
 import pandas as pd
 from numpy.typing import NDArray
+
+from volsto.market.varswap import ForwardVarianceCurve
 
 FloatArray = NDArray[np.float64]
 
@@ -98,6 +119,9 @@ _POLICY_RTOL = 1e-9
 #: relative tolerance of the ``VoV_SABR / ν_SABR`` classification
 _VOV_RTOL = 0.05
 MODES = ("marking", "historical")
+#: clip of the power-law exponent ``γ`` in ``|S(T)| ∝ T^−γ`` used to extend the pillar skews
+#: beyond the first and last pillar in historical mode (``γ < 1`` keeps ``∫₀ᵀ S`` finite)
+SKEW_EXPONENT_BOUNDS: tuple[float, float] = (0.0, 0.75)
 
 
 @dataclass(frozen=True)
@@ -197,6 +221,77 @@ class TargetSet:
     anchor: FloatArray = field(default_factory=lambda: np.ones(0))
     flags: tuple[str, ...] = ()
     atf_anchor: float = float("nan")
+    correl_target: FloatArray = field(default_factory=lambda: np.zeros(0))
+    skew_fn: Callable[[FloatArray], FloatArray] | None = field(
+        default=None, repr=False, compare=False
+    )
+    atm_vol_fn: Callable[[FloatArray], FloatArray] | None = field(
+        default=None, repr=False, compare=False
+    )
+
+    @property
+    def term_structure_source(self) -> str:
+        """``"surface"`` when the market skew / ATMF vol on ``(0, T]`` come from the surface,
+        ``"pillar power law"`` when they are interpolated from the pillars (module docstring)."""
+        return "surface" if self.skew_fn is not None else "pillar power law"
+
+    def market_skew(self, t: FloatArray | float) -> FloatArray:
+        """Market ATM skew ``∂σ̂/∂k`` at maturities ``t > 0`` (module docstring)."""
+        t_ = np.atleast_1d(np.asarray(t, dtype=np.float64))
+        if np.any(t_ <= 0):
+            raise ValueError("maturities must be positive")
+        if self.skew_fn is not None:
+            return np.asarray(self.skew_fn(t_), dtype=np.float64)
+        return pillar_power_law_skew(self.pillars, self.skew_target, t_)
+
+    def atmf_curve(self, t_max: float) -> ForwardVarianceCurve:
+        """The ATMF total-variance curve ``σ̂_t² t`` as a :class:`ForwardVarianceCurve` to
+        ``t_max`` (so ``xi0(t) = σ²(t) = d(σ̂_t² t)/dt``, book p. 475): the surface's ATMF vols on
+        a weekly grid (denser in the first month) in marking mode, the pillar ATMF vols with a
+        flat vol before the first pillar and beyond the last in historical mode."""
+        if self.atm_vol_fn is not None:
+            short = np.array([1.0, 2.0, 3.0, 5.0, 10.0, 15.0, 22.0]) / 365.0
+            weekly = np.arange(1, int(np.ceil(52 * t_max)) + 2) / 52.0
+            mats = np.unique(
+                np.concatenate((short[short < t_max], weekly[weekly < t_max], [t_max]))
+            )
+            W = np.asarray(self.atm_vol_fn(mats), dtype=np.float64) ** 2 * mats
+            if np.any(np.diff(W) <= 0):
+                raise ValueError("the ATMF total variance is not increasing in T")
+            return ForwardVarianceCurve(mats, W)
+        p = np.asarray(self.pillars, dtype=np.float64)
+        a = np.asarray(self.atf, dtype=np.float64)
+        end = max(float(t_max), float(p[-1])) + 1.0
+        mats = np.concatenate(([0.5 * p[0]], p, [end]))
+        vols = np.concatenate(([a[0]], a, [a[-1]]))
+        W = vols * vols * mats
+        W = np.maximum.accumulate(W + 1e-12 * np.arange(W.size))
+        return ForwardVarianceCurve(mats, W)
+
+    def with_ssr_target(
+        self,
+        ssr_target: (
+            float | Sequence[float] | FloatArray | Mapping[float, float] | Callable[[float], float]
+        ),
+    ) -> TargetSet:
+        """The same targets at another SSR dial (module docstring): ``SpotVolCovar = ssr σ_0
+        Skew``; marking ``vovol = ½ ssr atf ν_SABR A`` (``VolVar = vovol²``); historical
+        ``VolVar`` unchanged.  ``ssr_target`` is a scalar, one value per pillar, a mapping
+        ``T → value`` (interpolated) or a callable."""
+        if isinstance(ssr_target, (Mapping,)) or callable(ssr_target):
+            ssr = np.array([_curve(ssr_target, float(T)) for T in self.pillars])
+        else:
+            arr = np.asarray(ssr_target, dtype=np.float64)
+            ssr = np.full(self.pillars.size, float(arr)) if arr.ndim == 0 else arr.copy()
+        if ssr.shape != self.pillars.shape:
+            raise ValueError("ssr_target must be a scalar or one value per pillar")
+        svc = ssr * self.sigma_0 * self.skew_target
+        if self.mode == "marking" and self.sabr:
+            nu = np.array([s.nu_sabr for s in self.sabr])
+            vovol = 0.5 * ssr * self.atf * nu * self.anchor
+        else:
+            vovol = self.vovol.copy()
+        return replace(self, spot_vol_covar=svc, vovol=vovol, vol_var=vovol * vovol, ssr_target=ssr)
 
     def frame(self) -> pd.DataFrame:
         d = {
@@ -210,6 +305,8 @@ class TargetSet:
             "vol_var_target": self.vol_var,
             "vol_var_se": self.vol_var_se,
         }
+        if self.correl_target.size == self.pillars.size:
+            d["correl_target"] = self.correl_target
         if self.sabr:
             d["nu_sabr"] = np.array([s.nu_sabr for s in self.sabr])
             d["rho_sabr"] = np.array([s.rho_sabr for s in self.sabr])
@@ -305,6 +402,21 @@ def marking_targets(
     skew = np.array([s.skew_sabr for s in sabr])
     vovol = 0.5 * ssr * atf * nu * anchor
     svc = ssr * s0 * skew
+    rho = np.array([s.rho_sabr for s in sabr])
+    fn = getattr(surface, "atm_skew", None)
+    if callable(fn):
+
+        def skew_fn(t: FloatArray) -> FloatArray:
+            return np.asarray(surface.atm_skew(t), dtype=np.float64)
+
+    else:
+
+        def skew_fn(t: FloatArray) -> FloatArray:
+            return np.array([surface_atm_derivatives(surface, float(x), h)[1] for x in t])
+
+    def atm_vol_fn(t: FloatArray) -> FloatArray:
+        return np.asarray(surface.atm_vol(t), dtype=np.float64)
+
     return TargetSet(
         "marking",
         ps,
@@ -322,6 +434,9 @@ def marking_targets(
         anchor,
         tuple(flags),
         atf3,
+        rho,
+        skew_fn,
+        atm_vol_fn,
     )
 
 
@@ -367,6 +482,8 @@ def historical_targets(
     ssr = np.array([r.ssr for r in sr])
     ssr_se = np.array([r.se for r in sr])
     svc = ssr * s0 * skew
+    with np.errstate(divide="ignore", invalid="ignore"):
+        correl = svc * atf / (s0 * vovol)
     return TargetSet(
         "historical",
         ps,
@@ -383,7 +500,42 @@ def historical_targets(
         float("nan"),
         np.ones(ps.size),
         tuple(flags),
+        float("nan"),
+        np.asarray(correl, dtype=np.float64),
     )
+
+
+def pillar_power_law_skew(
+    pillars: FloatArray,
+    skews: FloatArray,
+    t: FloatArray,
+    exponent_bounds: tuple[float, float] = SKEW_EXPONENT_BOUNDS,
+) -> FloatArray:
+    """The pillar skews extended to maturities ``t`` as a power law in ``T`` (module docstring):
+    ``ln|S|`` linear in ``ln T`` between pillars, ``|S(T)| = |S(T_end)| (T/T_end)^−γ`` beyond the
+    first / last pillar with ``γ`` the end segment's exponent clipped to ``exponent_bounds``; the
+    sign is the pillars' common sign (a sign change raises).  One pillar gives ``γ`` at the lower
+    bound (flat)."""
+    p = np.asarray(pillars, dtype=np.float64)
+    s = np.asarray(skews, dtype=np.float64)
+    t_ = np.atleast_1d(np.asarray(t, dtype=np.float64))
+    if p.size == 0 or np.any(s == 0) or not (np.all(s < 0) or np.all(s > 0)):
+        raise ValueError("pillar skews must be non-zero and of one sign")
+    order = np.argsort(p)
+    p, s = p[order], s[order]
+    sign = float(np.sign(s[0]))
+    lp, ls = np.log(p), np.log(np.abs(s))
+    lo_b, hi_b = exponent_bounds
+    if p.size == 1:
+        g_lo = g_hi = lo_b
+    else:
+        g_lo = float(np.clip(-(ls[1] - ls[0]) / (lp[1] - lp[0]), lo_b, hi_b))
+        g_hi = float(np.clip(-(ls[-1] - ls[-2]) / (lp[-1] - lp[-2]), lo_b, hi_b))
+    lt = np.log(t_)
+    inner = np.interp(lt, lp, ls)
+    out = np.where(lt < lp[0], ls[0] - g_lo * (lt - lp[0]), inner)
+    out = np.where(lt > lp[-1], ls[-1] - g_hi * (lt - lp[-1]), out)
+    return np.asarray(sign * np.exp(out), dtype=np.float64)
 
 
 __all__ = [
@@ -393,10 +545,12 @@ __all__ = [
     "SABR_CURVATURE_H",
     "SABR_FINITE_T_LIMIT",
     "SIGMA0_MATURITY",
+    "SKEW_EXPONENT_BOUNDS",
     "SabrPillar",
     "TargetSet",
     "historical_targets",
     "marking_targets",
+    "pillar_power_law_skew",
     "sabr_reduce",
     "surface_atm_derivatives",
 ]

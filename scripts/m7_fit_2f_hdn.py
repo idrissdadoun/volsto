@@ -6,20 +6,26 @@ snapshot of the pricing date in ``configs/surfaces/snapshots/hdn_2022H2_ssvi``. 
 historical estimates at the last date (windows 100 / 60 — the sample has 127 trading days, so
 the SPEC's 250-day vol window is not available and every number is reported with the window it
 was measured on); the **historical-mode** fit (pillars 1m, 3m, 6m, 1y; ``k2`` fixed); the
-**marking-mode** fit on the last snapshot (same pillars, ``ssr_target`` 1.0) with the SSR dial
-table (0.8 / 1.0 / 1.2: fitted parameters and the naked kernel's numerical SSR by
-``ssr_numerical_many`` with 4·10⁴ paths); stage 3 on the marking fit (2·10⁵ particles — the
-development count — and 2·10⁵ pricing paths; **this script calibrates a leverage** and says
+**marking-mode** fit on the last snapshot (same pillars, ``ssr_target`` 1.0, the soft-skew fitter
+at ``--skew-weight`` / ``--ssr-measure``, with the floor / ceiling message when it fires) with the
+SSR dial table (0.8 / 1.0 / 1.2: fitted parameters, achieved SSR under both measures, the
+message and the naked kernel's numerical SSR by ``ssr_numerical_many`` with 4·10⁴ paths); the
+skew-weight trade-off at ``ssr_target`` over ``--tradeoff-weights`` (achieved SSR, naked-skew
+gap, leverage proxy; with ``--tradeoff-stage3`` a leverage is calibrated per weight for the
+actual mean ``|L − 1|`` and the numerical LSV SSR); stage 3 on the marking fit (2·10⁵ particles —
+the development count — and 2·10⁵ pricing paths; **this script calibrates leverages** and says
 so); the rolling stability run in historical mode every 5 dates with the identification flags.
 Outputs in ``outputs/m7/``: ``fit_2f_hdn.md``, ``fit_2f_hdn.yaml`` (marking),
-``fit_2f_hdn_historical.yaml``, ``hdn_estimates.csv``, ``hdn_stability.csv``.
+``fit_2f_hdn_historical.yaml``, ``hdn_estimates.csv``, ``hdn_stability.csv``,
+``hdn_skew_tradeoff.csv``.
 
 Data notes carried from the first M7 run: the snapshots quote ATM maturities to 1.5–3y only
 (median 2y), so the 2y / 3y pillars sit on the SSVI extrapolation and their daily changes are
 an artefact — the fit uses the 1m–1y pillars; over H2 2022 the historical SSR read 0.81–0.84
 (60 days) at every pillar to 1y, below the floor ``R ≥ 1`` of a naked or local-vol-type model,
 so the historical-mode ``SpotVolCovar`` target asks for less spot/vol covariance than the
-kernel's own skew implies (the skew guard then binds).
+kernel's own skew implies (the fit's tracking detail reports the miss; the floor / ceiling message
+fires only when the request lies outside the attainable band of ``attainable_ssr``).
 """
 
 from __future__ import annotations
@@ -32,11 +38,14 @@ import pandas as pd
 
 from volsto.analytics.smile_dynamics import ssr_numerical_many
 from volsto.calibration.fit_2f import (
+    DEFAULT_SKEW_WEIGHT,
+    SSR_MEASURE_CHOICES,
     BreakEvenFitConfig,
     Stage3Inputs,
     fit_2f_historical,
     fit_2f_marking,
     naked_kernel,
+    skew_weight_tradeoff,
 )
 from volsto.calibration.history import SurfaceHistory, estimate_history
 from volsto.calibration.stability import flag_unidentified, rolling_fit
@@ -60,6 +69,18 @@ def main() -> None:
         choices=("market", "model"),
         default="market",
         help="sigma_hat prefactor convention of the fit (fit_2f module docstring)",
+    )
+    ap.add_argument("--skew-weight", type=float, default=DEFAULT_SKEW_WEIGHT)
+    ap.add_argument("--ssr-measure", choices=SSR_MEASURE_CHOICES, default="auto")
+    ap.add_argument(
+        "--tradeoff-weights",
+        default="1,0.1",
+        help="comma-separated skew weights of the marking trade-off table ('' to skip)",
+    )
+    ap.add_argument(
+        "--tradeoff-stage3",
+        action="store_true",
+        help="calibrate a leverage per trade-off weight (actual mean |L - 1|, numerical SSR)",
     )
     ap.add_argument("--n-particles", type=int, default=200_000)
     ap.add_argument("--n-paths", type=int, default=200_000)
@@ -92,11 +113,18 @@ def main() -> None:
         "1.5-3y only, median 2y, so the 2y/3y pillars sit on the SSVI extrapolation and their "
         "daily changes are an artefact: annualised std of d ln vs_vol 0.46 / 0.62 against 0.24 "
         "at 1y, cross-pillar correlation with the 1y pillar 0.07 / -0.01).  SSR_hist < 1 over "
-        "H2 2022 (0.81-0.84 on 60 days): below the floor of a naked kernel, so the historical "
-        "SpotVolCovar target is met only with the skew guard binding.",
-        f"k2 fixed at {args.k2:g}; sigma_hat prefactor convention: {args.prefactor}.",
+        "H2 2022 (0.81-0.84 on 60 days): below the R >= 1 of a naked kernel, so the historical "
+        "SpotVolCovar target is missed (see the tracking detail and the attainable band).",
+        f"k2 fixed at {args.k2:g}; sigma_hat prefactor convention: {args.prefactor}; skew weight "
+        f"{args.skew_weight:g}; SSR measure {args.ssr_measure}.",
     ]
-    cfg = BreakEvenFitConfig(pillars=pillars, k2=args.k2, sigma_hat_prefactor=args.prefactor)
+    cfg = BreakEvenFitConfig(
+        pillars=pillars,
+        k2=args.k2,
+        sigma_hat_prefactor=args.prefactor,
+        skew_weight=args.skew_weight,
+        ssr_measure=args.ssr_measure,
+    )
     # historical mode
     t0 = time.perf_counter()
     r_hist = fit_2f_historical(hist, cfg, window_vol=args.window_vol, window_ssr=args.window_ssr)
@@ -167,7 +195,12 @@ def main() -> None:
             "rho_SX2": r.params.rho_SX2,
             "rho12": r.params.rho12,
             "chi": r.breakeven.chi,
-            "active": ",".join(r.first.active_labels),
+            "nu_limit": r.first.nu_limit_binding,
+            "ssr_fitted": float(r.targets.ssr_target.mean()),
+            "ssr_achieved_lsv": r.ssr_achieved_lsv_mean,
+            "ssr_achieved_naked": r.ssr_achieved_naked_mean,
+            "skew_gap": r.mean_skew_gap,
+            "message": "yes" if r.message else "no",
         }
         for x in num:
             row[f"ssr_num_{x.T:g}"] = x.R
@@ -182,6 +215,34 @@ def main() -> None:
         pd.DataFrame(rows).round(4).to_string(index=False),
         "```",
     ]
+    weights = [float(x) for x in args.tradeoff_weights.split(",") if x.strip()]
+    if weights:
+        t0 = time.perf_counter()
+        s3_tr = None
+        if args.tradeoff_stage3:
+            s3_tr = Stage3Inputs(
+                surface=surface,
+                particle=ParticleConfig(n_particles=args.n_particles, horizon=3.0),
+                sim=SimConfig(),
+                pricing_sim=SimConfig(n_paths=args.n_paths, chunk_size=100_000, seed=7),
+                ssr_pillars=pillars,
+                breakeven_pillars=(0.25, 1.0),
+                forward_starts=(),
+            )
+        trade = skew_weight_tradeoff(
+            surface, cfg, weights=weights, ssr_target=args.ssr_target, stage3=s3_tr
+        )
+        trade.to_csv(out / "hdn_skew_tradeoff.csv", index=False)
+        lines += [
+            "",
+            f"## Skew-weight trade-off at ssr_target {args.ssr_target:g} ({len(weights)} weights, "
+            f"{time.perf_counter() - t0:.0f} s, recalibrated: "
+            f"{'yes' if bool(trade['recalibrated'].any()) else 'no'})",
+            "",
+            "```",
+            trade.drop(columns=["message"]).round(4).T.to_string(),
+            "```",
+        ]
     if not args.no_stability:
         t0 = time.perf_counter()
         frame = rolling_fit(
