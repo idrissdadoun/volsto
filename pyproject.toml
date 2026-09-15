@@ -28,6 +28,7 @@ viewers = ["plotly>=5.18", "streamlit>=1.30", "openpyxl>=3.1"]
 data = ["yfinance>=0.2"]
 dev = [
     "pytest>=7.4",
+    "pytest-xdist>=3.5",
     "black>=24.1",
     "ruff>=0.4",
     "mypy>=1.8",
