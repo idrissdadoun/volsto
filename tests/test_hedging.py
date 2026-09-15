@@ -453,6 +453,20 @@ def _preset_products(fc: ForwardCurve) -> dict[str, object]:
     }
 
 
+#: measured hedged / unhedged P&L std ratios (Black–Scholes 20%, monthly rebalancing, 8·10³
+#: paths, 2026-09-15) of the presets that do NOT improve on the unhedged product at that
+#: frequency — recorded, bounded at 1.5× their measured value (SPEC §8.1 deviation 7c)
+PRESETS_WORSE_THAN_UNHEDGED_MONTHLY: dict[str, float] = {
+    # with the test's half-spreads (1 bp spot, 0.2 vp options): the churn of the noisy barrier
+    # call-spread quantity is what costs (zero-cost ratios 1.48 and 1.68 for the two KO products)
+    "KnockOutOption": 2.83,
+    "VarianceSwap": 2.06,
+    "KnockOutVarianceSwap": 8.47,
+    "ConditionalVarianceSwap": 1.50,
+    "VolKnockOutPut": 2.12,
+}
+
+
 @pytest.mark.parametrize("name", sorted(_preset_products(ForwardCurve.from_config(MKT))))
 def test_presets_run_end_to_end(bs: BlackScholes, fc: ForwardCurve, name: str) -> None:
     """Each per-product preset on one product, world = pricing (Black–Scholes 20%, monthly
@@ -483,6 +497,25 @@ def test_presets_run_end_to_end(bs: BlackScholes, fc: ForwardCurve, name: str) -
     print(
         f"  hedged std {np.std(r.pnl_total, ddof=1):.5f} vs product std {unhedged_std:.5f}; notes {r.pricing_notes}"
     )
+    # sanity of the hedge itself (measured failure this guards: the autocall preset scaled the
+    # product's ABSOLUTE levels by spot_reference again — call spreads worth 0, the barrier put
+    # deep in the money — and the solve scaled the dead call spreads' quantities to 1e137 with a
+    # digital-put leg 800x the product's std): no leg may carry more than 50x the product's std
+    # (the variance products' spot and strip legs run 8-17x a tiny product std under
+    # Black-Scholes pricing = world, measured) and the preset must not make the book worse than
+    # 2x the unhedged product
+    leg_std = np.std(r.pnl_hedges, axis=0, ddof=1)
+    assert np.all(leg_std <= 50.0 * unhedged_std + 1e-12), dict(zip(r.instruments, leg_std))
+    ratio = float(np.std(r.pnl_total, ddof=1) / unhedged_std)
+    print(f"  hedged / unhedged std ratio {ratio:.2f}")
+    if name in PRESETS_WORSE_THAN_UNHEDGED_MONTHLY:
+        # recorded (SPEC §8.1 deviation 7c): under MONTHLY rebalancing these presets leave the
+        # book noisier than the unhedged product — the static log-contract strips' discrete
+        # delta-hedging error (variance products) and noisy gamma / vega quantities on the
+        # discontinuous or vol-barrier payoffs; the studies rebalance daily
+        assert ratio <= 1.5 * PRESETS_WORSE_THAN_UNHEDGED_MONTHLY[name], ratio
+    else:
+        assert ratio <= 2.0, ratio
 
 
 def test_early_termination_unwinds(bs: BlackScholes, fc: ForwardCurve) -> None:

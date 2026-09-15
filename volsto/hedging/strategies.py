@@ -109,6 +109,9 @@ FloatArray = NDArray[np.float64]
 #: fit at 6·10³ paths reached hundreds on single paths near expiry, P&L std 11–18 ± 5–8 % of
 #: notional); a well-conditioned solve is biased by ~0.1%
 DEFAULT_RIDGE = 1e-3
+#: an instrument's squared sensitivity below this fraction of its first-date cross-path level
+#: on a path makes it dead there (quantity 0): see GreekTargetStrategy.solve
+DEAD_SENSITIVITY = 1e-12
 DELTA_REGIMES = ("model", "sticky_strike", "sticky_skew", "sticky_moneyness", "sticky_local_vol")
 #: default smoothing width of the digital call-spread replication (fraction of the level, §6.9)
 DEFAULT_DIGITAL_WIDTH = 0.02
@@ -264,8 +267,19 @@ class GreekTargetStrategy:
             H = H + reg[None, :, None] * np.eye(len(solved))[None, :, :]
             if self.turnover > 0 and q_prev is not None:
                 rhs = rhs + self.turnover * q_prev[:, solved]
-            # scale rows/cols for conditioning
-            d = np.sqrt(np.maximum(np.einsum("pjj->pj", H), 1e-300))
+            # scale rows/cols for conditioning; an instrument whose squared sensitivity on a
+            # path is below DEAD_SENSITIVITY x its first-date level is DEAD on that path (an
+            # expired-in-all-but-name call spread, a regressed vega crossing zero): it is taken
+            # out of the path's system with quantity 0 instead of being scaled up by 1/sqrt(H_jj)
+            # (measured: quantities of 1e137 on the autocall preset's call spreads)
+            diag_h = np.einsum("pjj->pj", H)
+            dead = diag_h <= DEAD_SENSITIVITY * floor[None, :]
+            if dead.any():
+                eye = np.eye(len(solved))
+                H = np.where(dead[:, :, None] | dead[:, None, :], eye[None, :, :], H)
+                rhs = np.where(dead, 0.0, rhs)
+                diag_h = np.einsum("pjj->pj", H)
+            d = np.sqrt(np.maximum(diag_h, 1e-300))
             Hs = H / (d[:, :, None] * d[:, None, :])
             rs = rhs / d
             try:
@@ -274,7 +288,7 @@ class GreekTargetStrategy:
                 xs = np.stack(
                     [np.linalg.lstsq(Hs[p], rs[p], rcond=None)[0] for p in range(n_paths)]
                 )
-            q[:, solved] = xs / d
+            q[:, solved] = np.where(dead, 0.0, xs / d)
             resid = b + np.einsum("pgj,pj->pg", A, q[:, solved])
         else:
             resid = b
@@ -647,7 +661,10 @@ def preset_vko(product: Any, ctx: PresetContext) -> GreekTargetStrategy:
 
 def preset_autocall(product: Any, ctx: PresetContext) -> GreekTargetStrategy:
     obs = np.asarray(product.observation_times, dtype=np.float64)
-    levels = np.asarray(product.autocall_levels, dtype=np.float64) * float(product.spot_reference)
+    # Autocall.autocall_levels and .ki_barrier are ABSOLUTE levels (the product scales its
+    # fractions by spot_reference itself; measured: scaling again put the call spreads at
+    # spot x level and the barrier put deep in the money, value 5553 on a spot of 100)
+    levels = np.asarray(product.autocall_levels, dtype=np.float64)
     inst: list[HedgeInstrument] = [ctx.spot_instrument()]
     for i, (t_i, lvl) in enumerate(zip(obs, levels, strict=True), start=1):
         inst.append(
@@ -663,7 +680,7 @@ def preset_autocall(product: Any, ctx: PresetContext) -> GreekTargetStrategy:
             )
         )
     T = float(obs[-1])
-    b = float(product.ki_barrier) * float(product.spot_reference)
+    b = float(product.ki_barrier)
     inst.append(ctx.vanilla(b, T, -1, "put at barrier"))
     inst.append(
         Digital(
