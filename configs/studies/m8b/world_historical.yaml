@@ -1,0 +1,288 @@
+spec:
+  market:
+    spot: 3839.5
+    rate_curve:
+      times:
+      - 0.08333333333333333
+      - 0.25
+      - 1.0
+      - 2.0
+      - 5.0
+      - 10.0
+      - 30.0
+      rates:
+      - 0.0412
+      - 0.044199999999999996
+      - 0.0473
+      - 0.0441
+      - 0.039900000000000005
+      - 0.0388
+      - 0.0397
+    dividend_curve:
+      times:
+      - 0.019178082191780823
+      - 0.0273972602739726
+      - 0.030136986301369864
+      - 0.03287671232876712
+      - 0.03561643835616438
+      - 0.038356164383561646
+      - 0.049315068493150684
+      - 0.052054794520547946
+      - 0.0547945205479452
+      - 0.057534246575342465
+      - 0.06575342465753424
+      - 0.0684931506849315
+      - 0.07123287671232877
+      - 0.07397260273972603
+      - 0.07671232876712329
+      - 0.08493150684931507
+      - 0.08767123287671233
+      - 0.09041095890410959
+      - 0.0958904109589041
+      - 0.10410958904109589
+      - 0.11506849315068493
+      - 0.13150684931506848
+      - 0.13424657534246576
+      - 0.15342465753424658
+      - 0.1643835616438356
+      - 0.20821917808219179
+      - 0.21095890410958903
+      - 0.2493150684931507
+      - 0.3041095890410959
+      - 0.30684931506849317
+      - 0.32602739726027397
+      - 0.38082191780821917
+      - 0.3835616438356164
+      - 0.41643835616438357
+      - 0.4575342465753425
+      - 0.4986301369863014
+      - 0.5534246575342465
+      - 0.6301369863013698
+      - 0.7068493150684931
+      - 0.7479452054794521
+      - 0.8027397260273973
+      - 0.8794520547945206
+      - 0.9561643835616438
+      - 0.9972602739726028
+      - 1.0520547945205478
+      - 1.2054794520547945
+      - 1.473972602739726
+      - 1.9726027397260273
+      - 2.96986301369863
+      rates:
+      - -0.01838721926768919
+      - 0.0015021584752514623
+      - 0.0008969682770018149
+      - 0.001268405702549573
+      - -0.006275188337972961
+      - -0.00470989809364382
+      - 0.0029052466508903683
+      - 0.002650173770702123
+      - -0.001547173626872489
+      - 0.00034422975465332305
+      - 0.0034279614677060564
+      - 0.003646083935873332
+      - 0.003635618923273772
+      - 0.001151055609011343
+      - 0.0015898360340762122
+      - 0.004980562756824946
+      - 0.005977666455666889
+      - 0.0051575264478058045
+      - 0.003141487927360033
+      - 0.005650422570243437
+      - 0.006784873572621761
+      - 0.00901340199077568
+      - 0.010007109043443046
+      - 0.010024321406241776
+      - 0.012616235483862126
+      - 0.01231955646174115
+      - 0.012722699906117756
+      - 0.01232651379135497
+      - 0.011438626081305114
+      - 0.011774476234698619
+      - 0.011623835665635088
+      - 0.012645939381130851
+      - 0.012865962744556751
+      - 0.013381480099905368
+      - 0.012761067215129858
+      - 0.012634381509625528
+      - 0.012179989104750119
+      - 0.012652898108856071
+      - 0.012802443472327823
+      - 0.012680270780941085
+      - 0.012281256474733777
+      - 0.01269033966237371
+      - 0.012948792385218639
+      - 0.01230008946371736
+      - 0.011968840435228263
+      - 0.01199356587834201
+      - 0.011681668394511804
+      - 0.012857847646507431
+      - 0.013193105819171358
+  surface:
+    atm_maturities:
+    - 0.08333333333333333
+    - 0.25
+    - 0.5
+    - 1.0
+    - 1.5
+    - 2.0
+    - 3.0
+    atm_vols:
+    - 0.20304627555897678
+    - 0.2200262629162214
+    - 0.22632665547567316
+    - 0.22752076585329087
+    - 0.22449975057210234
+    - 0.22459170131307093
+    - 0.22183008881601596
+    rho: -0.7603754000654006
+    eta: 1.6174269861897328
+    gamma: 0.2313381762295083
+    max_maturity: 3.0
+  model:
+    nu: 3.119528778936861
+    theta: 0.07657236962969073
+    k1: 20.0
+    k2: 0.2
+    rho12: 0.45284829050727277
+    rho_SX1: -0.7045100194009724
+    rho_SX2: -0.9510334542573321
+  particle:
+    n_particles: 800000
+    horizon: 3.0
+    bandwidth_factor: 1.5
+    bandwidth_min: 0.0005
+    kernel: gaussian
+    regression: local_linear
+    min_window: 2000
+    min_window_fraction: 0.01
+    bias_correction: true
+    quantile_clip: 0.005
+    tail_extrapolation: log_quadratic
+    n_regression_points: 201
+    leverage_std_span: 6.0
+    leverage_dk: 0.0025
+    l_min: 0.05
+    l_max: 20.0
+    second_pass: false
+    seed: 12345
+    antithetic: true
+  sim:
+    n_paths: 200000
+    dt_max:
+      breaks:
+      - 0.25
+      - 2.0
+      dts:
+      - 0.0006849315068493151
+      - 0.0027397260273972603
+      - 0.004
+    chunk_size: 50000
+    antithetic: true
+    seed: 0
+    local_var_time_average: true
+    predictor_corrector: false
+    pc_eta: 0.5
+    weak_order2: true
+    local_var_time_eval: start
+    sv_order2: true
+    record_all_steps: false
+    chunk_memory_mb: 512
+  local_vol: null
+  perturbation: null
+fit:
+  label: world_historical
+  config:
+    pillars:
+    - 0.25
+    - 0.5
+    - 1.0
+    mat_min: 0.25
+    smooth_breakeven: true
+    sabrw_power: 1.0
+    atf_ref: 0.3
+    k2: 0.2
+    k1_bounds:
+    - 0.3
+    - 20.0
+    k1_min_gap: 0.05
+    k1_grid: 25
+    radicand_floor: 0.5
+    skew_mode: soft
+    skew_eps:
+    - 0.1
+    - 0.1
+    skew_pillars:
+    - 1.0
+    - 5.0
+    skew_weight: 10.0
+    weights_covar: relative
+    weights_volvar: relative
+    term_structure: atmf
+    nu_cap: 3.5
+    chi_bounds:
+    - -0.99
+    - 0.99
+    omega_max: 20.0
+    stage3_tolerance: 0.1
+    rho12_flag: 0.9
+    n_quad: 64
+    n_inner: 32
+    n_ts: 64
+    n_quad_ts: 32
+    n_inner_ts: 24
+  ssr_target: 0.8254213853579531
+  breakeven:
+    k1: 20.0
+    k2: 0.2
+    omega1: 5.998045464349314
+    omega2: 0.4973693002533021
+    lambda1: -4.22568312645665
+    lambda2: -0.4730148436614501
+    chi: -0.99
+  status: interior
+  messages: []
+  mode: historical
+  world: (ii) historical
+  ssr_target_note: historical mode has one SSR target per pillar (ssr_target_pillars);
+    the scalar ssr_target above is their mean and is informational only
+  ssr_target_pillars:
+    '0.25': 0.8188384832710646
+    '0.5': 0.8207157648620922
+    '1': 0.8367099079407023
+  pricing_date: '2022-12-30'
+  discriminator:
+    verdict: surface artefact
+    reason: 'T=0.0833333: raw SSR 0.942 + 2 x 0.153 = 1.249 is not below 1'
+  provenance:
+    history: outputs/m7/hdn_history_ssvi.csv (SSVI snapshots, 127 days)
+    fit_call: fit_2f_historical(history, BreakEvenFitConfig(pillars=(0.25, 0.5, 1.0),
+      k2=0.2, skew_mode='soft', skew_weight=10, skew_eps=0.1), window_vol=100, window_ssr=60)
+    m7_script: scripts/m7_fit_2f_hdn.py --skew-mode soft --skew-weight 10 --no-stage3
+      -> outputs/m7/fit_2f_hdn_historical.yaml
+    cross_check:
+    - parameters equal outputs/m7/fit_2f_hdn_historical.yaml
+    first:
+      objective: 1.6961323007467484
+      active: []
+      k1_at_bound: true
+      notes:
+      - 'historical mode: the leverage integrals interpolate the skew residual (S
+        - lambda.J) linearly between the pillars, flat outside'
+      - k1 = 20 sits on a bound of (0.3, 20.0)
+      - 'k1 standard error: k1 at a bound; lambda standard errors at fixed k1'
+    second:
+      objective: 0.24992746343629557
+      bound_flags:
+      - chi at lower bound
+      n_distinct_optima: 1
+      notes:
+      - 'historical mode: the empirical VolVar target is kept (the correlation-preserving
+        rebuild applies to the SABR correlation of marking mode)'
+    target_flags:
+    - windows vol 100 / ssr 60, end 2022-12-30
+    notes: []
+    risk_regime: sticky_strike
+    wall_seconds: 0.21692137498757802
+    recalibrated: false

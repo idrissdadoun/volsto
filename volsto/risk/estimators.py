@@ -55,7 +55,13 @@ from volsto.models.base import Model
 from volsto.models.bs import BlackScholes
 from volsto.products.base import Product
 from volsto.products.vanilla import EuropeanOption
-from volsto.risk.engine import RiskEngine, RiskState, Sensitivity, surface_of
+from volsto.risk.engine import (
+    RiskEngine,
+    RiskState,
+    Sensitivity,
+    model_regime_spot_bump,
+    surface_of,
+)
 from volsto.risk.greeks import _spot_state
 
 FloatArray = NDArray[np.float64]
@@ -233,8 +239,8 @@ def conditional_greeks(
     mc = MonteCarlo(sim)
     draws = mc.draws_for(grid, model)
     s0 = model.spot
-    up = model.bump(spot=s0 * float(np.exp(spot_size)))
-    dn = model.bump(spot=s0 * float(np.exp(-spot_size)))
+    up = model_regime_spot_bump(model, s0 * float(np.exp(spot_size)))
+    dn = model_regime_spot_bump(model, s0 * float(np.exp(-spot_size)))
     s_up, s_dn = up.spot, dn.spot
     feats: list[FloatArray] = []
     tg: dict[str, list[FloatArray]] = {"value": [], "delta": [], "gamma": []}

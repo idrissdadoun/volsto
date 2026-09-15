@@ -196,6 +196,21 @@ class _Counter:
                 self.misses += 1
 
 
+def model_regime_spot_bump(model: Model, spot: float) -> Model:
+    """The ``"model"``-regime spot bump of any model: the spot moved with the model's own
+    dynamics held.  LSV: ``LSV.bump(spot=)`` re-anchors the leverage so ``L(t, S)`` stays fixed in
+    spot; Black–Scholes: the vol unchanged; **pure local vol**: ``σ_loc(t, S)`` held in absolute
+    spot through :meth:`~volsto.market.dupire.LocalVolSurface.reanchored` — *not*
+    ``LocalVol.bump(spot=)``, which keeps the local vol indexed in ``k`` (the sticky-local-vol
+    move; measured on the placeholder surface it left the hedger's LV "model" delta 21% below the
+    LV model's own delta at ``t = 0``).  Used by the hedging regression engine and the §7.11
+    conditional-Greeks estimator for their CRN spot bumps."""
+    if isinstance(model, LocalVol):
+        fc = model.forward_curve.with_spot(float(spot))
+        return LocalVol(model.local_vol.reanchored(fc), fc)
+    return model.bump(spot=float(spot))
+
+
 class LSVBuilder:
     """LSV models from states through the leverage cache (SPEC v2 §7.1); with
     ``allow_calibrate=False`` a missing entry raises :class:`~volsto.calibration.cache.

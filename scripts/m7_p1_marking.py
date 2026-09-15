@@ -24,10 +24,16 @@ and VolVar within the config tolerance of the fit's targets) is reported per fit
 here.  ``--iterate k`` runs the iteration against simulation on every fit (``k`` extra
 calibrations each, not cached) and reports its convergence.
 
-Shadow rotation (``--rotation``, default ``spx``; ``--policies`` default both): the M6 headline
-3y autocall on the ``(1.0, 0.10)`` fit, central differences at ±1 rota, the rotated states
-calibrated into the cache (``configs/studies/m7_p1_marking/rotation_<surface>_<policy>.yaml``
-records the refit sets and the greeks), ``--rotation-paths`` default 2·10⁵ (seed 2024).
+Shadow rotation (``--rotation``, default ``spx``; ``--policies`` default all three): the M6
+headline 3y autocall on the ``(1.0, 0.10)`` fit, central differences at ±1 rota, the rotated
+states calibrated into the cache, the same product under pure local vol on the same surfaces
+(``--rotation-paths`` default 2·10⁵, seed 2024).  Reported in the owner's declared convention
+(``ROTATION_CONVENTION``: rota +1 = 6M 90/110 skew steepens by 0.56 vp; fee = P1 price − LV
+price; desk P&L per +1 rota for a SHORT position = −(d fee)): the P1 / LV / fee levels, the LV
+rotation, the P1 usual and recalibrated rotations, the fee and desk-P&L usual / recalibrated /
+shadow rotations, each with its standard error
+(``configs/studies/m7_p1_marking/rotation_<surface>_<policy>.yaml`` records the refit sets, the
+convention and every quantity as ``[value, stderr]``).
 
 Outputs: ``<out>/p1_marking.md``, ``p1_marking_fits.csv``, ``p1_marking_shadow_rotation.csv``.
 Every section states its wall clock and whether it recalibrated.  Full run (10–20 min; under
@@ -70,7 +76,11 @@ from volsto.config import (
     load_yaml,
     to_mapping,
 )
-from volsto.risk.shadow_rotation import RECALIBRATION_POLICIES, rotation_shadow_sensitivity
+from volsto.risk.shadow_rotation import (
+    RECALIBRATION_POLICIES,
+    ROTATION_CONVENTION,
+    rotation_shadow_sensitivity,
+)
 from volsto.studies.m6 import AUTOCALL_NAME, headline_products
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -310,14 +320,19 @@ def main() -> None:
                 row.update(
                     {
                         "stage3_assertion": "pass" if s3.within_tolerance else "FAIL",
-                        "stage3_max_gap_svc": float(
-                            chk.query("quantity == 'SpotVolCovar'")["gap_vs_target"].abs().max()
-                        ),
-                        "stage3_max_gap_volvar": float(
-                            chk.query("quantity == 'VolVar'")["gap_vs_target"].abs().max()
-                        ),
+                        # asserted (owner decision 2026-09-15): the engine bias per quantity;
+                        # the target gaps are reported, not asserted (binding fits)
                         "stage3_max_engine_bias_svc": float(
                             chk.query("quantity == 'SpotVolCovar'")["engine_bias"].abs().max()
+                        ),
+                        "stage3_max_engine_bias_volvar": float(
+                            chk.query("quantity == 'VolVar'")["engine_bias"].abs().max()
+                        ),
+                        "stage3_max_gap_svc_reported": float(
+                            chk.query("quantity == 'SpotVolCovar'")["gap_vs_target"].abs().max()
+                        ),
+                        "stage3_max_gap_volvar_reported": float(
+                            chk.query("quantity == 'VolVar'")["gap_vs_target"].abs().max()
                         ),
                         "mean_abs_L_minus_1": s3.mean_abs_l_minus_1,
                         "recalibrated": miss,
@@ -391,10 +406,24 @@ def main() -> None:
                 "status": {k: f.status for k, f in rep.fits.items()},
                 "n_particles": int(args.n_particles),
                 "pricing": {"n_paths": int(args.rotation_paths), "seed": 2024},
+                "convention": rep.convention,
+                "n_lv_builds": rep.n_lv_builds,
+                "p1_level": [rep.p1_level.value, rep.p1_level.stderr],
+                "lv_level": [rep.lv_level.value, rep.lv_level.stderr],
                 "fee": [rep.fee.value, rep.fee.stderr],
+                "lv_rotation": [rep.lv_rotation.value, rep.lv_rotation.stderr],
                 "usual": [rep.usual.value, rep.usual.stderr],
                 "recalibrated": [rep.recalibrated.value, rep.recalibrated.stderr],
                 "shadow": [rep.shadow.value, rep.shadow.stderr],
+                "fee_usual": [rep.fee_usual.value, rep.fee_usual.stderr],
+                "fee_recalibrated": [rep.fee_recalibrated.value, rep.fee_recalibrated.stderr],
+                "fee_shadow": [rep.fee_shadow.value, rep.fee_shadow.stderr],
+                "desk_pnl_usual": [rep.desk_pnl_usual.value, rep.desk_pnl_usual.stderr],
+                "desk_pnl_recalibrated": [
+                    rep.desk_pnl_recalibrated.value,
+                    rep.desk_pnl_recalibrated.stderr,
+                ],
+                "desk_pnl_shadow": [rep.desk_pnl_shadow.value, rep.desk_pnl_shadow.stderr],
             }
             (STUDY_DIR / f"rotation_{surface}_{policy}.yaml").write_text(
                 yaml.safe_dump(doc, sort_keys=False), encoding="utf-8"
@@ -402,9 +431,13 @@ def main() -> None:
             fr = rep.frame()
             fr.insert(0, "policy", policy)
             fr.insert(0, "surface", surface)
+            fr["p1_level"] = rep.p1_level.value
+            fr["p1_level_se"] = rep.p1_level.stderr
+            fr["lv_level"] = rep.lv_level.value
+            fr["lv_level_se"] = rep.lv_level.stderr
             fr["fee"] = rep.fee.value
             fr["fee_se"] = rep.fee.stderr
-            rot_rows += fr.to_dict(orient="records")
+            rot_rows += [{str(k): v for k, v in r.items()} for r in fr.to_dict(orient="records")]
             rot_lines += [
                 "",
                 f"### Shadow rotation, {surface}, {policy} (cache entries before {misses_before}; "
@@ -435,6 +468,8 @@ def main() -> None:
         md += [
             "",
             "## Shadow rotation (3y autocall, per rota)",
+            "",
+            f"Convention: {ROTATION_CONVENTION}.",
             "",
             markdown_table(pd.DataFrame(rot_rows), 6),
         ]

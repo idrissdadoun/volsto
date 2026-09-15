@@ -41,7 +41,12 @@ bumped model's path has its own history, so the plain CRN difference of a path-d
 carries the history's sensitivity as noise (measured on the study cliquet's static replication
 ``cliquet + strip − put = Σ rᵢ``, whose vega is zero: the plain-bump vega exposure grew from 0.22
 to 0.80 over the year and the variance-swap quantity it drove was noise); the bumped future is
-re-anchored at the base spot at ``t`` and spliced onto the base history.  The fitted-gradient
+re-anchored at the base spot at ``t`` and spliced onto the base history — for a **spot-kind**
+bump (the §7.2 delta regimes, :meth:`~volsto.hedging.hedger.PricingContext.regime_delta_bump`)
+at the base spot times the bump's own spot ratio ``e^{±h}``, so the regime delta measures the
+bumped model's future from the bumped spot (re-anchoring both sides at the base spot removed the
+spot move from the hybrid and drove the regime-delta target to ~0 — the bug fixed at the M8
+acceptance).  The fitted-gradient
 estimator is kept as ``delta_estimator="gradient"`` for diagnostics.  Any number of
 **bumped pricing models** (:class:`Bump`: a vol-shifted or surface-perturbed and
 recalibrated model, a model-parameter bump, …) whose per-path payoff differences are regressed the
@@ -55,15 +60,49 @@ hedge states.  When the world model carries a different factor structure from th
 to their initial value 0 at every date — the desk's model sees no factor move it cannot observe
 — and the report says so; same class and factor count pass the factors through.
 
+**Memory.**  Every bumped path set is kept for the hybrid targets at every date (``memory_bytes``:
+≈ ``(3 + bump sides) × 5 arrays × n_paths × n_cols × 8`` bytes, 1.5 GB at 2·10⁴ paths, 260
+columns and one two-sided bump).  ``stream_bumps=True`` (owner decision (d) at the M8 acceptance)
+trades memory for disk: each bumped set is written per array as ``.npy`` files into a fresh
+temporary directory (``tempfile.mkdtemp(prefix="volsto-bumps-")`` under ``scratch_dir``, else the
+environment variable :data:`SCRATCH_ENV`, else the system temp) as soon as it is concatenated and
+not kept; :meth:`ConditionalPricer.hybrid_payoffs` loads it with ``np.load(mmap_mode="r")``,
+computes the hybrid payoffs and drops it.  ``memory_bytes`` then counts the resident arrays only
+and ``streamed_bytes`` the on-disk footprint; :meth:`ConditionalPricer.close` (and ``__del__``,
+best effort) removes the directory.  The two modes give identical results (the same arrays are
+read back; ``test_stream_bumps_matches_in_memory``).
+
+**Control variate on the difference (§7.11; owner decision (b) at the M8 acceptance).**  The
+model-bump targets of the objects with a Black–Scholes proxy (:mod:`volsto.hedging.controls`:
+vanillas, digitals, forward starts before ``T1`` and portfolios of those) are controlled with the
+same payoff difference under a Black–Scholes **shadow** on the same spot normals (one per proxy
+vol, the pricing model's forward curve; the shadow's future spliced at ``t`` like the hybrid
+targets): ``y_i − β (c_i − E[c_i | state_i])`` with ``β = Cov(y, c)/Var(c)`` on the alive paths
+of the date and the conditional expectation the analytic Black value difference (exact for the
+shadow, so the regression stays unbiased whatever ``β``).  Applies to the surface-driven bumps
+only (:class:`Bump` carries the bumped surfaces or the flat vol shifts); the hybrid-CRN spot
+bumps and the parameter bumps are untouched.  ``Fit.variance_reduction`` / ``Fit.beta`` report
+it per bump, ``control_variate=False`` switches it off, and an object without a proxy is noted
+once per class (cliquets, autocalls, barriers, variance products, accumulated-sum options).
+
 Checked by ``tests/test_hedging.py`` (``test_conditional_pricer_bs``: the regressed value and
 delta of a vanilla against Black–Scholes along the paths; the t = 0 value equals the Monte Carlo
-price on the same draws).
+price on the same draws; ``test_regime_delta_bump_reanchors_at_the_bumped_spot``: the
+sticky-strike regime delta at ``t = 0`` equals the M5 ``delta_gamma`` estimator;
+``test_control_variate_vega_vanilla_lv`` and
+``test_control_variate_forward_risk_reversal_skew_tent``: the controlled and raw targets agree
+in expectation and the variance reductions are reported).
 """
 
 from __future__ import annotations
 
+import contextlib
+import os
+import shutil
+import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -73,9 +112,17 @@ from volsto.config import SimConfig
 from volsto.engine.grid import TimeGrid
 from volsto.engine.paths import PathSet
 from volsto.engine.rng import GaussianDraws
+from volsto.hedging.controls import (
+    MIN_SHADOW_VOL,
+    ProxyLeg,
+    ShadowBrownian,
+    proxy_legs,
+    proxy_note,
+)
 from volsto.hedging.state import HedgeState, hedge_state
 from volsto.models.base import Model
 from volsto.products.base import Product
+from volsto.risk.engine import model_regime_spot_bump
 
 FloatArray = NDArray[np.float64]
 BoolArray = NDArray[np.bool_]
@@ -88,12 +135,29 @@ DEFAULT_KNOTS = 8
 #: (a spot move under a delta regime: normalised like the CRN delta, by ``S_up − S_dn`` and
 #: ``S_t/S₀``), ``"second"`` (second difference ``(up − 2 base + dn)/unit²``)
 BUMP_KINDS = ("model", "spot", "second")
+#: environment variable naming the scratch directory of streamed bump sets (``stream_bumps``);
+#: an explicit ``scratch_dir`` wins, the system temp is the fallback
+SCRATCH_ENV = "VOLSTO_SCRATCH"
+#: prefix of the per-pricer scratch directories (``tempfile.mkdtemp``), so a crashed run's
+#: leftovers are recognisable
+STREAM_PREFIX = "volsto-bumps-"
+#: the five arrays of a :class:`~volsto.engine.paths.PathSet` written per streamed set
+_PATH_ARRAYS = ("log_spot", "variance", "factors", "int_var", "sum_sq")
 
 
 @dataclass(frozen=True)
 class Bump:
     """A bumped pricing model for one target: ``value(up) − value(dn or base)`` over ``unit``.
-    ``kind`` names the sensitivity (``"vega"``, ``"fwd_var:0.25-0.5"``, ``"skew_T:1"``, …)."""
+    ``kind`` names the sensitivity (``"vega"``, ``"fwd_var:0.25-0.5"``, ``"skew_T:1"``, …).
+
+    A **surface-driven** bump carries what the §7.11 control variate needs to shadow it under
+    Black–Scholes (:mod:`volsto.hedging.controls`): the perturbed states' implied surfaces
+    ``up_surface`` / ``dn_surface`` (vega / volga parallel, forward-variance buckets, the
+    ``skew_T`` / ``curvature_T`` tents — the proxy vol of a leg moves by the bumped surface's
+    vol minus the base surface's at the leg's ``(k, T)``), or, for a bare Black–Scholes pricing
+    model whose vega bump is the flat ``±VOL_BUMP``, the flat shifts ``vol_shift_up`` /
+    ``vol_shift_dn``.  A model-parameter bump (``param:<name>``) or a spot-kind bump carries
+    neither and gets no control."""
 
     name: str
     up: Model
@@ -101,6 +165,10 @@ class Bump:
     unit: float = 1.0
     description: str = ""
     kind: str = "model"
+    up_surface: Any = None
+    dn_surface: Any = None
+    vol_shift_up: float | None = None
+    vol_shift_dn: float | None = None
 
     def __post_init__(self) -> None:
         if self.unit == 0 or not np.isfinite(self.unit):
@@ -109,6 +177,24 @@ class Bump:
             raise ValueError(f"kind must be one of {BUMP_KINDS}")
         if self.kind in ("second", "spot") and self.dn is None:
             raise ValueError(f"a {self.kind!r} bump needs both up and dn models")
+        if self.up_surface is not None and self.vol_shift_up is not None:
+            raise ValueError("a bump carries either surfaces or flat vol shifts, not both")
+        if self.dn is None and (self.dn_surface is not None or self.vol_shift_dn is not None):
+            raise ValueError("a one-sided bump cannot carry a dn surface or vol shift")
+        if self.dn is not None and self.controllable and not self._has_dn_control:
+            raise ValueError("a two-sided controllable bump needs the dn surface or vol shift too")
+
+    @property
+    def _has_dn_control(self) -> bool:
+        return self.dn_surface is not None or self.vol_shift_dn is not None
+
+    @property
+    def controllable(self) -> bool:
+        """Whether the bump carries a Black–Scholes shadow (surfaces or flat vol shifts) — a
+        ``"model"`` or ``"second"`` kind; spot-kind bumps are never controlled."""
+        return self.kind in ("model", "second") and (
+            self.up_surface is not None or self.vol_shift_up is not None
+        )
 
 
 def hedge_basis(x: FloatArray, knots: FloatArray, degree: int = 2) -> FloatArray:
@@ -146,7 +232,10 @@ class Fit:
     ``delta`` and ``gamma`` — stored as the first and second derivatives in ``ln S_t``, converted
     per unit spot by :meth:`ConditionalPricer.evaluate` —, one per bump name), the feature
     standardisation, the kept columns and clip range, the spline knots, the alive paths' share
-    and the fit diagnostics."""
+    and the fit diagnostics.  The §7.11 control variate's report per bump name:
+    ``variance_reduction`` (``Var(y) / Var(y − β (c − E[c | state]))`` on the alive paths; 1.0
+    when the bump was not controlled), ``beta`` (0.0 when not controlled) and the ``controlled``
+    names."""
 
     t: float
     degree: int
@@ -163,6 +252,10 @@ class Fit:
     columns: tuple[int, ...] = (0,)
     lo: FloatArray = field(default_factory=lambda: np.full(1, -np.inf))
     hi: FloatArray = field(default_factory=lambda: np.full(1, np.inf))
+    variance_reduction: dict[str, float] = field(default_factory=dict)
+    variance_reduction_se: dict[str, float] = field(default_factory=dict)
+    beta: dict[str, float] = field(default_factory=dict)
+    controlled: tuple[str, ...] = ()
 
     def basis(self, features: FloatArray) -> FloatArray:
         """The design matrix: the kept feature columns (``columns`` — a state column constant
@@ -215,6 +308,9 @@ class Fit:
 
 
 DELTA_ESTIMATORS = ("hybrid_crn", "gradient")
+#: path-bootstrap draws (and seed) for the standard error of a control's variance reduction
+CV_BOOTSTRAP_DRAWS = 64
+CV_BOOTSTRAP_SEED = 7
 CLIP_QUANTILE = 0.001  # the basis is evaluated inside the pricing paths' [0.1%, 99.9%] range
 # ridge on the normal equations, relative to each column's own diagonal entry (scale-free), the
 # intercept unpenalised (so the t = 0 fit is exactly the sample mean and the product leg
@@ -250,9 +346,24 @@ class ConditionalPricer:
     delta_estimator: str = "hybrid_crn"
     hybrid_bumps: bool = True
     ridge: float = DEFAULT_RIDGE
+    stream_bumps: bool = False
+    scratch_dir: str | Path | None = None
+    #: the §7.11 control variate on the difference for the surface-driven model bumps of the
+    #: objects with a Black–Scholes proxy (:mod:`volsto.hedging.controls`; module docstring)
+    control_variate: bool = True
+    #: the base implied surface the proxy vols are read from (the pricing context's; a
+    #: Black–Scholes pricing model uses its own ``vol`` instead; ``None`` without a state)
+    surface: Any = None
     paths: PathSet = field(init=False, repr=False)
     payoffs: list[ObjectPayoffs] = field(init=False, repr=False)
+    #: the bumped sets kept in memory (every set unless ``stream_bumps``)
     bumped_paths: dict[str, PathSet] = field(init=False, repr=False, default_factory=dict)
+    #: the bumped sets' keys in simulation order (``"up"``, ``"dn"``, ``"bump:<name>:<side>"``)
+    bump_keys: tuple[str, ...] = field(init=False, default=())
+    #: re-anchoring log-shift of each bumped set's future at the splice (module docstring)
+    bump_shifts: dict[str, float] = field(init=False, repr=False, default_factory=dict)
+    streamed: dict[str, dict[str, Path]] = field(init=False, repr=False, default_factory=dict)
+    stream_path: Path | None = field(init=False, default=None)
     hybrids: dict[float, dict[str, FloatArray]] = field(
         init=False, repr=False, default_factory=dict
     )
@@ -262,6 +373,18 @@ class ConditionalPricer:
     )
     notes: list[str] = field(init=False, default_factory=list)
     n_simulations: int = field(init=False, default=0)
+    #: the spot Brownian of the pricing draws at the record columns (``None`` when no control
+    #: applies: control off, no controllable bump or no object with a proxy)
+    brownian: ShadowBrownian | None = field(init=False, repr=False, default=None)
+    #: the Black–Scholes proxy legs per object index (``None``: no proxy)
+    proxies: dict[int, tuple[ProxyLeg, ...] | None] = field(
+        init=False, repr=False, default_factory=dict
+    )
+    #: per ``(object, bump name)``: the legs' shadow vols ``(base, up, dn)`` (``dn`` ``None`` for
+    #: a one-sided bump); ``None`` when the bump cannot be shadowed for that object
+    shadow_vols: dict[tuple[int, str], tuple[FloatArray, FloatArray, FloatArray | None] | None] = (
+        field(init=False, repr=False, default_factory=dict)
+    )
 
     def __post_init__(self) -> None:
         if not self.objects:
@@ -272,6 +395,7 @@ class ConditionalPricer:
         if self.delta_estimator not in DELTA_ESTIMATORS:
             raise ValueError(f"delta_estimator must be one of {DELTA_ESTIMATORS}")
         self._simulate()
+        self._prepare_controls()
 
     # -- simulation ----------------------------------------------------------------------------
 
@@ -285,13 +409,25 @@ class ConditionalPricer:
             self.sim.antithetic,
         )
         s0 = self.model.spot
-        up = self.model.bump(spot=s0 * float(np.exp(self.spot_size)))
-        dn = self.model.bump(spot=s0 * float(np.exp(-self.spot_size)))
+        # the "model" regime of every model class (LocalVol.bump(spot=) would hold the local vol
+        # in k, the sticky-local-vol move: volsto.risk.engine.model_regime_spot_bump)
+        up = model_regime_spot_bump(self.model, s0 * float(np.exp(self.spot_size)))
+        dn = model_regime_spot_bump(self.model, s0 * float(np.exp(-self.spot_size)))
         models: list[tuple[str, Model]] = [("base", self.model), ("up", up), ("dn", dn)]
+        # the re-anchoring shift of each bumped set's future at the splice: the CRN spot bumps
+        # move the spot by ±h; a spot-kind bump (a delta regime) moves it by its own spot ratio
+        # — re-anchored at the base spot the spot move would be removed from the hybrid and the
+        # regime-delta target driven to ~0 —; a model bump leaves the spot where it is
+        shifts: dict[str, float] = {"up": self.spot_size, "dn": -self.spot_size}
         for b in self.bumps:
             models.append((f"bump:{b.name}:up", b.up))
+            if b.kind == "spot":
+                shifts[f"bump:{b.name}:up"] = float(np.log(b.up.spot / s0))
             if b.dn is not None:
                 models.append((f"bump:{b.name}:dn", b.dn))
+                if b.kind == "spot":
+                    shifts[f"bump:{b.name}:dn"] = float(np.log(b.dn.spot / s0))
+        self.bump_shifts = shifts
         n_obj = len(self.objects)
         pay: dict[str, FloatArray] = {k: np.empty((self.sim.n_paths, n_obj)) for k, _ in models}
         parts: dict[str, list[PathSet]] = {k: [] for k, _ in models}
@@ -303,9 +439,27 @@ class ConditionalPricer:
                 parts[key].append(ps)
         self.n_simulations = len(models)
         self.paths = PathSet.concat(parts.pop("base"))
-        # every bumped path set is kept for the hybrid (history-held) targets at every date;
-        # memory_bytes reports the footprint
-        self.bumped_paths = {k: PathSet.concat(v) for k, v in parts.items()}
+        # every bumped path set is needed for the hybrid (history-held) targets at every date:
+        # kept in memory (memory_bytes reports the footprint) or, with stream_bumps, written to
+        # the scratch directory as soon as it is concatenated and memory-mapped back on demand
+        self.bump_keys = tuple(parts)
+        self.bumped_paths = {}
+        self.streamed = {}
+        if self.stream_bumps:
+            base_dir = self.scratch_dir or os.environ.get(SCRATCH_ENV) or None
+            self.stream_path = Path(tempfile.mkdtemp(prefix=STREAM_PREFIX, dir=base_dir))
+        for i, k in enumerate(list(parts)):
+            ps = PathSet.concat(parts.pop(k))
+            if self.stream_path is None:
+                self.bumped_paths[k] = ps
+                continue
+            files: dict[str, Path] = {}
+            for arr in _PATH_ARRAYS:
+                f = self.stream_path / f"{i:03d}_{arr}.npy"
+                np.save(f, getattr(ps, arr))
+                files[arr] = f
+            self.streamed[k] = files
+            del ps
         self.payoffs = []
         for j in range(n_obj):
             bumps: dict[str, tuple[FloatArray, FloatArray | None]] = {}
@@ -364,11 +518,12 @@ class ConditionalPricer:
         col = self.idx[key]
         n_obj = len(self.objects)
         out: dict[str, FloatArray] = {}
-        for name, bumped in self.bumped_paths.items():
+        for name in self.bump_keys:
             if name.startswith("bump:") and not self.hybrid_bumps:
                 continue
-            shift = {"up": self.spot_size, "dn": -self.spot_size}.get(name, 0.0)
-            hyb = self._hybrid(bumped, col, shift)
+            bumped = self.bumped_set(name)
+            hyb = self._hybrid(bumped, col, self.bump_shifts.get(name, 0.0))
+            del bumped  # a streamed set is dropped as soon as the hybrid is built
             pay = np.empty((self.sim.n_paths, n_obj))
             for j, obj in enumerate(self.objects):
                 pay[:, j] = obj.payoff(hyb, self.idx)
@@ -378,20 +533,58 @@ class ConditionalPricer:
         self.hybrids[key] = out
         return out
 
+    def bumped_set(self, name: str) -> PathSet:
+        """The bumped path set ``name``: the resident one, or a :class:`PathSet` on read-only
+        memory maps of the streamed ``.npy`` files (``stream_bumps``)."""
+        if name in self.bumped_paths:
+            return self.bumped_paths[name]
+        if name not in self.streamed:
+            raise KeyError(f"no bumped path set {name!r}")
+        files = self.streamed[name]
+        arrays = {arr: np.load(files[arr], mmap_mode="r") for arr in _PATH_ARRAYS}
+        return PathSet(self.paths.times, *(arrays[arr] for arr in _PATH_ARRAYS))
+
+    @staticmethod
+    def _set_bytes(p: PathSet) -> int:
+        return int(
+            p.log_spot.nbytes
+            + p.variance.nbytes
+            + p.factors.nbytes
+            + p.int_var.nbytes
+            + p.sum_sq.nbytes
+        )
+
     @property
     def memory_bytes(self) -> int:
-        """Footprint of the kept path sets (base and every bumped set)."""
-        sets = [self.paths, *self.bumped_paths.values()]
-        return int(
-            sum(
-                p.log_spot.nbytes
-                + p.variance.nbytes
-                + p.factors.nbytes
-                + p.int_var.nbytes
-                + p.sum_sq.nbytes
-                for p in sets
-            )
-        )
+        """Footprint of the resident path sets (the base set and every bumped set kept in
+        memory; a streamed set counts in :attr:`streamed_bytes` instead)."""
+        return sum(self._set_bytes(p) for p in [self.paths, *self.bumped_paths.values()])
+
+    @property
+    def streamed_bytes(self) -> int:
+        """On-disk footprint of the streamed bumped sets (0 unless ``stream_bumps``)."""
+        total = 0
+        for files in self.streamed.values():
+            for f in files.values():
+                with contextlib.suppress(OSError):
+                    total += f.stat().st_size
+        return total
+
+    def close(self) -> None:
+        """Remove the scratch directory of the streamed sets (idempotent; the pricer cannot
+        build new hybrids afterwards — its cached fits stay usable)."""
+        d = self.stream_path
+        self.stream_path = None
+        self.streamed = {}
+        if d is not None:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def __del__(self) -> None:  # best effort: a failed __post_init__ has no stream_path
+        try:
+            if getattr(self, "stream_path", None) is not None:
+                self.close()
+        except Exception:  # never raise from a finaliser
+            pass
 
     # -- features --------------------------------------------------------------------------------
 
@@ -417,6 +610,145 @@ class ConditionalPricer:
             np.column_stack([*base, hs.features]) if hs.features.shape[1] else np.column_stack(base)
         )
         return np.asarray(feats, dtype=np.float64), hs
+
+    # -- control variate (§7.11) -------------------------------------------------------------
+
+    def _prepare_controls(self) -> None:
+        """Register the objects' Black–Scholes proxies and build the shadow Brownian when at
+        least one controllable bump meets at least one object with a proxy (module docstring;
+        :mod:`volsto.hedging.controls`); one note per object class without a proxy."""
+        self.proxies = {}
+        self.shadow_vols = {}
+        self.brownian = None
+        if not self.control_variate or not any(b.controllable for b in self.bumps):
+            return
+        base_vol = float(self.model.vol) if hasattr(self.model, "vol") else None
+        if base_vol is None and self.surface is None:
+            note = "no Black-Scholes control: the pricer has no base surface (raw bump targets)"
+            if note not in self.notes:
+                self.notes.append(note)
+            return
+        any_proxy = False
+        for j, obj in enumerate(self.objects):
+            legs = proxy_legs(obj)
+            self.proxies[j] = legs
+            if legs is None:
+                note = proxy_note(obj)
+                if note not in self.notes:
+                    self.notes.append(note)
+                continue
+            any_proxy = True
+            for b in self.bumps:
+                if b.controllable:
+                    self.shadow_vols[(j, b.name)] = self._shadow_vols(legs, b, base_vol)
+        if not any_proxy:
+            return
+        self.brownian = ShadowBrownian.from_draws(
+            self.sim.seed if self.seed is None else self.seed,
+            self.sim.n_paths,
+            self.grid,
+            self.sim.antithetic,
+            self.sim.chunk_ranges(self.grid.n_records, self.model.n_factors),
+        )
+
+    def _shadow_vols(
+        self, legs: Sequence[ProxyLeg], b: Bump, base_vol: float | None
+    ) -> tuple[FloatArray, FloatArray, FloatArray | None] | None:
+        """The legs' shadow vols under bump ``b``: base (the pricing model's own flat vol, else
+        the base surface's vol at the leg's ``(k, T)``), up and dn (base + the bumped surface's
+        vol minus the base surface's, or + the flat shift), floored at ``MIN_SHADOW_VOL``."""
+        if base_vol is not None:
+            base = np.full(len(legs), base_vol)
+        else:
+            base = np.array([leg.vol(self.surface) for leg in legs])
+
+        def side(surface: Any, shift: float | None) -> FloatArray | None:
+            if shift is not None:
+                return np.asarray(np.maximum(base + shift, MIN_SHADOW_VOL))
+            if surface is None or self.surface is None:
+                return None
+            delta = np.array([leg.vol(surface) - leg.vol(self.surface) for leg in legs])
+            return np.asarray(np.maximum(base + delta, MIN_SHADOW_VOL))
+
+        up = side(b.up_surface, b.vol_shift_up)
+        if up is None:
+            return None
+        dn = side(b.dn_surface, b.vol_shift_dn) if b.dn is not None else None
+        if b.dn is not None and dn is None:
+            return None
+        return base, up, dn
+
+    def control(self, obj_index: int, t: float, b: Bump) -> tuple[FloatArray, FloatArray] | None:
+        """The per-path control ``c`` of bump ``b`` for one object at ``t`` and its analytic
+        conditional expectation ``E[c | state]`` (``(n_paths,)`` each), scaled exactly like the
+        target — ``(u − d)/(2 unit)``, ``(u − base)/unit`` or ``(u − 2 base + d)/unit²`` of the
+        legs' shadow payoffs spliced at ``t`` —, or ``None`` when no control applies (no proxy,
+        the bump not controllable, a forward-start leg past its ``T1``: noted)."""
+        legs = self.proxies.get(obj_index)
+        vols = self.shadow_vols.get((obj_index, b.name))
+        if legs is None or vols is None or self.brownian is None:
+            return None
+        if not all(leg.active(float(t)) for leg in legs):
+            note = proxy_note(self.objects[obj_index], float(t))
+            if note not in self.notes:
+                self.notes.append(note)
+            return None
+        col = self.idx[float(t)]
+        fc = self.model.forward_curve
+        ln_s_t = self.paths.log_spot_at(col)
+        base_v, up_v, dn_v = vols
+        n = self.sim.n_paths
+
+        def side(v: FloatArray) -> tuple[FloatArray, FloatArray]:
+            c = np.zeros(n)
+            e = np.zeros(n)
+            assert self.brownian is not None
+            for leg, vol in zip(legs, v, strict=True):
+                c += self.brownian.leg_payoff(leg, self.paths, self.idx, col, float(vol), fc)
+                e += leg.weight * leg.conditional_value(ln_s_t, float(t), float(vol), fc)
+            return c, e
+
+        c_up, e_up = side(up_v)
+        if b.kind == "second":
+            assert dn_v is not None
+            c_dn, e_dn = side(dn_v)
+            c_0, e_0 = side(base_v)
+            u2 = b.unit * b.unit
+            return (c_up - 2.0 * c_0 + c_dn) / u2, (e_up - 2.0 * e_0 + e_dn) / u2
+        if dn_v is not None:
+            c_dn, e_dn = side(dn_v)
+            return (c_up - c_dn) / (2.0 * b.unit), (e_up - e_dn) / (2.0 * b.unit)
+        c_0, e_0 = side(base_v)
+        return (c_up - c_0) / b.unit, (e_up - e_0) / b.unit
+
+    @staticmethod
+    def controlled_target(
+        y: FloatArray, c: FloatArray, e: FloatArray, alive: BoolArray
+    ) -> tuple[FloatArray, float, float, float]:
+        """``y − β (c − e)`` with ``β = Cov(y, c)/Var(c)`` on the alive paths, the variance
+        reduction ``Var(y)/Var(y − β (c − e))`` there (``inf`` when the controlled target is
+        constant, 1.0 when ``y`` is), ``β``, and the bootstrap standard error of the reduction
+        (:data:`CV_BOOTSTRAP_DRAWS` path resamples; 0 when there is nothing to estimate)."""
+        ya, ca = y[alive], c[alive]
+        var_c = float(ca.var(ddof=1)) if ca.size > 1 else 0.0
+        beta = float(np.cov(ya, ca, ddof=1)[0, 1] / var_c) if var_c > 0.0 else 0.0
+        out = np.asarray(y - beta * (c - e), dtype=np.float64)
+        var_y = float(ya.var(ddof=1)) if ya.size > 1 else 0.0
+        ra = out[alive]
+        var_r = float(ra.var(ddof=1)) if ya.size > 1 else 0.0
+        ratio = 1.0 if var_y == 0.0 else (var_y / var_r if var_r > 0.0 else float("inf"))
+        # standard error of the ratio of two sample variances: a path bootstrap (the ratio is
+        # a Monte Carlo number and is never reported without one)
+        se = 0.0
+        if np.isfinite(ratio) and ratio != 1.0 and ya.size >= 8:
+            rng = np.random.default_rng(CV_BOOTSTRAP_SEED)
+            n = ya.size
+            idx = rng.integers(0, n, size=(CV_BOOTSTRAP_DRAWS, n))
+            vy = ya[idx].var(axis=1, ddof=1)
+            vr = ra[idx].var(axis=1, ddof=1)
+            good = vr > 0.0
+            se = float((vy[good] / vr[good]).std(ddof=1)) if good.sum() > 1 else float("nan")
+        return out, ratio, beta, se
 
     # -- regression ----------------------------------------------------------------------------
 
@@ -456,7 +788,9 @@ class ConditionalPricer:
         # whole hedged variance of the study cliquet's static replication)
         d_ln = d_raw / ratio * s_t
         targets["delta"] = d_ln
-        targets["gamma"] = g_raw / ratio**2 * s_t * s_t + d_ln
+        # the pure dollar gamma S_t² Γ: independent of the 'delta' key, which a delta-regime bump
+        # (kind "spot", named "delta") replaces by the regime's dollar delta
+        targets["gamma"] = g_raw / ratio**2 * s_t * s_t
         for b in self.bumps:
             if self.hybrid_bumps:
                 u = hyb[f"bump:{b.name}:up"][:, obj_index]
@@ -467,14 +801,39 @@ class ConditionalPricer:
                 assert d is not None
                 targets[b.name] = (u - 2.0 * pay.base + d) / (b.unit * b.unit)
             elif b.kind == "spot":
+                # the regime delta: per unit spot at t is (u - d) / (S_t (e^h - e^-h)) =
+                # (u - d) / (S_up - S_dn) / ratio; regressed as the DOLLAR delta (x S_t) like the
+                # hybrid-CRN delta above, since evaluate() divides every "delta" prediction by S_t
                 assert d is not None
-                targets[b.name] = (u - d) / (b.up.spot - b.dn.spot) / ratio  # type: ignore[union-attr]
+                targets[b.name] = (
+                    (u - d) / (b.up.spot - b.dn.spot) / ratio * s_t  # type: ignore[union-attr]
+                )
             else:
                 targets[b.name] = (
                     (u - d) / (2.0 * b.unit) if d is not None else (u - pay.base) / b.unit
                 )
-        raw = feats[alive]
+        # the §7.11 control on the difference: the shadow Black-Scholes payoff difference on the
+        # same normals, centred at its analytic conditional expectation, regressed out of the
+        # bump target (variance reduction and beta reported per bump; 1.0 / 0.0 without one)
+        variance_reduction: dict[str, float] = {}
+        variance_reduction_se: dict[str, float] = {}
+        betas: dict[str, float] = {}
+        controlled: list[str] = []
         n_alive = int(alive.sum())
+        for b in self.bumps:
+            ce = self.control(obj_index, float(t), b) if n_alive > 1 else None
+            if ce is None:
+                variance_reduction[b.name], betas[b.name] = 1.0, 0.0
+                variance_reduction_se[b.name] = 0.0
+                continue
+            (
+                targets[b.name],
+                variance_reduction[b.name],
+                betas[b.name],
+                variance_reduction_se[b.name],
+            ) = self.controlled_target(targets[b.name], ce[0], ce[1], alive)
+            controlled.append(b.name)
+        raw = feats[alive]
         nf = self.model.n_factors
         moving = [0] + [1 + nf + i for i, nm in enumerate(hs.names) if nm.startswith("u_")]
         state_cols = raw[:, 1 + nf :] if raw.shape[1] > 1 + nf else np.zeros((raw.shape[0], 0))
@@ -559,8 +918,21 @@ class ConditionalPricer:
             )
             if note not in self.notes:
                 self.notes.append(note)
+        fit.variance_reduction = variance_reduction
+        fit.variance_reduction_se = variance_reduction_se
+        fit.beta = betas
+        fit.controlled = tuple(controlled)
         self.fits[key] = fit
         return fit
+
+    def cv_reductions(self) -> list[float]:
+        """Every controlled bump's variance reduction over the fits computed so far (dates ×
+        objects), for the run's ``cv_reduction_median``."""
+        return [f.variance_reduction[k] for f in self.fits.values() for k in f.controlled]
+
+    def cv_reduction_ses(self) -> list[float]:
+        """The bootstrap standard errors matching :meth:`cv_reductions`."""
+        return [f.variance_reduction_se[k] for f in self.fits.values() for k in f.controlled]
 
     # -- evaluation --------------------------------------------------------------------------
 
@@ -598,7 +970,7 @@ class ConditionalPricer:
             elif kind == "delta":
                 vals = fit.predict("delta", feats) / s_t
             elif kind == "gamma":
-                vals = (fit.predict("gamma", feats) - fit.predict("delta", feats)) / (s_t * s_t)
+                vals = fit.predict("gamma", feats) / (s_t * s_t)
             else:
                 vals = fit.predict(kind, feats)
             if hs.any_terminated:
@@ -635,6 +1007,8 @@ __all__ = [
     "BUMP_KINDS",
     "DEFAULT_KNOTS",
     "MIN_REGRESSION_PATHS",
+    "SCRATCH_ENV",
+    "STREAM_PREFIX",
     "Bump",
     "ConditionalPricer",
     "Fit",

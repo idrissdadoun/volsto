@@ -22,11 +22,16 @@ Fast:
 * historical mode: recovery on the one-year order-one history under the **default** config
   (``skew_mode="auto"`` → soft all-pillar penalty at weight 10, report decision v) and the
   two-point fit reported; the rolling fit and identification flags;
-* stage 3 on the cached 2F Table 8.2 LSV: the P1 first-order SSR within 10% of the numerical LSV
-  SSR, the break-even assertion machinery (``breakeven_check`` on the Table 8.2 LSV against
-  ``ssr = 1`` targets fails with the message separating the first-order miss from the engine
-  bias; :class:`BreakEvenValidationError` carries the result; the iteration plumbing on the cached
-  model) and the study specs round trip.
+* the stage-3 assertion machinery on synthetic check tables (the owner's split on the M7 Part 3
+  report: the engine bias — simulated against the first-order break-evens at the fitted
+  parameters — is asserted at 10%; the target miss of a binding fit is reported in the table and
+  in one sentence of the failure message, never asserted; a row without a first-order value falls
+  back to the target gap and is flagged); stage 3 on the cached 2F Table 8.2 LSV: the P1
+  first-order SSR within 10% of the numerical LSV SSR, ``breakeven_check`` on the Table 8.2 LSV
+  against ``ssr = 1`` targets (SpotVolCovar engine bias within 10% with a +177% target miss
+  reported; the VolVar rows without a first-order value fall back to the target gap and fail);
+  :class:`BreakEvenValidationError` carries the result; the iteration plumbing on the cached
+  model; the study specs round trip.
 
 Slow: the three-year mixing recovery under the default config (owner's tolerances; un-xfailed
 per report decision v), the explicit two-point configuration as a strict xfail with the measured
@@ -51,6 +56,7 @@ from volsto.analytics.reparam import BreakEvenParams, to_breakeven
 from volsto.calibration.fit_2f import (
     BINDING_MESSAGE,
     INFEASIBLE_MESSAGE,
+    NO_FIRST_ORDER_NOTE,
     NU_CAP_WARNING,
     BreakEvenFitConfig,
     BreakEvenValidationError,
@@ -680,17 +686,118 @@ def test_rolling_fit_and_flags(synthetic_1y) -> None:  # type: ignore[no-untyped
         rolling_fit(hist, cfg, start=hist.dates[10], window_vol=120)
 
 
+def _check_input(**over: float) -> pd.DataFrame:
+    """A one-pillar simulated break-even table (the columns ``breakeven_check`` reads): both
+    targets missed by +25% at first order (a binding fit) with a small engine bias at the solution
+    (SpotVolCovar +2%, VolVar +0.8%); ``volvar_target_fit`` is the step-3 target the fit solved."""
+    rec: dict[str, float] = {
+        "T": 0.25,
+        "svc_sim": -0.102,
+        "svc_se": 0.001,
+        "svc_target": -0.08,
+        "svc_p1_first_order": -0.10,
+        "volvar_sim": 0.0126,
+        "volvar_se": 0.0001,
+        "volvar_target": 0.02,
+        "volvar_target_fit": 0.01,
+        "volvar_p1_first_order": 0.0125,
+    }
+    rec.update(over)
+    return pd.DataFrame([rec])
+
+
+def test_breakeven_check_engine_bias_rule() -> None:
+    """The owner's split of the stage-3 assertion on synthetic check tables: ``within`` is
+    ``|engine_bias| <= tolerance`` (simulated against the first-order break-evens at the fitted
+    parameters); ``gap_vs_target`` and ``first_order_miss`` are reported columns.  A +25% target
+    miss with a 2% engine bias passes with an empty message and the miss in the table; a +20%
+    engine bias fails with the message naming that row's engine bias only (the VolVar row with the
+    large miss and small bias is not a failure) and one sentence listing the first-order misses
+    above the tolerance as reported, not asserted; misses below the tolerance are not listed; a
+    row without a finite non-zero first-order value falls back to the target gap and is flagged
+    :data:`NO_FIRST_ORDER_NOTE`; ``volvar_target`` stands in for a missing
+    ``volvar_target_fit``."""
+    chk, ok, msg = breakeven_check(_check_input(), 0.10)
+    assert ok and msg == "" and chk["within"].all() and (chk["note"] == "").all()
+    assert list(chk.columns) == [
+        "T",
+        "quantity",
+        "sim",
+        "se",
+        "target",
+        "first_order",
+        "gap_vs_target",
+        "first_order_miss",
+        "engine_bias",
+        "within",
+        "note",
+    ]
+    svc = chk[chk["quantity"] == "SpotVolCovar"].iloc[0]
+    assert svc["first_order_miss"] == pytest.approx(0.25)
+    assert svc["engine_bias"] == pytest.approx(0.02)
+    assert svc["gap_vs_target"] == pytest.approx(0.275)
+    vv = chk[chk["quantity"] == "VolVar"].iloc[0]
+    assert vv["target"] == 0.01 and vv["first_order_miss"] == pytest.approx(0.25)
+    assert vv["engine_bias"] == pytest.approx(0.008)
+    # a +20% engine bias on the covariance: FAIL on that row only, the misses reported
+    chk, ok, msg = breakeven_check(_check_input(svc_sim=-0.12), 0.10)
+    assert not ok and list(chk["within"]) == [False, True]
+    assert msg.startswith(
+        "simulated break-evens outside 10% of the first-order break-evens at the fitted "
+        "parameters (engine bias): SpotVolCovar at T=0.25: simulated -0.12000 +/- 0.00100 vs "
+        "first-order -0.10000 at the fitted parameters (engine bias +20.0%; target -0.08000, "
+        "+50.0%)"
+    )
+    assert "VolVar at T=0.25: simulated" not in msg
+    assert msg.endswith(
+        ". First-order misses of the targets above 10%, reported, not asserted (the first-order "
+        "fit's miss of its target, a binding constraint when the fit says so): "
+        "SpotVolCovar at T=0.25 +25.0%, VolVar at T=0.25 +25.0%."
+    )
+    # misses below the tolerance are not listed
+    _, ok, msg = breakeven_check(
+        _check_input(svc_sim=-0.12, svc_target=-0.098, volvar_target_fit=0.0123), 0.10
+    )
+    assert not ok and "engine bias +20.0%" in msg and "reported, not asserted" not in msg
+    # the tolerance applies to the engine bias: 2% fails at 1%, 0.8% passes
+    chk, ok, msg = breakeven_check(_check_input(), 0.01)
+    assert not ok and list(chk["within"]) == [False, True] and "engine bias +2.0%" in msg
+    # no first-order value: the target gap decides, flagged
+    chk, ok, msg = breakeven_check(_check_input(svc_p1_first_order=float("nan")), 0.10)
+    svc = chk[chk["quantity"] == "SpotVolCovar"].iloc[0]
+    assert not ok and not svc["within"] and svc["note"] == NO_FIRST_ORDER_NOTE
+    assert np.isnan(svc["engine_bias"]) and np.isnan(svc["first_order_miss"])
+    assert (
+        "SpotVolCovar at T=0.25: simulated -0.10200 +/- 0.00100 vs target -0.08000 (+27.5%; "
+        f"{NO_FIRST_ORDER_NOTE})" in msg
+    ) and msg.endswith("when the fit says so): VolVar at T=0.25 +25.0%.")
+    # every failing row a fallback: the header names the target gap, not the engine bias
+    assert "(no first-order value: target gap): SpotVolCovar" in msg
+    assert chk[chk["quantity"] == "VolVar"]["within"].all()
+    chk, ok, msg = breakeven_check(_check_input(svc_p1_first_order=0.0, svc_sim=-0.085), 0.10)
+    svc = chk[chk["quantity"] == "SpotVolCovar"].iloc[0]
+    assert ok and msg == "" and svc["within"] and svc["note"] == NO_FIRST_ORDER_NOTE
+    # volvar_target when the fit carried no step-3 target
+    chk, ok, _ = breakeven_check(_check_input(volvar_target_fit=float("nan")), 0.10)
+    vv = chk[chk["quantity"] == "VolVar"].iloc[0]
+    assert ok and vv["target"] == 0.02 and vv["first_order_miss"] == pytest.approx(-0.375)
+
+
 def test_stage3_machinery_on_cached_2f(ssvi, fast_sim) -> None:  # type: ignore[no-untyped-def]
     """Stage 3 on the cached 2F Table 8.2 LSV (8e5 particles, never calibrated here) through the
     ``model=`` override with the Table 8.2 kernel's P1 table: the numerical LSV SSR (2.48 / 2.14 at
     3M / 1Y) against the P1 first-order SSR (2.64 / 2.08, within 10%), the SSR the targets imply
     (≈ 0.95), the naked mixing skew, the simulated break-evens with standard errors, the forward
     table at 1y-into-1y with the spot 1y skew and its ratio; "recalibrated: no".  The break-even
-    assertion: the Table 8.2 LSV is not an ``ssr = 1`` fit, so the check fails with the message
-    naming the pillar, the simulated value, the target, the first-order miss and the engine bias;
-    ``fit_2f`` with stage 3 on the cached model raises :class:`BreakEvenValidationError` carrying
-    the result, and ``iterate_against_simulation=1`` (plumbing only: the cached model stands in for
-    the calibration) records two iteration rows and the correction columns."""
+    assertion under the owner's split: the Table 8.2 LSV is not an ``ssr = 1`` fit, so the
+    SpotVolCovar rows carry a first-order miss of +177% / +118% (reported) with an engine bias
+    within 10% (−6% / +5%, within); the step-2 table carries no VolVar first-order value, so the
+    VolVar rows fall back to the target gap (flagged) and fail; the message names the fallback
+    rows and lists the SpotVolCovar misses as reported, not asserted; ``fit_2f`` with stage 3 on
+    the cached model raises :class:`BreakEvenValidationError` carrying the result (the fitted
+    parameters' first order against the Table 8.2 simulation: an engine-bias failure), and
+    ``iterate_against_simulation=1`` (plumbing only: the cached model stands in for the
+    calibration) records two iteration rows and the correction columns."""
     from volsto.calibration.cache import build_market
 
     spec = _reference_spec("2f")
@@ -730,9 +837,20 @@ def test_stage3_machinery_on_cached_2f(ssvi, fast_sim) -> None:  # type: ignore[
     assert ft["fwd_skew_90_110"].iloc[0] > 0
     assert "recalibrated: no" in rep.summary()
     # the stage-3 assertion on a model that is not a fit of these targets
-    assert len(rep.check) == 4 and not rep.within_tolerance and "FAIL" in rep.summary()
-    assert "SpotVolCovar at T=0.25" in rep.check_message and "engine bias" in rep.check_message
-    assert "first-order fit missed the target" in rep.check_message
+    ck = rep.check
+    assert len(ck) == 4 and not rep.within_tolerance and "FAIL" in rep.summary()
+    svc = ck[ck["quantity"] == "SpotVolCovar"]
+    assert svc["within"].all() and (svc["engine_bias"].abs() < 0.10).all()
+    assert (svc["first_order_miss"] > 1.0).all() and (svc["note"] == "").all()
+    vv = ck[ck["quantity"] == "VolVar"]
+    assert not vv["within"].any() and (vv["note"] == NO_FIRST_ORDER_NOTE).all()
+    assert np.isnan(vv["engine_bias"]).all() and (vv["gap_vs_target"] > 1.0).all()
+    assert "VolVar at T=0.25: simulated" in rep.check_message
+    # every failing row is a fallback row here, so the header names the target-gap rule
+    assert NO_FIRST_ORDER_NOTE in rep.check_message
+    assert "(no first-order value: target gap):" in rep.check_message
+    assert "when the fit says so): SpotVolCovar at T=0.25 +" in rep.check_message
+    assert "SpotVolCovar at T=0.25: simulated" not in rep.check_message
     chk, ok, msg = breakeven_check(rep.breakeven_table, 5.0)  # a 500% tolerance passes
     assert ok and msg == "" and chk["within"].all()
     with pytest.raises(BreakEvenValidationError):
@@ -750,6 +868,8 @@ def test_stage3_machinery_on_cached_2f(ssvi, fast_sim) -> None:  # type: ignore[
     res = exc.value.result
     assert res is not None and res.stage3 is not None and res.stage3_passed is False
     assert not res.recalibrated and "FAIL" in res.summary()
+    assert "(engine bias): SpotVolCovar at T=0.25: simulated" in str(exc.value)
+    assert (res.stage3.check["note"] == "").all()  # the fit's table carries every first order
     it = fit_2f(
         tg, lsv.kernel.xi0, cfg, stage3=light, iterate_against_simulation=1, assert_stage3=False
     )

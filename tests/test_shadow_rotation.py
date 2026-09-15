@@ -1,7 +1,7 @@
-"""Shadow-rotation greek (SPEC §15 Part 3 KEEP list and report decision ix;
-``risk/shadow_rotation.py``).  No calibration runs here: the rotated states of
-``scripts/m7_p1_marking.py`` are read from the cache with ``allow_calibrate=False`` (skipped when
-absent); no wall-clock assertion.
+"""Shadow-rotation greek (SPEC §15 Part 3 KEEP list and report decision ix, restated in the
+owner's declared convention; ``risk/shadow_rotation.py``).  No calibration runs here: the rotated
+states of ``scripts/m7_p1_marking.py`` are read from the cache with ``allow_calibrate=False``
+(skipped when absent); no wall-clock assertion.
 
 * the rota: 2/sqrt(T) ln(110/90) vol points of 90/110 skew (0.568 at 6M, 0.560 with the saturated
   profile), the ATM skew moved by exactly ``−size · 0.02/sqrt(max(T, 1M))`` with the ATM vol
@@ -12,13 +12,18 @@ absent); no wall-clock assertion.
   ``Skew_SABR`` moves by ∓ one rota, the sticky targets hold ``VoV_BE`` / ``Corr_BE`` at the base
   values (the variant also the two-point skew reference), the round-trip surface refits to the base
   parameters, ν rises with the rotation under both policies, an unknown policy raises;
+* the convention algebra on a synthetic report (no cache): ``fee = P1 − LV``, ``fee_* = P1_* −
+  lv_rotation``, ``fee_shadow = recalibrated − usual`` exactly (the LV rotation cancels), every
+  ``desk_pnl_*`` the exact negative of its ``fee_*`` with the same standard error, the frame rows
+  and the convention line;
 * d(fee)/d(rota) of the M6 headline 3y autocall on the cached calibrations under both owner
-  policies: usual, recalibrated and shadow with standard errors, shadow = recalibrated − usual
-  path by path, the refit sets equal the study's record, nothing recalibrated; the **sign test**
-  (decision ix) on the recorded study numbers: the owner expected ``|shadow_sticky| >>
-  |shadow_sabr|`` with the sticky-break-even shadow negative — measured: both shadows positive
-  (the recalibration offsets the usual rotation under both policies), the sticky one 1.4× the
-  SABR-linked one; the test asserts what was measured and records the expectation.
+  policies: the P1 / LV / fee levels, the LV rotation, the usual, recalibrated and shadow rotations
+  of the P1 price, the fee and the desk P&L with standard errors, the refit sets equal the study's
+  record, nothing recalibrated; the **sign test** (decision ix in the convention) on the recorded
+  study numbers: the desk-P&L shadow for the short note is **negative** under ``sticky_breakeven``
+  (and under ``sabr_linked``, reported), ``|desk_pnl_shadow(sticky)| > |desk_pnl_shadow(sabr)|``
+  (measured ratio about 1.4 — the deck's ordering), the fee shadow equals the P1 shadow to
+  round-off, the LV rotation is recorded with its stderr and the convention string is present.
 """
 
 from __future__ import annotations
@@ -44,16 +49,21 @@ from volsto.config import (
     load_yaml,
 )
 from volsto.market.surface import atm_skew_numeric, perturbed_surface
-from volsto.risk.engine import RiskState, surface_of
+from volsto.risk.engine import RiskState, Sensitivity, surface_of
 from volsto.risk.shadow_rotation import (
+    LV_STATES,
+    P1_STATES,
     RECALIBRATION_POLICIES,
     ROTA_T_MIN,
+    ROTATION_CONVENTION,
+    ShadowRotationReport,
     refit_on_rotated,
     rota_skew_vol_points,
     rota_slope,
     rotation_perturbation,
     rotation_shadow_sensitivity,
     rotation_states,
+    shadow_quantities,
 )
 from volsto.studies.m6 import AUTOCALL_NAME, headline_products
 
@@ -167,35 +177,192 @@ def test_rotated_refit_under_the_policies() -> None:
         )
 
 
+def test_convention_algebra_on_a_synthetic_report() -> None:
+    """:func:`shadow_quantities` on synthetic per-path payoffs (no cache, no pricing): the fee
+    level is ``P1 − LV`` path by path, ``fee_usual = usual − lv_rotation`` and
+    ``fee_recalibrated = recalibrated − lv_rotation`` in value, ``fee_shadow`` equals
+    ``recalibrated − usual`` (and the P1 ``shadow``) exactly with the same standard error, every
+    ``desk_pnl_*`` is the exact negative of its ``fee_*`` with the same standard error, the
+    standard errors are those of the per-path combinations; the report's frame lists the nine
+    quantities in order, its summary starts with the convention line and states the policy;
+    missing states raise."""
+    rng = np.random.default_rng(3)
+    n, size = 4_000, 0.5
+    base = rng.normal(0.9, 0.05, n)
+    p1 = {
+        "base": base,
+        "up": base - 0.02 + rng.normal(0, 1e-3, n),
+        "down": base + 0.02 + rng.normal(0, 1e-3, n),
+        "up_refit": base - 0.01 + rng.normal(0, 1e-3, n),
+        "down_refit": base + 0.01 + rng.normal(0, 1e-3, n),
+    }
+    lv = {
+        "base": base - 0.07 + rng.normal(0, 1e-2, n),
+        "up": base - 0.07 - 0.03 + rng.normal(0, 1e-2, n),
+        "down": base - 0.07 + 0.03 + rng.normal(0, 1e-2, n),
+    }
+    assert set(p1) == set(P1_STATES) and set(lv) == set(LV_STATES)
+    q = shadow_quantities(p1, lv, size=size, n_paths=n)
+    c = 1.0 / (2.0 * size)
+
+    def se(x: np.ndarray) -> float:
+        return float(x.std(ddof=1) / np.sqrt(n))
+
+    fee_paths = p1["base"] - lv["base"]
+    assert q["fee"].value == pytest.approx(fee_paths.mean(), abs=1e-14)
+    assert q["fee"].stderr == pytest.approx(se(fee_paths), rel=1e-12)
+    assert q["p1_level"].value - q["lv_level"].value == pytest.approx(q["fee"].value, abs=1e-14)
+    lv_rot = c * (lv["up"] - lv["down"])
+    assert q["lv_rotation"].value == pytest.approx(lv_rot.mean(), abs=1e-14)
+    assert q["lv_rotation"].stderr == pytest.approx(se(lv_rot), rel=1e-12)
+    for name in ("usual", "recalibrated"):
+        assert q[f"fee_{name}"].value == pytest.approx(
+            q[name].value - q["lv_rotation"].value, abs=1e-14
+        )
+    fee_usual_paths = c * (p1["up"] - p1["down"]) - lv_rot
+    assert q["fee_usual"].stderr == pytest.approx(se(fee_usual_paths), rel=1e-12)
+    assert q["fee_shadow"].value == pytest.approx(
+        q["fee_recalibrated"].value - q["fee_usual"].value, abs=1e-14
+    )
+    assert q["fee_shadow"].value == pytest.approx(
+        q["recalibrated"].value - q["usual"].value, abs=1e-14
+    )
+    assert (
+        q["fee_shadow"].value == q["shadow"].value and q["fee_shadow"].stderr == q["shadow"].stderr
+    )
+    shadow_paths = c * (p1["up_refit"] - p1["down_refit"] - p1["up"] + p1["down"])
+    assert q["shadow"].stderr == pytest.approx(se(shadow_paths), rel=1e-12)
+    for name in ("usual", "recalibrated", "shadow"):
+        d, f = q[f"desk_pnl_{name}"], q[f"fee_{name}"]
+        assert d.value == -f.value and d.stderr == f.stderr and d.unit == f.unit
+        assert d.states == f.states and d.size == f.size and d.scheme == f.scheme
+    assert q["usual"].scheme == "central" and q["fee"].scheme == "level"
+    assert all(v.n_paths == n for v in q.values())
+    rep = ShadowRotationReport(
+        product="synthetic",
+        policy="sticky_breakeven",
+        size=size,
+        convention=ROTATION_CONVENTION,
+        p1_level=q["p1_level"],
+        lv_level=q["lv_level"],
+        fee=q["fee"],
+        lv_rotation=q["lv_rotation"],
+        usual=q["usual"],
+        recalibrated=q["recalibrated"],
+        shadow=q["shadow"],
+        fee_usual=q["fee_usual"],
+        fee_recalibrated=q["fee_recalibrated"],
+        fee_shadow=q["fee_shadow"],
+        desk_pnl_usual=q["desk_pnl_usual"],
+        desk_pnl_recalibrated=q["desk_pnl_recalibrated"],
+        desk_pnl_shadow=q["desk_pnl_shadow"],
+        fits={},
+        param_moves={},
+        per_vol_point={0.5: rota_skew_vol_points(0.5)},
+        n_calibrations=0,
+        n_lv_builds=0,
+        n_cache_misses=0,
+        recalibrated_any=False,
+        wall_seconds=0.0,
+    )
+    fr = rep.frame()
+    assert list(fr["greek"]) == [
+        "lv_rotation",
+        "usual",
+        "recalibrated",
+        "fee_usual",
+        "fee_recalibrated",
+        "fee_shadow",
+        "desk_pnl_usual",
+        "desk_pnl_recalibrated",
+        "desk_pnl_shadow",
+    ]
+    row = fr.set_index("greek").loc["desk_pnl_shadow"]
+    assert row["per_rota"] == -q["fee_shadow"].value and row["per_rota_se"] == q["shadow"].stderr
+    assert row["per_vp_90_110_0.5y"] == pytest.approx(
+        -q["fee_shadow"].value / rota_skew_vol_points(0.5)
+    )
+    text = rep.summary()
+    assert text.startswith("convention: " + ROTATION_CONVENTION)
+    assert "policy sticky_breakeven" in text and "fee = P1 - LV" in text
+    assert "0.56 vp" in ROTATION_CONVENTION and "SHORT position = -(d fee)" in ROTATION_CONVENTION
+    assert isinstance(q["fee"], Sensitivity)
+    with pytest.raises(ValueError):
+        shadow_quantities({k: v for k, v in p1.items() if k != "up_refit"}, lv, size=1.0, n_paths=n)
+
+
 def test_sign_test_on_the_recorded_study() -> None:
-    """Report decision ix on the recorded study numbers (``rotation_spx_<policy>.yaml``, 2·10⁵
-    paths, 2·10⁵-particle calibrations; skipped when absent): shadow = recalibrated − usual for
-    each policy; the usual rotation is the same under both (same base set, same rotated
-    surfaces); the owner's expected ordering ``|shadow_sticky| >> |shadow_sabr|`` holds in
-    magnitude (ratio about 1.4, asserted > 1) but **the sticky shadow is positive, not negative**:
-    under both policies the recalibrated rotation is smaller in magnitude than the usual one (the
-    refit set partly offsets the skew-up move), most so under sticky break-evens.  Asserted as
-    measured; the variant (break-evens and skew reference held) is printed when recorded."""
+    """Report decision ix in the owner's declared convention, on the recorded study numbers
+    (``rotation_spx_<policy>.yaml``, 2·10⁵ paths, 2·10⁵-particle calibrations; skipped when
+    absent).  The desk-P&L shadow per +1 rota for the short note is **negative** under
+    ``sticky_breakeven`` (the fee rises when the marking set follows a skew-up rotation — the
+    deck's "fee increases, negative P&L") and, reported, under ``sabr_linked`` too;
+    ``|desk_pnl_shadow(sticky_breakeven)| > |desk_pnl_shadow(sabr_linked)|`` (measured ratio about
+    1.4, printed — the deck's ordering); ``fee_shadow`` equals the P1 shadow ``recalibrated −
+    usual`` to round-off; ``fee_usual = usual − lv_rotation``; the usual P1 rotation is the same
+    under both policies (same base set, same rotated surfaces); ``lv_rotation`` is recorded with a
+    positive stderr; the convention string is present.  The variant (break-evens and skew
+    reference held) is printed when recorded."""
     recs = {p: _record(p) for p in RECALIBRATION_POLICIES}
     if any(recs[p] is None for p in OWNER_POLICIES):
         pytest.skip("rotation records absent (scripts/m7_p1_marking.py)")
-    out = {}
+    keys = (
+        "lv_rotation",
+        "usual",
+        "recalibrated",
+        "shadow",
+        "fee_usual",
+        "fee_recalibrated",
+        "fee_shadow",
+        "desk_pnl_usual",
+        "desk_pnl_recalibrated",
+        "desk_pnl_shadow",
+    )
+    out: dict[str, dict[str, np.ndarray]] = {}
     for p, doc in recs.items():
         if doc is None:
             continue
-        usual, recal, shadow = (np.array(doc[k]) for k in ("usual", "recalibrated", "shadow"))
-        assert shadow[0] == pytest.approx(recal[0] - usual[0], abs=1e-12)
-        assert usual[1] > 0 and recal[1] > 0 and shadow[1] > 0
-        out[p] = (usual, recal, shadow)
-        print(p, "usual", usual, "recalibrated", recal, "shadow", shadow)
-    u_s, r_s, sh_s = out["sabr_linked"]
-    u_t, r_t, sh_t = out["sticky_breakeven"]
-    assert u_s[0] == pytest.approx(u_t[0], abs=1e-12)  # same usual rotation
-    assert u_s[0] < 0 and abs(u_s[0]) > 5 * u_s[1]  # the note is short skew
-    assert abs(r_s[0]) < abs(u_s[0]) and abs(r_t[0]) < abs(u_t[0])  # recalibration offsets
-    assert sh_s[0] > 3 * sh_s[1] and sh_t[0] > 3 * sh_t[1]  # both shadows positive
-    assert abs(sh_t[0]) > abs(sh_s[0])  # the owner's magnitude ordering
-    assert not sh_t[0] < 0, "the owner's expected negative sticky shadow is not reproduced"
+        if "desk_pnl_shadow" not in doc:
+            pytest.skip(f"rotation_spx_{p}.yaml predates the convention (re-run the script)")
+        assert doc["convention"] == ROTATION_CONVENTION
+        q = {k: np.array(doc[k], dtype=float) for k in keys}
+        for k in ("p1_level", "lv_level", "fee"):
+            v = np.array(doc[k], dtype=float)
+            assert np.isfinite(v).all() and v[1] > 0, k
+        assert np.array(doc["fee"])[0] == pytest.approx(
+            np.array(doc["p1_level"])[0] - np.array(doc["lv_level"])[0], abs=1e-12
+        )
+        assert all(q[k][1] > 0 for k in keys)
+        assert q["shadow"][0] == pytest.approx(q["recalibrated"][0] - q["usual"][0], abs=1e-12)
+        assert q["fee_shadow"][0] == pytest.approx(q["shadow"][0], abs=1e-12)
+        assert q["fee_shadow"][1] == pytest.approx(q["shadow"][1], abs=1e-12)
+        assert q["fee_usual"][0] == pytest.approx(q["usual"][0] - q["lv_rotation"][0], abs=1e-12)
+        assert q["fee_recalibrated"][0] == pytest.approx(
+            q["recalibrated"][0] - q["lv_rotation"][0], abs=1e-12
+        )
+        assert q["fee_shadow"][0] == pytest.approx(
+            q["fee_recalibrated"][0] - q["fee_usual"][0], abs=1e-12
+        )
+        for name in ("usual", "recalibrated", "shadow"):
+            assert q[f"desk_pnl_{name}"][0] == -q[f"fee_{name}"][0]
+            assert q[f"desk_pnl_{name}"][1] == q[f"fee_{name}"][1]
+        out[p] = q
+        print(
+            p,
+            *(f"{k} {q[k][0]:+.6f} +/- {q[k][1]:.6f}" for k in keys),
+            f"desk_pnl_shadow z {q['desk_pnl_shadow'][0] / q['desk_pnl_shadow'][1]:+.1f}",
+            sep="\n  ",
+        )
+    sabr, sticky = out["sabr_linked"], out["sticky_breakeven"]
+    assert sabr["usual"][0] == pytest.approx(sticky["usual"][0], abs=1e-12)  # same usual rotation
+    assert sabr["lv_rotation"][0] == pytest.approx(sticky["lv_rotation"][0], abs=1e-12)
+    assert sabr["usual"][0] < 0 and abs(sabr["usual"][0]) > 5 * sabr["usual"][1]  # short skew
+    d_sticky, d_sabr = sticky["desk_pnl_shadow"], sabr["desk_pnl_shadow"]
+    assert d_sticky[0] < -3 * d_sticky[1], "desk-P&L shadow not negative under sticky_breakeven"
+    print("sabr_linked desk-P&L shadow negative:", bool(d_sabr[0] < 0), d_sabr)
+    ratio = abs(d_sticky[0]) / abs(d_sabr[0])
+    print(f"|desk_pnl_shadow| sticky / sabr = {ratio:.3f}")
+    assert ratio > 1.0, ratio  # the deck's ordering (measured about 1.4)
 
 
 @pytest.mark.parametrize("policy", OWNER_POLICIES)
@@ -203,8 +370,10 @@ def test_shadow_rotation_on_cached_calibrations(policy: str) -> None:
     """d(fee)/d(rota) of the M6 headline 3y autocall at ``(ssr 1, eps 0.10)`` on the cached
     calibrations of ``scripts/m7_p1_marking.py`` (4·10⁴ paths here, the study's 2·10⁵ in
     ``outputs/m7/p1_marking.md``): the refit sets equal the study's record, no cache miss, nothing
-    recalibrated, finite sensitivities with standard errors, shadow = recalibrated − usual path by
-    path.  The numbers are printed, not asserted (Monte Carlo at the test's path count)."""
+    recalibrated (five leverage states, three LV builds), finite levels and sensitivities with
+    standard errors in the declared convention, shadow = recalibrated − usual path by path,
+    ``fee_shadow`` the P1 shadow, ``desk_pnl_*`` = −``fee_*``.  The numbers are printed, not
+    asserted (Monte Carlo at the test's path count)."""
     doc = _record(policy)
     if doc is None:
         pytest.skip(f"rotation_spx_{policy}.yaml absent (scripts/m7_p1_marking.py)")
@@ -232,10 +401,17 @@ def test_shadow_rotation_on_cached_calibrations(policy: str) -> None:
     except CacheMissError as exc:
         pytest.skip(f"rotated calibrations not in the cache (tests never calibrate): {exc}")
     print(rep.summary())
-    assert rep.policy == policy
+    assert rep.policy == policy and rep.convention == ROTATION_CONVENTION
     assert rep.n_cache_misses == 0 and not rep.recalibrated_any and rep.n_calibrations == 5
-    for s in (rep.fee, rep.usual, rep.recalibrated, rep.shadow):
-        assert np.isfinite(s.value) and s.stderr > 0
+    assert rep.n_lv_builds == 3
+    for s in (rep.p1_level, rep.lv_level, rep.fee, rep.lv_rotation, *(r[2] for r in rep.rows())):
+        assert np.isfinite(s.value) and s.stderr > 0, s
     assert rep.shadow.value == pytest.approx(rep.recalibrated.value - rep.usual.value, abs=1e-12)
-    assert 0.8 < rep.fee.value < 1.1
-    assert set(rep.frame()["greek"]) == {"usual", "recalibrated", "shadow"}
+    assert rep.fee_shadow.value == rep.shadow.value and rep.fee_shadow.stderr == rep.shadow.stderr
+    assert rep.fee_usual.value == pytest.approx(rep.usual.value - rep.lv_rotation.value, abs=1e-12)
+    assert rep.desk_pnl_shadow.value == -rep.fee_shadow.value
+    assert rep.desk_pnl_usual.value == -rep.fee_usual.value
+    assert rep.desk_pnl_recalibrated.value == -rep.fee_recalibrated.value
+    assert 0.8 < rep.p1_level.value < 1.1 and 0.8 < rep.lv_level.value < 1.1
+    assert rep.fee.value == pytest.approx(rep.p1_level.value - rep.lv_level.value, abs=1e-12)
+    assert len(rep.frame()) == 9 and "desk_pnl_shadow" in set(rep.frame()["greek"])

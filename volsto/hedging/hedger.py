@@ -18,9 +18,13 @@ recalibration rule.
    revaluation ``V_{k+1} − V_k``, hedge legs ``q_k (I_{k+1} − I_k)``, each in time-0 money; at the
    last date the values are the realised discounted payoffs;
 4. with a :class:`RecalibrationRule` the world's conditional skew at each date is measured, the P1
-   set refit when it moved by more than the tolerance and the pricing model rebuilt through the
-   leverage cache (hit rate reported); the **recalibration P&L** is ``V_k(new set) − V_k(old set)``
-   at the same world state, isolated as its own leg.
+   set refit when it moved by more than ``skew_move_threshold`` under the rule's ``policy``
+   (:data:`~volsto.risk.shadow_rotation.RECALIBRATION_POLICIES`: ``"sabr_linked"`` refits every
+   target on the state surface; ``"sticky_breakeven"`` holds the break-even targets at the base
+   fit's values and lets only the skew constraint follow the state surface;
+   ``"sticky_breakeven_skew"`` holds the skew reference too) and the pricing model rebuilt through
+   the leverage cache (hit rate reported); the **recalibration P&L** is ``V_k(new set) − V_k(old
+   set)`` at the same world state, isolated as its own leg.
 
 Total P&L per path ``= product leg + Σ hedge legs − costs``; the zero-cost total is reported next
 to it (costs are additive).  The product leg sums to ``payoff − V₀`` exactly on every path
@@ -31,6 +35,12 @@ simulation per bumped model (``1 + 2`` spot bumps ``+`` one or two per target bu
 ``n_paths`` paths over the grid, one world simulation, and ``n_dates × n_objects`` regressions
 of ``O(n_paths × n_basis²)``; the estimate scales a one-chunk timing.  Long runs are shard-able by
 path blocks (the M9 ``--shard`` form): ``world_paths`` and ``world_seed`` select the block.
+**Memory:** the bumped path sets are kept for the hybrid targets (``budget["pricing_paths_gb"]``);
+``stream_bumps=True`` writes them to a scratch directory (``scratch_dir``, the ``VOLSTO_SCRATCH``
+variable or the system temp) and memory-maps them back per date instead
+(``budget["streamed_paths_gb"]``; :class:`~volsto.hedging.pricing.ConditionalPricer`), passed to
+every pricer the run builds, the recalibration rebuilds included; the scratch directories are
+removed when the run ends.
 
 Checked by ``tests/test_hedging.py``.
 """
@@ -42,6 +52,7 @@ import logging
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -52,6 +63,7 @@ from volsto.config import SimConfig, SurfacePerturbation
 from volsto.engine.grid import TimeGrid
 from volsto.engine.paths import PathSet
 from volsto.engine.rng import GaussianDraws
+from volsto.hedging.controls import MIN_SHADOW_VOL
 from volsto.hedging.instruments import Spot, deduplicate_names, expand_rolls
 from volsto.hedging.pricing import Bump, ConditionalPricer, union_grid
 from volsto.hedging.strategies import (
@@ -62,12 +74,14 @@ from volsto.hedging.strategies import (
     Strategy,
     default_strategy,
 )
+from volsto.market.surface import ArbitrageError
 from volsto.models.base import Model
 from volsto.products.base import Portfolio, Product
 from volsto.risk.engine import BSBuilder, LSVBuilder, LVBuilder, RiskState, surface_of
 from volsto.risk.greeks import _spot_state
 from volsto.risk.ladders import PILLARS as RISK_PILLARS
 from volsto.risk.ladders import bucket_epsilon
+from volsto.risk.shadow_rotation import RECALIBRATION_POLICIES, held_targets
 
 log = logging.getLogger(__name__)
 
@@ -79,6 +93,17 @@ FREQUENCIES = {"daily": 1.0 / 252.0, "weekly": 1.0 / 52.0, "monthly": 1.0 / 12.0
 TENT_SIZE = 0.01
 VOL_BUMP = 0.01
 SPOT_BUMP = 0.01
+#: default ``RecalibrationRule.skew_move_threshold`` (vol per unit log-moneyness): the world's
+#: conditional skew is a three-strike regression under the world model whose own noise measured
+#: 0.002-0.008 (SPEC §8.1, the Black-Scholes world without a skew move); 0.01 sits above it so a
+#: world without a skew move never triggers a spurious refit (owner decision (c), M8 acceptance)
+SKEW_MOVE_THRESHOLD = 0.01
+#: the state surface logs when fewer than this fraction of the paths invert to a finite vol
+STATE_SURFACE_MIN_INVERTED = 0.99
+#: halvings of a tent / forward-variance bump that fails the surface's arbitrage checks before
+#: giving up — the M5 ``RiskEngine.max_halvings`` default (a +1 vp skew tent at the 2y pillar
+#: breaks the calendar condition on the placeholder surface: halved once it passes)
+MAX_HALVINGS = 4
 
 
 # --------------------------------------------------------------------------------------------
@@ -199,10 +224,38 @@ class PricingContext:
 
         return fn
 
-    def _bumped(self, pert: SurfacePerturbation, mode: str = "recalibrate") -> Model:
+    def _bumped(self, pert: SurfacePerturbation, mode: str = "recalibrate") -> tuple[Model, Any]:
+        """The model rebuilt on the perturbed state and that state's implied surface (the
+        latter travels with the :class:`Bump` for the §7.11 control's proxy vols)."""
         assert self.state is not None and self.builder is not None
-        model: Model = self.builder.build(self.state.with_perturbation(pert), mode)
-        return model
+        state = self.state.with_perturbation(pert)
+        model: Model = self.builder.build(state, mode)
+        return model, surface_of(state)
+
+    def _bumped_halving(
+        self, make: Callable[[float], SurfacePerturbation], size: float, label: str
+    ) -> tuple[Model, Any, float]:
+        """:meth:`_bumped` on ``make(size)``, the size halved until the perturbed surface passes
+        the no-arbitrage checks (M5's ``RiskEngine.perturbed_state``, at most
+        :data:`MAX_HALVINGS` times; noted when halved) — the achieved size is returned so the
+        caller scales the bump's ``unit`` and the target stays per the nominal size."""
+        s = float(size)
+        last: Exception | None = None
+        for _ in range(MAX_HALVINGS + 1):
+            try:
+                model, surface = self._bumped(make(s))
+            except ArbitrageError as exc:
+                last = exc
+                s *= 0.5
+                continue
+            if s != size:
+                note = f"{label}: bump halved to {s:.3g} of {size:.3g} (arbitrage check)"
+                if note not in self.notes:
+                    self.notes.append(note)
+            return model, surface, s
+        raise ArbitrageError(
+            f"bump {label} fails the arbitrage checks after {MAX_HALVINGS} halvings: {last}"
+        )
 
     def available_targets(self) -> list[str]:
         base = ["delta", "gamma"]
@@ -228,22 +281,36 @@ class PricingContext:
                 return self.regime_delta_bump(delta_regime)
             return None
         if name in ("vega", "volga"):
+            # what the §7.11 control needs to shadow the bump: the perturbed surfaces, or the
+            # flat shifts of a bare Black-Scholes model (its dn vol floored like the model's)
+            shadow: dict[str, Any] = {}
             if self.state is not None:
-                up = self._bumped(SurfacePerturbation("parallel", {"size": VOL_BUMP}))
-                dn = self._bumped(SurfacePerturbation("parallel", {"size": -VOL_BUMP}))
+                up, s_up = self._bumped(SurfacePerturbation("parallel", {"size": VOL_BUMP}))
+                dn, s_dn = self._bumped(SurfacePerturbation("parallel", {"size": -VOL_BUMP}))
+                shadow = {"up_surface": s_up, "dn_surface": s_dn}
             elif hasattr(self.model, "vol"):
                 v = float(self.model.vol)
+                v_dn = max(v - VOL_BUMP, MIN_SHADOW_VOL)
                 up = self.model.bump(vol=v + VOL_BUMP)
-                dn = self.model.bump(vol=max(v - VOL_BUMP, 1e-4))
+                dn = self.model.bump(vol=v_dn)
+                shadow = {"vol_shift_up": VOL_BUMP, "vol_shift_dn": v_dn - v}
             else:
                 raise ValueError(
                     f"target {name!r} needs a pricing state or a model with a vol; available: "
                     f"{self.available_targets()}"
                 )
             if name == "vega":
-                return Bump("vega", up, dn, VOL_BUMP, "parallel +1 vp, central", kind="model")
+                return Bump(
+                    "vega", up, dn, VOL_BUMP, "parallel +1 vp, central", kind="model", **shadow
+                )
             return Bump(
-                "volga", up, dn, VOL_BUMP, "second difference in the parallel vol", kind="second"
+                "volga",
+                up,
+                dn,
+                VOL_BUMP,
+                "second difference in the parallel vol",
+                kind="second",
+                **shadow,
             )
         if self.state is None:
             raise ValueError(
@@ -253,16 +320,19 @@ class PricingContext:
         if name.startswith("fwd_var:"):
             lo, hi = (float(x) for x in name.split(":")[1].split("-"))
             eps = bucket_epsilon(self.surface, lo, hi, 0.01)
-            up = self._bumped(
-                SurfacePerturbation("total_variance", {"eps": eps, "t_lo": lo, "t_hi": hi})
+            up, s_up, achieved = self._bumped_halving(
+                lambda e: SurfacePerturbation("total_variance", {"eps": e, "t_lo": lo, "t_hi": hi}),
+                eps,
+                name,
             )
             return Bump(
                 name,
                 up,
                 None,
-                1.0,
+                achieved / eps,
                 f"forward-variance bucket [{lo:g}, {hi:g}] +1 vp of its VS vol",
                 kind="model",
+                up_surface=s_up,
             )
         if name.startswith("skew_T:") or name.startswith("curvature_T:"):
             T = float(name.split(":")[1])
@@ -271,18 +341,32 @@ class PricingContext:
             if name.startswith("skew_T:"):
                 from volsto.risk.ladders import skew_slope
 
-                pert = SurfacePerturbation(
-                    "skew_tent", {"pillars": pillars, "index": i, "slope": skew_slope(TENT_SIZE)}
-                )
+                def make(size: float) -> SurfacePerturbation:
+                    return SurfacePerturbation(
+                        "skew_tent", {"pillars": pillars, "index": i, "slope": skew_slope(size)}
+                    )
+
             else:
                 from volsto.risk.ladders import curvature_coefficient
 
-                pert = SurfacePerturbation(
-                    "curvature_tent",
-                    {"pillars": pillars, "index": i, "curv": curvature_coefficient(TENT_SIZE)},
-                )
-            up = self._bumped(pert)
-            return Bump(name, up, None, 1.0, f"{name}: +1 vp of 90/110 at the pillar", kind="model")
+                def make(size: float) -> SurfacePerturbation:
+                    return SurfacePerturbation(
+                        "curvature_tent",
+                        {"pillars": pillars, "index": i, "curv": curvature_coefficient(size)},
+                    )
+
+            # the tent size is halved until the surface passes the arbitrage checks (as M5);
+            # the unit keeps the target per +1 vp of 90/110 whatever the achieved size
+            up, s_up, achieved = self._bumped_halving(make, TENT_SIZE, name)
+            return Bump(
+                name,
+                up,
+                None,
+                achieved / TENT_SIZE,
+                f"{name}: +1 vp of 90/110 at the pillar (bump {achieved / TENT_SIZE:g} vp)",
+                kind="model",
+                up_surface=s_up,
+            )
         if name.startswith("param:"):
             pname = name.split(":")[1]
             from volsto.risk.engine import default_params_bump
@@ -318,22 +402,57 @@ class RecalibrationRule:
     """``"on_skew_move"`` (module docstring): at each rebalancing date the world's conditional
     ATM skew at the ``pillars`` (tenors from the date) is measured by regressing a three-strike
     vanilla strip under the **world** model on the world state; when it moved by more than
-    ``tol`` (vol per unit log-moneyness, any pillar) since the last refit the P1 set is refit on
-    the state surface (:func:`~volsto.calibration.fit_2f.fit_2f` on
-    :func:`~volsto.calibration.targets.marking_targets` of a quadratic-smile state surface) and
-    the pricing model rebuilt with the new parameters through the cache (``builder``); the
-    reference skew is the world's own at ``t = 0``, so a world without a skew move never
-    recalibrates.  ``refit`` may replace the fit call (``(state_surface, base_params) -> params``).
+    ``skew_move_threshold`` (vol per unit log-moneyness, any pillar; default
+    :data:`SKEW_MOVE_THRESHOLD`) since the last refit the P1 set is refit on the state surface
+    (:func:`~volsto.calibration.fit_2f.fit_2f` on
+    :func:`~volsto.calibration.targets.marking_targets` of a quadratic-smile state surface) under
+    ``policy`` (:data:`~volsto.risk.shadow_rotation.RECALIBRATION_POLICIES`, the semantics of
+    :func:`~volsto.risk.shadow_rotation.refit_on_rotated`): ``"sabr_linked"`` refits every target
+    on the state surface; ``"sticky_breakeven"`` holds the break-even targets (``spot_vol_covar``,
+    ``vol_var``, ``vovol``, ``vov_be_raw``, ``correl_target``) at the **base** fit's values and
+    lets only the skew constraint follow the state surface; ``"sticky_breakeven_skew"`` holds the
+    two-point skew reference too (:func:`~volsto.risk.shadow_rotation.held_targets`).  The base
+    fit is ``base_fit`` (a :class:`~volsto.calibration.fit_2f.FitResult`); when ``None`` under a
+    sticky policy the hedger computes the marking fit of the pricing surface once, at the first
+    rebalancing date, with the rule's config and ``ssr_target``
+    (:func:`~volsto.calibration.fit_2f.fit_2f_marking`), stores it here and logs it.  The pricing
+    model is rebuilt with the new parameters through the cache (``builder``); the reference skew
+    is the world's own at ``t = 0``, so a world without a skew move never recalibrates.  ``refit``
+    may replace the fit call (``(state_surface, base_params) -> params``; the policy is then the
+    callable's business).  ``log_rows`` records every refit with its policy.
     """
 
     pillars: tuple[float, ...] = (0.25, 1.0)
-    tol: float = 0.02
+    skew_move_threshold: float = SKEW_MOVE_THRESHOLD
     h: float = 0.05
     fit_config: Any = None
     ssr_target: float = 1.0
     refit: Callable[..., Any] | None = None
     max_refits: int = 100
+    policy: str = "sabr_linked"
+    base_fit: Any | None = None
     log_rows: list[dict[str, Any]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.policy not in RECALIBRATION_POLICIES:
+            raise ValueError(f"policy must be one of {RECALIBRATION_POLICIES}")
+        if not (self.skew_move_threshold > 0.0):
+            raise ValueError("skew_move_threshold must be positive")
+
+    @property
+    def sticky(self) -> bool:
+        """Whether the policy holds targets of a base fit."""
+        return self.policy != "sabr_linked"
+
+    def config(self) -> Any:
+        """The fit config: ``fit_config`` or the default on the rule's pillars."""
+        from volsto.calibration.fit_2f import BreakEvenFitConfig
+
+        return self.fit_config or BreakEvenFitConfig(
+            pillars=tuple(self.pillars),
+            mat_min=0.0,
+            skew_pillars=(min(self.pillars), max(self.pillars)),
+        )
 
 
 class _StateSurface:
@@ -445,7 +564,12 @@ class HedgeResult:
 class Hedger:
     """Module docstring.  ``pricing`` is a :class:`PricingContext` (or a bare model),
     ``world`` a model; ``sim`` the pricing configuration (paths, schedule, scheme), ``world_paths``
-    the number of world paths (default ``sim.n_paths``)."""
+    the number of world paths (default ``sim.n_paths``); ``stream_bumps`` / ``scratch_dir`` and
+    ``control_variate`` (the §7.11 control on the difference for the surface-driven bump targets
+    of the objects with a Black–Scholes proxy, :mod:`volsto.hedging.controls`; its median
+    variance reduction over dates and controlled objects is ``budget["cv_reduction_median"]``)
+    are passed to every :class:`~volsto.hedging.pricing.ConditionalPricer` the run builds
+    (module docstring, *Memory*)."""
 
     pricing: PricingContext | Model
     world: Model
@@ -457,6 +581,10 @@ class Hedger:
     world_seed: int | None = None
     degree: int = 2
     verbose: bool = True
+    stream_bumps: bool = False
+    scratch_dir: str | Path | None = None
+    _twin: ConditionalPricer | None = field(default=None, init=False, repr=False)
+    control_variate: bool = True
 
     def __post_init__(self) -> None:
         if not isinstance(self.pricing, PricingContext):
@@ -638,8 +766,76 @@ class Hedger:
                 flush=True,
             )
         t0 = time.perf_counter()
-        pricer = ConditionalPricer(ctx.model, objects, grid, self.sim, tuple(bumps), self.degree)
+        pricer = self._pricer(ctx.model, objects, grid, bumps)
+        pricers = [pricer]
         t_price = time.perf_counter() - t0
+        try:
+            return self._run(
+                product,
+                strategy,
+                instruments,
+                objects,
+                obj_index,
+                net_index,
+                net_legs,
+                run_notes,
+                dates,
+                grid,
+                bumps,
+                pricer,
+                pricers,
+                t_price,
+                t_run,
+                projected,
+                n_models,
+                dict(preset_kwargs),
+            )
+        finally:
+            for p in pricers:
+                p.close()
+
+    def _pricer(
+        self, model: Model, objects: list[Product], grid: TimeGrid, bumps: Sequence[Bump]
+    ) -> ConditionalPricer:
+        return ConditionalPricer(
+            model,
+            objects,
+            grid,
+            self.sim,
+            tuple(bumps),
+            self.degree,
+            stream_bumps=self.stream_bumps,
+            scratch_dir=self.scratch_dir,
+            control_variate=self.control_variate,
+            surface=self.context.surface,
+        )
+
+    def _run(
+        self,
+        product: Product,
+        strategy: Strategy,
+        instruments: list[Any],
+        objects: list[Product],
+        obj_index: dict[int, int | None],
+        net_index: int | None,
+        net_legs: list[int],
+        run_notes: list[str],
+        dates: FloatArray,
+        grid: TimeGrid,
+        bumps: list[Bump],
+        pricer: ConditionalPricer,
+        pricers: list[ConditionalPricer],
+        t_price: float,
+        t_run: float,
+        projected: float,
+        n_models: int,
+        preset_kwargs: dict[str, Any],
+    ) -> HedgeResult:
+        """The rebalancing loop of :meth:`run` (split so the scratch directories of every pricer
+        built — the recalibration rebuilds included — are removed whatever happens)."""
+        ctx = self.context
+        T = float(product.maturity)
+        fc = ctx.forward_curve
         world = self._simulate_world(grid)
         idx = grid.fixing_index
         n_w = world.n_paths
@@ -670,8 +866,37 @@ class Hedger:
         skew_ref: FloatArray | None = None
         rule = self.recalibration
         world_skew_pricer = None
+        self._twin = None
         if rule is not None:
             world_skew_pricer = self._world_skew_pricer(dates, rule, grid, world)
+            pricers.append(world_skew_pricer)
+            self._twin = self._twin_skew_pricer(world_skew_pricer)
+            pricers.append(self._twin)
+            if rule.sticky and rule.base_fit is None and ctx.surface is not None:
+                # the base marking fit the sticky policies hold their targets at: computed once,
+                # at the first rebalancing date, from the pricing surface with the rule's config
+                from volsto.calibration.fit_2f import fit_2f_marking
+
+                t_fit = time.perf_counter()
+                rule.base_fit = fit_2f_marking(
+                    ctx.surface, rule.config(), ssr_target=rule.ssr_target
+                )
+                msg = (
+                    f"recalibration policy {rule.policy}: base marking fit computed from the "
+                    f"pricing surface at t = 0 ({rule.base_fit.status}, "
+                    f"{time.perf_counter() - t_fit:.1f} s): {rule.base_fit.params!r}"
+                )
+                log.info(msg)
+                run_notes.append(msg)
+                rule.log_rows.append(
+                    {
+                        "t": 0.0,
+                        "event": "base_fit",
+                        "policy": rule.policy,
+                        "params": repr(rule.base_fit.params),
+                        "status": rule.base_fit.status,
+                    }
+                )
 
         def values_at(
             pr: ConditionalPricer, obj: int, t: float, want: Sequence[str]
@@ -751,14 +976,13 @@ class Hedger:
                     skew_ref = skew_now
                 moved = float(np.max(np.abs(skew_now - skew_ref)))
                 did = False
-                if moved > rule.tol and n_refits < rule.max_refits:
+                if moved > rule.skew_move_threshold and n_refits < rule.max_refits:
                     new_ctx, hit = self._recalibrate(t, world_skew_pricer, kdx, rule, world)
                     if new_ctx is not None:
                         n_refits += 1
                         cache_hits += int(hit)
-                        new_pricer = ConditionalPricer(
-                            new_ctx.model, objects, grid, self.sim, tuple(bumps), self.degree
-                        )
+                        new_pricer = self._pricer(new_ctx.model, objects, grid, bumps)
+                        pricers.append(new_pricer)
                         new_prod, _ = new_pricer.evaluate(0, t, world, ["value"])
                         d_recal = new_prod["value"] - prod["value"]
                         pnl_recal += np.where(alive, d_recal, 0.0)
@@ -780,6 +1004,8 @@ class Hedger:
                     {
                         "t": t,
                         "skew_move": moved,
+                        "threshold": rule.skew_move_threshold,
+                        "policy": rule.policy,
                         "recalibrated": did,
                         "params": None if not did else repr(cur_pricer.model),
                     }
@@ -858,9 +1084,23 @@ class Hedger:
             "n_dates": float(n_dates),
             "n_objects": float(len(objects)),
             "pricing_paths_gb": float(pricer.memory_bytes / 1e9),
+            "streamed_paths_gb": float(pricer.streamed_bytes / 1e9),
             "refits": float(n_refits),
             "cache_hit_rate": float(cache_hits / n_refits) if n_refits else float("nan"),
         }
+        # the §7.11 control's median variance reduction over dates and controlled objects
+        # (NaN when nothing was controlled: control off, no surface-driven bump or no proxy)
+        reductions = [r for p in pricers for r in p.cv_reductions()]
+        red_ses = [r for p in pricers for r in p.cv_reduction_ses()]
+        budget["cv_reduction_median"] = float(np.median(reductions)) if reductions else float("nan")
+        # the spread over dates and objects, and the median bootstrap se of one reduction
+        budget["cv_reduction_q25"] = (
+            float(np.quantile(reductions, 0.25)) if reductions else float("nan")
+        )
+        budget["cv_reduction_q75"] = (
+            float(np.quantile(reductions, 0.75)) if reductions else float("nan")
+        )
+        budget["cv_reduction_se_median"] = float(np.median(red_ses)) if red_ses else float("nan")
         notes = tuple(
             dict.fromkeys(
                 [
@@ -901,6 +1141,15 @@ class Hedger:
                 "n_paths_pricing": self.sim.n_paths,
                 "n_paths_world": n_w,
                 "recalibration": None if rule is None else "on_skew_move",
+                "recalibration_policy": None if rule is None else rule.policy,
+                "skew_move_threshold": None if rule is None else rule.skew_move_threshold,
+                "stream_bumps": self.stream_bumps,
+                "scratch_dir": None if self.scratch_dir is None else str(self.scratch_dir),
+                "control_variate": self.control_variate,
+                # the preset's keyword arguments (run(product, q=0.5)), or those the strategy
+                # was built with by default_strategy when it is passed in
+                "preset_kwargs": dict(preset_kwargs)
+                or dict(getattr(strategy, "preset_kwargs", None) or {}),
             },
             {k_: np.array(v) for k_, v in greeks_by_date.items()},
             {k_: np.array(v) for k_, v in moves.items() if v},
@@ -911,65 +1160,135 @@ class Hedger:
     def _world_skew_pricer(
         self, dates: FloatArray, rule: RecalibrationRule, grid: TimeGrid, world: PathSet
     ) -> ConditionalPricer:
-        """Vanilla strips under the world model at every date and pillar (three strikes)."""
-        from volsto.products.vanilla import EuropeanOption
+        """The skew strip under the **world** model: at every rebalancing date ``t`` and pillar
+        ``τ`` three forward-start options ``(S_{t+τ}/S_t − e^{k})^±`` at ``k ∈ {−h, 0, +h}`` —
+        struck at the *forward moneyness of each path* (a vanilla struck at ``F(T) e^{k}`` would
+        sit anywhere from far below to far above a path's own forward at ``t``; inverting it at
+        the path's forward mixes moneyness across paths).  Their conditional values at ``t`` are
+        homogeneous in ``S_t`` and invert path by path to the world's conditional smile at ``t``
+        (:meth:`_state_surface`).  No bumps, no control variate; streamed like the other pricers."""
+        from volsto.products.forward_start import ForwardStartOption
 
         fc = self.world.forward_curve
         disc = fc.rate_curve
         objs: list[Product] = []
         for t in dates:
             for tau in rule.pillars:
-                T = float(t) + tau
-                f = float(fc.forward(T))
                 for k in (-rule.h, 0.0, rule.h):
-                    objs.append(EuropeanOption(f * float(np.exp(k)), T, 1 if k >= 0 else -1, disc))
+                    objs.append(
+                        ForwardStartOption(
+                            float(t), float(t) + tau, float(np.exp(k)), 1 if k >= 0 else -1, disc
+                        )
+                    )
         g = union_grid([self.world], objs, dates, self.sim)
         wsim = self._world_sim()
-        return ConditionalPricer(self.world, objs, g, wsim, (), self.degree, seed=wsim.seed + 7)
+        return ConditionalPricer(
+            self.world,
+            objs,
+            g,
+            wsim,
+            (),
+            self.degree,
+            seed=wsim.seed + 7,
+            stream_bumps=self.stream_bumps,
+            scratch_dir=self.scratch_dir,
+            control_variate=False,
+        )
+
+    def _twin_skew_pricer(self, strip: ConditionalPricer) -> ConditionalPricer:
+        """The same strip under the **pricing** model on the same grid, paths and seed (a CRN
+        twin): the pricing model's own prediction of the conditional smile at every date, so the
+        recalibration trigger reads the world's skew *in excess* of it (:meth:`_world_skew`)."""
+        return ConditionalPricer(
+            self.context.model,
+            list(strip.objects),
+            strip.grid,
+            strip.sim,
+            (),
+            self.degree,
+            seed=strip.seed,
+            stream_bumps=self.stream_bumps,
+            scratch_dir=self.scratch_dir,
+            control_variate=False,
+        )
 
     def _state_surface(
         self, pr: ConditionalPricer, kdx: int, t: float, rule: RecalibrationRule, world: PathSet
     ) -> _StateSurface:
-        """The mean state surface at ``t``: implied vols of the strip regressed on the world
-        state and evaluated on the world paths (averaged over paths)."""
+        """The conditional smile at ``t`` read **per path** from the strip of
+        :meth:`_world_skew_pricer` and averaged: each forward-start's regressed conditional value
+        (time-0 money) is taken
+        to time-``t`` money, inverted on the ratio (forward ``F(t + τ)/F(t)``, strike ``e^{k}``,
+        maturity ``τ``, discount ``DF(t + τ)/DF(t)``) and the ATMF vol, the central-difference
+        skew and the second-difference curvature across the three strikes are averaged over the
+        paths where the inversion is finite (a regressed value below intrinsic inverts to NaN and
+        is dropped; a kept fraction under :data:`STATE_SURFACE_MIN_INVERTED` is logged).  The M8
+        reading inverted the path-*averaged* price — the unconditional ``(t + τ)``-option, whose
+        "vol over τ" carries the spot variance over ``[0, t]`` (measured: the 3M ATMF vol read
+        0.218 at ``t = 0`` and 0.394 at ``t = 0.5`` on a world without any shock, the factor
+        ``sqrt((t + τ)/τ)``), so the proxy moved at every date and the rule refit at every
+        date."""
         from volsto.market.bs import implied_vol
 
         fc = self.world.forward_curve
         n_pill = len(rule.pillars)
-        atf, skew, curv, pil = [], [], [], []
+        df_t = float(fc.rate_curve.df(t))
+        h = float(rule.h)
+        atf, skew, curv = [], [], []
         for pi, tau in enumerate(rule.pillars):
             T = t + tau
             base_obj = kdx * n_pill * 3 + pi * 3
-            vols = []
-            for si, k in enumerate((-rule.h, 0.0, rule.h)):
-                obj = base_obj + si
-                # the world paths: features of the vanilla = (ln S_t, X_t) of the WORLD paths
-                # (same model class): evaluate on the pricer's own paths to average consistently
-                out, _ = pr.evaluate(obj, t, pr.paths, ["value"])
-                v = float(np.mean(out["value"]))
-                f_t = float(np.mean(np.exp(pr.paths.log_spot_at(pr.idx[t])))) * float(
-                    fc.forward(T) / fc.forward(t)
+            f_ratio = float(fc.forward(T) / fc.forward(t))
+            df = float(fc.rate_curve.df(T)) / df_t
+            ivs = []
+            for si, k in enumerate((-h, 0.0, h)):
+                out, _ = pr.evaluate(base_obj + si, t, pr.paths, ["value"])
+                iv = implied_vol(
+                    out["value"] / df_t, f_ratio, float(np.exp(k)), tau, 1 if k >= 0 else -1, df
                 )
-                strike = float(fc.forward(T)) * float(np.exp(k))
-                df = float(fc.rate_curve.df(T)) / float(fc.rate_curve.df(t))
-                price_t = v / float(fc.rate_curve.df(t))  # time-t money
-                cp = 1 if k >= 0 else -1
-                iv = float(np.asarray(implied_vol(price_t, f_t, strike, tau, cp, df)).ravel()[0])
-                vols.append((float(np.log(strike / f_t)), iv))
-            ks = np.array([x[0] for x in vols])
-            ivs = np.array([x[1] for x in vols])
-            a = np.polyfit(ks, ivs, 2)  # iv ≈ a0 k² + a1 k + a2
-            pil.append(tau)
-            atf.append(float(a[2]))
-            skew.append(float(a[1]))
-            curv.append(float(2 * a[0]))
-        return _StateSurface(np.array(pil), np.array(atf), np.array(skew), np.array(curv), fc)
+                ivs.append(np.asarray(iv, dtype=np.float64))
+            lo, mid, hi = ivs
+            ok = np.isfinite(lo) & np.isfinite(mid) & np.isfinite(hi)
+            if not ok.any():
+                raise ValueError(
+                    f"state surface at t={t:g}, pillar {tau:g}: no path inverts to a finite vol"
+                )
+            if ok.mean() < STATE_SURFACE_MIN_INVERTED:
+                log.info(
+                    "state surface t=%g pillar %g: %.1f%% of the paths invert",
+                    t,
+                    tau,
+                    100 * ok.mean(),
+                )
+            atf.append(float(mid[ok].mean()))
+            skew.append(float(((hi - lo)[ok] / (2.0 * h)).mean()))
+            curv.append(float(((hi - 2.0 * mid + lo)[ok] / (h * h)).mean()))
+        return _StateSurface(
+            np.asarray(rule.pillars, dtype=np.float64),
+            np.asarray(atf),
+            np.asarray(skew),
+            np.asarray(curv),
+            fc,
+        )
 
     def _world_skew(
         self, pr: ConditionalPricer, kdx: int, t: float, rule: RecalibrationRule, world: PathSet
     ) -> FloatArray:
-        surf = self._state_surface(pr, kdx, t, rule, world)
-        return np.asarray(surf.skew, dtype=np.float64)
+        """The world's conditional skew at ``t`` **in excess of the pricing model's own
+        prediction** at the same date: the CRN twin strip (:meth:`_twin_skew_pricer`) is read
+        by :meth:`_state_surface` the same way and the rule triggers on the *change* of the
+        excess since the last refit (the reference is the excess at ``t = 0``, reset at each
+        refit).  An LSV world's forward skew at date ``t`` differs from its spot skew by far more
+        than the threshold with no shock at all (measured on the SPX marking fit: the M8 rule,
+        which compared the world's skew with its own ``t = 0`` value, refit at every one of 11
+        monthly dates), whereas the excess is exactly 0 under world = pricing (identical
+        simulations), the shock's rota shows up in it after the shock, and the held rotation
+        triggers no further refit once the reference has reset."""
+        twin = self._twin
+        assert twin is not None
+        sw = self._state_surface(pr, kdx, t, rule, world)
+        sp = self._state_surface(twin, kdx, t, rule, world)
+        return np.asarray(sw.skew - sp.skew, dtype=np.float64)
 
     def _recalibrate(
         self, t: float, pr: ConditionalPricer, kdx: int, rule: RecalibrationRule, world: PathSet
@@ -979,29 +1298,47 @@ class Hedger:
             ctx.notes.append("recalibration rule needs an LSV pricing state: skipped")
             return None, False
         surf = self._state_surface(pr, kdx, t, rule, world)
-        from volsto.calibration.fit_2f import BreakEvenFitConfig, fit_2f, marking_targets_for
+        from volsto.calibration.fit_2f import fit_2f, marking_targets_for
         from volsto.market.varswap import xi0_curve
 
-        cfg = rule.fit_config or BreakEvenFitConfig(
-            pillars=tuple(rule.pillars),
-            mat_min=0.0,
-            skew_pillars=(min(rule.pillars), max(rule.pillars)),
-        )
+        cfg = rule.config()
+        held_flags: tuple[str, ...] = ()
         if rule.refit is not None:
             params = rule.refit(surf, ctx.state.spec.model)
         else:
             targets = marking_targets_for(surf, cfg, ssr_target=rule.ssr_target)
+            if rule.sticky:
+                if rule.base_fit is None:
+                    raise ValueError(
+                        f"recalibration policy {rule.policy!r} needs base_fit (the hedger computes "
+                        "it at the first rebalancing date from the pricing surface)"
+                    )
+                n_flags = len(targets.flags)
+                targets = held_targets(targets, rule.base_fit.targets, rule.policy)
+                held_flags = tuple(targets.flags[n_flags:])
             xi0 = xi0_curve(
                 ctx.surface, float(min(ctx.surface.max_maturity, max(targets.pillars) + t))
             )
             params = fit_2f(targets, xi0, cfg).params
         changes = {f.name: float(getattr(params, f.name)) for f in dataclasses.fields(params)}
         new_state = _with_params(ctx.state, changes)
-        hit = (
-            bool(ctx.builder.cache.has(new_state.spec)) if hasattr(ctx.builder, "cache") else False
-        )
+        if hasattr(ctx.builder, "has"):
+            hit = bool(ctx.builder.has(new_state))
+        elif hasattr(ctx.builder, "cache"):
+            hit = bool(ctx.builder.cache.has(new_state.spec))
+        else:
+            hit = False
         model = ctx.builder.build(new_state, "recalibrate")
-        rule.log_rows.append({"t": t, "params": repr(params), "cache_hit": hit})
+        rule.log_rows.append(
+            {
+                "t": t,
+                "event": "refit",
+                "policy": rule.policy,
+                "params": repr(params),
+                "cache_hit": hit,
+                "held": "; ".join(held_flags),
+            }
+        )
         return PricingContext(model, new_state, ctx.builder, ctx.surface, ctx.label), hit
 
 
@@ -1019,6 +1356,7 @@ def realised_spot(world: PathSet, idx: Any, T: float, fc: Any) -> FloatArray:
 
 __all__ = [
     "FREQUENCIES",
+    "SKEW_MOVE_THRESHOLD",
     "SPOT_BUMP",
     "TENT_SIZE",
     "VOL_BUMP",

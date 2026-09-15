@@ -96,11 +96,14 @@ to it.  Historical mode keeps its empirical VolVar target (no SABR correlation t
 from it biased ν by −20%). ``ν_cap`` (default 3.5 since report decision viii, was 2.5) is a
 config value, not a hard-wired rail: when a fit binds it (step 2 box or step 3)
 :data:`NU_CAP_WARNING` is logged and attached to the messages.  **Stage-3 assertion** (decision
-viii): the simulated SpotVolCovar and VolVar of the calibrated model must be within
-``stage3_tolerance`` (10%) of the fit's targets (:func:`breakeven_check`; the message separates a
-first-order miss of the target — a binding fit — from the engine bias at the solution), which
-makes a higher-ν fit self-checking since the first-order engine is about 15% biased beyond ν ≈ 4;
-:func:`fit_2f` raises :class:`BreakEvenValidationError` (carrying the result) when it fails.
+viii, restricted to the engine-bias term by the owner on the M7 Part 3 report): the simulated
+SpotVolCovar and VolVar of the calibrated model must be within ``stage3_tolerance`` (10%) of the
+**analytic (first-order) break-evens evaluated at the fitted parameters** — the engine bias
+(:func:`breakeven_check`).  The miss of the fit's *targets* by the first-order fit is a binding
+fit, already reported by the binding status: it is reported per pillar in the check table
+(``gap_vs_target``, ``first_order_miss``) and never asserted.  The split makes a higher-ν fit
+self-checking since the first-order engine is about 15% biased beyond ν ≈ 4; :func:`fit_2f`
+raises :class:`BreakEvenValidationError` (carrying the result) when it fails.
 ``iterate_against_simulation=k`` refits ``k`` times with the targets divided by the cumulative
 simulated/analytic factors measured at each solution and reports the convergence.  **ρ12
 diagnostic** (decision vii): ``|ρ12| > rho12_flag`` (0.9) is noted as the two-factor structure
@@ -174,10 +177,14 @@ DEFAULT_NU_CAP = 3.5
 #: tolerances on the three-year mixing history, weight 1 misses ρ_SX1 by 0.073)
 DEFAULT_SKEW_WEIGHT = 10.0
 #: stage-3 assertion: simulated SpotVolCovar and VolVar within this relative distance of the
-#: fit's targets (owner, report decision viii)
+#: first-order break-evens at the fitted parameters — the engine bias (owner, report decision
+#: viii; restricted to the engine-bias term on the M7 Part 3 report, the target miss reported)
 DEFAULT_STAGE3_TOLERANCE = 0.10
 #: ``|ρ12|`` above which the two-factor structure is flagged as collapsing (report decision vii)
 RHO12_COLLAPSE = 0.9
+#: ``note`` of a stage-3 check row without a finite non-zero first-order value: the verdict
+#: falls back to the gap vs the fit's target (:func:`breakeven_check`)
+NO_FIRST_ORDER_NOTE = "no first-order value: target gap used"
 #: the two-point skew tolerance (owner default, both points)
 DEFAULT_SKEW_EPS = 0.10
 #: the two constraint maturities ``(T_s, T_l)``
@@ -1604,9 +1611,10 @@ class Stage3Inputs:
 
 
 class BreakEvenValidationError(RuntimeError):
-    """The stage-3 assertion failed (report decision viii): the simulated break-evens of the
-    calibrated model are not within the tolerance of the fit's targets.  ``result`` carries the
-    :class:`FitResult` (with its stage 3) when raised by :func:`fit_2f`, so nothing is lost."""
+    """The stage-3 assertion failed (report decision viii, engine-bias term): the simulated
+    break-evens of the calibrated model are not within the tolerance of the first-order
+    break-evens at the fitted parameters.  ``result`` carries the :class:`FitResult` (with its
+    stage 3) when raised by :func:`fit_2f`, so nothing is lost."""
 
     def __init__(self, message: str, result: Any = None) -> None:
         super().__init__(message)
@@ -1617,10 +1625,14 @@ class BreakEvenValidationError(RuntimeError):
 class Stage3Report:
     """Stage-3 tables (module docstring) with the wall clocks and the recalibration flag.
     ``check`` is the assertion table (per breakeven pillar and quantity: simulated value and
-    standard error, the fit's target, the first-order value at the solution, the relative gaps
-    to both, ``within``), ``within_tolerance`` its verdict at ``tolerance`` and
-    ``check_message`` the clear message when it fails (the first-order miss of the target —
-    binding — and the engine bias at the solution are reported separately)."""
+    standard error, the fit's target, the first-order value at the solution, ``engine_bias`` =
+    simulated / first-order − 1 — the asserted term —, ``gap_vs_target`` and
+    ``first_order_miss`` = first-order / target − 1 — reported, never asserted: a binding fit —,
+    ``within`` = ``|engine_bias| <= tolerance`` and ``note``, which flags a row without a
+    first-order value where the target gap was used instead), ``within_tolerance`` its verdict
+    at ``tolerance`` and ``check_message`` the clear message when it fails (names the engine-bias
+    failures only, then lists the first-order misses above the tolerance as reported, not
+    asserted)."""
 
     mean_abs_l_minus_1: float
     leverage_table: pd.DataFrame
@@ -1650,7 +1662,12 @@ class Stage3Report:
             self.skew_table.drop(columns=["note"]).round(4).to_string(index=False),
             "simulated break-evens of the LSV vs targets:",
             self.breakeven_table.round(5).to_string(index=False),
-            f"stage-3 assertion (simulated within {self.tolerance:.0%} of the fit's targets): "
+            "stage-3 check (engine_bias = sim / first-order - 1 asserted; gap_vs_target and "
+            "first_order_miss reported, not asserted):",
+            self.check.round(5).to_string(index=False),
+            f"stage-3 assertion (engine bias: simulated within {self.tolerance:.0%} of the "
+            "first-order break-evens at the fitted parameters; the target miss of a binding fit "
+            "is reported, not asserted): "
             + ("PASS" if self.within_tolerance else "FAIL - " + self.check_message),
         ]
         if len(self.forward_table):
@@ -1746,12 +1763,18 @@ def simulated_breakeven_table(
 
 
 def breakeven_check(be_table: pd.DataFrame, tolerance: float) -> tuple[pd.DataFrame, bool, str]:
-    """The stage-3 assertion (report decision viii): per pillar, ``svc_sim`` against
-    ``svc_target`` and ``volvar_sim`` against ``volvar_target_fit`` (the step-3 target the fit
-    solved; ``volvar_target`` when the fit carried none) within ``tolerance`` relative.  Returns
-    the check table, the verdict and the message (empty when passed), which separates the
-    first-order miss of the target (a binding fit) from the engine bias at the solution
-    (simulated against first order)."""
+    """The stage-3 assertion (report decision viii, restricted to the engine-bias term by the
+    owner on the M7 Part 3 report): per pillar and quantity (SpotVolCovar, VolVar), the
+    simulated value against the **first-order value at the fitted parameters** within
+    ``tolerance`` relative — ``engine_bias = sim / first_order − 1``, ``within = |engine_bias| <=
+    tolerance``.  The gap to the fit's target (``svc_target``; ``volvar_target_fit``, the step-3
+    target the fit solved, or ``volvar_target`` when the fit carried none) and the first-order
+    miss of that target (``first_order_miss = first_order / target − 1``, a binding fit, already
+    reported by the binding status) are REPORTED columns, never asserted.  A row without a
+    finite non-zero first-order value falls back to the target gap and is flagged in ``note``
+    (``NO_FIRST_ORDER_NOTE``).  Returns the check table, the verdict and the message (empty when
+    passed), which names the engine-bias failures only and appends one sentence listing the
+    first-order misses above the tolerance as reported, not asserted (binding fit)."""
     rows = []
     for rec in be_table.to_dict(orient="records"):
         vv_t = rec.get("volvar_target_fit", float("nan"))
@@ -1769,8 +1792,15 @@ def breakeven_check(be_table: pd.DataFrame, tolerance: float) -> tuple[pd.DataFr
         )
         for name, sim, se, target, fo in pairs:
             gap_t = sim / target - 1.0 if target else float("nan")
-            gap_fo = sim / fo - 1.0 if np.isfinite(fo) and fo else float("nan")
-            miss_fo = fo / target - 1.0 if np.isfinite(fo) and target else float("nan")
+            has_fo = bool(np.isfinite(fo) and fo)
+            gap_fo = sim / fo - 1.0 if has_fo else float("nan")
+            miss_fo = fo / target - 1.0 if has_fo and target else float("nan")
+            if has_fo:
+                within = bool(np.isfinite(gap_fo) and abs(gap_fo) <= tolerance)
+                note = ""
+            else:
+                within = bool(np.isfinite(gap_t) and abs(gap_t) <= tolerance)
+                note = NO_FIRST_ORDER_NOTE
             rows.append(
                 {
                     "T": rec["T"],
@@ -1782,7 +1812,8 @@ def breakeven_check(be_table: pd.DataFrame, tolerance: float) -> tuple[pd.DataFr
                     "gap_vs_target": gap_t,
                     "first_order_miss": miss_fo,
                     "engine_bias": gap_fo,
-                    "within": bool(np.isfinite(gap_t) and abs(gap_t) <= tolerance),
+                    "within": within,
+                    "note": note,
                 }
             )
     table = pd.DataFrame(rows)
@@ -1792,13 +1823,42 @@ def breakeven_check(be_table: pd.DataFrame, tolerance: float) -> tuple[pd.DataFr
     bad = table[~table["within"]]
     parts = []
     for r in bad.to_dict(orient="records"):
-        parts.append(
-            f"{r['quantity']} at T={r['T']:g}: simulated {r['sim']:.5f} +/- {r['se']:.5f} vs "
-            f"target {r['target']:.5f} ({r['gap_vs_target']:+.1%}; first-order fit missed the "
-            f"target by {r['first_order_miss']:+.1%}, engine bias at the solution "
-            f"{r['engine_bias']:+.1%})"
+        if r["note"]:
+            parts.append(
+                f"{r['quantity']} at T={r['T']:g}: simulated {r['sim']:.5f} +/- {r['se']:.5f} vs "
+                f"target {r['target']:.5f} ({r['gap_vs_target']:+.1%}; {r['note']})"
+            )
+        else:
+            parts.append(
+                f"{r['quantity']} at T={r['T']:g}: simulated {r['sim']:.5f} +/- {r['se']:.5f} vs "
+                f"first-order {r['first_order']:.5f} at the fitted parameters (engine bias "
+                f"{r['engine_bias']:+.1%}; target {r['target']:.5f}, {r['gap_vs_target']:+.1%})"
+            )
+    # the header names the rule that judged the failing rows: the engine bias when any of them
+    # had a first-order value, the target gap when none had (the fallback rows say so)
+    any_fo = bool((bad["note"] == "").any())
+    any_fb = bool((bad["note"] != "").any())
+    if any_fo and any_fb:
+        rule = "engine bias; target gap where no first-order value"
+    elif any_fo:
+        rule = "engine bias"
+    else:
+        rule = "no first-order value: target gap"
+    msg = (
+        f"simulated break-evens outside {tolerance:.0%} of the first-order break-evens at the "
+        f"fitted parameters ({rule}): " + "; ".join(parts)
+    )
+    misses = table[np.abs(table["first_order_miss"].to_numpy(dtype=float)) > tolerance]
+    if len(misses):
+        listed = ", ".join(
+            f"{r['quantity']} at T={r['T']:g} {r['first_order_miss']:+.1%}"
+            for r in misses.to_dict(orient="records")
         )
-    msg = f"simulated break-evens outside {tolerance:.0%} of the fit's targets: " + "; ".join(parts)
+        msg += (
+            f". First-order misses of the targets above {tolerance:.0%}, reported, not asserted "
+            f"(the first-order fit's miss of its target, a binding constraint when the fit says "
+            f"so): {listed}."
+        )
     return table, False, msg
 
 
@@ -2490,6 +2550,7 @@ __all__ = [
     "DEFAULT_STAGE3_TOLERANCE",
     "INFEASIBLE_MESSAGE",
     "MAX_FINITE_SE",
+    "NO_FIRST_ORDER_NOTE",
     "NU_CAP_WARNING",
     "RHO12_COLLAPSE",
     "RISK_REGIME",

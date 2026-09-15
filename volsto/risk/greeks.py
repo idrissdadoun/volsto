@@ -65,6 +65,12 @@ def _spot_state(state: RiskState, regime: str, h: float) -> tuple[RiskState, str
     return moved.with_perturbation(pert, label=f"{regime} S={spot:.4f}"), "recalibrate"
 
 
+def spot_state(state: RiskState, regime: str, h: float) -> tuple[RiskState, str]:
+    """Public name of :func:`_spot_state` (the state after a log-spot move ``h`` under a §7.2
+    regime and the builder mode that prices it), for the hedging engine and the studies."""
+    return _spot_state(state, regime, h)
+
+
 def delta_gamma(
     engine: RiskEngine,
     product: Product,

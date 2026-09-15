@@ -45,7 +45,13 @@ study can drop or add a leg).  Built from the product's structure:
   (static ``1/K²`` weights); the vol swap adds ``volga`` with the var-swap-vs-vol-swap spread;
 * cliquet family: ``delta`` + the cap-call strip (static, ``q`` per period, the decomposition's 1
   by default) + a variance swap sized on ``vega`` (the net forward-variance exposure); the
-  global-floor leg via the accumulated-sum put (static, from ``decompose()``);
+  global-floor leg via the accumulated-sum put (static, from ``decompose()``).  ``q`` is a
+  **strategy parameter** (owner decision (a) at the M8 acceptance): ``default_strategy(cliquet,
+  ctx, q=0.5)`` — a scalar or one weight per period — is the study's "q-weighted cap calls +
+  net-sized var swap"; with ``q = 1`` the replication is exact and the swap only sees regression
+  noise.  The strip's instrument name carries ``q`` when it is not 1 (``"cap-call strip q=0.5"``)
+  and the hedger records the preset keyword arguments in ``HedgeResult.settings["preset_kwargs"]``
+  (carried on the strategy as ``preset_kwargs`` by :func:`default_strategy`);
 * up / down variance, convexity spread: ``delta`` + variance swap (``vega``) + ``skew_T`` via an
   option strip + the complementary conditional variance swap where the corridor identity applies
   (static);
@@ -95,6 +101,14 @@ from volsto.products.base import Product
 
 FloatArray = NDArray[np.float64]
 
+#: relative ridge of the per-path solve: an instrument's quantity is shrunk where its squared
+#: sensitivity falls below ``ridge`` times its cross-path mean, the LARGER of today's mean and the
+#: mean at the strategy's first date — so an instrument whose sensitivity decays over the life
+#: (a variance swap's vega near expiry) or crosses zero on a path (its regressed vega) cannot take
+#: a noise-driven quantity (measured: the cliquet preset's var-swap quantity on the SPX marking
+#: fit at 6·10³ paths reached hundreds on single paths near expiry, P&L std 11–18 ± 5–8 % of
+#: notional); a well-conditioned solve is biased by ~0.1%
+DEFAULT_RIDGE = 1e-3
 DELTA_REGIMES = ("model", "sticky_strike", "sticky_skew", "sticky_moneyness", "sticky_local_vol")
 #: default smoothing width of the digital call-spread replication (fraction of the level, §6.9)
 DEFAULT_DIGITAL_WIDTH = 0.02
@@ -128,11 +142,15 @@ class GreekTargetStrategy:
     targets: tuple[Target, ...]
     instruments: list[HedgeInstrument]
     static: dict[str, float | Callable[[float], float]] = field(default_factory=dict)
-    ridge: float = 1e-8
+    ridge: float = DEFAULT_RIDGE
     turnover: float = 0.0
     delta_regime: str = "model"
     name: str = "greek-target"
     notes: list[str] = field(default_factory=list)
+    _level0: dict[str, float] = field(default_factory=dict, init=False, repr=False)
+    #: the keyword arguments the preset was built with (set by :func:`default_strategy`; recorded
+    #: in ``HedgeResult.settings["preset_kwargs"]``)
+    preset_kwargs: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.delta_regime not in DELTA_REGIMES:
@@ -169,6 +187,7 @@ class GreekTargetStrategy:
             self.delta_regime,
             self.name,
             list(self.notes),
+            dict(self.preset_kwargs),
         )
 
     def without(self, *instrument_names: str) -> GreekTargetStrategy:
@@ -184,6 +203,7 @@ class GreekTargetStrategy:
             self.delta_regime,
             self.name,
             list(self.notes),
+            dict(self.preset_kwargs),
         )
 
     def solve(
@@ -231,7 +251,16 @@ class GreekTargetStrategy:
             # magnitude), so an instrument whose sensitivities vanish on a path (a deep-OTM
             # option) is shrunk to zero there instead of taking a noise-driven quantity
             level = np.mean(np.einsum("pjj->pj", H), axis=0)
-            reg = self.ridge * level + self.turnover
+            names_solved = [self.instruments[j].name for j in solved]
+            for nm, lv in zip(names_solved, level, strict=True):
+                self._level0.setdefault(nm, float(lv))
+            floor = np.array(
+                [
+                    max(float(lv), self._level0[nm])
+                    for nm, lv in zip(names_solved, level, strict=True)
+                ]
+            )
+            reg = self.ridge * floor + self.turnover
             H = H + reg[None, :, None] * np.eye(len(solved))[None, :, :]
             if self.turnover > 0 and q_prev is not None:
                 rhs = rhs + self.turnover * q_prev[:, solved]
@@ -486,9 +515,26 @@ def preset_variance_swap(product: Any, ctx: PresetContext) -> GreekTargetStrateg
     return GreekTargetStrategy(tuple(targets), inst, static, name="variance preset")
 
 
+def cap_call_strip_name(q: Sequence[float] | float) -> str:
+    """``"cap-call strip"`` for the decomposition's ``q = 1``, else the name carrying ``q``
+    (``"cap-call strip q=0.5"``; per-period weights listed)."""
+    arr = np.atleast_1d(np.asarray(q, dtype=np.float64))
+    if np.all(arr == 1.0):
+        return "cap-call strip"
+    if arr.size == 1 or np.all(arr == arr[0]):
+        return f"cap-call strip q={float(arr[0]):g}"
+    return "cap-call strip q=[" + ",".join(f"{w:g}" for w in arr) + "]"
+
+
 def preset_cliquet(
     product: Any, ctx: PresetContext, *, q: Sequence[float] | float = 1.0
 ) -> GreekTargetStrategy:
+    """Cliquet family (module docstring): ``delta`` + the cap-call strip weighted ``q`` (static,
+    long, one weight per period or a scalar; the decomposition's exact replication at the default
+    ``q = 1``) + the accumulated-sum put (static, short) when the cliquet has a global floor + a
+    variance swap sized on the **net** ``vega`` — the study's "q-weighted cap calls + net-sized var
+    swap" for ``q < 1``.  The strip's name carries ``q`` when it is not 1
+    (:func:`cap_call_strip_name`)."""
     from volsto.products.cliquet import AdditiveCliquet, ReverseCliquet
 
     cl = (
@@ -501,7 +547,11 @@ def preset_cliquet(
     static: dict[str, float | Callable[[float], float]] = {}
     if cl is not None and np.isfinite(cl.local_cap):
         strip = CapCallStrip(
-            cliquet=cl, q=q, cost=ctx.cost_vol_points, reference_vol=ctx.atm_vol(T)
+            cliquet=cl,
+            q=q,
+            cost=ctx.cost_vol_points,
+            reference_vol=ctx.atm_vol(T),
+            name=cap_call_strip_name(q),
         )
         inst.append(strip)
         # the cliquet is SHORT the cap calls of its decomposition: the hedge is long them
@@ -718,12 +768,17 @@ PRESETS: dict[str, Callable[..., GreekTargetStrategy]] = {
 
 
 def default_strategy(product: Product, ctx: PresetContext, **kwargs: Any) -> GreekTargetStrategy:
-    """The registered preset of the product's class (module docstring); a class without one gets
-    the vanilla preset (delta only) with a note."""
+    """The registered preset of the product's class (module docstring) built with ``kwargs`` —
+    the preset's strategy parameters (the cliquet family's ``q``, the forward start's ``skew``,
+    the vanilla's ``vol_hedged``, …), recorded on the strategy as ``preset_kwargs`` and by the
+    hedger in ``HedgeResult.settings``; a class without a preset gets the vanilla preset (delta
+    only) with a note."""
     for cls in type(product).__mro__:
         fn = PRESETS.get(cls.__name__)
         if fn is not None:
-            return fn(product, ctx, **kwargs)
+            s = fn(product, ctx, **kwargs)
+            s.preset_kwargs = dict(kwargs)
+            return s
     s = preset_vanilla(product, ctx)
     s.notes.append(f"no preset registered for {type(product).__name__}: delta only")
     return s
@@ -739,6 +794,7 @@ __all__ = [
     "PresetContext",
     "Strategy",
     "Target",
+    "cap_call_strip_name",
     "default_strategy",
     "preset_autocall",
     "preset_barrier",

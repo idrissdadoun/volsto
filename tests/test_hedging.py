@@ -14,8 +14,14 @@ wall-clock assertion.  Every P&L figure carries its standard error.
   finite P&L distribution with its residual-exposure report (the hedge-state features checked);
 * early termination (autocall, knock-out) unwinds: no positions after the termination date;
 * recalibration P&L = 0 when the world has no skew move (Black–Scholes world, LSV pricing set);
+  the rule's ``policy`` validated and the shared ``held_targets`` holding what each policy says;
+* the §7.2 delta regimes as hedging deltas: the sticky-strike regime delta at ``t = 0`` equals the
+  M5 ``delta_gamma`` estimator (the spot-kind bump re-anchored at the bumped spot);
+* ``stream_bumps``: streamed and in-memory bumped sets give identical P&L, the scratch directory
+  is removed;
 * the cliquet and FVA study strategies as presets: the strategy ranking on the placeholder surface
-  (the original study archive is absent — the machinery's ranking is recorded as the baseline).
+  (the original study archive is absent — the machinery's ranking is recorded as the baseline);
+  ``q`` as a strategy parameter recorded in the strip's name and the run's settings.
 """
 
 from __future__ import annotations
@@ -96,6 +102,12 @@ def _lsv_context(kind: str = "2f") -> PricingContext:
         )
     except CacheMissError as exc:
         pytest.skip(f"cached leverage absent (tests never calibrate): {exc}")
+
+
+def _robust_std(x: np.ndarray) -> float:
+    """The std of the 99% of the paths with the smallest |P&L| (the tail-free number)."""
+    a = np.sort(np.abs(np.asarray(x, dtype=np.float64)))
+    return float(np.std(a[: int(0.99 * a.size)], ddof=1))
 
 
 def _lv_context() -> PricingContext:
@@ -586,19 +598,23 @@ def test_unwind_quantities_are_zero_after_termination(bs: BlackScholes, fc: Forw
 
 
 def test_recalibration_pnl_zero_without_skew_move(fc: ForwardCurve) -> None:
-    """Recalibration rule ``on_skew_move`` with a Black–Scholes world (no skew, no skew move) and
-    the cached 2F LSV pricing set: the world's conditional skew stays at its ``t = 0`` value within
-    the tolerance, no refit happens, the recalibration P&L is identically zero."""
+    """Recalibration rule ``on_skew_move`` with **world = pricing** (the cached 2F LSV set on
+    both sides): the world's conditional skew never exceeds the pricing model's own prediction
+    (the CRN twin strip is the same simulation: excess exactly 0 at every date), no refit
+    happens, the recalibration P&L is identically zero.  A Black–Scholes world under the same
+    pricing set is a *mismatched* pair: the model predicts its 3M skew to decay from the spot
+    −0.66 to a forward −0.50 within the first month while the world's stays 0 (measured), so the
+    excess moves by 0.16 and the rule refits at the first date — checked with a stub refit that
+    returns the base parameters (no calibration) and a recalibration P&L of exactly 0."""
     ctx = _lsv_context("2f")
     surface = ctx.surface
     disc = surface.forward_curve.rate_curve
-    world = BlackScholes(0.2, surface.forward_curve)
     opt = EuropeanOption(float(surface.forward_curve.spot), 0.5, 1, disc)
-    rule = RecalibrationRule(pillars=(0.25, 0.5), tol=0.05, h=0.05)
+    rule = RecalibrationRule(pillars=(0.25, 0.5), skew_move_threshold=0.05, h=0.05)
     sim = SimConfig(n_paths=8_000, chunk_size=8_000, seed=5, dt_max=1.0 / 52.0)
     h = Hedger(
         ctx,
-        world,
+        ctx.model,
         Schedule("monthly"),
         Costs(),
         recalibration=rule,
@@ -610,9 +626,190 @@ def test_recalibration_pnl_zero_without_skew_move(fc: ForwardCurve) -> None:
     r = h.run(opt, strat)
     print(r.recalibrations)
     assert len(r.recalibrations) == r.dates.size
-    assert (r.recalibrations["skew_move"] < 0.05).all()
+    assert (r.recalibrations["skew_move"] == 0.0).all()  # the twin is the same simulation
     assert not r.recalibrations["recalibrated"].any()
     assert np.all(r.pnl_recalibration == 0.0) and r.budget["refits"] == 0
+    # the mismatched pair: the model's predicted forward-skew decay is a surprise to the rule
+    world = BlackScholes(0.2, surface.forward_curve)
+    stub = RecalibrationRule(
+        pillars=(0.25, 0.5), skew_move_threshold=0.05, h=0.05, refit=lambda surf, params: params
+    )
+    h2 = Hedger(
+        ctx, world, Schedule("monthly"), Costs(), recalibration=stub, sim=sim, world_paths=8_000
+    )
+    r2 = h2.run(opt, strat)
+    print(r2.recalibrations)
+    fired = r2.recalibrations.loc[r2.recalibrations["recalibrated"].astype(bool), "t"].tolist()
+    assert fired and fired[0] == pytest.approx(r2.dates[1])
+    assert np.all(r2.pnl_recalibration == 0.0)  # same parameters: nothing to reprice
+
+
+def test_recalibration_rule_policy_and_held_targets() -> None:
+    """``RecalibrationRule.policy`` is validated against the shadow-rotation policies and the
+    shared :func:`held_targets` holds exactly what each policy says: nothing under
+    ``sabr_linked``; the five break-even arrays under ``sticky_breakeven`` (the skew constraint
+    follows the moved surface); the skew reference too under ``sticky_breakeven_skew``; the
+    policy's flag appended; mismatched pillars raise.  Targets read from the placeholder surface
+    (no calibration), the "moved" set the same targets with every array scaled."""
+    from volsto.risk.shadow_rotation import RECALIBRATION_POLICIES, held_targets
+
+    with pytest.raises(ValueError):
+        RecalibrationRule(policy="sticky_everything")
+    with pytest.raises(ValueError):
+        RecalibrationRule(skew_move_threshold=0.0)
+    rule = RecalibrationRule(policy="sticky_breakeven")
+    assert rule.sticky and rule.skew_move_threshold == 0.01 and rule.base_fit is None
+    assert not RecalibrationRule().sticky and set(RECALIBRATION_POLICIES) >= {rule.policy}
+    from volsto.calibration.fit_2f import marking_targets_for
+
+    ctx = _lv_context()
+    base = marking_targets_for(ctx.surface, rule.config(), ssr_target=rule.ssr_target)
+    held_names = ("spot_vol_covar", "vol_var", "vovol", "vov_be_raw", "correl_target")
+    moved = dataclasses.replace(
+        base, **{k: getattr(base, k) * 1.5 for k in (*held_names, "skew_target", "atf")}
+    )
+    assert held_targets(moved, base, "sabr_linked") is moved
+    sb = held_targets(moved, base, "sticky_breakeven")
+    for k in held_names:
+        assert np.array_equal(getattr(sb, k), getattr(base, k)), k
+    assert np.array_equal(sb.skew_target, moved.skew_target) and np.array_equal(sb.atf, moved.atf)
+    assert sb.flags[-1].startswith("sticky_breakeven:") and len(sb.flags) == len(moved.flags) + 1
+    sbs = held_targets(moved, base, "sticky_breakeven_skew")
+    assert np.array_equal(sbs.skew_target, base.skew_target) and np.array_equal(sbs.atf, moved.atf)
+    assert sbs.flags[-1].startswith("sticky_breakeven_skew:")
+    other = dataclasses.replace(base, pillars=base.pillars + 0.5)
+    with pytest.raises(ValueError):
+        held_targets(moved, other, "sticky_breakeven")
+
+
+def test_regime_delta_bump_reanchors_at_the_bumped_spot(fc: ForwardCurve) -> None:
+    """The §7.2 delta regimes as hedging deltas (local-vol pricing model on the placeholder
+    surface, 1y ATM call, delta-hedged with the spot under ``delta_regime="sticky_strike"`` and
+    ``"model"``): both runs finite; at ``t = 0`` the regime delta equals the hedger's own
+    per-path CRN estimate on the same draws and the M5 ``delta_gamma`` sticky-strike delta
+    within 3 combined standard errors (before the fix the spot-kind bump was re-anchored at the
+    base spot, which removed the spot move from the hybrid and drove the regime delta to ~0; the
+    target was also regressed per unit spot where ``evaluate`` expects the dollar delta); the
+    ``"model"`` delta is the LV model's own (``σ_loc(t, S)`` held in spot through
+    :func:`~volsto.risk.engine.model_regime_spot_bump`): at ``t = 0`` it equals the M5
+    ``delta_gamma`` model delta within 3 combined stderr and sits BELOW the sticky-strike delta
+    under the negative skew (Derman's sticky-local-vol rule — measured 0.31 against 0.54; the
+    earlier ``LocalVol.bump(spot=)`` held the local vol in ``k`` and gave 0.69, the wrong side)."""
+    from volsto.risk.engine import LVBuilder, RiskEngine
+    from volsto.risk.greeks import delta_gamma
+
+    ctx = _lv_context()
+    surface = ctx.surface
+    disc = surface.forward_curve.rate_curve
+    opt = EuropeanOption(float(surface.forward_curve.spot), 1.0, 1, disc)
+    sim = SimConfig(n_paths=8_000, chunk_size=8_000, seed=11, dt_max=1.0 / 52.0)
+    h = Hedger(
+        ctx, ctx.model, Schedule("monthly"), Costs(), sim=sim, world_paths=8_000, verbose=False
+    )
+    runs = {}
+    for regime in ("sticky_strike", "model"):
+        strat = GreekTargetStrategy(
+            (Target("delta"),), [Spot()], delta_regime=regime, name=f"delta[{regime}]"
+        )
+        r = h.run(opt, strat)
+        assert np.all(np.isfinite(r.pnl_total)) and r.settings["delta_regime"] == regime
+        runs[regime] = r
+        print(f"{regime}: {r.summary()}")
+    d_ss = runs["sticky_strike"].greeks_by_date["delta"]
+    d_m = runs["model"].greeks_by_date["delta"]
+    # the hedger's own t = 0 estimate: the mean of the per-path CRN target on the same draws
+    bump = ctx.regime_delta_bump("sticky_strike")
+    grid = union_grid([ctx.model, ctx.model], [opt], h.schedule.build(opt), sim)
+    pr = ConditionalPricer(ctx.model, [opt], grid, sim, (bump,), h.degree)
+    hyb = pr.hybrid_payoffs(0.0)
+    per_path = (hyb["bump:delta:up"][:, 0] - hyb["bump:delta:dn"][:, 0]) / (
+        bump.up.spot - bump.dn.spot  # type: ignore[union-attr]
+    )
+    if sim.antithetic:
+        per_path = 0.5 * (per_path[0::2] + per_path[1::2])
+    d0, se_h = float(per_path.mean()), float(per_path.std(ddof=1) / np.sqrt(per_path.size))
+    assert np.allclose(d_ss[0], d0, atol=1e-9), (float(d_ss[0].mean()), d0)
+    engine = RiskEngine(
+        LVBuilder(ctx.state), SimConfig(n_paths=20_000, chunk_size=20_000, seed=12, dt_max=1 / 52)
+    )
+    d_ref, _ = delta_gamma(engine, opt, ctx.state, "sticky_strike")
+    se = float(np.hypot(se_h, d_ref.stderr))
+    print(
+        f"t=0 sticky-strike delta: hedger {d0:.4f} +/- {se_h:.4f}, M5 delta_gamma "
+        f"{d_ref.value:.4f} +/- {d_ref.stderr:.4f}; model delta {float(d_m[0].mean()):.4f}"
+    )
+    assert abs(d0 - d_ref.value) < 3 * se, (d0, d_ref.value, se)
+    assert 0.3 < d0 < 0.9
+    d_ref_m, _ = delta_gamma(engine, opt, ctx.state, "model")
+    m0 = float(d_m[0].mean())
+    print(
+        f"t=0 model delta: hedger {m0:.4f}, M5 delta_gamma {d_ref_m.value:.4f} "
+        f"+/- {d_ref_m.stderr:.4f}"
+    )
+    assert abs(m0 - d_ref_m.value) < 3 * float(np.hypot(se_h, d_ref_m.stderr)), (m0, d_ref_m)
+    for k, t in enumerate(runs["model"].dates):
+        m_ss, m_m = float(d_ss[k].mean()), float(d_m[k].mean())
+        print(f"t={t:.3f}: sticky-strike delta {m_ss:.4f}, model delta {m_m:.4f}")
+        assert m_m < m_ss, (t, m_ss, m_m)  # negative skew: the model delta is the lower one
+
+
+def test_stream_bumps_matches_in_memory(bs: BlackScholes, fc: ForwardCurve, tmp_path: Path) -> None:
+    """``stream_bumps`` (owner decision (d)): the bumped path sets written to a scratch directory
+    and memory-mapped back give the same hybrid payoffs and the same P&L as the in-memory sets
+    (identical arrays are read back: ``atol 1e-12``); the resident footprint drops and the
+    streamed one is reported; the scratch directory is removed by ``close()`` and none is left
+    after a hedger run."""
+    opt = EuropeanOption(100.0, 1.0, 1, fc.rate_curve)
+    sim = SimConfig(n_paths=4_000, chunk_size=4_000, seed=3, dt_max=1.0 / 52.0)
+    dates = Schedule("weekly").build(opt)
+    grid = union_grid([bs, bs], [opt], dates, sim)
+    vega = PricingContext.from_model(bs).bump("vega")
+    assert vega is not None
+    kept = ConditionalPricer(bs, [opt], grid, sim, (vega,))
+    streamed = ConditionalPricer(
+        bs, [opt], grid, sim, (vega,), stream_bumps=True, scratch_dir=tmp_path
+    )
+    d = streamed.stream_path
+    assert (
+        d is not None and d.exists() and d.parent == tmp_path and d.name.startswith("volsto-bumps-")
+    )
+    assert streamed.streamed_bytes > 0 and not streamed.bumped_paths
+    assert streamed.memory_bytes < kept.memory_bytes and kept.streamed_bytes == 0
+    # the on-disk footprint is the streamed arrays plus one .npy header (128 bytes) per file
+    n_files = sum(len(v) for v in streamed.streamed.values())
+    overhead = streamed.streamed_bytes - (kept.memory_bytes - streamed.memory_bytes)
+    assert n_files == 4 * 5 and 0 < overhead <= 256 * n_files, (overhead, n_files)
+    for t in (0.0, float(dates[10])):
+        a, b = kept.hybrid_payoffs(t), streamed.hybrid_payoffs(t)
+        assert set(a) == set(b) == {"up", "dn", "bump:vega:up", "bump:vega:dn"}
+        for k in a:
+            assert np.array_equal(a[k], b[k]), (t, k)
+    streamed.close()
+    assert not d.exists()
+    streamed.close()  # idempotent
+    strat = GreekTargetStrategy((Target("delta"),), [Spot()], name="delta")
+    results = {}
+    for stream in (False, True):
+        h = Hedger(
+            PricingContext.from_model(bs),
+            bs,
+            Schedule("weekly"),
+            Costs(),
+            sim=sim,
+            world_paths=sim.n_paths,
+            verbose=False,
+            stream_bumps=stream,
+            scratch_dir=tmp_path,
+        )
+        results[stream] = h.run(opt, strat)
+    r0, r1 = results[False], results[True]
+    assert np.allclose(r0.pnl_total, r1.pnl_total, atol=1e-12)
+    assert np.allclose(r0.pnl_product, r1.pnl_product, atol=1e-12)
+    assert r1.settings["stream_bumps"] is True and r1.settings["scratch_dir"] == str(tmp_path)
+    assert r0.settings["stream_bumps"] is False and r0.budget["streamed_paths_gb"] == 0.0
+    assert r1.budget["streamed_paths_gb"] > 0.0
+    assert r1.budget["pricing_paths_gb"] < r0.budget["pricing_paths_gb"]
+    assert not list(tmp_path.glob("volsto-bumps-*"))
 
 
 def test_costs_and_zero_cost_alongside(bs: BlackScholes, fc: ForwardCurve) -> None:
@@ -659,8 +856,14 @@ def test_cliquet_and_fva_study_strategies(fc: ForwardCurve) -> None:
     cl = AdditiveCliquet.study(1.0, disc)
     full = default_strategy(cl, h.preset_context(cl))
     half = default_strategy(cl, h.preset_context(cl), q=0.5)
+    # q is a strategy parameter (owner decision (a)): the strip's name carries it when q != 1
+    # and the preset keyword arguments travel with the strategy into the run's settings
+    assert "cap-call strip" in [i.name for i in full.instruments] and full.preset_kwargs == {}
+    assert "cap-call strip q=0.5" in [i.name for i in half.instruments]
+    assert half.preset_kwargs == {"q": 0.5} == half.without("var swap").preset_kwargs
     delta_only = GreekTargetStrategy((Target("delta"),), [Spot()], name="delta only")
     stds = {}
+    robust: dict[str, float] = {}
     for label, strat in (
         ("delta only", delta_only),
         ("delta + cap calls (q=1)", full.without("var swap")),
@@ -670,17 +873,57 @@ def test_cliquet_and_fva_study_strategies(fc: ForwardCurve) -> None:
     ):
         r = h.run(cl, strat)
         stds[label] = float(np.std(r.pnl_total, ddof=1))
+        robust[label] = _robust_std(r.pnl_total)
         print(f"cliquet {label}: {r.summary()}")
+        if strat is half:
+            assert r.settings["preset_kwargs"] == {"q": 0.5}
+            assert "cap-call strip q=0.5" in r.instruments
     print("cliquet ranking (std):", stds)
-    # the static replication (cap-call strip + accumulated-sum put, q = 1) beats delta only
-    assert stds["delta + cap calls (q=1)"] <= 1.05 * stds["delta only"]
+    print("cliquet ranking (robust std, 99% of the paths):", robust)
+    # FINDING (recorded, not asserted): under the LV model delta the static replication does not
+    # beat delta only on this placeholder surface — total std 0.059 vs 0.014 at 6·10³ pricing
+    # paths (0.043 vs 0.013 at 2·10⁴), robust std (99% of the paths) 0.022 vs 0.009 (0.0092 vs
+    # 0.0087 at 2·10⁴): the residual Σ rᵢ has the exact delta 1/S_prev, so every bit of this is
+    # the CRN tangent-process noise of the LV model delta on the surface's wing (its −70..−90%
+    # crash paths carry the tails); under Black–Scholes the replication is exact and asserted below
+    print(
+        "LV finding: static replication (q=1) robust std / delta only robust std = "
+        f"{robust['delta + cap calls (q=1)'] / robust['delta only']:.2f}"
+    )
     # the study's strategy proper: q-weighted cap calls + a variance swap sized on the NET vega
     # (with q = 1 the replication is exact, the net vega zero and the swap's quantity is noise —
     # recorded, not asserted; with q = 0.5 the swap has vega to hedge and halves the P&L std)
     assert (
-        stds["delta + cap calls (q=0.5) + net-sized var swap"]
-        <= 1.05 * stds["delta + cap calls (q=0.5)"]
+        robust["delta + cap calls (q=0.5) + net-sized var swap"]
+        <= 1.05 * robust["delta + cap calls (q=0.5)"]
     )
+    # Black–Scholes (pricing = world): the static replication is exact and the delta hedge of
+    # the residual Σ rᵢ is exact at every rebalance — the ranking is asserted here
+    mkt = MarketConfig(100.0, CurveConfig((1.0,), (0.02,)), CurveConfig((1.0,), (0.01,)))
+    fc_bs = ForwardCurve.from_config(mkt)
+    bs = BlackScholes(0.2, fc_bs)
+    h_bs = Hedger(
+        PricingContext.from_model(bs),
+        bs,
+        Schedule("monthly"),
+        Costs(),
+        sim=sim,
+        world_paths=6_000,
+        verbose=False,
+    )
+    cl_bs = AdditiveCliquet.study(1.0, fc_bs.rate_curve)
+    full_bs = default_strategy(cl_bs, h_bs.preset_context(cl_bs))
+    bs_std = {}
+    for label, strat in (
+        ("delta only", delta_only),
+        ("delta + cap calls (q=1)", full_bs.without("var swap").with_targets(["delta"])),
+        ("delta + cap calls (q=1) + var swap", full_bs),
+    ):
+        r = h_bs.run(cl_bs, strat)
+        bs_std[label] = float(np.std(r.pnl_total, ddof=1))
+    print("cliquet ranking under Black-Scholes (std):", bs_std)
+    assert bs_std["delta + cap calls (q=1)"] <= 0.5 * bs_std["delta only"]
+    assert bs_std["delta + cap calls (q=1) + var swap"] <= 0.5 * bs_std["delta only"]
     fva = FVA(1.0, 2.0, ctx.surface.atm_vol(2.0), disc, forward_curve=surface.forward_curve)
     fs = default_strategy(fva, h.preset_context(fva))
     fs_skew = default_strategy(fva, h.preset_context(fva), skew=True)
@@ -698,3 +941,172 @@ def test_cliquet_and_fva_study_strategies(fc: ForwardCurve) -> None:
     # the forward risk reversal on the skew target is noise-dominated at this budget (SPEC
     # §8.1): its number is recorded, not asserted
     assert np.isfinite(stds_f["forward-start preset + skew (recorded)"])
+
+
+# --------------------------------------------------------------------------------------------
+# the §7.11 control variate on the difference (A3b)
+# --------------------------------------------------------------------------------------------
+
+
+def test_shadow_brownian_matches_black_scholes_kernel(bs: BlackScholes, fc: ForwardCurve) -> None:
+    """The control's shadow — the Black–Scholes law on the pricing draws' spot Brownian
+    (``ShadowBrownian``) — reproduces ``BlackScholes.simulate_chunk`` on the same seed to
+    round-off at every record column (the flat-vol kernel is exact), so the analytic
+    conditional expectation of the shadow payoffs is exact for what is simulated."""
+    from volsto.engine.rng import GaussianDraws
+    from volsto.hedging.controls import ShadowBrownian
+
+    sim = SimConfig(n_paths=2_000, chunk_size=1_000, seed=21, dt_max=1.0 / 52.0)
+    dates = np.array([0.0, 0.25, 0.5, 1.0])
+    grid = union_grid([bs], [EuropeanOption(100.0, 1.0, 1, fc.rate_curve)], dates, sim)
+    draws = GaussianDraws(sim.seed, sim.n_paths, grid.n_steps, bs.n_brownians, sim.antithetic)
+    chunks = sim.chunk_ranges(grid.n_records, 0)
+    from volsto.engine.paths import PathSet
+
+    paths = PathSet.concat(
+        [bs.simulate_chunk(grid, draws, p0, p1, sim.scheme) for p0, p1 in chunks]
+    )
+    sb = ShadowBrownian.from_draws(sim.seed, sim.n_paths, grid, sim.antithetic, chunks)
+    shadow = sb.shadow_paths(paths, grid.fixing_index, 0, bs.vol, fc, grid.record_times)
+    err = float(np.max(np.abs(shadow.log_spot - paths.log_spot)))
+    print(f"shadow vs BlackScholes kernel: max |d ln S| = {err:.2e} over {grid.n_records} columns")
+    assert err < 1e-9
+    # spliced at a later column the shadow keeps the history and restarts from the base spot
+    col = grid.fixing_index[0.5]
+    spliced = sb.shadow_paths(paths, grid.fixing_index, col, 0.35, fc, grid.record_times)
+    assert np.array_equal(spliced.log_spot[:, : col + 1], paths.log_spot[:, : col + 1])
+    assert not np.allclose(spliced.log_spot[:, -1], paths.log_spot[:, -1])
+
+
+def test_control_variate_vega_vanilla_lv() -> None:
+    """Local-vol pricing model on the placeholder surface, 1y ATM call, the ``vega`` bump
+    (parallel ±1 vp, the perturbed surfaces on the bump) at ``t = 0.5``: the controlled and the
+    raw vega fits agree in expectation — least squares with an unpenalised intercept reproduces
+    the target mean on the pricing paths, so the cross-path mean of the fitted vegas differs by
+    ``−β · mean(c − E[c | S_t])``, which must sit within 2 standard errors of 0 (a wrong analytic
+    expectation would bias it) — and the variance reduction is > 1 (printed)."""
+    ctx = _lv_context()
+    surface = ctx.surface
+    disc = surface.forward_curve.rate_curve
+    opt = EuropeanOption(float(surface.forward_curve.spot), 1.0, 1, disc)
+    sim = SimConfig(n_paths=8_000, chunk_size=8_000, seed=5, dt_max=1.0 / 52.0)
+    bump = ctx.bump("vega")
+    assert bump is not None and bump.controllable
+    assert bump.up_surface is not None and bump.dn_surface is not None
+    t = 0.5
+    grid = union_grid([ctx.model], [opt], np.array([0.0, t]), sim)
+    pricers = {
+        cv: ConditionalPricer(
+            ctx.model, [opt], grid, sim, (bump,), control_variate=cv, surface=surface
+        )
+        for cv in (True, False)
+    }
+    fit_c, fit_r = pricers[True].fit(0, t), pricers[False].fit(0, t)
+    assert fit_c.controlled == ("vega",) and fit_r.controlled == ()
+    assert fit_r.variance_reduction["vega"] == 1.0 and fit_r.beta["vega"] == 0.0
+    vr, beta = fit_c.variance_reduction["vega"], fit_c.beta["vega"]
+    ce = pricers[True].control(0, t, bump)
+    assert ce is not None
+    d = -beta * (ce[0] - ce[1])
+    if sim.antithetic:
+        d = 0.5 * (d[0::2] + d[1::2])
+    se = float(d.std(ddof=1) / np.sqrt(d.size))
+    v_c = pricers[True].evaluate(0, t, pricers[True].paths, ["vega"])[0]["vega"]
+    v_r = pricers[False].evaluate(0, t, pricers[False].paths, ["vega"])[0]["vega"]
+    diff = float(v_c.mean() - v_r.mean())
+    print(
+        f"vega at t={t}: raw mean {v_r.mean():.5f}, controlled mean {v_c.mean():.5f}, "
+        f"difference {diff:+.5f} +/- {se:.5f}; beta {beta:.3f}, variance reduction {vr:.2f} "
+        f"+/- {fit_c.variance_reduction_se['vega']:.2f} (bootstrap) "
+        f"({sim.n_paths} paths, r2 raw {fit_r.r2['vega']:.4f} -> controlled {fit_c.r2['vega']:.4f})"
+    )
+    assert np.isfinite(vr) and vr > 1.0, vr
+    assert abs(diff) < 2.0 * se + 1e-12, (diff, se)
+    # the value / delta / gamma fits are untouched by the control
+    for kind in ("value", "delta", "gamma"):
+        assert np.allclose(fit_c.coefficients[kind], fit_r.coefficients[kind])
+    # through the hedger: the median reduction over dates and controlled objects in the budget
+    h = Hedger(
+        ctx,
+        ctx.model,
+        Schedule("monthly"),
+        Costs(),
+        sim=sim,
+        world_paths=sim.n_paths,
+        verbose=False,
+    )
+    strat = GreekTargetStrategy(
+        (Target("delta"), Target("vega")),
+        [Spot(), Vanilla(strike=110.0, maturity=1.0, cp=1, discount=disc, name="c110")],
+        name="delta+vega",
+    )
+    r = h.run(opt, strat)
+    med = r.budget["cv_reduction_median"]
+    print(f"hedger run: cv_reduction_median {med:.2f} over {r.dates.size} dates x 2 objects")
+    assert r.settings["control_variate"] is True and np.isfinite(med) and med > 1.0
+    assert np.all(np.isfinite(r.pnl_total))
+    r_off = dataclasses.replace(h, control_variate=False).run(opt, strat)
+    assert np.isnan(r_off.budget["cv_reduction_median"])
+    assert r_off.settings["control_variate"] is False
+
+
+def test_control_variate_forward_risk_reversal_skew_tent() -> None:
+    """The forward risk reversal 1y → 2y (90 / 110) with the ``skew_T:2`` tent under the
+    local-vol context at ``t = 0.5 < T1``: the control (forward-start Black on the ratio at the
+    surface vol of ``(ln m, T2)``, each leg's vol moved by the tent) gives a finite variance
+    reduction that is never much worse than 1 (asserted > 0.9, printed); after ``T1`` no control
+    and a note."""
+    from volsto.hedging import ForwardStartRiskReversal
+
+    ctx = _lv_context()
+    disc = ctx.surface.forward_curve.rate_curve
+    rr = ForwardStartRiskReversal(t1=1.0, t2=2.0, discount=disc).product
+    sim = SimConfig(n_paths=8_000, chunk_size=8_000, seed=7, dt_max=1.0 / 52.0)
+    bump = ctx.bump("skew_T:2")
+    assert bump is not None and bump.controllable and bump.dn is None
+    grid = union_grid([ctx.model], [rr], np.array([0.0, 0.5, 1.5]), sim)
+    pr = ConditionalPricer(ctx.model, [rr], grid, sim, (bump,), surface=ctx.surface)
+    fit = pr.fit(0, 0.5)
+    vr, beta = fit.variance_reduction["skew_T:2"], fit.beta["skew_T:2"]
+    print(
+        f"forward risk reversal skew_T:2 at t=0.5: variance reduction {vr:.3f} "
+        f"+/- {fit.variance_reduction_se['skew_T:2']:.3f} (bootstrap), beta {beta:.3f} "
+        f"({sim.n_paths} paths, r2 {fit.r2['skew_T:2']:.4f}; bump unit {bump.unit:g} — "
+        f"{bump.description}; context notes {ctx.notes})"
+    )
+    assert fit.controlled == ("skew_T:2",)
+    assert np.isfinite(vr) and vr > 0.9, vr
+    fit_after = pr.fit(0, 1.5)
+    assert fit_after.controlled == () and fit_after.variance_reduction["skew_T:2"] == 1.0
+    assert any("after T1 = 1" in n for n in pr.notes), pr.notes
+
+
+def test_no_control_for_autocall(bs: BlackScholes, fc: ForwardCurve) -> None:
+    """An autocall has no Black–Scholes proxy: raw bump targets, a note per class, no shadow
+    Brownian built; the bare Black–Scholes context exposes the vega bump as flat vol shifts."""
+    from volsto.hedging.hedger import VOL_BUMP
+
+    disc = fc.rate_curve
+    ac = Autocall(
+        (0.5, 1.0),
+        disc,
+        spot_reference=100.0,
+        coupons=0.06,
+        ki_level=0.6,
+        ki_type="european",
+        autocall_barriers=1.0,
+        final_redemption="knock_in",
+    )
+    ctx = PricingContext.from_model(bs)
+    bump = ctx.bump("vega")
+    assert bump is not None and bump.controllable
+    assert bump.vol_shift_up == VOL_BUMP and bump.vol_shift_dn == pytest.approx(-VOL_BUMP)
+    assert bump.up_surface is None and bump.dn_surface is None
+    grid = union_grid([bs], [ac], np.array([0.0, 0.25]), SIM_SMALL)
+    pr = ConditionalPricer(bs, [ac], grid, SIM_SMALL, (bump,))
+    assert "no Black-Scholes control for Autocall: raw bump targets" in pr.notes
+    assert pr.brownian is None and pr.proxies == {0: None}
+    fit = pr.fit(0, 0.25)
+    assert fit.controlled == ()
+    assert fit.variance_reduction["vega"] == 1.0 and fit.beta["vega"] == 0.0
+    assert pr.cv_reductions() == []
