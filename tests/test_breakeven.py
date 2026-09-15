@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
+import logging
 import math
 import time
 from pathlib import Path
@@ -661,7 +662,7 @@ class _QuadSurface:
         return np.full_like(np.asarray(T, dtype=np.float64), self.atf)
 
 
-def test_sabr_reduction(ssvi) -> None:  # type: ignore[no-untyped-def]
+def test_sabr_reduction(ssvi, caplog) -> None:  # type: ignore[no-untyped-def]
     """Step 0.  At ``SabrW_Power = 0`` ``sabr_reduce`` on a quadratic smile built from ``(atf,
     ν_SABR, ρ_SABR)`` recovers ``ν`` and ``ρ`` to 1e-6 (the Hagan β = 1 inversion; central
     differences of a quadratic are exact) with ``Skew_SABR = ∂σ̂/∂k``; ``VoV_SABR = atf ν_SABR``
@@ -671,7 +672,12 @@ def test_sabr_reduction(ssvi) -> None:  # type: ignore[no-untyped-def]
     negative only for a concave smile (NaN and the flag); ``|ρ| > 1`` is clipped with the flag;
     flags are never silent (finite differences, ``ν² T > 1``); the half-width ``h`` is recorded.
     The reference SSVI (analytic ``atm_skew``) gets no flag at any pillar 1M–10Y; ``p = 1``
-    against ``p = 0`` moves its ``ν_SABR`` by +0.4% to +0.5% (positive ATM curvature, atf < 0.3)."""
+    against ``p = 0`` moves its ``ν_SABR`` by +0.4% to +0.5% (positive ATM curvature, atf < 0.3).
+    **Radicand guard** (report decision iii, default ``c = 0.5``): a concave smile whose radicand
+    falls below ``6 smi² (1 − c)`` is floored there — flagged, logged at WARNING,
+    ``radicand_guarded`` set, and (since ``3 smi² < 4 smi²``) ``Corr_SABR`` clipped to −1 with its
+    own flag; ``radicand_floor=None`` restores the NaN of a negative radicand; the guard never fires
+    on the reference SSVI (nor on the 127 SPX 2022 H2 snapshots, measured in the study)."""
     fd = "no analytic atm_skew"
     for atf, nu, rho in itertools.product((0.15, 0.25), (0.3, 0.8, 1.5), (-0.9, -0.5, 0.0, 0.6)):
         s = _QuadSurface.from_sabr(atf, nu, rho)
@@ -705,16 +711,31 @@ def test_sabr_reduction(ssvi) -> None:  # type: ignore[no-untyped-def]
     assert len(flat.flags) == 2 and fd in flat.flags[0] and "finite-T" in flat.flags[1]
     assert flat.nu_sabr == pytest.approx(math.sqrt(6) * 0.5)
     assert flat.rho_sabr == pytest.approx(-2.0 / math.sqrt(6))
-    # concave smile with a small skew: negative radicand
-    bad = sabr_reduce(_QuadSurface(0.2, -0.05, -0.5), 1.0, sabrw_power=0.0)
-    assert math.isnan(bad.nu_sabr) and math.isnan(bad.rho_sabr) and math.isnan(bad.vov_sabr)
-    assert len(bad.flags) == 2 and "negative radicand" in bad.flags[1]
-    # |rho| > 1: clipped and flagged
-    clip = sabr_reduce(_QuadSurface(0.2, -0.3, -0.5), 1.0, sabrw_power=0.0)
+    # concave smile with a small skew: negative radicand -> the guard floors it (default c = 0.5)
+    with caplog.at_level(logging.WARNING, logger="volsto.calibration.targets"):
+        bad = sabr_reduce(_QuadSurface(0.2, -0.05, -0.5), 1.0, sabrw_power=0.0)
+    assert bad.radicand_guarded and any("radicand guard" in f for f in bad.flags)
+    assert any("floored" in rec.getMessage() for rec in caplog.records)
+    assert bad.nu_sabr == pytest.approx(math.sqrt(3 * 0.05**2)) and bad.rho_sabr == -1.0
+    assert any("clipped" in f for f in bad.flags) and not math.isnan(bad.vov_sabr)
+    nan = sabr_reduce(_QuadSurface(0.2, -0.05, -0.5), 1.0, sabrw_power=0.0, radicand_floor=None)
+    assert math.isnan(nan.nu_sabr) and math.isnan(nan.rho_sabr) and not nan.radicand_guarded
+    assert len(nan.flags) == 2 and "negative radicand" in nan.flags[1]
+    with pytest.raises(ValueError):
+        sabr_reduce(_QuadSurface(0.2, -0.05, -0.5), 1.0, radicand_floor=1.0)
+    # |rho| > 1 without the guard: clipped and flagged (with the default guard it also floors,
+    # 0.24 < 3 x 0.09 = 0.27)
+    clip = sabr_reduce(_QuadSurface(0.2, -0.3, -0.5), 1.0, sabrw_power=0.0, radicand_floor=None)
     rad = 6 * 0.3**2 + 3 * 0.2 * (-0.5)
     assert rad > 0 and 2 * 0.3 / math.sqrt(rad) > 1
     assert clip.nu_sabr == pytest.approx(math.sqrt(rad)) and clip.rho_sabr == -1.0
     assert len(clip.flags) == 2 and "clipped" in clip.flags[1]
+    g = sabr_reduce(_QuadSurface(0.2, -0.3, -0.5), 1.0, sabrw_power=0.0)
+    assert g.radicand_guarded and g.nu_sabr == pytest.approx(math.sqrt(0.27))
+    # marking targets carry the guard flag per pillar
+    tg_g = marking_targets(_QuadSurface(0.2, -0.05, -0.5), (0.25, 1.0, 2.0), mat_min=0.0)
+    assert all(s.radicand_guarded for s in tg_g.sabr)
+    assert sum("radicand guard fired" in f for f in tg_g.flags) == 3
     assert clip.skew_sabr == pytest.approx(-0.3, abs=1e-10)
     r05 = sabr_reduce(_QuadSurface.from_sabr(0.2, 1.0, -0.6), 1.0, h=0.05, sabrw_power=0.0)
     assert r05.nu_sabr == pytest.approx(1.0, abs=1e-6) and r05.h == 0.05
@@ -725,7 +746,7 @@ def test_sabr_reduction(ssvi) -> None:  # type: ignore[no-untyped-def]
     for T in (1.0 / 12.0, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0):
         r0 = sabr_reduce(ssvi, T, sabrw_power=0.0)
         r1 = sabr_reduce(ssvi, T)
-        assert r0.flags == () and r1.flags == ()
+        assert r0.flags == () and r1.flags == () and not r1.radicand_guarded
         assert r1.skew == pytest.approx(float(ssvi.atm_skew(T)), rel=1e-12) and r1.curv > 0
         moves.append(r1.nu_sabr / r0.nu_sabr - 1.0)
     print("nu_sabr p=1 vs p=0:", np.round(moves, 4))

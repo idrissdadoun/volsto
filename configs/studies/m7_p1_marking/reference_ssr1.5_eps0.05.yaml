@@ -31,13 +31,13 @@ spec:
     gamma: 0.5
     max_maturity: 10.0
   model:
-    nu: 2.5000000001526193
-    theta: 0.08124520512680758
-    k1: 7.753721113785216
+    nu: 3.5000000002327303
+    theta: 0.06488007105720903
+    k1: 13.22191331354585
     k2: 0.2
-    rho12: 0.9999998350213791
-    rho_SX1: -0.9999999993122146
-    rho_SX2: -0.999999855451465
+    rho12: 0.999999189035287
+    rho_SX1: -0.999999996936775
+    rho_SX2: -0.9999992847762594
   particle:
     n_particles: 200000
     horizon: 3.0
@@ -102,6 +102,7 @@ fit:
     - 20.0
     k1_min_gap: 0.05
     k1_grid: 25
+    radicand_floor: 0.5
     skew_mode: twopoint
     skew_eps:
     - 0.05
@@ -109,15 +110,17 @@ fit:
     skew_pillars:
     - 1.0
     - 5.0
-    skew_weight: 1.0
+    skew_weight: 10.0
     weights_covar: relative
     weights_volvar: relative
     term_structure: atmf
-    nu_cap: 2.5
+    nu_cap: 3.5
     chi_bounds:
     - -0.99
     - 0.99
     omega_max: 20.0
+    stage3_tolerance: 0.1
+    rho12_flag: 0.9
     n_quad: 64
     n_inner: 32
     n_ts: 64
@@ -125,21 +128,21 @@ fit:
     n_inner_ts: 24
   ssr_target: 1.5
   breakeven:
-    k1: 7.753721113785216
+    k1: 13.22191331354585
     k2: 0.2
-    omega1: 4.593774031217506
-    omega2: 0.4062260306614025
-    lambda1: -4.593774028057975
-    lambda2: -0.40622597194202487
-    chi: -0.989998327847676
+    omega1: 6.545839825101608
+    omega2: 0.4541605197761571
+    lambda1: -6.545839805050228
+    lambda2: -0.45416019494977133
+    chi: -0.9899999025900467
   status: binding
   messages:
   - 'skew constraint binds at T=5 (upper edge: naked skew = (1-0.05) x Skew_SABR =
     -0.13472): naked skew -0.13472 vs market -0.14181 (-5.0%, eps 0.05); SpotVolCovar
-    achieved vs target: 0.25y -0.34643/-0.21782 (+59.0%), 0.5y -0.19898/-0.15550 (+28.0%),
-    1y -0.11948/-0.10891 (+9.7%), 2y -0.07732/-0.07487 (+3.3%), 3y -0.06048/-0.05963
-    (+1.4%), 5y -0.04426/-0.04434 (-0.2%), 10y -0.02699/-0.02917 (-7.5%)'
-  - nu at cap 2.5; first-order break-even engine ~15% biased beyond ~4; raise only
+    achieved vs target: 0.25y -0.28466/-0.21782 (+30.7%), 0.5y -0.16548/-0.15550 (+6.4%),
+    1y -0.10780/-0.10891 (-1.0%), 2y -0.07476/-0.07487 (-0.1%), 3y -0.06007/-0.05963
+    (+0.7%), 5y -0.04464/-0.04434 (+0.7%), 10y -0.02712/-0.02917 (-7.0%)'
+  - nu at cap 3.5; first-order break-even engine ~15% biased beyond ~4; raise only
     if stage-3 simulation validates (step 2 box |lambda1|+|lambda2| <= 2 nu_cap)
   surface: reference
   skew_eps: 0.05

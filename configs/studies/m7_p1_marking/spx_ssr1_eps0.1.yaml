@@ -210,6 +210,7 @@ fit:
     - 20.0
     k1_min_gap: 0.05
     k1_grid: 25
+    radicand_floor: 0.5
     skew_mode: twopoint
     skew_eps:
     - 0.1
@@ -217,15 +218,17 @@ fit:
     skew_pillars:
     - 1.0
     - 5.0
-    skew_weight: 1.0
+    skew_weight: 10.0
     weights_covar: relative
     weights_volvar: relative
     term_structure: atmf
-    nu_cap: 2.5
+    nu_cap: 3.5
     chi_bounds:
     - -0.99
     - 0.99
     omega_max: 20.0
+    stage3_tolerance: 0.1
+    rho12_flag: 0.9
     n_quad: 64
     n_inner: 32
     n_ts: 64

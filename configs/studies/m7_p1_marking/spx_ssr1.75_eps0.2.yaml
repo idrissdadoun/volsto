@@ -141,13 +141,13 @@ spec:
     gamma: 0.2313381762295083
     max_maturity: 3.0
   model:
-    nu: 1.394307038294448
-    theta: 0.312350391955572
-    k1: 9.633342331912775
+    nu: 1.0870961775889738
+    theta: 0.38865251836048753
+    k1: 10.20402150115028
     k2: 0.2
-    rho12: 0.9879289015616137
-    rho_SX1: -0.955248090499616
-    rho_SX2: -0.9121287079620382
+    rho12: 0.9969698913649498
+    rho_SX1: -0.8549113132152286
+    rho_SX2: -0.870526699143093
   particle:
     n_particles: 200000
     horizon: 3.0
@@ -192,7 +192,7 @@ spec:
   local_vol: null
   perturbation: null
 fit:
-  label: spx_ssr1.5_eps0.05
+  label: spx_ssr1.75_eps0.2
   config:
     pillars:
     - 0.25
@@ -213,8 +213,8 @@ fit:
     radicand_floor: 0.5
     skew_mode: twopoint
     skew_eps:
-    - 0.05
-    - 0.05
+    - 0.2
+    - 0.2
     skew_pillars:
     - 1.0
     - 5.0
@@ -234,21 +234,16 @@ fit:
     n_ts: 64
     n_quad_ts: 32
     n_inner_ts: 24
-  ssr_target: 1.5
+  ssr_target: 1.75
   breakeven:
-    k1: 9.633342331912775
+    k1: 10.20402150115028
     k2: 0.2
-    omega1: 1.92258057358399
-    omega2: 0.8732918461669933
-    lambda1: -1.836541421747763
-    lambda2: -0.7965545633180826
-    chi: 0.96179632560318
-  status: binding
-  messages:
-  - 'skew constraint binds at T=3 (lower edge: naked skew = (1+0.05) x Skew_SABR =
-    -0.20057): naked skew -0.20057 vs market -0.19102 (+5.0%, eps 0.05); SpotVolCovar
-    achieved vs target: 0.25y -0.12593/-0.12279 (+2.6%), 0.5y -0.10131/-0.10527 (-3.8%),
-    1y -0.08721/-0.08809 (-1.0%), 2y -0.07352/-0.07190 (+2.2%), 3y -0.06388/-0.06309
-    (+1.2%)'
+    omega1: 1.3301450159013528
+    omega2: 0.845614361293051
+    lambda1: -1.1371560223109167
+    lambda2: -0.7361298786844346
+    chi: 0.99
+  status: interior
+  messages: []
   surface: spx
-  skew_eps: 0.05
+  skew_eps: 0.2

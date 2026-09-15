@@ -25,22 +25,25 @@ as prefactor of the sensitivities — the gate-validated convention of
     VolVar_P1(T) = SensiSpot² + 2 SensiSpot ½ atf_T λ·A_T + SensiX² + SensiY² + 2 ρ_XY SensiX SensiY
 
 with ``S_t`` the market ATM skew, ``f(t) = σ²(t)/(σ̂_t σ̂_T)`` on the market ATMF curve and ``J_t``
-the kernel's order-one skew at every ``t ∈ (0, T]``.  ``SensiSpot`` is the spot sensitivity the
-leverage generates when it absorbs the skew residual ``S − Skew_naked`` (eq. 12.52 in covariance
+the kernel's order-one skew at every ``t ∈ (0, T]``. ``SensiSpot`` is the spot sensitivity the
+leverage generates when it absorbs the skew residual ``S − Skew_naked`` (eq.  12.52 in covariance
 form: ``SpotVolCovar_P1 = σ_0 R_LSV S`` at order one); it is zero when the naked skew equals the
 market skew at every maturity, and ``SpotVolCovar_P1`` and ``Skew_naked`` are affine in ``λ`` at
 fixed ``(k1, k2)`` (:class:`P1Maps`).  *Reading of the specification (flagged):* the owner's
-``VolVar_P1`` carries ``σ_0² f(T)²`` and ``σ_0 f(T) A`` terms, i.e. a non-zero ``SensiSpot = σ_0
-f(T)`` — the leverage-included (P1-deco) break-even, the ``SVC_PILV`` of the previous message —
-so ``SpotVolCovar_P1`` is this form, not the naked kernel's (``SensiSpot = 0``, reported as
-``svc_naked``).  The owner's ``VolVar_P1`` as written has both cross terms at half weight
-(``(λ_i/2) σ_0 f A_i`` and ``(ω1 ω2/4) ρ_XY A1 A2``; the quadratic form ``(SensiSpot + SensiX +
-SensiY)²`` has ``2 SensiSpot ρ_Si SensiX_i = SensiSpot λ_i A_i atf`` and ``2 ρ_XY SensiX SensiY =
-(ω1 ω2/2) ρ_XY A1 A2 atf²``); the engine's full quadratic form — the one the analytic-vs-
-simulation gate validated — is used.  In historical mode (no surface) the skew residual is
-interpolated linearly in ``t`` between the pillars (flat outside): ``(1/T) ∫ f (S − λ·J)`` uses
-the pillar values of ``S`` and ``J``, so the leverage term vanishes whenever the naked skew
-matches the market at the pillars (the synthetic recovery test).
+``VolVar_P1`` carries ``σ_0² f(T)²`` and ``σ_0 f(T) A`` terms, i.e.  a non-zero ``SensiSpot = σ_0
+f(T)`` — the leverage-included (P1-deco) break-even, the ``SVC_PILV`` of the previous message — so
+``SpotVolCovar_P1`` is this form, not the naked kernel's (``SensiSpot = 0``, reported as
+``svc_naked``) — **confirmed by the owner (report decision i: production's definition; the naked
+reading is trivially satisfied by ρ = Corr_SABR)**.  The owner's ``VolVar_P1`` as written has both
+cross terms at half weight (``(λ_i/2) σ_0 f A_i`` and ``(ω1 ω2/4) ρ_XY A1 A2``; the quadratic form
+``(SensiSpot + SensiX + SensiY)²`` has ``2 SensiSpot ρ_Si SensiX_i = SensiSpot λ_i A_i atf`` and ``2
+ρ_XY SensiX SensiY = (ω1 ω2/2) ρ_XY A1 A2 atf²``); the engine's full quadratic form — the one the
+analytic-vs- simulation gate validated — is used (owner, report decision ii; the slide's half-weight
+cross-term coefficients remain an **unresolved normalisation** of that formula, recorded here).  In
+historical mode (no surface) the skew residual is interpolated linearly in ``t`` between the pillars
+(flat outside): ``(1/T) ∫ f (S − λ·J)`` uses the pillar values of ``S`` and ``J``, so the leverage
+term vanishes whenever the naked skew matches the market at the pillars (the synthetic recovery
+test).
 
 **Step 2 — first minimisation** over ``(k1, λ1, λ2)``, ``k2`` fixed (0.2)::
 
@@ -60,7 +63,11 @@ loadings (conservative for opposite signs).  The skew constraint pillars must be
 a constraint maturity outside them (5Y on a surface quoted to 3Y, a history to 3Y) is moved to
 the nearest fitted pillar with a note, never dropped silently.  ``skew_mode="soft"`` replaces the
 two-point constraint by the all-pillar penalty ``skew_weight Σ_i (Skew_naked_i/Skew_SABR_i − 1)²``
-added to the covariance objective (normalised as the relative weights), not the default.
+added to the covariance objective (normalised as the relative weights).  ``skew_mode="auto"``
+(default) is two-point in marking mode and **soft in historical mode** (owner, report decision v:
+the two-point configuration leaves ρ_SX1 unidentified on the three-year synthetic recovery,
+−0.664 against −0.759; soft at the default weight 10 gives −0.716 / −0.461, ν 1.798, θ 0.245, k1
+5.78, inside the owner's tolerances).
 
 **Binding and infeasibility (never a silent railed fit).**  With ``eps ≥ 0`` the two skew slabs
 always intersect in the ``λ`` plane (their normals ``J(1Y)``, ``J(5Y)`` are independent for ``k1 ≠
@@ -86,8 +93,18 @@ at ``ρ_SABR`` always** (owner): the VolVar target is rebuilt from the achieved 
 target — so a missed covariance never forces ``|ρ| = 1``; the requested ``VoV_BE²`` is reported next
 to it.  Historical mode keeps its empirical VolVar target (no SABR correlation there; the empirical
 ``SpotVolCovar/sqrt(VolVar)`` reaches −1.02 at 3M on the one-year synthetic history, and the rebuild
-from it biased ν by −20%). ``ν_cap`` (default 2.5) is a config value, not a hard-wired rail: when a
-fit binds it (step 2 box or step 3) :data:`NU_CAP_WARNING` is logged and attached to the messages.
+from it biased ν by −20%). ``ν_cap`` (default 3.5 since report decision viii, was 2.5) is a
+config value, not a hard-wired rail: when a fit binds it (step 2 box or step 3)
+:data:`NU_CAP_WARNING` is logged and attached to the messages.  **Stage-3 assertion** (decision
+viii): the simulated SpotVolCovar and VolVar of the calibrated model must be within
+``stage3_tolerance`` (10%) of the fit's targets (:func:`breakeven_check`; the message separates a
+first-order miss of the target — a binding fit — from the engine bias at the solution), which
+makes a higher-ν fit self-checking since the first-order engine is about 15% biased beyond ν ≈ 4;
+:func:`fit_2f` raises :class:`BreakEvenValidationError` (carrying the result) when it fails.
+``iterate_against_simulation=k`` refits ``k`` times with the targets divided by the cumulative
+simulated/analytic factors measured at each solution and reports the convergence.  **ρ12
+diagnostic** (decision vii): ``|ρ12| > rho12_flag`` (0.9) is noted as the two-factor structure
+collapsing.
 
 **Always reported** (:meth:`FitResult.summary`, :meth:`FitResult.config_yaml`): the fitted
 parameters; the naked skew at 1Y / 5Y against the market (within ``eps`` or the binding message);
@@ -95,8 +112,9 @@ the free short-end naked skew (1M and the pillars below 1Y); per pillar the Spot
 VolVar targets and achieved values, the implied correlation and the first-order P1 SSR; with
 stage 3 the calibrated LSV's numerical SSR (a diagnostic, never a target: at ``ssr_target = 1`` the
 model cannot realise SSR 1 without leverage, pure SV floors near 1.5), the mean ``|L − 1|`` and the
-forward 90/110 skew at 1y-into-1y and 2y-into-1y against the spot 1y skew (sticky-strike marking
-gives about 130–150% of spot skew, book eq. 12.52).
+forward 90/110 skew at 1y-into-1y and 2y-into-1y against the spot 1y skew — a diagnostic,
+not a target (owner, report decision vi: the measured 1.0–1.17 is reported; the 130–150% figure
+was a long-maturity heuristic with different SSR inputs).
 
 **Stage 3 — validation, nothing refit** (:func:`stage3_validation`): the leverage is calibrated
 for the fitted parameters (or a cached ``model=`` is used), and the report carries (a) mean ``|L −
@@ -131,6 +149,7 @@ from volsto.calibration.history import WINDOW_SSR, WINDOW_VOL, SurfaceHistory
 from volsto.calibration.targets import (
     DEFAULT_ATF_REF,
     DEFAULT_MAT_MIN,
+    DEFAULT_RADICAND_FLOOR,
     DEFAULT_SABRW_POWER,
     DEFAULT_TARGET_PILLARS,
     SABR_CURVATURE_H,
@@ -149,13 +168,24 @@ FloatArray = NDArray[np.float64]
 
 #: the fixed slow mean reversion (owner default)
 DEFAULT_K2 = 0.2
-#: the ν cap (config; owner default 2.5)
-DEFAULT_NU_CAP = 2.5
+#: the ν cap (config; owner default 3.5 since the M7 Part 3 report decision viii, was 2.5)
+DEFAULT_NU_CAP = 3.5
+#: the soft-mode skew weight (historical-mode default; weight 10 meets the owner's recovery
+#: tolerances on the three-year mixing history, weight 1 misses ρ_SX1 by 0.073)
+DEFAULT_SKEW_WEIGHT = 10.0
+#: stage-3 assertion: simulated SpotVolCovar and VolVar within this relative distance of the
+#: fit's targets (owner, report decision viii)
+DEFAULT_STAGE3_TOLERANCE = 0.10
+#: ``|ρ12|`` above which the two-factor structure is flagged as collapsing (report decision vii)
+RHO12_COLLAPSE = 0.9
 #: the two-point skew tolerance (owner default, both points)
 DEFAULT_SKEW_EPS = 0.10
 #: the two constraint maturities ``(T_s, T_l)``
 DEFAULT_SKEW_PILLARS: tuple[float, float] = (1.0, 5.0)
 SKEW_MODES = ("twopoint", "soft")
+#: ``skew_mode`` choices: ``"auto"`` resolves to ``"twopoint"`` in marking mode and ``"soft"`` in
+#: historical mode (report decision v; :func:`resolve_skew_mode`)
+SKEW_MODE_CHOICES = ("auto", *SKEW_MODES)
 WEIGHT_KINDS = ("relative", "uniform")
 #: term-structure factor ``f(t)`` of the leverage integrals
 TERM_STRUCTURE_KINDS = ("atmf", "flat", "vs")
@@ -200,11 +230,15 @@ class BreakEvenFitConfig:
     ``smooth_breakeven`` (SmoothBreakEven, on), ``sabrw_power`` / ``atf_ref`` (the convexity
     rescaling of step 0; 1 / 0.3).  Step 2: ``k2`` fixed (0.2), ``k1_bounds`` (``k1_bounds[0]``
     must exceed ``k2 + k1_min_gap``), ``k1_grid`` points of the coarse geometric grid,
-    ``skew_mode`` (:data:`SKEW_MODES`), ``skew_eps`` a float (both points) or ``(eps_s, eps_l)``
-    (normalised to a pair), ``skew_pillars`` ``(T_s, T_l)``, ``skew_weight`` (soft mode only),
+    ``skew_mode`` (:data:`SKEW_MODE_CHOICES`; ``"auto"`` → two-point in marking mode, soft in
+    historical mode), ``skew_eps`` a float (both points) or ``(eps_s, eps_l)`` (normalised to a
+    pair), ``skew_pillars`` ``(T_s, T_l)``, ``skew_weight`` (soft mode only; 10), ``radicand_floor``
+    (the step-0 guard ``c``),
     ``weights_covar`` (:data:`WEIGHT_KINDS` or one weight per fitted pillar), ``term_structure``
     (``f(t)`` of the leverage integrals).  Step 3: ``weights_volvar``, ``nu_cap`` (config cap of
-    both minimisations, warning when bound), ``chi_bounds``, ``omega_max``.  Quadrature orders
+    both minimisations, 3.5, warning when bound), ``chi_bounds``, ``omega_max``.  Diagnostics:
+    ``stage3_tolerance`` (the stage-3 assertion, 10%), ``rho12_flag`` (``|ρ12|`` above which the
+    two-factor structure is flagged as collapsing, 0.9).  Quadrature orders
     ``n_quad`` / ``n_inner`` (pillar kernels) and ``n_ts`` / ``n_quad_ts`` / ``n_inner_ts`` (the
     term-structure integrals, ``t = T u^p``)."""
 
@@ -217,16 +251,19 @@ class BreakEvenFitConfig:
     k1_bounds: tuple[float, float] = (0.3, 20.0)
     k1_min_gap: float = 0.05
     k1_grid: int = 25
-    skew_mode: str = "twopoint"
+    radicand_floor: float | None = DEFAULT_RADICAND_FLOOR
+    skew_mode: str = "auto"
     skew_eps: float | tuple[float, float] = DEFAULT_SKEW_EPS
     skew_pillars: tuple[float, float] = DEFAULT_SKEW_PILLARS
-    skew_weight: float = 1.0
+    skew_weight: float = DEFAULT_SKEW_WEIGHT
     weights_covar: str | tuple[float, ...] = "relative"
     weights_volvar: str | tuple[float, ...] = "relative"
     term_structure: str = "atmf"
     nu_cap: float = DEFAULT_NU_CAP
     chi_bounds: tuple[float, float] = (-0.99, 0.99)
     omega_max: float = 20.0
+    stage3_tolerance: float = DEFAULT_STAGE3_TOLERANCE
+    rho12_flag: float = RHO12_COLLAPSE
     n_quad: int = 64
     n_inner: int = 32
     n_ts: int = 64
@@ -251,8 +288,14 @@ class BreakEvenFitConfig:
             )
         if self.k1_grid < 3:
             raise ValueError("k1_grid must be at least 3")
-        if self.skew_mode not in SKEW_MODES:
-            raise ValueError(f"skew_mode must be one of {SKEW_MODES}")
+        if self.skew_mode not in SKEW_MODE_CHOICES:
+            raise ValueError(f"skew_mode must be one of {SKEW_MODE_CHOICES}")
+        if self.radicand_floor is not None and not 0.0 <= self.radicand_floor < 1.0:
+            raise ValueError("radicand_floor must be in [0, 1) or None")
+        if not 0.0 < self.stage3_tolerance < 1.0:
+            raise ValueError("stage3_tolerance must be in (0, 1)")
+        if not 0.0 < self.rho12_flag <= 1.0:
+            raise ValueError("rho12_flag must be in (0, 1]")
         eps = self.skew_eps
         pair = (float(eps), float(eps)) if isinstance(eps, int | float) else tuple(eps)
         if len(pair) != 2 or not all(math.isfinite(e) and e >= 0.0 for e in pair):
@@ -288,6 +331,22 @@ class BreakEvenFitConfig:
         e = self.skew_eps
         assert isinstance(e, tuple)
         return float(e[0]), float(e[1])
+
+
+def resolve_skew_mode(cfg: BreakEvenFitConfig, targets: TargetSet) -> tuple[str, str]:
+    """The skew mode of a fit and a note: an explicit ``cfg.skew_mode`` is kept; ``"auto"``
+    gives ``"twopoint"`` on marking targets and ``"soft"`` on historical targets (owner, report
+    decision v: the soft all-pillar penalty is the historical-mode default, since the two-point
+    configuration leaves ρ_SX1 unidentified on the synthetic recovery)."""
+    if cfg.skew_mode != "auto":
+        return cfg.skew_mode, ""
+    mode = "twopoint" if targets.mode == "marking" else "soft"
+    return mode, f"skew_mode 'auto' resolved to '{mode}' ({targets.mode} mode)"
+
+
+def _resolved(cfg: BreakEvenFitConfig, targets: TargetSet) -> tuple[BreakEvenFitConfig, str]:
+    mode, note = resolve_skew_mode(cfg, targets)
+    return (cfg if mode == cfg.skew_mode else replace(cfg, skew_mode=mode)), note
 
 
 # --------------------------------------------------------------------------------------------
@@ -861,9 +920,15 @@ def _select_pillars(targets: TargetSet, pillars: Sequence[float]) -> tuple[Float
 
 
 def _first_problem(
-    targets: TargetSet, cfg: BreakEvenFitConfig, xi0: ForwardVarianceCurve
+    targets: TargetSet,
+    cfg: BreakEvenFitConfig,
+    xi0: ForwardVarianceCurve,
+    svc_correction: FloatArray | None = None,
 ) -> tuple[_FirstProblem, list[str]]:
+    cfg, mode_note = _resolved(cfg, targets)
     idx, notes = _select_pillars(targets, cfg.pillars)
+    if mode_note:
+        notes.append(mode_note)
     T = np.asarray(targets.pillars, dtype=np.float64)[idx]
     skew = np.asarray(targets.skew_target, dtype=np.float64)[idx]
     if np.any(skew == 0) or not np.all(np.isfinite(skew)):
@@ -888,6 +953,15 @@ def _first_problem(
     if cfg.skew_mode == "twopoint":
         notes += cnotes
     svc = np.asarray(targets.spot_vol_covar, dtype=np.float64)[idx]
+    if svc_correction is not None:
+        corr = np.asarray(svc_correction, dtype=np.float64)
+        if corr.shape != svc.shape or np.any(~np.isfinite(corr)) or np.any(corr <= 0):
+            raise ValueError("svc_correction needs one finite positive factor per fitted pillar")
+        svc = svc / corr
+        notes.append(
+            "SpotVolCovar targets divided by the simulated/analytic factors "
+            f"{np.round(corr, 4).tolist()} (iterate_against_simulation)"
+        )
     svc_se = np.asarray(targets.spot_vol_covar_se, dtype=np.float64)[idx]
     prob = _FirstProblem(
         quads,
@@ -1151,10 +1225,17 @@ def _first_stderr(
     return k1_se, np.asarray(cov[1:, 1:], dtype=np.float64), notes
 
 
-def fit_first(targets: TargetSet, cfg: BreakEvenFitConfig, xi0: ForwardVarianceCurve) -> FirstFit:
-    """Step 2 (module docstring)."""
+def fit_first(
+    targets: TargetSet,
+    cfg: BreakEvenFitConfig,
+    xi0: ForwardVarianceCurve,
+    *,
+    svc_correction: FloatArray | None = None,
+) -> FirstFit:
+    """Step 2 (module docstring); ``svc_correction`` divides the SpotVolCovar targets (the
+    iteration against simulation of :func:`fit_2f`)."""
     t0 = time.perf_counter()
-    prob, notes = _first_problem(targets, cfg, xi0)
+    prob, notes = _first_problem(targets, cfg, xi0, svc_correction)
     best, sols = _optimise_k1(prob, cfg)
     k1 = best.k1
     at_bound = bool(k1 <= cfg.k1_bounds[0] * (1 + 1e-6) or k1 >= cfg.k1_bounds[1] * (1 - 1e-6))
@@ -1179,7 +1260,7 @@ def fit_first(targets: TargetSet, cfg: BreakEvenFitConfig, xi0: ForwardVarianceC
         _constraint_table(prob, best),
         _short_end_table(prob, targets, xi0, best.lam, k1, cfg),
         best.maps,
-        cfg.skew_mode,
+        prob.skew_mode,
         tuple(notes),
         time.perf_counter() - t0,
     )
@@ -1235,9 +1316,16 @@ def volvar_p1(
     return np.asarray(vv, dtype=np.float64), nu
 
 
-def fit_second(targets: TargetSet, cfg: BreakEvenFitConfig, first: FirstFit) -> SecondFit:
+def fit_second(
+    targets: TargetSet,
+    cfg: BreakEvenFitConfig,
+    first: FirstFit,
+    *,
+    volvar_correction: FloatArray | None = None,
+) -> SecondFit:
     """Step 3 (module docstring): SLSQP with the ν cap as an inequality from ten starts; the
-    best optimum is kept and the number of distinct optima reported."""
+    best optimum is kept and the number of distinct optima reported.  ``volvar_correction``
+    divides the VolVar targets (the iteration against simulation of :func:`fit_2f`)."""
     t0 = time.perf_counter()
     idx, _ = _select_pillars(targets, cfg.pillars)
     notes: list[str] = []
@@ -1259,6 +1347,15 @@ def fit_second(targets: TargetSet, cfg: BreakEvenFitConfig, first: FirstFit) -> 
         vv_t = np.asarray((svc / corr) ** 2, dtype=np.float64)
     else:
         raise ValueError("marking targets need a finite, non-zero Corr_BE at every pillar")
+    if volvar_correction is not None:
+        corr_vv = np.asarray(volvar_correction, dtype=np.float64)
+        if corr_vv.shape != vv_t.shape or np.any(~np.isfinite(corr_vv)) or np.any(corr_vv <= 0):
+            raise ValueError("volvar_correction needs one finite positive factor per fitted pillar")
+        vv_t = vv_t / corr_vv
+        notes.append(
+            "VolVar targets divided by the simulated/analytic factors "
+            f"{np.round(corr_vv, 4).tolist()} (iterate_against_simulation)"
+        )
     w = _weights(cfg.weights_volvar, vv_t)
     lam = first.lam
     A = first.maps.naked.A
@@ -1400,7 +1497,7 @@ def fit_messages(
         what = (
             f"the two-point skew constraint (T={ct['T'].iloc[0]:g}y within eps_s={eps_s:g}, "
             f"T={ct['T'].iloc[1]:g}y within eps_l={eps_l:g})"
-            if cfg.skew_mode == "twopoint"
+            if first.skew_mode == "twopoint"
             else "the soft-mode box"
         )
         skews = ", ".join(
@@ -1422,7 +1519,7 @@ def fit_messages(
         status = "infeasible"
     else:
         status = "interior"
-        if cfg.skew_mode == "twopoint":
+        if first.skew_mode == "twopoint":
             for rec in ct.to_dict(orient="records"):
                 if not rec["binding_edge"]:
                     continue
@@ -1506,9 +1603,24 @@ class Stage3Inputs:
     mixing_dt: float = 1.0 / 365.0
 
 
+class BreakEvenValidationError(RuntimeError):
+    """The stage-3 assertion failed (report decision viii): the simulated break-evens of the
+    calibrated model are not within the tolerance of the fit's targets.  ``result`` carries the
+    :class:`FitResult` (with its stage 3) when raised by :func:`fit_2f`, so nothing is lost."""
+
+    def __init__(self, message: str, result: Any = None) -> None:
+        super().__init__(message)
+        self.result = result
+
+
 @dataclass(frozen=True)
 class Stage3Report:
-    """Stage-3 tables (module docstring) with the wall clocks and the recalibration flag."""
+    """Stage-3 tables (module docstring) with the wall clocks and the recalibration flag.
+    ``check`` is the assertion table (per breakeven pillar and quantity: simulated value and
+    standard error, the fit's target, the first-order value at the solution, the relative gaps
+    to both, ``within``), ``within_tolerance`` its verdict at ``tolerance`` and
+    ``check_message`` the clear message when it fails (the first-order miss of the target —
+    binding — and the engine bias at the solution are reported separately)."""
 
     mean_abs_l_minus_1: float
     leverage_table: pd.DataFrame
@@ -1521,6 +1633,10 @@ class Stage3Report:
     recalibrated: bool
     n_particles: int
     n_paths: int
+    check: pd.DataFrame = field(default_factory=pd.DataFrame)
+    tolerance: float = DEFAULT_STAGE3_TOLERANCE
+    within_tolerance: bool = True
+    check_message: str = ""
 
     def summary(self) -> str:
         lines = [
@@ -1534,6 +1650,8 @@ class Stage3Report:
             self.skew_table.drop(columns=["note"]).round(4).to_string(index=False),
             "simulated break-evens of the LSV vs targets:",
             self.breakeven_table.round(5).to_string(index=False),
+            f"stage-3 assertion (simulated within {self.tolerance:.0%} of the fit's targets): "
+            + ("PASS" if self.within_tolerance else "FAIL - " + self.check_message),
         ]
         if len(self.forward_table):
             lines += [
@@ -1567,43 +1685,144 @@ def spot_skew_90_110(surface: Any, T: float) -> float:
     return float(v[0] - v[1])
 
 
+def _calibrated(params: BergomiParams, inputs: Stage3Inputs) -> tuple[Any, float, bool, int]:
+    """``(lsv, calibration seconds, recalibrated, n_particles)``: the leverage calibrated on
+    ``inputs.surface`` for ``params``, or ``inputs.model`` as given."""
+    from volsto.calibration.particle import calibrate_leverage
+    from volsto.models.bergomi import BergomiSV
+    from volsto.models.lsv import LSV
+
+    surface = inputs.surface
+    if inputs.model is not None:
+        lsv = inputs.model
+        return lsv, 0.0, False, int(lsv.leverage.metadata.get("n_particles", 0))
+    fc = surface.forward_curve
+    xi0 = xi0_curve(surface, min(surface.max_maturity, max(inputs.particle.horizon + 1.0, 5.0)))
+    kernel = BergomiSV(params, xi0, fc)
+    t0 = time.perf_counter()
+    result = calibrate_leverage(
+        surface, kernel, inputs.particle, inputs.sim, local_vol_cfg=inputs.local_vol
+    )
+    lsv = LSV(kernel, result.leverage)
+    return lsv, time.perf_counter() - t0, True, int(inputs.particle.n_particles)
+
+
+def simulated_breakeven_table(
+    lsv: Any,
+    pillars: Sequence[float],
+    targets: TargetSet,
+    psim: Any,
+    *,
+    eps: float,
+    fit_table: pd.DataFrame | None,
+) -> pd.DataFrame:
+    """The simulated break-evens of ``lsv`` per pillar against the fit's targets and first-order
+    values: ``svc_target`` the SpotVolCovar target, ``volvar_target`` the requested ``VoV_BE²``,
+    ``volvar_target_fit`` the step-3 target the fit solved (the ρ_SABR rebuild in marking mode),
+    ``*_p1_first_order`` the fit's analytic values at its solution."""
+    from volsto.analytics.breakeven import simulated_breakevens
+
+    rows = []
+    for T in pillars:
+        b = simulated_breakevens(lsv, float(T), sim=psim, eps=eps, sigma_0=targets.sigma_0)
+        rows.append(
+            {
+                "T": float(T),
+                "svc_sim": b.spot_vol_covar,
+                "svc_se": b.spot_vol_covar_se,
+                "svc_target": _target_at(targets, float(T), targets.spot_vol_covar),
+                "svc_p1_first_order": _table_at(fit_table, float(T), "svc_model"),
+                "volvar_sim": b.vol_var,
+                "volvar_se": b.vol_var_se,
+                "volvar_target": _target_at(targets, float(T), targets.vol_var),
+                "volvar_target_fit": _table_at(fit_table, float(T), "volvar_target"),
+                "volvar_p1_first_order": _table_at(fit_table, float(T), "volvar_model"),
+                "corr_sim": b.correl,
+                "corr_target": _target_at(targets, float(T), targets.correl_target),
+                "ssr_sim": b.ssr,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def breakeven_check(be_table: pd.DataFrame, tolerance: float) -> tuple[pd.DataFrame, bool, str]:
+    """The stage-3 assertion (report decision viii): per pillar, ``svc_sim`` against
+    ``svc_target`` and ``volvar_sim`` against ``volvar_target_fit`` (the step-3 target the fit
+    solved; ``volvar_target`` when the fit carried none) within ``tolerance`` relative.  Returns
+    the check table, the verdict and the message (empty when passed), which separates the
+    first-order miss of the target (a binding fit) from the engine bias at the solution
+    (simulated against first order)."""
+    rows = []
+    for rec in be_table.to_dict(orient="records"):
+        vv_t = rec.get("volvar_target_fit", float("nan"))
+        if not np.isfinite(vv_t):
+            vv_t = rec["volvar_target"]
+        pairs = (
+            (
+                "SpotVolCovar",
+                rec["svc_sim"],
+                rec["svc_se"],
+                rec["svc_target"],
+                rec["svc_p1_first_order"],
+            ),
+            ("VolVar", rec["volvar_sim"], rec["volvar_se"], vv_t, rec["volvar_p1_first_order"]),
+        )
+        for name, sim, se, target, fo in pairs:
+            gap_t = sim / target - 1.0 if target else float("nan")
+            gap_fo = sim / fo - 1.0 if np.isfinite(fo) and fo else float("nan")
+            miss_fo = fo / target - 1.0 if np.isfinite(fo) and target else float("nan")
+            rows.append(
+                {
+                    "T": rec["T"],
+                    "quantity": name,
+                    "sim": sim,
+                    "se": se,
+                    "target": target,
+                    "first_order": fo,
+                    "gap_vs_target": gap_t,
+                    "first_order_miss": miss_fo,
+                    "engine_bias": gap_fo,
+                    "within": bool(np.isfinite(gap_t) and abs(gap_t) <= tolerance),
+                }
+            )
+    table = pd.DataFrame(rows)
+    ok = bool(table["within"].all()) if len(table) else True
+    if ok:
+        return table, True, ""
+    bad = table[~table["within"]]
+    parts = []
+    for r in bad.to_dict(orient="records"):
+        parts.append(
+            f"{r['quantity']} at T={r['T']:g}: simulated {r['sim']:.5f} +/- {r['se']:.5f} vs "
+            f"target {r['target']:.5f} ({r['gap_vs_target']:+.1%}; first-order fit missed the "
+            f"target by {r['first_order_miss']:+.1%}, engine bias at the solution "
+            f"{r['engine_bias']:+.1%})"
+        )
+    msg = f"simulated break-evens outside {tolerance:.0%} of the fit's targets: " + "; ".join(parts)
+    return table, False, msg
+
+
 def stage3_validation(
     params: BergomiParams,
     inputs: Stage3Inputs,
     targets: TargetSet,
     *,
     fit_table: pd.DataFrame | None = None,
+    tolerance: float = DEFAULT_STAGE3_TOLERANCE,
+    assert_breakevens: bool = False,
 ) -> Stage3Report:
     """Stage 3 (module docstring): calibrate the leverage on ``inputs.surface`` for ``params``
-    (or take ``inputs.model``) and report the validation tables; nothing is refit."""
-    from volsto.analytics.breakeven import simulated_breakevens
+    (or take ``inputs.model``) and report the validation tables; nothing is refit.  The
+    break-even assertion (:func:`breakeven_check`) is always evaluated and reported; with
+    ``assert_breakevens`` a failure raises :class:`BreakEvenValidationError`."""
     from volsto.analytics.forward_smile import forward_smile
     from volsto.analytics.smile_dynamics import ssr_numerical_many
     from volsto.calibration.history import mixing_atmf_batch
-    from volsto.calibration.particle import calibrate_leverage
-    from volsto.models.bergomi import BergomiSV
-    from volsto.models.lsv import LSV
 
     t_all = time.perf_counter()
     surface = inputs.surface
-    if inputs.model is None:
-        fc = surface.forward_curve
-        xi0 = xi0_curve(surface, min(surface.max_maturity, max(inputs.particle.horizon + 1.0, 5.0)))
-        kernel = BergomiSV(params, xi0, fc)
-        t0 = time.perf_counter()
-        result = calibrate_leverage(
-            surface, kernel, inputs.particle, inputs.sim, local_vol_cfg=inputs.local_vol
-        )
-        cal_s = time.perf_counter() - t0
-        lsv = LSV(kernel, result.leverage)
-        recalibrated = True
-        n_particles = int(inputs.particle.n_particles)
-    else:
-        lsv = inputs.model
-        kernel = lsv.kernel
-        cal_s = 0.0
-        recalibrated = False
-        n_particles = int(lsv.leverage.metadata.get("n_particles", 0))
+    lsv, cal_s, recalibrated, n_particles = _calibrated(params, inputs)
+    kernel = lsv.kernel
     mean_abs, lev_table = mean_abs_leverage_deviation(lsv.leverage, surface)
     psim = inputs.pricing_sim
     ssr_rows = ssr_numerical_many(lsv, list(inputs.ssr_pillars), eps=inputs.eps, sim=psim)
@@ -1650,28 +1869,10 @@ def stage3_validation(
             }
         )
     skew_table = pd.DataFrame(skew_rows)
-    be_rows = []
-    for T in inputs.breakeven_pillars:
-        b = simulated_breakevens(lsv, float(T), sim=psim, eps=inputs.eps, sigma_0=targets.sigma_0)
-        svc_t = _target_at(targets, float(T), targets.spot_vol_covar)
-        vv_t = _target_at(targets, float(T), targets.vol_var)
-        be_rows.append(
-            {
-                "T": float(T),
-                "svc_sim": b.spot_vol_covar,
-                "svc_se": b.spot_vol_covar_se,
-                "svc_target": svc_t,
-                "svc_p1_first_order": _table_at(fit_table, float(T), "svc_model"),
-                "volvar_sim": b.vol_var,
-                "volvar_se": b.vol_var_se,
-                "volvar_target": vv_t,
-                "volvar_p1_first_order": _table_at(fit_table, float(T), "volvar_model"),
-                "corr_sim": b.correl,
-                "corr_target": _target_at(targets, float(T), targets.correl_target),
-                "ssr_sim": b.ssr,
-            }
-        )
-    be_table = pd.DataFrame(be_rows)
+    be_table = simulated_breakeven_table(
+        lsv, inputs.breakeven_pillars, targets, psim, eps=inputs.eps, fit_table=fit_table
+    )
+    check, within, check_msg = breakeven_check(be_table, tolerance)
     fwd_rows = []
     for t1, t2 in inputs.forward_starts:
         sm = forward_smile(lsv, t1, t2, [0.9, 1.1], psim)
@@ -1694,7 +1895,7 @@ def stage3_validation(
                 "ratio_se": fs_se / abs(spot),
             }
         )
-    return Stage3Report(
+    report = Stage3Report(
         mean_abs,
         lev_table,
         ssr_table,
@@ -1706,7 +1907,14 @@ def stage3_validation(
         recalibrated,
         n_particles,
         int(psim.n_paths),
+        check,
+        float(tolerance),
+        within,
+        check_msg,
     )
+    if assert_breakevens and not within:
+        raise BreakEvenValidationError(check_msg)
+    return report
 
 
 # --------------------------------------------------------------------------------------------
@@ -1738,10 +1946,16 @@ class FitResult:
     recalibrated: bool
     pricing_date: pd.Timestamp | None = None
     notes: tuple[str, ...] = field(default_factory=tuple)
+    iterations: pd.DataFrame | None = None
 
     @property
     def constraints(self) -> pd.DataFrame:
         return self.first.constraints
+
+    @property
+    def stage3_passed(self) -> bool | None:
+        """The stage-3 assertion verdict (None without stage 3)."""
+        return None if self.stage3 is None else bool(self.stage3.within_tolerance)
 
     @property
     def short_end(self) -> pd.DataFrame:
@@ -1805,10 +2019,13 @@ class FitResult:
                     if self.stage3 is None
                     else {
                         "mean_abs_L_minus_1": float(self.stage3.mean_abs_l_minus_1),
+                        "assertion_passed": bool(self.stage3.within_tolerance),
+                        "assertion_message": self.stage3.check_message,
                         "ssr_lsv": _records(self.stage3.ssr_table),
                         "forward_skew": _records(self.stage3.forward_table),
                     }
                 ),
+                "iterations": None if self.iterations is None else _records(self.iterations),
                 "recalibrated": bool(self.recalibrated),
                 "wall_seconds": float(self.wall_seconds),
             },
@@ -1850,6 +2067,11 @@ class FitResult:
         notes = (*self.notes, *f.notes, *s.notes, *self.targets.flags)
         if notes:
             lines.append("notes: " + "; ".join(notes))
+        if self.iterations is not None and len(self.iterations):
+            lines += [
+                "iteration against simulation (targets corrected by the simulated/analytic gap):",
+                self.iterations.round(4).to_string(index=False),
+            ]
         if self.stage3 is not None:
             lines.append(self.stage3.summary())
         return "\n".join(lines)
@@ -1878,37 +2100,160 @@ def fit_2f(
     *,
     stage3: Stage3Inputs | None = None,
     pricing_date: pd.Timestamp | None = None,
+    iterate_against_simulation: int = 0,
+    assert_stage3: bool = True,
 ) -> FitResult:
     """Steps 2 and 3 on ``targets`` with the forward-variance curve ``xi0``, the status and
-    messages, and stage 3 when ``stage3`` is given (module docstring)."""
+    messages, and stage 3 when ``stage3`` is given (module docstring).  ``skew_mode="auto"`` is
+    resolved on the targets' mode (:func:`resolve_skew_mode`) and the resolved config is
+    returned.  ``iterate_against_simulation=k`` (needs ``stage3``): after the fit, ``k`` times, the
+    leverage is calibrated, the break-evens simulated at every fitted pillar and the targets
+    divided by the cumulative simulated/analytic factors before a refit (so the simulated
+    break-evens of the final model land on the original targets up to first-order curvature);
+    the per-iteration gaps are in :attr:`FitResult.iterations`; when an iteration moves the worst
+    simulated gap vs target up (a binding fit cannot follow corrected targets) the loop stops and
+    keeps the best iteration, with a note — measured on SPX 2022-12-30 ``(1.0, 0.10)`` (binding):
+    the raw iteration diverged, ν 1.94 → 2.08 → 2.28 with ρ → −1 / −1 and the VolVar gap 0.31 →
+    1.53.  With ``assert_stage3`` (default) a failed stage-3 assertion raises
+    :class:`BreakEvenValidationError` carrying the full result.
+    """
     t0 = time.perf_counter()
-    c = cfg or BreakEvenFitConfig()
-    _, notes = _select_pillars(targets, c.pillars)
-    first = fit_first(targets, c, xi0)
-    second = fit_second(targets, c, first)
-    status, messages = fit_messages(first, second, c)
-    be = BreakEvenParams(
-        first.k1, c.k2, second.omega1, second.omega2, first.lambda1, first.lambda2, second.chi
-    )
-    params = be.to_book()
-    st = second.table
-    table = first.table.copy()
-    for col in (
-        "volvar_target_requested",
-        "volvar_target",
-        "volvar_model",
-        "vov_target",
-        "vov_model",
-        "corr_target",
-        "corr_model",
-    ):
-        table[col] = st[col].to_numpy()
+    c, mode_note = _resolved(cfg or BreakEvenFitConfig(), targets)
+    idx, notes = _select_pillars(targets, c.pillars)
+    if mode_note:
+        notes.append(mode_note)
+    if iterate_against_simulation < 0:
+        raise ValueError("iterate_against_simulation must be a non-negative integer")
+    if iterate_against_simulation and stage3 is None:
+        raise ValueError("iterate_against_simulation needs stage3 inputs (the simulation)")
+    n = idx.size
+    factors_svc = np.ones(n)
+    factors_vv = np.ones(n)
+
+    def solve(f_svc: FloatArray | None, f_vv: FloatArray | None) -> tuple[Any, ...]:
+        first = fit_first(targets, c, xi0, svc_correction=f_svc)
+        second = fit_second(targets, c, first, volvar_correction=f_vv)
+        status, messages = fit_messages(first, second, c)
+        be = BreakEvenParams(
+            first.k1, c.k2, second.omega1, second.omega2, first.lambda1, first.lambda2, second.chi
+        )
+        params = be.to_book()
+        st = second.table
+        table = first.table.copy()
+        for col in (
+            "volvar_target_requested",
+            "volvar_target",
+            "volvar_model",
+            "vov_target",
+            "vov_model",
+            "corr_target",
+            "corr_model",
+        ):
+            table[col] = st[col].to_numpy()
+        if f_svc is not None:
+            table["svc_correction"] = f_svc
+            table["volvar_correction"] = f_vv
+        return first, second, status, messages, be, params, table
+
+    def gaps(check: pd.DataFrame, quantity: str, column: str) -> float:
+        return float(np.max(np.abs(check.loc[check["quantity"] == quantity, column])))
+
+    first, second, status, messages, be, params, table = solve(None, None)
+    iterations: pd.DataFrame | None = None
+    if iterate_against_simulation:
+        assert stage3 is not None
+        pillars = tuple(float(t) for t in table["T"])
+        rows = []
+        best: tuple[float, Any] | None = None
+        diverged = False
+        for it in range(1, iterate_against_simulation + 1):
+            lsv, cal_s, _, _ = _calibrated(params, stage3)
+            bt = simulated_breakeven_table(
+                lsv, pillars, targets, stage3.pricing_sim, eps=stage3.eps, fit_table=table
+            )
+            chk, _, _ = breakeven_check(bt, c.stage3_tolerance)
+            worst = max(
+                gaps(chk, "SpotVolCovar", "gap_vs_target"), gaps(chk, "VolVar", "gap_vs_target")
+            )
+            rows.append(
+                {
+                    "iteration": it - 1,
+                    "nu": params.nu,
+                    "theta": params.theta,
+                    "k1": params.k1,
+                    "rho_SX1": params.rho_SX1,
+                    "rho_SX2": params.rho_SX2,
+                    "rho12": params.rho12,
+                    "status": status,
+                    "max_gap_svc_vs_target": gaps(chk, "SpotVolCovar", "gap_vs_target"),
+                    "max_gap_volvar_vs_target": gaps(chk, "VolVar", "gap_vs_target"),
+                    "max_engine_bias_svc": gaps(chk, "SpotVolCovar", "engine_bias"),
+                    "max_engine_bias_volvar": gaps(chk, "VolVar", "engine_bias"),
+                    "calibration_seconds": cal_s,
+                }
+            )
+            current = (first, second, status, messages, be, params, table, factors_svc, factors_vv)
+            if best is not None and worst > best[0] * (1.0 + 1e-9):
+                # the correction moved the simulated break-evens away from the targets (a binding
+                # fit cannot follow the corrected targets): keep the best iteration and stop
+                diverged = True
+                first, second, status, messages, be, params, table, factors_svc, factors_vv = best[
+                    1
+                ]
+                break
+            best = (worst, current)
+            r_svc = bt["svc_sim"].to_numpy() / table["svc_model"].to_numpy()
+            r_vv = bt["volvar_sim"].to_numpy() / table["volvar_model"].to_numpy()
+            factors_svc = factors_svc * r_svc
+            factors_vv = factors_vv * r_vv
+            first, second, status, messages, be, params, table = solve(factors_svc, factors_vv)
+        iterations = pd.DataFrame(rows)
+        if diverged:
+            worst_by_it = np.maximum(
+                iterations["max_gap_svc_vs_target"], iterations["max_gap_volvar_vs_target"]
+            )
+            notes.append(
+                f"iterate_against_simulation diverged at iteration {len(rows) - 1}: the worst "
+                f"simulated gap vs target grew beyond the best {float(worst_by_it.min()):.3f} "
+                f"(the fit is {status}, a constrained covariance cannot follow corrected "
+                f"targets); kept iteration {int(np.argmin(worst_by_it))}"
+            )
+        else:
+            notes.append(
+                f"iterated {iterate_against_simulation}x against simulation: cumulative target "
+                f"corrections svc {np.round(factors_svc, 4).tolist()}, volvar "
+                f"{np.round(factors_vv, 4).tolist()}"
+            )
+    if abs(params.rho12) > c.rho12_flag:
+        notes.append(
+            f"rho12 = {params.rho12:+.3f}: |rho12| > {c.rho12_flag:g}, two-factor structure "
+            "collapsing (the two factors are nearly one)"
+        )
     s3 = None
     recalibrated = False
     if stage3 is not None:
-        s3 = stage3_validation(params, stage3, targets, fit_table=table)
+        s3 = stage3_validation(
+            params, stage3, targets, fit_table=table, tolerance=c.stage3_tolerance
+        )
         recalibrated = s3.recalibrated
-    return FitResult(
+        if iterations is not None:
+            last = {
+                "iteration": iterate_against_simulation,
+                "nu": params.nu,
+                "theta": params.theta,
+                "k1": params.k1,
+                "rho_SX1": params.rho_SX1,
+                "rho_SX2": params.rho_SX2,
+                "rho12": params.rho12,
+                "status": status,
+                "max_gap_svc_vs_target": gaps(s3.check, "SpotVolCovar", "gap_vs_target"),
+                "max_gap_volvar_vs_target": gaps(s3.check, "VolVar", "gap_vs_target"),
+                "max_engine_bias_svc": gaps(s3.check, "SpotVolCovar", "engine_bias"),
+                "max_engine_bias_volvar": gaps(s3.check, "VolVar", "engine_bias"),
+                "calibration_seconds": s3.calibration_seconds,
+            }
+            iterations = pd.concat([iterations, pd.DataFrame([last])], ignore_index=True)
+    result = FitResult(
         params,
         be,
         targets,
@@ -1925,7 +2270,11 @@ def fit_2f(
         recalibrated,
         pricing_date,
         tuple(notes),
+        iterations,
     )
+    if assert_stage3 and s3 is not None and not s3.within_tolerance:
+        raise BreakEvenValidationError(s3.check_message, result=result)
+    return result
 
 
 def naked_kernel(result: FitResult, forward_curve: Any) -> Any:
@@ -1943,27 +2292,59 @@ def fit_2f_marking(
     anchor_power: float = 1.0,
     stage3: Stage3Inputs | None = None,
     h: float = SABR_CURVATURE_H,
+    iterate_against_simulation: int = 0,
+    assert_stage3: bool = True,
 ) -> FitResult:
     """Marking mode on a surface: targets by :func:`~volsto.calibration.targets.marking_targets`
-    (the config's pillars, ``mat_min``, SmoothBreakEven and step-0 conventions), ``ξ₀`` the
-    surface's variance-swap strip to the last fitted pillar."""
+    (the config's pillars, ``mat_min``, SmoothBreakEven, the radicand guard and step-0
+    conventions), ``ξ₀`` the surface's variance-swap strip to the last fitted pillar."""
     c = cfg or BreakEvenFitConfig()
-    targets = marking_targets(
-        surface,
-        c.pillars,
-        ssr_target=ssr_target,
-        anchor_power=anchor_power,
-        h=h,
-        mat_min=c.mat_min,
-        smooth_breakeven=c.smooth_breakeven,
-        sabrw_power=c.sabrw_power,
-        atf_ref=c.atf_ref,
-    )
+    targets = marking_targets_for(surface, c, ssr_target=ssr_target, anchor_power=anchor_power, h=h)
     t_max = float(min(surface.max_maturity, max(targets.pillars)))
     xi0 = xi0_curve(surface, t_max)
     c = replace(c, pillars=tuple(float(t) for t in targets.pillars))
-    r = fit_2f(targets, xi0, c, stage3=stage3)
-    return replace(r, notes=(*r.notes, *(f"target: {f}" for f in targets.flags if "dropped" in f)))
+    try:
+        r = fit_2f(
+            targets,
+            xi0,
+            c,
+            stage3=stage3,
+            iterate_against_simulation=iterate_against_simulation,
+            assert_stage3=assert_stage3,
+        )
+    except BreakEvenValidationError as exc:
+        if exc.result is not None:
+            exc.result = _with_target_notes(exc.result, targets)
+        raise
+    return _with_target_notes(r, targets)
+
+
+def _with_target_notes(r: FitResult, targets: TargetSet) -> FitResult:
+    extra = tuple(f"target: {f}" for f in targets.flags if "dropped" in f or "guard" in f)
+    return replace(r, notes=(*r.notes, *extra)) if extra else r
+
+
+def marking_targets_for(
+    surface: Any,
+    cfg: BreakEvenFitConfig,
+    *,
+    ssr_target: SsrInput = 1.0,
+    anchor_power: float = 1.0,
+    h: float = SABR_CURVATURE_H,
+) -> TargetSet:
+    """:func:`~volsto.calibration.targets.marking_targets` with the config's target settings."""
+    return marking_targets(
+        surface,
+        cfg.pillars,
+        ssr_target=ssr_target,
+        anchor_power=anchor_power,
+        h=h,
+        mat_min=cfg.mat_min,
+        smooth_breakeven=cfg.smooth_breakeven,
+        sabrw_power=cfg.sabrw_power,
+        atf_ref=cfg.atf_ref,
+        radicand_floor=cfg.radicand_floor,
+    )
 
 
 def _curve_from_vs(pillars: FloatArray, vs_vol: FloatArray) -> ForwardVarianceCurve:
@@ -2105,15 +2486,20 @@ __all__ = [
     "DEFAULT_NU_CAP",
     "DEFAULT_SKEW_EPS",
     "DEFAULT_SKEW_PILLARS",
+    "DEFAULT_SKEW_WEIGHT",
+    "DEFAULT_STAGE3_TOLERANCE",
     "INFEASIBLE_MESSAGE",
     "MAX_FINITE_SE",
     "NU_CAP_WARNING",
+    "RHO12_COLLAPSE",
     "RISK_REGIME",
     "SKEW_MODES",
+    "SKEW_MODE_CHOICES",
     "TERM_STRUCTURE_KINDS",
     "WEIGHT_KINDS",
     "AffineMaps",
     "BreakEvenFitConfig",
+    "BreakEvenValidationError",
     "FirstFit",
     "FitResult",
     "FitSpec",
@@ -2127,6 +2513,7 @@ __all__ = [
     "TermStructureBank",
     "affine_maps",
     "affine_maps_from_kernels",
+    "breakeven_check",
     "fit_2f",
     "fit_2f_historical",
     "fit_2f_marking",
@@ -2136,9 +2523,12 @@ __all__ = [
     "fit_spec_document",
     "k1_profile",
     "load_fit_spec",
+    "marking_targets_for",
     "mean_abs_leverage_deviation",
     "naked_kernel",
     "pillar_quad",
+    "resolve_skew_mode",
+    "simulated_breakeven_table",
     "spot_skew_90_110",
     "stage3_validation",
     "term_structure_bank",

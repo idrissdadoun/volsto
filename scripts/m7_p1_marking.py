@@ -1,14 +1,17 @@
 """M7 Part 3 final: the P1 marking calibration (SABR break-evens, two-point 1Y/5Y hard skew
-constraint) on the reference SSVI and SPX 2022-12-30, with every diagnostic and the
-shadow-rotation greek (owner's "M7 Part 3 FINAL"; methodology in the module docstrings of
+constraint) on SPX 2022-12-30 (the marking reference since the owner's report decision vii; the
+placeholder SSVI on request with ``--surfaces spx,reference``), with every diagnostic, the
+stage-3 assertion and the shadow-rotation greek under both recalibration policies (owner's "M7
+Part 3 FINAL" and report decisions; methodology in the module docstrings of
 :mod:`volsto.calibration.fit_2f`, :mod:`volsto.calibration.targets` and
 :mod:`volsto.risk.shadow_rotation`).
 
-Fits: ``(ssr_target, skew_eps) = (1.0, 0.10)`` and ``(1.5, 0.05)`` with the fitter's defaults
-otherwise (pillars 3M–10Y inside the surface, MatMin 3M, SmoothBreakEven, k2 = 0.2, ν cap 2.5).
-Surfaces: the reference SSVI of ``configs/studies/lsv_reference_2f.yaml`` (to 10Y) and the plain
-SSVI snapshot ``configs/surfaces/snapshots/hdn_2022H2_ssvi/spx_2022-12-30.yaml`` (quoted to 3Y:
-the 5Y / 10Y pillars are dropped and the 5Y skew constraint moves to 3Y, with the fitter's note).
+Fits: ``--pairs`` (default ``(ssr_target, skew_eps) = (1.0, 0.10)`` and ``(1.5, 0.05)``) with the
+fitter's defaults otherwise (pillars 3M–10Y inside the surface, MatMin 3M, SmoothBreakEven, k2 =
+0.2, ν cap 3.5).  Surfaces: the plain SSVI snapshot
+``configs/surfaces/snapshots/hdn_2022H2_ssvi/spx_2022-12-30.yaml`` (quoted to 3Y: the 5Y / 10Y
+pillars are dropped and the 5Y skew constraint moves to 3Y, with the fitter's note) and, on
+request, the reference SSVI of ``configs/studies/lsv_reference_2f.yaml`` (to 10Y).
 
 Per fit: the fitted parameter set is written as a study spec
 (``configs/studies/m7_p1_marking/<surface>_ssr<s>_eps<e>.yaml``), its leverage calibrated into the
@@ -16,18 +19,21 @@ cache (``ParticleConfig`` of the reference study spec, ``--n-particles`` default
 a cache hit is reported as not recalibrated), and stage 3 runs on the cached LSV: numerical SSR at
 3M / 6M / 1Y / 2Y / 3Y (diagnostic), mean ``|L − 1|``, naked mixing skew and simulated
 SpotVolCovar / VolVar at 3M / 1Y, forward 90/110 skew at 1y-into-1y and 2y-into-1y against the
-spot 1y skew (``--n-paths`` default 10⁵, seed 7).
+spot 1y skew (``--n-paths`` default 10⁵, seed 7); the stage-3 assertion (simulated SpotVolCovar
+and VolVar within the config tolerance of the fit's targets) is reported per fit, never raised
+here.  ``--iterate k`` runs the iteration against simulation on every fit (``k`` extra
+calibrations each, not cached) and reports its convergence.
 
-Shadow rotation (``--rotation``, default both surfaces): the M6 headline 3y autocall on the
-``(1.0, 0.10)`` fit, central differences at ±1 rota, the four rotated states calibrated into the
-cache (``configs/studies/m7_p1_marking/rotation_<surface>.yaml`` records the refit sets),
-``--rotation-paths`` default 2·10⁵ (seed 2024).
+Shadow rotation (``--rotation``, default ``spx``; ``--policies`` default both): the M6 headline
+3y autocall on the ``(1.0, 0.10)`` fit, central differences at ±1 rota, the rotated states
+calibrated into the cache (``configs/studies/m7_p1_marking/rotation_<surface>_<policy>.yaml``
+records the refit sets and the greeks), ``--rotation-paths`` default 2·10⁵ (seed 2024).
 
 Outputs: ``<out>/p1_marking.md``, ``p1_marking_fits.csv``, ``p1_marking_shadow_rotation.csv``.
-Every section states its wall clock and whether it recalibrated.  Full run (about an hour; under
+Every section states its wall clock and whether it recalibrated.  Full run (10–20 min; under
 ``caffeinate -i``)::
 
-    caffeinate -i .venv/bin/python scripts/m7_p1_marking.py
+    caffeinate -i .venv/bin/python scripts/m7_p1_marking.py --surfaces spx,reference
 
 Smoke test (first order only)::
 
@@ -49,6 +55,7 @@ import yaml
 from volsto.calibration.cache import LeverageCache, build_market
 from volsto.calibration.fit_2f import (
     BreakEvenFitConfig,
+    BreakEvenValidationError,
     FitResult,
     Stage3Inputs,
     fit_2f_marking,
@@ -63,7 +70,7 @@ from volsto.config import (
     load_yaml,
     to_mapping,
 )
-from volsto.risk.shadow_rotation import rotation_shadow_sensitivity
+from volsto.risk.shadow_rotation import RECALIBRATION_POLICIES, rotation_shadow_sensitivity
 from volsto.studies.m6 import AUTOCALL_NAME, headline_products
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -73,7 +80,7 @@ SPX_SNAPSHOT = (
 )
 STUDY_DIR = ROOT / "configs" / "studies" / "m7_p1_marking"
 FITS: tuple[tuple[float, float], ...] = ((1.0, 0.10), (1.5, 0.05))
-SURFACES = ("reference", "spx")
+SURFACES = ("spx", "reference")
 SSR_PILLARS = (0.25, 0.5, 1.0, 2.0, 3.0)
 BE_PILLARS = (0.25, 1.0)
 FORWARD_STARTS = ((1.0, 2.0), (2.0, 3.0))
@@ -126,7 +133,17 @@ def fit_row(surface: str, ssr: float, eps: float, r: FitResult) -> dict[str, Any
     )
     row["corr_model_mean"] = float(r.table["corr_model"].mean())
     row["corr_target_mean"] = float(r.table["corr_target"].mean())
+    row["rho12_collapse"] = any("collapsing" in n for n in r.notes)
     return row
+
+
+def _pairs(text: str) -> list[tuple[float, float]]:
+    out = []
+    for item in text.split(","):
+        if item.strip():
+            a, b = item.split(":")
+            out.append((float(a), float(b)))
+    return out
 
 
 def _transpose(df: pd.DataFrame) -> pd.DataFrame:
@@ -157,11 +174,14 @@ def markdown_table(df: pd.DataFrame, digits: int = 4) -> str:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--surfaces", default=",".join(SURFACES))
+    ap.add_argument("--surfaces", default="spx", help="comma-separated: spx, reference")
+    ap.add_argument("--pairs", default="1.0:0.10,1.5:0.05", help="ssr_target:skew_eps pairs")
+    ap.add_argument("--iterate", type=int, default=0, help="iterate_against_simulation k")
     ap.add_argument("--n-particles", type=int, default=200_000)
     ap.add_argument("--n-paths", type=int, default=100_000)
     ap.add_argument("--mixing-paths", type=int, default=100_000)
-    ap.add_argument("--rotation", default=",".join(SURFACES), help="surfaces, or 'none'")
+    ap.add_argument("--rotation", default="spx", help="surfaces, or 'none'")
+    ap.add_argument("--policies", default=",".join(RECALIBRATION_POLICIES))
     ap.add_argument("--rotation-paths", type=int, default=200_000)
     ap.add_argument("--no-stage3", action="store_true")
     ap.add_argument("--no-rotation", action="store_true")
@@ -174,6 +194,7 @@ def main() -> None:
     out.mkdir(parents=True, exist_ok=True)
     cache = LeverageCache(args.cache)
     surfaces = [s for s in args.surfaces.split(",") if s]
+    pairs = _pairs(args.pairs)
     pricing = SimConfig(n_paths=int(args.n_paths), chunk_size=100_000, seed=7)
     rows: list[dict[str, Any]] = []
     details: list[str] = []
@@ -181,11 +202,44 @@ def main() -> None:
     for surface in surfaces:
         spec = base_spec(surface, int(args.n_particles))
         _, surf, _ = build_market(spec)
-        for ssr, eps in FITS:
+        for ssr, eps in pairs:
             t0 = time.perf_counter()
             cfg = BreakEvenFitConfig(skew_eps=eps)
             r = fit_2f_marking(surf, cfg, ssr_target=ssr)
             fo_s = time.perf_counter() - t0
+            iterated: FitResult | None = None
+            if args.iterate and not args.no_stage3:
+                t_it = time.perf_counter()
+                try:
+                    iterated = fit_2f_marking(
+                        surf,
+                        cfg,
+                        ssr_target=ssr,
+                        stage3=Stage3Inputs(
+                            surface=surf,
+                            particle=spec.particle,
+                            sim=spec.sim,
+                            pricing_sim=pricing,
+                            ssr_pillars=(0.25, 1.0),
+                            breakeven_pillars=tuple(float(t) for t in r.table["T"]),
+                            forward_starts=(),
+                            mixing_paths=int(args.mixing_paths),
+                        ),
+                        iterate_against_simulation=int(args.iterate),
+                        assert_stage3=False,
+                    )
+                except BreakEvenValidationError as exc:
+                    iterated = exc.result
+                print(
+                    f"  iterated {args.iterate}x ({time.perf_counter() - t_it:.0f} s, "
+                    f"recalibrated {args.iterate + 1}x):\n"
+                    + (
+                        iterated.iterations.round(4).to_string(index=False)
+                        if iterated is not None and iterated.iterations is not None
+                        else "-"
+                    ),
+                    flush=True,
+                )
             name = label(surface, ssr, eps)
             row = fit_row(surface, ssr, eps, r)
             row["fit_seconds"] = fo_s
@@ -200,6 +254,24 @@ def main() -> None:
                 r.targets.frame().round(5).to_string(index=False),
                 "```",
             ]
+            if iterated is not None and iterated.iterations is not None:
+                s3i = iterated.stage3
+                block += [
+                    "",
+                    f"Iteration against simulation (k = {args.iterate}; every iteration "
+                    "recalibrates the leverage, not cached):",
+                    "",
+                    "```",
+                    iterated.iterations.round(4).to_string(index=False),
+                    "final params: " + repr(iterated.params),
+                    "stage-3 assertion on the final model: "
+                    + (
+                        "PASS"
+                        if s3i is not None and s3i.within_tolerance
+                        else "FAIL - " + (s3i.check_message if s3i is not None else "no stage 3")
+                    ),
+                    "```",
+                ]
             spec_path = write_fit_spec(
                 r,
                 spec,
@@ -232,9 +304,21 @@ def main() -> None:
                     ),
                     r.targets,
                     fit_table=r.table,
+                    tolerance=cfg.stage3_tolerance,
                 )
+                chk = s3.check
                 row.update(
                     {
+                        "stage3_assertion": "pass" if s3.within_tolerance else "FAIL",
+                        "stage3_max_gap_svc": float(
+                            chk.query("quantity == 'SpotVolCovar'")["gap_vs_target"].abs().max()
+                        ),
+                        "stage3_max_gap_volvar": float(
+                            chk.query("quantity == 'VolVar'")["gap_vs_target"].abs().max()
+                        ),
+                        "stage3_max_engine_bias_svc": float(
+                            chk.query("quantity == 'SpotVolCovar'")["engine_bias"].abs().max()
+                        ),
                         "mean_abs_L_minus_1": s3.mean_abs_l_minus_1,
                         "recalibrated": miss,
                         "calibration_seconds": cal_s if miss else 0.0,
@@ -260,7 +344,9 @@ def main() -> None:
                 ]
                 print(
                     f"  leverage {'calibrated' if miss else 'hit'} {cal_s:.0f} s; stage 3 "
-                    f"{s3.wall_seconds:.0f} s; |L-1| {s3.mean_abs_l_minus_1:.3f}; SSR "
+                    f"{s3.wall_seconds:.0f} s; assertion "
+                    f"{'PASS' if s3.within_tolerance else 'FAIL'}; "
+                    f"|L-1| {s3.mean_abs_l_minus_1:.3f}; SSR "
                     + ", ".join(
                         f"{x['T']:g}: {x['ssr_lsv']:.3f}±{x['ssr_lsv_se']:.3f}"
                         for x in s3.ssr_table.to_dict(orient="records")
@@ -276,7 +362,9 @@ def main() -> None:
     rot_rows: list[dict[str, Any]] = []
     if not args.no_rotation and args.rotation != "none":
         rsim = SimConfig(n_paths=int(args.rotation_paths), chunk_size=100_000, seed=2024)
-        for surface in [s for s in args.rotation.split(",") if s]:
+        policies = [p for p in args.policies.split(",") if p]
+        combos = [(sf, pol) for sf in args.rotation.split(",") if sf for pol in policies]
+        for surface, policy in combos:
             spec = base_spec(surface, int(args.n_particles))
             fc, _, _ = build_market(spec)
             product = headline_products(fc.rate_curve, spec.market.spot)[AUTOCALL_NAME]
@@ -290,10 +378,12 @@ def main() -> None:
                 pricing_sim=rsim,
                 size=1.0,
                 product_name=f"{AUTOCALL_NAME} on {surface}",
+                policy=policy,
             )
             any_recal = any_recal or rep.recalibrated_any
             doc = {
                 "surface": surface,
+                "policy": policy,
                 "ssr_target": 1.0,
                 "skew_eps": 0.10,
                 "size": rep.size,
@@ -306,17 +396,18 @@ def main() -> None:
                 "recalibrated": [rep.recalibrated.value, rep.recalibrated.stderr],
                 "shadow": [rep.shadow.value, rep.shadow.stderr],
             }
-            (STUDY_DIR / f"rotation_{surface}.yaml").write_text(
+            (STUDY_DIR / f"rotation_{surface}_{policy}.yaml").write_text(
                 yaml.safe_dump(doc, sort_keys=False), encoding="utf-8"
             )
             fr = rep.frame()
+            fr.insert(0, "policy", policy)
             fr.insert(0, "surface", surface)
             fr["fee"] = rep.fee.value
             fr["fee_se"] = rep.fee.stderr
             rot_rows += fr.to_dict(orient="records")
             rot_lines += [
                 "",
-                f"### Shadow rotation, {surface} (cache entries before {misses_before}; "
+                f"### Shadow rotation, {surface}, {policy} (cache entries before {misses_before}; "
                 f"{rep.n_cache_misses} misses; recalibrated: "
                 f"{'yes' if rep.recalibrated_any else 'no'}; {rep.wall_seconds:.0f} s)",
                 "",

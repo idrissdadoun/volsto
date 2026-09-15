@@ -31,13 +31,13 @@ spec:
     gamma: 0.5
     max_maturity: 10.0
   model:
-    nu: 2.50000000097309
-    theta: 0.0586812419260278
-    k1: 6.34845675919964
+    nu: 3.5
+    theta: 0.046421874095145046
+    k1: 9.820042265121801
     k2: 0.2
-    rho12: 0.9999947749049475
-    rho_SX1: -0.9999999840701702
-    rho_SX2: -0.9999953304201683
+    rho12: 0.9870448450210993
+    rho_SX1: -0.9999727906893636
+    rho_SX2: -0.9881907734024639
   particle:
     n_particles: 200000
     horizon: 3.0
@@ -102,6 +102,7 @@ fit:
     - 20.0
     k1_min_gap: 0.05
     k1_grid: 25
+    radicand_floor: 0.5
     skew_mode: twopoint
     skew_eps:
     - 0.1
@@ -109,15 +110,17 @@ fit:
     skew_pillars:
     - 1.0
     - 5.0
-    skew_weight: 1.0
+    skew_weight: 10.0
     weights_covar: relative
     weights_volvar: relative
     term_structure: atmf
-    nu_cap: 2.5
+    nu_cap: 3.5
     chi_bounds:
     - -0.99
     - 0.99
     omega_max: 20.0
+    stage3_tolerance: 0.1
+    rho12_flag: 0.9
     n_quad: 64
     n_inner: 32
     n_ts: 64
@@ -125,21 +128,26 @@ fit:
     n_inner_ts: 24
   ssr_target: 1.0
   breakeven:
-    k1: 6.34845675919964
+    k1: 9.820042265121801
     k2: 0.2
-    omega1: 4.706595150631357
-    omega2: 0.2934062944280178
-    lambda1: -4.7065950756560975
-    lambda2: -0.29340492434390286
-    chi: -0.9892049607881469
+    omega1: 6.678878212308681
+    omega2: 0.3251396346517458
+    lambda1: -6.6786964846367
+    lambda2: -0.3212999870303032
+    chi: -0.9899999999999969
   status: binding
   messages:
   - 'skew constraint binds at T=1 (lower edge: naked skew = (1+0.1) x Skew_SABR =
     -0.37752): naked skew -0.37752 vs market -0.34320 (+10.0%, eps 0.1); SpotVolCovar
-    achieved vs target: 0.25y -0.35140/-0.14522 (+142.0%), 0.5y -0.19571/-0.10367
-    (+88.8%), 1y -0.11002/-0.07261 (+51.5%), 2y -0.06801/-0.04992 (+36.2%), 3y -0.05288/-0.03975
-    (+33.0%), 5y -0.03937/-0.02956 (+33.2%), 10y -0.02540/-0.01945 (+30.6%)'
-  - nu at cap 2.5; first-order break-even engine ~15% biased beyond ~4; raise only
-    if stage-3 simulation validates (step 2 box |lambda1|+|lambda2| <= 2 nu_cap)
+    achieved vs target: 0.25y -0.28654/-0.14522 (+97.3%), 0.5y -0.14994/-0.10367 (+44.6%),
+    1y -0.08790/-0.07261 (+21.1%), 2y -0.05897/-0.04992 (+18.1%), 3y -0.04777/-0.03975
+    (+20.2%), 5y -0.03679/-0.02956 (+24.5%), 10y -0.02412/-0.01945 (+24.0%)'
+  - 'skew constraint binds at T=5 (upper edge: naked skew = (1-0.1) x Skew_SABR =
+    -0.12763): naked skew -0.12763 vs market -0.14181 (-10.0%, eps 0.1); SpotVolCovar
+    achieved vs target: 0.25y -0.28654/-0.14522 (+97.3%), 0.5y -0.14994/-0.10367 (+44.6%),
+    1y -0.08790/-0.07261 (+21.1%), 2y -0.05897/-0.04992 (+18.1%), 3y -0.04777/-0.03975
+    (+20.2%), 5y -0.03679/-0.02956 (+24.5%), 10y -0.02412/-0.01945 (+24.0%)'
+  - nu at cap 3.5; first-order break-even engine ~15% biased beyond ~4; raise only
+    if stage-3 simulation validates (step 3)
   surface: reference
   skew_eps: 0.1

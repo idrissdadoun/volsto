@@ -1,9 +1,9 @@
-"""P1 marking calibration by SABR break-evens (SPEC §15 Part 3, owner's "M7 Part 3 FINAL";
-``calibration/fit_2f.py``, ``calibration/stability.py``).  Tests never calibrate a leverage:
-cached leverages are read with ``allow_calibrate=False`` and skipped when absent; no wall-clock
-assertion.  Every SSR asserted without a Monte Carlo standard error is a first-order value
-(optimiser / formula self-consistency); the calibrated LSV's numerical SSR is reported, never
-asserted equal to the target.
+"""P1 marking calibration by SABR break-evens (SPEC §15 Part 3, owner's "M7 Part 3 FINAL" and
+the report decisions; ``calibration/fit_2f.py``, ``calibration/stability.py``).  Tests never
+calibrate a leverage: cached leverages are read with ``allow_calibrate=False`` and skipped when
+absent; no wall-clock assertion.  Every SSR asserted without a Monte Carlo standard error is a
+first-order value (optimiser / formula self-consistency); the calibrated LSV's numerical SSR is
+reported, never asserted equal to the target.
 
 Fast:
 
@@ -16,15 +16,21 @@ Fast:
   two-point constraint binds only at 1Y / 5Y (3Y on a surface quoted to 3Y, with the note);
   ``ssr_target`` and ``skew_eps`` both exercised (scalar, pair, soft mode); the binding message
   on an incompatible ``(ssr, eps)`` pair and the infeasible message with the ν box; the ν-cap
-  warning logged; ``Corr_BE = ρ_SABR`` kept by the VolVar rebuild; the realised LSV SSR of the
-  cached study fits reported, not asserted equal to 1;
-* historical mode: recovery on the one-year order-one history (soft all-pillar skew, weight 10)
-  and the default two-point fit reported; the rolling fit and identification flags;
-* stage 3 on the cached 2F Table 8.2 LSV (the P1 first-order SSR within 10% of the numerical LSV
-  SSR) and the study specs round trip.
+  warning logged (cap 3.5, report decision viii); ``Corr_BE = ρ_SABR`` kept by the VolVar
+  rebuild; the ρ12 collapse note (decision vii); the realised LSV SSR and the stage-3 assertion
+  verdict of the cached study fits reported, not asserted equal to 1 / pass;
+* historical mode: recovery on the one-year order-one history under the **default** config
+  (``skew_mode="auto"`` → soft all-pillar penalty at weight 10, report decision v) and the
+  two-point fit reported; the rolling fit and identification flags;
+* stage 3 on the cached 2F Table 8.2 LSV: the P1 first-order SSR within 10% of the numerical LSV
+  SSR, the break-even assertion machinery (``breakeven_check`` on the Table 8.2 LSV against
+  ``ssr = 1`` targets fails with the message separating the first-order miss from the engine
+  bias; :class:`BreakEvenValidationError` carries the result; the iteration plumbing on the cached
+  model) and the study specs round trip.
 
-Slow: the three-year mixing recovery (owner's tolerances; soft weight 10 passes, the default
-two-point configuration is a strict xfail with the measured miss), the real-data run.
+Slow: the three-year mixing recovery under the default config (owner's tolerances; un-xfailed
+per report decision v), the explicit two-point configuration as a strict xfail with the measured
+ρ_SX1 miss, the real-data run.
 """
 
 from __future__ import annotations
@@ -47,13 +53,17 @@ from volsto.calibration.fit_2f import (
     INFEASIBLE_MESSAGE,
     NU_CAP_WARNING,
     BreakEvenFitConfig,
+    BreakEvenValidationError,
     Stage3Inputs,
     affine_maps,
     affine_maps_from_kernels,
+    breakeven_check,
+    fit_2f,
     fit_2f_historical,
     fit_2f_marking,
     load_fit_spec,
     pillar_quad,
+    resolve_skew_mode,
     stage3_validation,
     volvar_p1,
     write_fit_spec,
@@ -71,8 +81,6 @@ P82 = BergomiParams(1.74, 0.245, 5.35, 0.28, 0.0, -0.759, -0.487)
 STUDY_DIR = ROOT / "configs" / "studies" / "m7_p1_marking"
 SPX = ROOT / "configs" / "surfaces" / "snapshots" / "hdn_2022H2_ssvi" / "spx_2022-12-30.yaml"
 SSR_SIM = SimConfig(n_paths=40_000, dt_max=1.0 / 100.0, chunk_size=20_000, seed=7)
-#: recovery on the one-year history: soft all-pillar skew penalty, weight 10 (module docstring)
-RECOVERY_SOFT = {"skew_mode": "soft", "skew_weight": 10.0}
 
 
 def _cached(spec):  # type: ignore[no-untyped-def]
@@ -93,11 +101,15 @@ def _reference_spec(kind: str):  # type: ignore[no-untyped-def]
     )
 
 
-@pytest.fixture(scope="module")
-def spx():  # type: ignore[no-untyped-def]
+def _spx_surface():  # type: ignore[no-untyped-def]
     from volsto.market.loaders import load_ssvi_surface
 
     return load_ssvi_surface(SPX)
+
+
+@pytest.fixture(scope="module")
+def spx():  # type: ignore[no-untyped-def]
+    return _spx_surface()
 
 
 @pytest.fixture(scope="module")
@@ -132,18 +144,22 @@ def synthetic_3y():  # type: ignore[no-untyped-def]
 # --------------------------------------------------------------------------------------------
 
 
-def test_config_validation() -> None:
+def test_config_validation(ssvi) -> None:  # type: ignore[no-untyped-def]
     d = BreakEvenFitConfig()
     assert d.pillars == (0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0) and d.mat_min == 0.25
     assert d.smooth_breakeven and d.sabrw_power == 1.0 and d.atf_ref == 0.3
-    assert (d.k2, d.k1_bounds, d.skew_mode, d.skew_pillars) == (
-        0.2,
-        (0.3, 20.0),
-        "twopoint",
-        (1, 5),
-    )
-    assert d.skew_eps == (0.10, 0.10) and d.eps_pair == (0.10, 0.10) and d.nu_cap == 2.5
+    assert (d.k2, d.k1_bounds, d.skew_mode, d.skew_pillars) == (0.2, (0.3, 20.0), "auto", (1, 5))
+    assert d.skew_eps == (0.10, 0.10) and d.eps_pair == (0.10, 0.10) and d.nu_cap == 3.5
+    assert d.skew_weight == 10.0 and d.radicand_floor == 0.5 and d.stage3_tolerance == 0.10
+    assert d.rho12_flag == 0.9
     assert d.weights_covar == d.weights_volvar == "relative" and d.chi_bounds == (-0.99, 0.99)
+    tg = marking_targets(ssvi, (0.25, 1.0, 3.0))
+    assert resolve_skew_mode(d, tg)[0] == "twopoint"
+    hist_like = dataclasses.replace(tg, mode="historical", skew_fn=None, atm_vol_fn=None)
+    mode, note = resolve_skew_mode(d, hist_like)
+    assert mode == "soft" and "auto" in note
+    explicit = dataclasses.replace(d, skew_mode="twopoint")
+    assert resolve_skew_mode(explicit, hist_like) == ("twopoint", "")
     assert BreakEvenFitConfig(skew_eps=(0.1, 0.02)).eps_pair == (0.1, 0.02)
     assert BreakEvenFitConfig(skew_eps=0.05).skew_eps == (0.05, 0.05)
     for bad in (
@@ -155,10 +171,13 @@ def test_config_validation() -> None:
         {"weights_covar": "log"},
         {"weights_volvar": (1.0, -1.0)},
         {"term_structure": "linear"},
-        {"omega_max": 4.0},  # must exceed 2 nu_cap = 5
+        {"omega_max": 6.0},  # must exceed 2 nu_cap = 7
         {"nu_cap": 0.0},
         {"atf_ref": 0.0},
         {"skew_weight": -1.0},
+        {"radicand_floor": 1.0},
+        {"stage3_tolerance": 0.0},
+        {"rho12_flag": 1.5},
     ):
         with pytest.raises(ValueError):
             BreakEvenFitConfig(**bad)  # type: ignore[arg-type]
@@ -199,7 +218,7 @@ def test_affine_maps_match_engine(ssvi, rng) -> None:  # type: ignore[no-untyped
 def test_exact_qp_and_least_violation(rng) -> None:  # type: ignore[no-untyped-def]
     """The candidate enumeration of the inner 2-D QP against SLSQP on random instances (the ν
     box, random slabs, both together), and the least-violation programme: an empty set becomes
-    feasible exactly at the returned relaxation."""
+    feasible exactly at the returned relaxation of the slab rows, the box kept hard."""
     qp = fit_2f_module._qp2
     box = np.array([[1.0, 1.0], [1.0, -1.0], [-1.0, 1.0], [-1.0, -1.0]])
     n_active = 0
@@ -262,9 +281,8 @@ def test_nu_feasibility_polytope(rng) -> None:  # type: ignore[no-untyped-def]
             chi = rng.uniform(-1.0, 1.0)
             be = BreakEvenParams(2.0, 0.2, om[0], om[1], lam[0], lam[1], chi)
             assert be.nu >= bound * (1 - 1e-9)
-            _, nu = volvar_p1(
-                np.array([om[0], om[1], chi]), lam, np.ones((1, 2)), np.ones(1), np.zeros(1)
-            )
+            x = np.array([om[0], om[1], chi])
+            _, nu = volvar_p1(x, lam, np.ones((1, 2)), np.ones(1), np.zeros(1))
             assert nu == pytest.approx(be.nu, rel=1e-10)
 
 
@@ -282,7 +300,7 @@ def test_p1_breakeven_identities(ssvi, rng) -> None:  # type: ignore[no-untyped-
     tg = marking_targets(ssvi, pillars)
     cfg = BreakEvenFitConfig(pillars=pillars, k2=0.28, k1_bounds=(0.5, 20.0))
     prob, _ = fit_2f_module._first_problem(tg, cfg, xi0)
-    assert prob.bank.source == "surface"
+    assert prob.bank.source == "surface" and prob.skew_mode == "twopoint"
     mm = prob.maps(5.35)
     a, b = rng.normal(size=2), rng.normal(size=2)
     f0 = mm.svc(np.zeros(2))
@@ -316,7 +334,8 @@ def test_volvar_p1_quadratic_form(ssvi, rng) -> None:  # type: ignore[no-untyped
     """``volvar_p1`` is the engine's quadratic form: with ``SensiSpot = 0`` it equals
     ``first_order_breakevens(sigma_hat=atf).vol_var`` to 1e-12; with a spot sensitivity it is
     ``VolVar_naked + SensiSpot² + 2 SensiSpot ½ atf λ·A``.  The owner's transcription with both
-    cross terms at half weight is lower by the missing half, measured here (it is not used)."""
+    cross terms at half weight is lower by the missing half, measured here (report decision ii:
+    an unresolved normalisation, not used)."""
     pillars = (0.25, 1.0, 3.0)
     tg = marking_targets(ssvi, pillars)
     xi0 = xi0_curve(ssvi, 3.0)
@@ -334,11 +353,12 @@ def test_volvar_p1_quadratic_form(ssvi, rng) -> None:  # type: ignore[no-untyped
         assert np.allclose(vv0, [f.vol_var for f in fo], rtol=1e-12)
         spot = rng.normal(scale=0.02, size=3)
         vv, _ = volvar_p1(x, lam, m.A, tg.atf, spot)
-        assert np.allclose(vv, vv0 + spot**2 + 2 * spot * (0.5 * tg.atf * (m.A @ lam)), rtol=1e-12)
+        cross = 2 * spot * (0.5 * tg.atf * (m.A @ lam))
+        assert np.allclose(vv, vv0 + spot**2 + cross, rtol=1e-12)
         sx, sy = 0.5 * x[0] * m.A[:, 0] * tg.atf, 0.5 * x[1] * m.A[:, 1] * tg.atf
-        owner = spot**2 + spot * (0.5 * tg.atf * (m.A @ lam)) + sx**2 + sy**2 + be.rho_XY * sx * sy
+        owner = spot**2 + 0.5 * cross + sx**2 + sy**2 + be.rho_XY * sx * sy
         print("owner's half cross terms / quadratic form:", np.round(owner / vv, 4))
-        assert np.allclose(vv - owner, spot * (0.5 * tg.atf * (m.A @ lam)) + be.rho_XY * sx * sy)
+        assert np.allclose(vv - owner, 0.5 * cross + be.rho_XY * sx * sy)
 
 
 # --------------------------------------------------------------------------------------------
@@ -362,14 +382,14 @@ def test_breakeven_formula_reproduces_policy(ssvi, ref_fits) -> None:  # type: i
     assert np.allclose(r.table["svc_target"], tg.correl_target * tg.vovol, rtol=1e-12)
     t15 = ref_fits[(1.5, 0.05)].targets
     assert np.allclose(t15.vov_be_raw, 1.5 * tg.vov_be_raw, rtol=1e-12)
-    assert r.risk_regime == "sticky_strike"
+    assert r.risk_regime == "sticky_strike" and r.config.skew_mode == "twopoint"
 
 
 def test_twopoint_constraint_binds_only_at_1y_5y(ref_fits, spx_fits) -> None:  # type: ignore[no-untyped-def]
     """The skew constraint acts at the two points only: every active skew row names T = 1 or 5
     (3 on SPX, quoted to 3Y, with the relocation note), the naked skew is inside ``(1 ± eps)
     Skew_SABR`` there, and the free pillars are not held to ``eps`` (the short end moves by more:
-    reference (1.5, 0.05) +8% / +9% at 3M / 6M; SPX (1.0, 0.10) +57% / +33%); along the whole
+    reference (1.5, 0.05) +16% / +7% at 3M / 6M; SPX (1.0, 0.10) +57% / +33%); along the whole
     ``k1`` profile no other maturity is ever constrained."""
     for fits, points in ((ref_fits, {1.0, 5.0}), (spx_fits, {1.0, 3.0})):
         for (ssr, eps), r in fits.items():
@@ -404,12 +424,13 @@ def test_ssr_target_and_skew_eps_exercised(spx, spx_fits) -> None:  # type: igno
     assert np.allclose(pair.constraints["eps"], [0.10, 0.02])
     assert pair.constraints["gap_rel"].abs().iloc[1] <= 0.02 + 1e-9
     curve = fit_2f_marking(spx, BreakEvenFitConfig(), ssr_target={0.25: 1.2, 3.0: 0.9})
-    assert np.allclose(
-        curve.targets.ssr_target, np.interp(curve.table["T"], [0.25, 3.0], [1.2, 0.9])
-    )
+    expected = np.interp(curve.table["T"], [0.25, 3.0], [1.2, 0.9])
+    assert np.allclose(curve.targets.ssr_target, expected)
     gaps = []
     for w in (0.1, 10.0):
-        s = fit_2f_marking(spx, BreakEvenFitConfig(skew_mode="soft", skew_weight=w), ssr_target=1.0)
+        cfg_soft = BreakEvenFitConfig(skew_mode="soft", skew_weight=w)
+        s = fit_2f_marking(spx, cfg_soft, ssr_target=1.0)
+        assert s.config.skew_mode == "soft"
         assert not any(x.startswith("skew") for x in s.first.active)
         assert (s.constraints["binding_edge"] == "").all()
         gaps.append(s.mean_skew_gap)
@@ -421,11 +442,12 @@ def test_binding_message_on_incompatible_pair(ref_fits, spx_fits, ssvi, caplog) 
     (1Y at the steep edge ``(1+0.1)``, 3Y at the flat edge) and the message names the maturity, the
     edge, the naked-vs-market skew and the achieved-vs-target SpotVolCovar per pillar; on the
     reference SSVI ``(1.0, 0.10)`` the SpotVolCovar the SSR asks for is out of reach within the ν
-    cap (the P1 covariance is +142% of target at 3M), the box binds, ``|ρ| = 1`` follows from the cap
-    and the owner's ν-cap warning is logged and attached.  On SPX the constraint binds for every pair
-    of ``ssr ∈ {1, 1.25, 1.5, 1.75, 2} × eps ∈ {0.05, 0.1, 0.2, 0.3}`` except ``ssr 1.75`` with ``eps
-    ≥ 0.2``: that compatible pair binds nothing, carries no message and meets every SpotVolCovar
-    target within 2%."""
+    cap 3.5 (the P1 covariance is +97% of target at 3M), both skew points bind and step 3 sits on
+    the cap (``|ρ_SX1| = 1``, ρ12 +0.987: the collapse note fires); at ``(1.5, 0.05)`` the ν box
+    binds (ρ = −1 / −1, ρ12 = +1) and the owner's ν-cap warning is logged and attached.  On SPX
+    the constraint binds for every pair of ``ssr ∈ {1, 1.25, 1.5, 1.75, 2} × eps ∈ {0.05, 0.1, 0.2,
+    0.3}`` except ``ssr 1.75`` with ``eps ≥ 0.2``: that compatible pair binds nothing, carries no
+    message and meets every SpotVolCovar target within 2%."""
     r = spx_fits[(1.0, 0.10)]
     assert r.status == "binding"
     msgs = [m for m in r.messages if m.startswith("skew constraint binds")]
@@ -436,27 +458,27 @@ def test_binding_message_on_incompatible_pair(ref_fits, spx_fits, ssvi, caplog) 
         assert "SpotVolCovar achieved vs target: 0.25y" in m and "3y" in m
     assert BINDING_MESSAGE.split("{")[0] in msgs[0]
     ref = ref_fits[(1.0, 0.10)]
-    assert ref.status == "binding" and ref.first.box_binding and ref.second.nu_at_cap
-    warn = NU_CAP_WARNING.format(cap=2.5)
+    assert ref.status == "binding" and ref.second.nu_at_cap and not ref.first.box_binding
+    assert (ref.constraints["binding_edge"] != "").all()
+    warn = NU_CAP_WARNING.format(cap=3.5)
     assert warn == (
-        "nu at cap 2.5; first-order break-even engine ~15% biased beyond ~4; raise only if "
+        "nu at cap 3.5; first-order break-even engine ~15% biased beyond ~4; raise only if "
         "stage-3 simulation validates"
     )
     assert any(m.startswith(warn) for m in ref.messages)
-    assert ref.svc_rel_error[0] > 1.0 and abs(ref.params.rho_SX1) > 0.9999
+    assert ref.svc_rel_error[0] > 0.9 and abs(ref.params.rho_SX1) > 0.9999
+    assert ref.params.nu == pytest.approx(3.5, rel=1e-4)
+    assert any("collapsing" in n for n in ref.notes) and abs(ref.params.rho12) > 0.9
+    ref15 = ref_fits[(1.5, 0.05)]
+    assert ref15.first.box_binding and ref15.second.nu_at_cap
+    assert any("collapsing" in n for n in ref15.notes)
     with caplog.at_level(logging.WARNING, logger="volsto.calibration.fit_2f"):
-        fit_2f_marking(ssvi, BreakEvenFitConfig(pillars=(0.25, 1.0, 5.0)), ssr_target=1.0)
+        fit_2f_marking(ssvi, BreakEvenFitConfig(skew_eps=0.05), ssr_target=1.5)
     assert any(warn in rec.getMessage() for rec in caplog.records)
     ok = fit_2f_marking(_spx_surface(), BreakEvenFitConfig(skew_eps=0.20), ssr_target=1.75)
     print(ok.status, ok.messages, np.round(ok.constraints["gap_rel"], 4).tolist())
     assert ok.status == "interior" and ok.messages == () and ok.first.active == ()
     assert np.all(np.abs(ok.svc_rel_error) < 0.02)
-
-
-def _spx_surface():  # type: ignore[no-untyped-def]
-    from volsto.market.loaders import load_ssvi_surface
-
-    return load_ssvi_surface(SPX)
 
 
 def test_infeasible_message(spx) -> None:  # type: ignore[no-untyped-def]
@@ -480,7 +502,10 @@ def test_correl_rho_sabr_kept(spx_fits) -> None:  # type: ignore[no-untyped-def]
     """``Corr_BE = ρ_SABR`` always: the VolVar target is ``(SpotVolCovar_P1 / Corr_BE)²``, so the
     fitted model's spot/vol correlation ``SpotVolCovar / sqrt(VolVar)`` sits on ``ρ_SABR`` (within
     1% where the VolVar fit is tight) even where the covariance target is missed, and no
-    correlation is railed on SPX."""
+    correlation is railed on SPX; the ρ12 collapse note (decision vii) fires on ``(1.5, 0.05)``
+    (ρ12 +0.988) and not on ``(1.0, 0.10)`` (+0.74)."""
+    assert any("collapsing" in n for n in spx_fits[(1.5, 0.05)].notes)
+    assert not any("collapsing" in n for n in spx_fits[(1.0, 0.10)].notes)
     for r in spx_fits.values():
         t = r.table
         assert np.allclose(t["volvar_target"], (t["svc_model"] / t["corr_target"]) ** 2)
@@ -508,6 +533,7 @@ def test_tables_yaml_and_fit_spec(spx_fits, tmp_path) -> None:  # type: ignore[n
     assert from_mapping(BergomiParams, doc["model"]) == r.params
     assert from_mapping(BreakEvenFitConfig, doc["provenance"]["config"]) == r.config
     assert doc["provenance"]["status"] == "binding" and len(doc["provenance"]["messages"]) == 2
+    assert doc["provenance"]["iterations"] is None and doc["provenance"]["stage3"] is None
     base = dataclasses.replace(_reference_spec("2f"), model=P82)
     path = write_fit_spec(r, base, tmp_path / "x.yaml", n_particles=1234, ssr_target=1.0, label="x")
     fs = load_fit_spec(path)
@@ -519,9 +545,9 @@ def test_realised_lsv_ssr_reported_for_study_fits(fast_sim) -> None:  # type: ig
     """The cached study fits of ``scripts/m7_p1_marking.py`` (``configs/studies/m7_p1_marking``;
     skipped when absent): the recorded fit is reproduced by the fitter (same parameters, the cache
     key), the cached leverage is read (never calibrated), stage 3 reports the calibrated LSV's
-    numerical SSR at 3M and 1Y with standard errors and the mean ``|L − 1|`` — reported, not
-    asserted equal to the SSR target (the owner: a diagnostic, about 1.4–2.0 at ``ssr_target =
-    1``)."""
+    numerical SSR at 3M and 1Y with standard errors, the mean ``|L − 1|`` and the stage-3 assertion
+    verdict at 3M — reported, not asserted equal to the SSR target / pass (the owner: the realised
+    SSR is a diagnostic, about 1.4–2.0 at ``ssr_target = 1``)."""
     from volsto.calibration.cache import build_market
 
     specs = sorted(STUDY_DIR.glob("*_ssr*_eps*.yaml")) if STUDY_DIR.is_dir() else []
@@ -543,16 +569,24 @@ def test_realised_lsv_ssr_reported_for_study_fits(fast_sim) -> None:  # type: ig
                 sim=fs.spec.sim,
                 pricing_sim=sim,
                 ssr_pillars=(0.25, 1.0),
-                breakeven_pillars=(),
+                breakeven_pillars=(0.25,),
                 forward_starts=(),
                 model=lsv,
             ),
             r.targets,
             fit_table=r.table,
+            tolerance=fs.config.stage3_tolerance,
         )
         st = rep.ssr_table
-        print(path.name, r.status, f"|L-1| {rep.mean_abs_l_minus_1:.3f}")
+        print(
+            path.name,
+            r.status,
+            f"|L-1| {rep.mean_abs_l_minus_1:.3f}",
+            "stage-3 assertion",
+            "PASS" if rep.within_tolerance else "FAIL: " + rep.check_message,
+        )
         print(st.round(3).to_string(index=False))
+        assert len(rep.check) == 2 and rep.within_tolerance == bool(rep.check["within"].all())
         assert not rep.recalibrated and np.all(np.isfinite(st["ssr_lsv"]))
         assert (st["ssr_lsv_se"] > 0).all() and np.isfinite(rep.mean_abs_l_minus_1)
         assert np.allclose(st["ssr_target"], fs.ssr_target)
@@ -565,21 +599,21 @@ def test_realised_lsv_ssr_reported_for_study_fits(fast_sim) -> None:  # type: ig
 
 def test_historical_recovery_fast(synthetic_1y) -> None:  # type: ignore[no-untyped-def]
     """Recovery on the one-year order-one synthetic history (k2 fixed at the true 0.28, MatMin 3M,
-    windows 200 / 200) with the soft all-pillar skew penalty at weight 10: ν 1.602, θ 0.247, k1
-    5.217, ρ_SX1 −0.789, ρ_SX2 −0.508 (true 1.74, 0.245, 5.35, −0.759, −0.487) within 15% / 15% / 20%
-    / 0.2 / 0.2; SpotVolCovar within 5% of target; standard errors from the target noise.  The
-    default two-point configuration is reported: every SpotVolCovar within 2% but ν 1.422 (−18%) and
-    k1 4.47 (−16%): the covariance targets at five pillars do not pin ``(k1, λ)`` when the short-end
-    skew is free (the leverage term of the P1 break-even absorbs it)."""
+    windows 200 / 200) under the **default** config (``skew_mode="auto"`` → soft all-pillar penalty
+    at weight 10): ν 1.602, θ 0.247, k1 5.217, ρ_SX1 −0.789, ρ_SX2 −0.508 (true 1.74, 0.245, 5.35,
+    −0.759, −0.487) within 15% / 15% / 20% / 0.2 / 0.2; SpotVolCovar within 5% of target; standard
+    errors from the target noise.  The explicit two-point configuration is reported: every
+    SpotVolCovar within 2% but ν 1.422 (−18%) and k1 4.47 (−16%): the covariance targets at five
+    pillars do not pin ``(k1, λ)`` when the short-end skew is free (the leverage term of the P1
+    break-even absorbs it)."""
     hist = synthetic_1y.history
     base = BreakEvenFitConfig(
         pillars=tuple(map(float, hist.pillars)), k2=0.28, k1_bounds=(0.5, 20.0)
     )
-    r = fit_2f_historical(
-        hist, dataclasses.replace(base, **RECOVERY_SOFT), window_vol=200, window_ssr=200
-    )
+    r = fit_2f_historical(hist, base, window_vol=200, window_ssr=200)
     p = r.params
     print(r.summary())
+    assert r.config.skew_mode == "soft" and any("auto" in n for n in r.notes)
     assert r.targets.mode == "historical" and r.pricing_date == hist.dates[-1]
     assert r.table["T"].tolist() == [0.25, 0.5, 1.0, 2.0, 3.0]
     assert abs(p.nu - P82.nu) < 0.15 * P82.nu, p
@@ -587,23 +621,25 @@ def test_historical_recovery_fast(synthetic_1y) -> None:  # type: ignore[no-unty
     assert abs(p.k1 - P82.k1) < 0.20 * P82.k1, p
     assert abs(p.rho_SX1 - P82.rho_SX1) < 0.2 and abs(p.rho_SX2 - P82.rho_SX2) < 0.2, p
     assert r.first.feasible and np.all(np.abs(r.svc_rel_error) < 0.05), r.svc_rel_error
-    assert np.isfinite(r.first.k1_se) and np.all(
-        np.isfinite([r.first.lambda1_se, r.first.lambda2_se])
-    )
+    assert np.isfinite(r.first.k1_se)
+    assert np.all(np.isfinite([r.first.lambda1_se, r.first.lambda2_se]))
     assert np.allclose(r.table["volvar_target"], r.targets.vol_var)  # empirical VolVar kept
-    d = fit_2f_historical(hist, base, window_vol=200, window_ssr=200)
-    print("default two-point:", d.status, d.params, np.round(d.svc_rel_error, 3).tolist())
+    d = fit_2f_historical(
+        hist, dataclasses.replace(base, skew_mode="twopoint"), window_vol=200, window_ssr=200
+    )
+    print("two-point:", d.status, d.params, np.round(d.svc_rel_error, 3).tolist())
     assert np.all(np.abs(d.svc_rel_error) < 0.02)
     assert any("skew constraint T_l = 5y" in n for n in d.first.notes)
 
 
 def test_rolling_fit_and_flags(synthetic_1y) -> None:  # type: ignore[no-untyped-def]
-    """The rolling fit every 5 dates over dates 200–230 (windows 120 / 60, soft weight 10): seven
-    fits with the parameter, standard-error and status columns; standard errors above ``max_se``
-    are NaN with the raw value kept; ``flag_unidentified`` reads the break-even columns."""
+    """The rolling fit every 5 dates over dates 200–230 (windows 120 / 60, the default config: soft
+    weight 10 in historical mode): seven fits with the parameter, standard-error and status
+    columns; standard errors above ``max_se`` are NaN with the raw value kept;
+    ``flag_unidentified`` reads the break-even columns."""
     hist = synthetic_1y.history
     cfg = BreakEvenFitConfig(
-        pillars=tuple(map(float, hist.pillars)), k2=0.28, k1_bounds=(0.5, 20.0), **RECOVERY_SOFT
+        pillars=tuple(map(float, hist.pillars)), k2=0.28, k1_bounds=(0.5, 20.0)
     )
     frame = rolling_fit(
         hist,
@@ -619,10 +655,22 @@ def test_rolling_fit_and_flags(synthetic_1y) -> None:  # type: ignore[no-untyped
     for c in PARAM_COLUMNS:
         assert c in frame and f"{c}_se" in frame and f"{c}_se_raw" in frame
     assert {
-        "nu", "theta", "rho_SX1", "rho_SX2", "rho12", "first_objective", "second_objective",
-        "status", "svc_rel_error_max", "skew_gap_T_s", "skew_gap_T_l", "mean_skew_gap", "active",
-        "messages", "bound_flags",
-    } <= set(frame.columns)  # fmt: skip
+        "nu",
+        "theta",
+        "rho_SX1",
+        "rho_SX2",
+        "rho12",
+        "first_objective",
+        "second_objective",
+        "status",
+        "svc_rel_error_max",
+        "skew_gap_T_s",
+        "skew_gap_T_l",
+        "mean_skew_gap",
+        "active",
+        "messages",
+        "bound_flags",
+    } <= set(frame.columns)
     assert (frame["k2"] == 0.28).all() and set(frame["status"]) <= {"interior", "binding"}
     se = frame[[f"{c}_se" for c in PARAM_COLUMNS]].to_numpy(dtype=float)
     assert np.all(np.isnan(se) | (se <= fit_2f_module.MAX_FINITE_SE))
@@ -637,7 +685,12 @@ def test_stage3_machinery_on_cached_2f(ssvi, fast_sim) -> None:  # type: ignore[
     ``model=`` override with the Table 8.2 kernel's P1 table: the numerical LSV SSR (2.48 / 2.14 at
     3M / 1Y) against the P1 first-order SSR (2.64 / 2.08, within 10%), the SSR the targets imply
     (≈ 0.95), the naked mixing skew, the simulated break-evens with standard errors, the forward
-    table at 1y-into-1y with the spot 1y skew and its ratio; "recalibrated: no"."""
+    table at 1y-into-1y with the spot 1y skew and its ratio; "recalibrated: no".  The break-even
+    assertion: the Table 8.2 LSV is not an ``ssr = 1`` fit, so the check fails with the message
+    naming the pillar, the simulated value, the target, the first-order miss and the engine bias;
+    ``fit_2f`` with stage 3 on the cached model raises :class:`BreakEvenValidationError` carrying
+    the result, and ``iterate_against_simulation=1`` (plumbing only: the cached model stands in for
+    the calibration) records two iteration rows and the correction columns."""
     from volsto.calibration.cache import build_market
 
     spec = _reference_spec("2f")
@@ -676,6 +729,38 @@ def test_stage3_machinery_on_cached_2f(ssvi, fast_sim) -> None:  # type: ignore[
     assert len(ft) == 1 and ft["spot_skew_90_110"].iloc[0] > 0 and ft["ratio_se"].iloc[0] > 0
     assert ft["fwd_skew_90_110"].iloc[0] > 0
     assert "recalibrated: no" in rep.summary()
+    # the stage-3 assertion on a model that is not a fit of these targets
+    assert len(rep.check) == 4 and not rep.within_tolerance and "FAIL" in rep.summary()
+    assert "SpotVolCovar at T=0.25" in rep.check_message and "engine bias" in rep.check_message
+    assert "first-order fit missed the target" in rep.check_message
+    chk, ok, msg = breakeven_check(rep.breakeven_table, 5.0)  # a 500% tolerance passes
+    assert ok and msg == "" and chk["within"].all()
+    with pytest.raises(BreakEvenValidationError):
+        stage3_validation(P82, inputs, tg, fit_table=table, assert_breakevens=True)
+    light = dataclasses.replace(
+        inputs,
+        pricing_sim=dataclasses.replace(fast_sim, n_paths=20_000, chunk_size=20_000),
+        ssr_pillars=(0.25,),
+        breakeven_pillars=(0.25,),
+        forward_starts=(),
+        mixing_paths=20_000,
+    )
+    with pytest.raises(BreakEvenValidationError) as exc:
+        fit_2f(tg, lsv.kernel.xi0, cfg, stage3=light)
+    res = exc.value.result
+    assert res is not None and res.stage3 is not None and res.stage3_passed is False
+    assert not res.recalibrated and "FAIL" in res.summary()
+    it = fit_2f(
+        tg, lsv.kernel.xi0, cfg, stage3=light, iterate_against_simulation=1, assert_stage3=False
+    )
+    assert it.iterations is not None and list(it.iterations["iteration"]) == [0, 1]
+    assert {"max_gap_svc_vs_target", "max_engine_bias_svc", "calibration_seconds"} <= set(
+        it.iterations.columns
+    )
+    assert "svc_correction" in it.table and "volvar_correction" in it.table
+    assert any("iterated 1x against simulation" in n for n in it.notes) and not it.recalibrated
+    with pytest.raises(ValueError):
+        fit_2f(tg, lsv.kernel.xi0, cfg, iterate_against_simulation=1)
 
 
 # --------------------------------------------------------------------------------------------
@@ -686,15 +771,17 @@ def test_stage3_machinery_on_cached_2f(ssvi, fast_sim) -> None:  # type: ignore[
 @pytest.mark.slow
 def test_recovery_three_year_mixing(synthetic_3y) -> None:  # type: ignore[no-untyped-def]
     """SPEC recovery test on the three-year mixing history (seed 13, 10⁵ mixing paths per day,
-    windows 250 / 250, k2 fixed at 0.28, MatMin 3M) with the soft all-pillar skew penalty at
-    weight 10: ν 1.798, θ 0.245, k1 5.783, ρ −0.716 / −0.461 — inside the owner's tolerances (ν, θ,
-    k1 10%, ρ 0.05); weight 1 gives ρ_SX1 −0.686 (off 0.073)."""
+    windows 250 / 250, k2 fixed at 0.28, MatMin 3M) under the **default** config (auto → soft
+    all-pillar penalty at weight 10; report decision v): ν 1.798, θ 0.245, k1 5.783, ρ −0.716 /
+    −0.461 — inside the owner's tolerances (ν, θ, k1 10%, ρ 0.05); weight 1 gives ρ_SX1 −0.686 (off
+    0.073)."""
     hist = synthetic_3y.history
     cfg = BreakEvenFitConfig(
-        pillars=tuple(map(float, hist.pillars)), k2=0.28, k1_bounds=(0.5, 20.0), **RECOVERY_SOFT
+        pillars=tuple(map(float, hist.pillars)), k2=0.28, k1_bounds=(0.5, 20.0)
     )
     r = fit_2f_historical(hist, cfg, window_vol=250, window_ssr=250)
     print(r.summary())
+    assert r.config.skew_mode == "soft"
     p = r.params
     assert abs(p.nu - P82.nu) < 0.10 * P82.nu, p
     assert abs(p.theta - P82.theta) < 0.10 * P82.theta, p
@@ -705,18 +792,22 @@ def test_recovery_three_year_mixing(synthetic_3y) -> None:  # type: ignore[no-un
 @pytest.mark.slow
 @pytest.mark.xfail(
     strict=True,
-    reason="default two-point configuration (eps 0.10 at 1Y / 5Y -> 3Y, MatMin 3M) on the "
-    "three-year mixing history: nu 1.780 (+2.3%), theta 0.249, k1 5.801 (+8.4%) inside, but "
-    "rho_SX1 -0.664 (off 0.095 > 0.05), rho_SX2 -0.499; the covariance targets at 3M-3Y leave "
-    "the short-factor correlation unidentified when the short-end skew is free",
+    reason="the two-point configuration (eps 0.10 at 1Y / 5Y -> 3Y, MatMin 3M) on the three-year "
+    "mixing history: nu 1.780 (+2.3%), theta 0.249, k1 5.801 (+8.4%) inside, but rho_SX1 -0.664 "
+    "(off 0.095 > 0.05), rho_SX2 -0.499; the covariance targets at 3M-3Y leave the short-factor "
+    "correlation unidentified when the short-end skew is free - hence soft is the historical "
+    "default (report decision v)",
 )
-def test_recovery_three_year_default_twopoint(synthetic_3y) -> None:  # type: ignore[no-untyped-def]
+def test_recovery_three_year_twopoint(synthetic_3y) -> None:  # type: ignore[no-untyped-def]
     hist = synthetic_3y.history
     cfg = BreakEvenFitConfig(
-        pillars=tuple(map(float, hist.pillars)), k2=0.28, k1_bounds=(0.5, 20.0)
+        pillars=tuple(map(float, hist.pillars)),
+        k2=0.28,
+        k1_bounds=(0.5, 20.0),
+        skew_mode="twopoint",
     )
     p = fit_2f_historical(hist, cfg, window_vol=250, window_ssr=250).params
-    print("default two-point:", p)
+    print("two-point:", p)
     assert abs(p.nu - P82.nu) < 0.10 * P82.nu, p
     assert abs(p.theta - P82.theta) < 0.10 * P82.theta, p
     assert abs(p.k1 - P82.k1) < 0.10 * P82.k1, p
@@ -726,13 +817,13 @@ def test_recovery_three_year_default_twopoint(synthetic_3y) -> None:  # type: ig
 @pytest.mark.slow
 def test_real_data_end_to_end() -> None:
     """The 2022 H2 SPX history (plain SSVI snapshots): historical mode (pillars 3M–1Y, windows 100
-    / 60, soft weight 10) and marking mode on the last snapshot at both owner pairs; sanity only
-    (finite parameters, statuses, the policy reading)."""
+    / 60, the default soft penalty) and marking mode on the last snapshot at both owner pairs;
+    sanity only (finite parameters, statuses, the policy reading)."""
     path = ROOT / "outputs" / "m7" / "hdn_history_ssvi.csv"
     if not path.exists():
         pytest.skip("2022 H2 history not built (scripts/m7_hdn_history.py --no-essvi)")
     hist = SurfaceHistory(pd.read_csv(path))
-    cfg = BreakEvenFitConfig(pillars=(0.25, 0.5, 1.0), **RECOVERY_SOFT)
+    cfg = BreakEvenFitConfig(pillars=(0.25, 0.5, 1.0))
     r = fit_2f_historical(hist, cfg, window_vol=100, window_ssr=60)
     print(r.summary())
     assert all(np.isfinite(v) for v in dataclasses.asdict(r.params).values())

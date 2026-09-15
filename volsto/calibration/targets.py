@@ -25,24 +25,31 @@ convention; ``p = 0`` is the plain Hagan inversion).  Then::
     Corr_SABR(T) = 2 smi_T / ν_SABR(T)                      (= ρ_SABR, negative for equities)
     Skew_SABR(T) = smi_T
 
-*Reading of the owner's formulas (flagged in the report):* written with ``smi, cvx`` in the
-units above, ``sqrt(6 smi² + 3 atf cvx)`` is the lognormal ``ν_SABR`` (Hagan β = 1 at order one:
-``σ̂(k) ≈ atf + ½ρν k + (2 − 3ρ²)ν²/(12 atf) k²`` inverts to exactly this at ``p = 0``); the owner's
-confirmed fact "VoV_SABR is the ABSOLUTE vol of vol (ν_SABR · atf)" is the same formula in
-absolute smile units ``smi_abs = atf smi``, ``cvx_abs = atf² cvx``, and the owner's ``Corr_SABR =
-−2 smi / VoV_SABR`` is that formula with the smile quoted positive for a put skew (``smi_abs =
-−atf ∂σ̂/∂k``).  The library keeps ``Skew_SABR = ∂σ̂/∂k`` (negative), the units of the naked
-model skew of book eq. 8.54 it is compared with, and ``Corr_SABR = ρ_SABR``.  With ``p = 1`` the
-curvature term ``3 atf cvx = 3 atf_ref ∂²σ̂/∂k²`` no longer depends on ``atf``; against ``p = 0``
-it moves ``ν_SABR`` by +0.4% to +0.5% on the reference SSVI (``atf`` 0.20–0.22, positive ATM
-curvature) and by −2.5% to −3.8% on SPX 2022-12-30 (negative ATM vol curvature at ``h = 1e-3``),
-``Corr_SABR`` by −0.004 / −0.02 to −0.03 (measured in
-``tests/test_breakeven.py::test_sabr_reduction``).  The slope is the surface's analytic
-``atm_skew`` when it has one, the curvature the central difference of half-width ``h`` (default
-``1e-3``: the ``k → 0`` curvature; ``h = 0.02`` overstates it by 2.5× at 1M on the reference
-SSVI).  Flags, never silent: negative radicand (NaN), ``|Corr_SABR| > 1`` (clipped), no
-analytic ``atm_skew`` (central differences), ``ν_SABR² T > 1`` (the ``T → 0`` reduction ignores
-Hagan's finite-``T`` correction).
+*Reading of the owner's formulas (flagged in the report):* written with ``smi, cvx`` in the units
+above, ``sqrt(6 smi² + 3 atf cvx)`` is the lognormal ``ν_SABR`` (Hagan β = 1 at order one: ``σ̂(k) ≈
+atf + ½ρν k + (2 − 3ρ²)ν²/(12 atf) k²`` inverts to exactly this at ``p = 0``); the owner's confirmed
+fact "VoV_SABR is the ABSOLUTE vol of vol (ν_SABR · atf)" is the same formula in absolute smile
+units ``smi_abs = atf smi``, ``cvx_abs = atf² cvx``, and the owner's ``Corr_SABR = −2 smi /
+VoV_SABR`` is that formula with the smile quoted positive for a put skew (``smi_abs = −atf
+∂σ̂/∂k``).  The library keeps ``Skew_SABR = ∂σ̂/∂k`` (negative), the units of the naked model skew
+of book eq.  8.54 it is compared with, and ``Corr_SABR = ρ_SABR``.  With ``p = 1`` the curvature
+term ``3 atf cvx = 3 atf_ref ∂²σ̂/∂k²`` no longer depends on ``atf``; against ``p = 0`` it moves
+``ν_SABR`` by +0.4% to +0.5% on the reference SSVI (``atf`` 0.20–0.22, positive ATM curvature) and
+by −2.5% to −3.8% on SPX 2022-12-30 (negative ATM vol curvature at ``h = 1e-3``), ``Corr_SABR`` by
+−0.004 / −0.02 to −0.03 (measured in ``tests/test_breakeven.py::test_sabr_reduction``).  The slope
+is the surface's analytic ``atm_skew`` when it has one, the curvature the central difference of
+half-width ``h`` (default ``1e-3``: the ``k → 0`` curvature; ``h = 0.02`` overstates it by 2.5× at
+1M on the reference SSVI).  **Radicand guard** (owner, report decision iii): ``6 smi² + 3 atf cvx``
+is floored at ``6 smi² (1 − c)``, ``c = radicand_floor`` (config, default 0.5; ``None`` disables),
+logged at WARNING and flagged when it fires — a negative ATM curvature large enough to pull the
+radicand below the floor.  Note that ``|Corr_SABR| ≤ 1`` needs a radicand of at least ``4 smi²``, so
+the guard at ``c > 1/3`` (the default 0.5 gives ``3 smi²``) can still produce ``|Corr| > 1``, which
+is then clipped with its own flag; on the 127 SPX 2022 H2 snapshots and the reference SSVI the guard
+does not fire at any pillar (measured, ``tests/test_breakeven.py``).  Flags, never silent: the
+guard, negative radicand (NaN, only with the guard off), ``|Corr_SABR| > 1`` (clipped), no analytic
+``atm_skew`` (central differences), ``ν_SABR² T > 1`` (the ``T → 0`` reduction ignores Hagan's
+finite-``T`` correction).  The step-0 readings above were confirmed by the owner (report decision
+iii: "step 0 as built").
 
 **Step 1 — break-even targets** (marking mode, the default)::
 
@@ -52,21 +59,21 @@ Hagan's finite-``T`` correction).
     VolVar_target(T)       = VoV_BE(T)²
 
 *Rationale:* SABR-implied dynamics are SSR = 2 (``Corr_SABR · VoV_SABR = 2 atf Skew_SABR``: a 1F
-Bergomi model with ``k → 0`` matching the pillar meets both targets at ``ssr = 2``, checked to
-1e-5 in ``tests/test_breakeven.py``); ``ssr_target = 1`` marks sticky-strike by halving
-``VoV_SABR``.  The SSR the targets imply is ``SpotVolCovar_target / (σ_0 Skew_SABR) = ssr_target
-· atf_3M / σ_0`` before smoothing (``σ_0 = atf_1M``): 0.955 ssr on the reference SSVI, 1.084 ssr
-on SPX 2022-12-30; SmoothBreakEven moves it by less than 1% (0.947–0.962 and 1.083–1.085 at ssr
-1, :meth:`TargetSet.ssr_implied`).  ``ssr_target`` enters ``VoV_BE`` only; it is not a
-model-realised SSR target (the calibrated LSV's numerical SSR is a stage-3 diagnostic of
+Bergomi model with ``k → 0`` matching the pillar meets both targets at ``ssr = 2``, checked to 1e-5
+in ``tests/test_breakeven.py``); ``ssr_target = 1`` marks sticky-strike by halving ``VoV_SABR``.
+The SSR the targets imply is ``SpotVolCovar_target / (σ_0 Skew_SABR) = ssr_target · atf_3M / σ_0``
+before smoothing (``σ_0 = atf_1M``): 0.955 ssr on the reference SSVI, 1.084 ssr on SPX 2022-12-30;
+SmoothBreakEven moves it by less than 1% (0.947–0.962 and 1.083–1.085 at ssr 1,
+:meth:`TargetSet.ssr_implied`). ``ssr_target`` enters ``VoV_BE`` only; it is not a model-realised
+SSR target (the calibrated LSV's numerical SSR is a stage-3 diagnostic of
 :mod:`volsto.calibration.fit_2f`).  3M anchoring and **SmoothBreakEven** regularise the VoV term
 structure: with ``smooth_breakeven=True`` (default) ``ln VoV_BE`` is replaced by its least-squares
 polynomial in ``ln T`` of degree ``min(2, n − 2)`` over the ``n`` pillars (no smoothing below three
 pillars, flagged); the raw curve is kept (:attr:`TargetSet.vov_be_raw`) and the largest relative
-adjustment is flagged.  The correlation is not smoothed.  *SmoothBreakEven is the library's own
-definition* (the owner named the switch, not its form).  **MatMin**: pillars below ``mat_min``
-(default 3M, the owner's ``removeVolatilityPillarsBelow``) are dropped with a flag, as are pillars
-beyond the surface's ``max_maturity``; the default pillars run 3M–10Y.
+adjustment is flagged.  The correlation is not smoothed.  *SmoothBreakEven's log-log quadratic is
+the library's form*, accepted by the owner (report decision iv).  **MatMin**: pillars below
+``mat_min`` (default 3M, the owner's ``removeVolatilityPillarsBelow``) are dropped with a flag, as
+are pillars beyond the surface's ``max_maturity``; the default pillars run 3M–10Y.
 
 **σ_0** is the ATMF vol at :data:`SIGMA0_MATURITY` (one month) in both modes (the market proxy
 of ``σ_0 = L(0, S_0) sqrt(ξ_0^0)``; 0.2200 against 0.2194 for the cached 2F LSV on the reference
@@ -92,6 +99,7 @@ Checked by ``tests/test_breakeven.py`` (``test_sabr_reduction``,
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -101,6 +109,8 @@ import pandas as pd
 from numpy.typing import NDArray
 
 from volsto.market.varswap import ForwardVarianceCurve
+
+log = logging.getLogger(__name__)
 
 FloatArray = NDArray[np.float64]
 
@@ -115,6 +125,9 @@ SIGMA0_MATURITY = 1.0 / 12.0
 DEFAULT_ATF_REF = 0.3
 #: ``SabrW_Power`` (library convention, default 1)
 DEFAULT_SABRW_POWER = 1.0
+#: the radicand guard ``c`` (owner, M7 Part 3 report decision iii): ``6 smi² + 3 atf cvx`` is
+#: floored at ``6 smi² (1 − c)``; ``None`` disables the guard (NaN on a negative radicand)
+DEFAULT_RADICAND_FLOOR = 0.5
 #: pillars with ``ν_SABR² T`` above this are flagged (the ``T → 0`` reduction, module docstring)
 SABR_FINITE_T_LIMIT = 1.0
 #: default half-width in log-moneyness of the curvature stencil (the ``k → 0`` curvature)
@@ -148,6 +161,7 @@ class SabrPillar:
     cvx: float = float("nan")
     sabrw_power: float = DEFAULT_SABRW_POWER
     atf_ref: float = DEFAULT_ATF_REF
+    radicand_guarded: bool = False
 
     @property
     def vov_sabr(self) -> float:
@@ -215,10 +229,15 @@ def sabr_reduce(
     *,
     sabrw_power: float = DEFAULT_SABRW_POWER,
     atf_ref: float = DEFAULT_ATF_REF,
+    radicand_floor: float | None = DEFAULT_RADICAND_FLOOR,
 ) -> SabrPillar:
-    """Step 0 of one pillar (module docstring) with its flags."""
+    """Step 0 of one pillar (module docstring) with its flags; ``radicand_floor`` is the guard
+    ``c`` (the radicand floored at ``6 smi² (1 − c)``, logged and flagged when it fires; ``None``
+    disables it)."""
     if atf_ref <= 0:
         raise ValueError("atf_ref must be positive")
+    if radicand_floor is not None and not 0.0 <= radicand_floor < 1.0:
+        raise ValueError("radicand_floor must be in [0, 1) or None")
     atf0, skew0, curv0, analytic = surface_atm_derivatives(surface, T, h)
     flags: list[str] = []
     if not analytic:
@@ -235,6 +254,19 @@ def sabr_reduce(
         atf_ref=atf_ref,
     )
     rad = 6.0 * skew * skew + 3.0 * atf * cvx
+    guarded = False
+    if radicand_floor is not None:
+        floor = 6.0 * skew * skew * (1.0 - radicand_floor)
+        if rad < floor:
+            guarded = True
+            msg = (
+                f"T={T:g}: radicand 6 smi^2 + 3 atf cvx = {rad:.5f} below the guard "
+                f"6 smi^2 (1 - {radicand_floor:g}) = {floor:.5f} (ATM curvature "
+                f"{curv0:+.3f}): floored"
+            )
+            log.warning("sabr_reduce: %s", msg)
+            flags.append("radicand guard fired: " + msg)
+            rad = floor
     if rad <= 0:
         flags.append("negative radicand: smile too flat for its skew (nu_sabr NaN)")
         nu = float("nan")
@@ -262,6 +294,7 @@ def sabr_reduce(
         cvx,
         float(sabrw_power),
         float(atf_ref),
+        guarded,
     )
 
 
@@ -533,6 +566,7 @@ def marking_targets(
     smooth_breakeven: bool = True,
     sabrw_power: float = DEFAULT_SABRW_POWER,
     atf_ref: float = DEFAULT_ATF_REF,
+    radicand_floor: float | None = DEFAULT_RADICAND_FLOOR,
 ) -> TargetSet:
     """Marking-mode targets from a surface (steps 0 and 1 of the module docstring).
     ``ssr_target`` is a scalar, one value per retained pillar, a mapping ``T → value``
@@ -540,7 +574,15 @@ def marking_targets(
     :data:`SIGMA0_MATURITY`."""
     ps, flags = _filter_pillars(pillars, mat_min, getattr(surface, "max_maturity", None))
     sabr = tuple(
-        sabr_reduce(surface, float(T), h, sabrw_power=sabrw_power, atf_ref=atf_ref) for T in ps
+        sabr_reduce(
+            surface,
+            float(T),
+            h,
+            sabrw_power=sabrw_power,
+            atf_ref=atf_ref,
+            radicand_floor=radicand_floor,
+        )
+        for T in ps
     )
     for s in sabr:
         flags += [f"T={s.T:g}: {f}" for f in s.flags]
@@ -713,6 +755,7 @@ __all__ = [
     "ANCHOR_MATURITY",
     "DEFAULT_ATF_REF",
     "DEFAULT_MAT_MIN",
+    "DEFAULT_RADICAND_FLOOR",
     "DEFAULT_SABRW_POWER",
     "DEFAULT_TARGET_PILLARS",
     "MODES",
