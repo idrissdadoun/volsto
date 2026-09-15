@@ -5,9 +5,9 @@ dates on the trailing ``window_vol`` / ``window_ssr`` windows and returns one ro
 date with the break-even parameters ``(k1, λ1, λ2, ω1, ω2, χ)``, their standard errors (``k1``
 from the curvature of the ``k1`` profile — NaN with the fit's note when it has none —, ``λ``
 from the inner linear least squares, ``ω`` / ``χ`` from the second fit's Jacobian), the book
-parameters ``(ν, θ, ρ_SX1, ρ_SX2, ρ12)`` for reading, both objectives, the achieved SSR (the
-configured measure) against the historical target, the mean naked-skew gap, whether the ν
-feasibility limit binds, the floor / ceiling message of the soft-skew fitter and the bound
+parameters ``(ν, θ, ρ_SX1, ρ_SX2, ρ12)`` for reading, both objectives, the fit status
+(interior / binding / infeasible) and its messages, the largest SpotVolCovar miss, the naked-skew
+gaps at the two constraint points and on average, the active constraints and the bound
 flags.  A standard error above ``max_se`` (default
 :data:`~volsto.calibration.fit_2f.MAX_FINITE_SE` = 1e3; the second fit reported ``χ`` standard
 errors of about 1e7 on dates where ``ω`` sits on its bounds) is numerically unidentified and is
@@ -48,8 +48,8 @@ def rolling_fit(
     max_se: float = MAX_FINITE_SE,
 ) -> pd.DataFrame:
     """Parameter time series in historical mode: columns ``date``, :data:`PARAM_COLUMNS`,
-    their ``_se``, :data:`BOOK_COLUMNS`, ``first_objective, second_objective, ssr_target,
-    ssr_achieved, mean_skew_gap, n_active`` (ν-limit rows), ``k1_at_bound, message,
+    their ``_se``, :data:`BOOK_COLUMNS`, ``first_objective, second_objective, status,
+    svc_rel_error_max, skew_gap_T_s, skew_gap_T_l, mean_skew_gap, active, k1_at_bound, messages,
     bound_flags, wall_seconds`` and ``<name>_se_raw``.  ``start`` defaults to the first date with
     ``window_vol`` increments behind it; ``every`` is the step in dates; standard errors above
     ``max_se`` are stored as NaN (module docstring)."""
@@ -99,12 +99,14 @@ def rolling_fit(
                 "k2": p.k2,
                 "first_objective": f.objective,
                 "second_objective": s.objective,
-                "ssr_target": float(np.mean(r.ssr_requested)),
-                "ssr_achieved": r.ssr_achieved_mean,
+                "status": r.status,
+                "svc_rel_error_max": float(np.max(np.abs(r.svc_rel_error))),
+                "skew_gap_T_s": float(f.constraints["gap_rel"].iloc[0]),
+                "skew_gap_T_l": float(f.constraints["gap_rel"].iloc[1]),
                 "mean_skew_gap": r.mean_skew_gap,
-                "n_active": len(f.active),
+                "active": ";".join(f.active),
                 "k1_at_bound": f.k1_at_bound,
-                "message": r.message or "",
+                "messages": " | ".join(r.messages),
                 "bound_flags": ";".join(s.bound_flags),
                 "wall_seconds": time.perf_counter() - t0,
             }

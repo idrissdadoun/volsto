@@ -15,11 +15,13 @@
   ``ATMFVolOfVol``, the market-skew rescale of the spot sensitivity); the acceptance gate
   against simulation on a ``ν ∈ {0.5, 1, 1.74} × T ∈ {3M, 1Y, 2Y}`` grid (numbers in the test
   docstring).
-* ``targets``: the SABR reduction round trip and its flags (finite-differences, finite-``T``),
-  the marking targets and the policy check (absolute reading from the stored anchor, pillars
-  without 3M, the desk ``VoV_SABR`` classification), the ``ssr = 2`` identity of a 1F ``k → 0``
-  Bergomi model with its own SABR pillar, the historical targets from a Gaussian surface history
-  (the one-month ``σ_0`` flag).
+* ``targets`` (owner's "M7 Part 3 FINAL" steps 0–1): the SABR reduction round trip at
+  ``SabrW_Power = 0``, the 365-day quotes and the ``p = 1`` convexity rescaling, the flags; the
+  break-even targets ``VoV_BE = (atf_3M/atf_T)(ssr/2) VoV_SABR``, ``Corr_BE = ρ_SABR``,
+  ``SpotVolCovar = Corr_BE VoV_BE`` with SmoothBreakEven and MatMin, the policy check (absolute
+  reading from the stored anchor, the desk ``VoV_SABR`` classification), the ``ssr = 2`` identity
+  of a 1F ``k → 0`` Bergomi model with its own SABR pillar, the historical targets from a Gaussian
+  surface history (the one-month ``σ_0`` flag).
 
 Runtime (fast suite): the gate ≈ 30 s, the LSV local-branch test ≈ 30 s, the rest < 5 s.
 """
@@ -62,7 +64,9 @@ from volsto.calibration.targets import (
     SabrPillar,
     historical_targets,
     marking_targets,
+    sabr_from_365,
     sabr_reduce,
+    smooth_breakeven_curve,
 )
 from volsto.config import BergomiParams, CalibrationSpec, SimConfig, load_yaml
 from volsto.market import ForwardCurve, ForwardVarianceCurve
@@ -657,150 +661,166 @@ class _QuadSurface:
         return np.full_like(np.asarray(T, dtype=np.float64), self.atf)
 
 
-def test_sabr_reduction() -> None:
-    """``sabr_reduce`` on a quadratic smile built from ``(atf, ν_SABR, ρ_SABR)`` recovers ``ν``
-    and ``ρ`` to 1e-6 (the central differences of a quadratic are exact) with ``skew_sabr ==
-    skew``; the radicand ``6 skew² + 3 atf curv`` is negative only for a *concave* smile,
-    ``curv < −2 skew²/atf`` (a flat-curvature smile has ``ν = sqrt(6) |skew|`` whatever the
-    skew): NaN and the flag; ``−2 skew²/atf < curv < −⅔ skew²/atf`` gives ``|ρ| > 1``, clipped
-    with the flag, and ``skew_sabr ≠ skew`` then.  Flags are never silent: a surface without an
-    analytic ``atm_skew`` (this quadratic one) is flagged as finite-difference, ``ν_SABR² T >
-    1`` is flagged as beyond the ``T → 0`` reduction; the half-width ``h`` (default 1e-3) is
-    recorded on the pillar.  The reference SSVI (analytic ``atm_skew``, ``ν² T`` 0.6–0.8) gets
-    no flag at any pillar 1M–5Y."""
+def test_sabr_reduction(ssvi) -> None:  # type: ignore[no-untyped-def]
+    """Step 0.  At ``SabrW_Power = 0`` ``sabr_reduce`` on a quadratic smile built from ``(atf,
+    ν_SABR, ρ_SABR)`` recovers ``ν`` and ``ρ`` to 1e-6 (the Hagan β = 1 inversion; central
+    differences of a quadratic are exact) with ``Skew_SABR = ∂σ̂/∂k``; ``VoV_SABR = atf ν_SABR``
+    (absolute); the 365-day quotes round-trip through the owner's conversion (``smi = Smile_365 /
+    (100·2·√T)``, ``cvx = Convex_365 / (100·T·(atf/atf_ref)^p)``).  At the default ``p = 1``,
+    ``atf_ref = 0.3`` the radicand is ``6 skew² + 3 atf_ref curv`` exactly.  The radicand is
+    negative only for a concave smile (NaN and the flag); ``|ρ| > 1`` is clipped with the flag;
+    flags are never silent (finite differences, ``ν² T > 1``); the half-width ``h`` is recorded.
+    The reference SSVI (analytic ``atm_skew``) gets no flag at any pillar 1M–10Y; ``p = 1``
+    against ``p = 0`` moves its ``ν_SABR`` by +0.4% to +0.5% (positive ATM curvature, atf < 0.3)."""
     fd = "no analytic atm_skew"
     for atf, nu, rho in itertools.product((0.15, 0.25), (0.3, 0.8, 1.5), (-0.9, -0.5, 0.0, 0.6)):
         s = _QuadSurface.from_sabr(atf, nu, rho)
         for T in (0.25, 2.0):
-            r = sabr_reduce(s, T)
+            r = sabr_reduce(s, T, sabrw_power=0.0)
             assert isinstance(r, SabrPillar) and r.T == T and r.h == SABR_CURVATURE_H == 1e-3
             assert fd in r.flags[0] and len(r.flags) == 1 + (nu * nu * T > 1.0), r.flags
             if nu * nu * T > 1.0:
                 assert "finite-T" in r.flags[1]
-            assert abs(r.atf - atf) < 1e-12
+            assert abs(r.atf - atf) < 1e-12 and r.cvx == pytest.approx(r.curv, rel=1e-12)
             assert abs(r.nu_sabr - nu) < 1e-6 and abs(r.rho_sabr - rho) < 1e-6, (atf, nu, rho, r)
+            assert r.vov_sabr == pytest.approx(atf * nu, rel=1e-6)
             assert abs(r.skew - s.skew) < 1e-10 and abs(r.curv - s.curv) < 1e-6
-            assert r.skew_sabr == pytest.approx(s.skew, abs=1e-10)
+            assert r.skew_sabr == r.skew and r.corr_sabr == r.rho_sabr
+            # the 365-day quotes and the owner's conversion
+            a, sm, cv = sabr_from_365(
+                T, r.atf_365, r.smile_365, r.convex_365, sabrw_power=0.0, atf_ref=0.3
+            )
+            assert (a, sm, cv) == pytest.approx((r.atf, r.skew, r.curv), rel=1e-12)
+            # default p = 1: cvx = curv (atf_ref / atf)
+            r1 = sabr_reduce(s, T)
+            assert r1.sabrw_power == 1.0 and r1.atf_ref == 0.3
+            assert r1.cvx == pytest.approx(r1.curv * 0.3 / atf, rel=1e-12)
+            rad = 6.0 * s.skew**2 + 3.0 * 0.3 * s.curv
+            if rad > 0:
+                assert r1.nu_sabr == pytest.approx(math.sqrt(rad), rel=1e-6)
+            _, _, cv1 = sabr_from_365(T, r1.atf_365, r1.smile_365, r1.convex_365)
+            assert cv1 == pytest.approx(r1.cvx, rel=1e-12)
     # flat curvature: never a negative radicand
-    flat = sabr_reduce(_QuadSurface(0.2, -0.5, 0.0), 1.0)
+    flat = sabr_reduce(_QuadSurface(0.2, -0.5, 0.0), 1.0, sabrw_power=0.0)
     assert len(flat.flags) == 2 and fd in flat.flags[0] and "finite-T" in flat.flags[1]
     assert flat.nu_sabr == pytest.approx(math.sqrt(6) * 0.5)
     assert flat.rho_sabr == pytest.approx(-2.0 / math.sqrt(6))
     # concave smile with a small skew: negative radicand
-    bad = sabr_reduce(_QuadSurface(0.2, -0.05, -0.5), 1.0)
-    assert math.isnan(bad.nu_sabr) and math.isnan(bad.rho_sabr) and math.isnan(bad.skew_sabr)
+    bad = sabr_reduce(_QuadSurface(0.2, -0.05, -0.5), 1.0, sabrw_power=0.0)
+    assert math.isnan(bad.nu_sabr) and math.isnan(bad.rho_sabr) and math.isnan(bad.vov_sabr)
     assert len(bad.flags) == 2 and "negative radicand" in bad.flags[1]
-    assert 6 * 0.05**2 + 3 * 0.2 * (-0.5) < 0
-    # |rho| > 1: clipped and flagged, skew_sabr no longer the market skew
-    clip = sabr_reduce(_QuadSurface(0.2, -0.3, -0.5), 1.0)
+    # |rho| > 1: clipped and flagged
+    clip = sabr_reduce(_QuadSurface(0.2, -0.3, -0.5), 1.0, sabrw_power=0.0)
     rad = 6 * 0.3**2 + 3 * 0.2 * (-0.5)
     assert rad > 0 and 2 * 0.3 / math.sqrt(rad) > 1
     assert clip.nu_sabr == pytest.approx(math.sqrt(rad)) and clip.rho_sabr == -1.0
     assert len(clip.flags) == 2 and "clipped" in clip.flags[1]
-    assert clip.skew_sabr == pytest.approx(-0.5 * math.sqrt(rad)) and clip.skew_sabr != clip.skew
-    # the finite-difference half-width is an explicit argument, recorded on the pillar
-    r05 = sabr_reduce(_QuadSurface.from_sabr(0.2, 1.0, -0.6), 1.0, h=0.05)
+    assert clip.skew_sabr == pytest.approx(-0.3, abs=1e-10)
+    r05 = sabr_reduce(_QuadSurface.from_sabr(0.2, 1.0, -0.6), 1.0, h=0.05, sabrw_power=0.0)
     assert r05.nu_sabr == pytest.approx(1.0, abs=1e-6) and r05.h == 0.05
+    with pytest.raises(ValueError):
+        sabr_reduce(flat, 1.0, atf_ref=0.0)  # type: ignore[arg-type]
+    # the reference SSVI: no flags, the p = 1 rescale measured
+    moves = []
+    for T in (1.0 / 12.0, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0):
+        r0 = sabr_reduce(ssvi, T, sabrw_power=0.0)
+        r1 = sabr_reduce(ssvi, T)
+        assert r0.flags == () and r1.flags == ()
+        assert r1.skew == pytest.approx(float(ssvi.atm_skew(T)), rel=1e-12) and r1.curv > 0
+        moves.append(r1.nu_sabr / r0.nu_sabr - 1.0)
+    print("nu_sabr p=1 vs p=0:", np.round(moves, 4))
+    assert all(0.003 < m < 0.006 for m in moves), moves
 
 
 def test_marking_targets_and_policy_check(ssvi) -> None:  # type: ignore[no-untyped-def]
-    """Reference SSVI, pillars 1M…5Y: ``vovol_target = ½ ssr atf ν_SABR A`` exactly,
-    ``SpotVolCovar_target = ssr σ_0 Skew_SABR``, ``VolVar = vovol²``, ``σ_0 = atm_vol(1M)``,
-    ``A(3M) = 1`` and ``A = (atf(3M)/atf(T))^p``; ``policy_check`` reads ``"absolute"`` at
-    ``p = 1`` with ``mismatch_lognormal = 1/atf`` between 4 and 6 here (the lognormal reading
-    differs by more than a factor 3 at every pillar — the flag the owner asked for), also on a
-    pillar set without 3M (the anchor is stored, not re-interpolated), ``"neither"`` away from
-    3M at ``p = 0.5``, and classifies a desk ``VoV_SABR`` (``ν_SABR`` → lognormal, ``atf ν_SABR``
-    → absolute, ``2 ν_SABR`` → omega, else unknown); ``ssr_target`` as a mapping (linear
-    interpolation in T) and as a callable; ``anchor_power = 0`` gives ``A = 1``; pillars beyond
-    ``max_maturity`` are dropped with a flag; no SABR flag on this surface."""
+    """Step 1 on the reference SSVI, pillars 1M…5Y with ``mat_min = 0``: ``VoV_BE_raw =
+    (atf_3M/atf_T) (ssr/2) VoV_SABR`` exactly, ``VoV_BE`` its SmoothBreakEven (log-log quadratic;
+    within 1% here, unsmoothed when switched off), ``Corr_BE = ρ_SABR``, ``SpotVolCovar = Corr_BE
+    VoV_BE``, ``VolVar = VoV_BE²``, ``σ_0 = atm_vol(1M)``, the SSR the targets imply ``ssr atf_3M/σ_0``
+    before smoothing; the default MatMin 3M drops the 1M pillar with a flag, and the default
+    pillars run 3M–10Y; ``policy_check`` reads ``"absolute"`` on the raw curve at ``p = 1`` with
+    ``mismatch_lognormal = 1/atf`` between 4 and 6, also without a 3M pillar (stored anchor),
+    ``"neither"`` away from 3M at ``anchor_power = 0.5``, and classifies a desk ``VoV_SABR``;
+    ``ssr_target`` as a mapping (interpolated) and a callable; non-positive ``ssr`` refused;
+    pillars beyond ``max_maturity`` dropped with a flag."""
     pillars = (1.0 / 12.0, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0)
-    ts = marking_targets(ssvi, pillars, ssr_target=1.0, anchor_power=1.0)
-    assert ts.mode == "marking" and ts.anchor_power == 1.0
+    ts = marking_targets(ssvi, pillars, ssr_target=1.0, mat_min=0.0)
+    assert ts.mode == "marking" and ts.anchor_power == 1.0 and ts.smooth_breakeven
+    assert ts.smooth_degree == 2 and ts.sabrw_power == 1.0 and ts.atf_ref == 0.3
     assert np.allclose(ts.pillars, sorted(pillars)) and len(ts.sabr) == 7
     assert ts.flags == (), ts.flags
     atf3 = float(ssvi.atm_vol(0.25))
     assert ts.sigma_0 == float(ssvi.atm_vol(1.0 / 12.0)) == pytest.approx(0.22, abs=1e-6)
     assert ts.atf_anchor == atf3
-    assert all(s.h == SABR_CURVATURE_H for s in ts.sabr)
+    raw = np.array([(atf3 / s.atf) * 0.5 * s.vov_sabr for s in ts.sabr])
+    assert np.allclose(ts.vov_be_raw, raw, rtol=1e-14)
+    sm, deg = smooth_breakeven_curve(ts.pillars, raw)
+    assert deg == 2 and np.allclose(ts.vovol, sm, rtol=1e-14)
+    assert np.all(np.abs(ts.vovol / raw - 1.0) < 0.01)
     for i, T in enumerate(ts.pillars):
         s = ts.sabr[i]
         assert s.T == T and s.flags == () and abs(s.atf - float(ssvi.atm_vol(T))) < 1e-12
-        assert s.skew == pytest.approx(float(ssvi.atm_skew(T))) and s.skew < 0
-        assert s.skew_sabr == pytest.approx(s.skew, rel=1e-12)  # no clipping on this surface
-        anchor = (atf3 / s.atf) ** 1.0
-        assert ts.anchor[i] == pytest.approx(anchor, rel=1e-14)
-        assert ts.atf[i] == s.atf and ts.skew_target[i] == s.skew_sabr and ts.ssr_target[i] == 1.0
-        assert ts.vovol[i] == pytest.approx(0.5 * 1.0 * s.atf * s.nu_sabr * anchor, rel=1e-14)
-        assert ts.spot_vol_covar[i] == pytest.approx(1.0 * ts.sigma_0 * s.skew_sabr, rel=1e-14)
+        assert ts.skew_target[i] == s.skew == pytest.approx(float(ssvi.atm_skew(T)))
+        assert ts.anchor[i] == pytest.approx(atf3 / s.atf, rel=1e-14)
+        assert ts.correl_target[i] == s.rho_sabr and -0.81 < s.rho_sabr < -0.80
+        assert ts.spot_vol_covar[i] == pytest.approx(s.rho_sabr * ts.vovol[i], rel=1e-14)
         assert ts.vol_var[i] == pytest.approx(ts.vovol[i] ** 2, rel=1e-14)
         assert ts.spot_vol_covar_se[i] == 0.0 and ts.vol_var_se[i] == 0.0
-    assert ts.anchor[1] == pytest.approx(1.0) and ts.pillars[1] == 0.25
+    unsm = marking_targets(ssvi, pillars, mat_min=0.0, smooth_breakeven=False)
+    assert np.allclose(unsm.vovol, raw, rtol=1e-14) and unsm.smooth_degree == -1
+    ssr_raw = unsm.ssr_implied
+    assert np.allclose(ssr_raw, atf3 / ts.sigma_0, rtol=1e-12)  # ssr atf_3M / sigma_0
+    assert np.all(np.abs(ts.ssr_implied / ssr_raw - 1.0) < 0.01)
     frame = ts.frame()
-    assert len(frame) == 7 and {"nu_sabr", "rho_sabr", "anchor", "vovol_target"} <= set(frame)
-    # policy check
+    assert len(frame) == 7
+    assert {"vov_be_raw", "vov_sabr", "corr_be", "smile_365", "convex_365"} <= set(frame)
+    # MatMin and the default pillars
+    d = marking_targets(ssvi, pillars)
+    assert d.pillars[0] == 0.25 and any("below mat_min 0.25" in f for f in d.flags)
+    dd = marking_targets(ssvi)
+    assert dd.pillars.tolist() == [0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0]
+    # policy check on the raw curve
     pc = ts.policy_check()
     assert list(pc["T"]) == list(ts.pillars)
     assert (pc["reading"] == "absolute").all(), pc
     assert np.allclose(pc["vovol_target_at_ssr_1"], pc["policy_absolute"], rtol=1e-12)
     assert np.allclose(pc["mismatch_lognormal"], 1.0 / ts.atf, rtol=1e-12)
     assert np.all((pc["mismatch_lognormal"] > 4.0) & (pc["mismatch_lognormal"] < 6.0)), pc
-    ratio = pc["policy_lognormal"] / pc["vovol_target_at_ssr_1"]
-    assert np.all(ratio > 3.0), pc  # the lognormal reading would be off by more than 3x
-    # ssr as a mapping (interpolated in T) and as a callable
-    tm = marking_targets(ssvi, pillars, ssr_target={0.25: 1.5, 5.0: 0.8})
-    exp = np.interp(ts.pillars, [0.25, 5.0], [1.5, 0.8])
-    assert np.allclose(tm.ssr_target, exp)
-    assert np.allclose(tm.vovol, ts.vovol * exp) and np.allclose(
-        tm.spot_vol_covar, ts.spot_vol_covar * exp
+    # ssr as a mapping and a callable
+    tm = marking_targets(
+        ssvi, pillars, ssr_target={0.25: 1.5, 5.0: 0.8}, mat_min=0.0, smooth_breakeven=False
     )
-    assert np.allclose(tm.vol_var, ts.vol_var * exp * exp)
-    tc = marking_targets(ssvi, pillars, ssr_target=lambda T: 1.0 + 0.1 * T)
+    exp = np.interp(ts.pillars, [0.25, 5.0], [1.5, 0.8])
+    assert np.allclose(tm.ssr_target, exp) and np.allclose(tm.vovol, raw * exp)
+    assert np.allclose(tm.spot_vol_covar, unsm.spot_vol_covar * exp)
+    assert (tm.policy_check()["reading"] == "absolute").all()
+    tc = marking_targets(ssvi, pillars, ssr_target=lambda T: 1.0 + 0.1 * T, mat_min=0.0)
     assert np.allclose(tc.ssr_target, 1.0 + 0.1 * ts.pillars)
-    assert np.allclose(tc.spot_vol_covar, ts.spot_vol_covar * (1.0 + 0.1 * ts.pillars))
-    pcm = tm.policy_check()  # vovol / ssr recovers the unit-ssr value whatever the dial
-    assert (pcm["reading"] == "absolute").all()
-    # pillars without 3M: the stored anchor keeps the reading (was 'neither' by re-interpolation)
+    for ssr in (0.7, {0.25: 1.5, 3.0: 0.8}):
+        a = ts.with_ssr_target(ssr)
+        b = marking_targets(ssvi, pillars, ssr_target=ssr, mat_min=0.0)
+        for f in ("ssr_target", "spot_vol_covar", "vol_var", "vovol", "vov_be_raw"):
+            assert np.allclose(getattr(a, f), getattr(b, f), rtol=1e-12), f
+    with pytest.raises(ValueError):
+        marking_targets(ssvi, pillars, ssr_target=0.0)
+    # without 3M: the stored anchor keeps the reading
     t_no3m = marking_targets(ssvi, (0.5, 1.0, 2.0))
-    assert t_no3m.atf_anchor == atf3 and np.allclose(t_no3m.anchor, atf3 / t_no3m.atf)
-    pn = t_no3m.policy_check()
-    assert (pn["reading"] == "absolute").all(), pn
-    assert np.allclose(pn["mismatch_lognormal"], 1.0 / t_no3m.atf, rtol=1e-12)
-    # anchor_power 0.5: the formula is not the p = 1 policy away from 3M
-    ph = marking_targets(ssvi, pillars, anchor_power=0.5).policy_check()
+    assert t_no3m.atf_anchor == atf3 and (t_no3m.policy_check()["reading"] == "absolute").all()
+    ph = marking_targets(ssvi, pillars, anchor_power=0.5, mat_min=0.0).policy_check()
     assert ph.loc[ph["T"] == 0.25, "reading"].item() == "absolute"
     assert (ph.loc[ph["T"] != 0.25, "reading"] == "neither").all()
-    # the desk's VoV_SABR classified against nu_sabr
     nu_s = {float(x.T): x.nu_sabr for x in ts.sabr}
     for scale, kind in ((1.0, "lognormal"), (2.0, "omega")):
         pv = ts.policy_check(vov_sabr={T: scale * v for T, v in nu_s.items()})
         assert (pv["vov_reading"] == kind).all(), pv
-        assert np.allclose(pv["vov_over_nu"], scale)
-    pa = ts.policy_check(
-        vov_sabr=lambda T: float(ssvi.atm_vol(T)) * nu_s[min(nu_s, key=lambda x: abs(x - T))]
-    )
+    pa = ts.policy_check(vov_sabr={float(x.T): x.vov_sabr for x in ts.sabr})
     assert (pa["vov_reading"] == "absolute").all(), pa
-    pu = ts.policy_check(vov_sabr=lambda T: 1.4 * nu_s[min(nu_s, key=lambda x: abs(x - T))])
-    assert (pu["vov_reading"] == "unknown").all(), pu
-    assert "vov_sabr" not in pc.columns
-    # anchoring power
-    t0 = marking_targets(ssvi, pillars, anchor_power=0.0)
-    assert np.all(t0.anchor == 1.0) and np.allclose(t0.vovol, 0.5 * t0.atf * ts.frame()["nu_sabr"])
-    pc0 = t0.policy_check()
-    assert pc0.loc[pc0["T"] == 0.25, "reading"].item() == "absolute"
-    assert (pc0.loc[pc0["T"] != 0.25, "reading"] == "neither").all()
-    t2 = marking_targets(ssvi, pillars, anchor_power=2.0)
-    assert np.allclose(t2.anchor, (atf3 / t2.atf) ** 2) and np.allclose(
-        t2.vovol, ts.vovol * ts.anchor
-    )
-    # explicit sigma_0 and pillars beyond max_maturity
-    tsig = marking_targets(ssvi, pillars, sigma_0=0.3)
-    assert tsig.sigma_0 == 0.3 and np.allclose(
-        tsig.spot_vol_covar, ts.spot_vol_covar * 0.3 / ts.sigma_0
-    )
+    tsig = marking_targets(ssvi, pillars, sigma_0=0.3, mat_min=0.0)
+    assert tsig.sigma_0 == 0.3 and np.allclose(tsig.spot_vol_covar, ts.spot_vol_covar)
     td = marking_targets(ssvi, (1.0, 0.5, 12.0, 15.0))
     assert td.pillars.tolist() == [0.5, 1.0]
-    assert len(td.flags) == 1 and "beyond max_maturity" in td.flags[0] and "12.0" in td.flags[0]
+    assert any("beyond max_maturity" in f and "12.0" in f for f in td.flags)
+    assert any("fewer than three pillars" in f for f in td.flags)
     with pytest.raises(ValueError, match="no pillar"):
         marking_targets(ssvi, (12.0,))
 
@@ -808,11 +828,9 @@ def test_marking_targets_and_policy_check(ssvi) -> None:  # type: ignore[no-unty
 def test_marking_targets_sabr_consistency_at_ssr_2() -> None:
     """A 1F Bergomi model with ``k → 0`` is lognormal SABR with ``ν_Bergomi = ν_SABR``: on a
     quadratic pillar built from ``(atf, ν, ρ)`` at ``T = 1e-3`` the engine gives ``vovol = ν``,
-    ``Skew = ½ ρ ν`` and ``SSR = 2`` (the ``T → 0`` SSR of every diffusive model), and the
-    marking targets at ``ssr = 2`` (``anchor_power = 0``) equal the model's ``VolVar`` and
-    ``SpotVolCovar`` to 1e-5 (the ``k T = 1e-6`` residual of the finite ``k``) — the ½ of
-    ``vovol_target`` is the ``ssr = 2`` normalisation, not a ν/ω conversion; at ``ssr = 1`` both
-    targets are half the smile's diffusive dynamics."""
+    ``Skew = ½ ρ ν`` and ``SSR = 2``, and the step-1 targets at ``ssr = 2`` (``SabrW_Power = 0``,
+    ``anchor_power = 0``, one pillar, no MatMin) equal the model's ``VolVar`` and ``SpotVolCovar =
+    Corr_BE VoV_BE`` to 1e-5 — SABR dynamics are SSR 2, and ``ssr = 1`` halves ``VoV_SABR``."""
     T = 1e-3
     for atf, nu, rho in ((0.2, 1.0, -0.6), (0.25, 1.74, -0.7), (0.15, 0.5, 0.3)):
         q = _QuadSurface.from_sabr(atf, nu, rho)
@@ -820,12 +838,13 @@ def test_marking_targets_sabr_consistency_at_ssr_2() -> None:
         r = first_order_breakevens(p, ForwardVarianceCurve.flat(atf * atf), T)
         assert r.vovol == pytest.approx(nu, rel=1e-6) and r.ssr == pytest.approx(2.0, rel=1e-6)
         assert r.skew == pytest.approx(0.5 * rho * nu, rel=1e-6)
-        t2 = marking_targets(q, (T,), ssr_target=2.0, anchor_power=0.0, sigma_0=atf)
+        kw = {"anchor_power": 0.0, "sigma_0": atf, "mat_min": 0.0, "sabrw_power": 0.0}
+        t2 = marking_targets(q, (T,), ssr_target=2.0, **kw)  # type: ignore[arg-type]
         assert t2.sabr[0].nu_sabr == pytest.approx(nu, rel=1e-6)
         assert t2.vol_var[0] == pytest.approx(r.vol_var, rel=1e-5)
         assert t2.spot_vol_covar[0] == pytest.approx(r.spot_vol_covar, rel=1e-5)
         assert t2.skew_target[0] == pytest.approx(r.skew, rel=1e-5)
-        t1 = marking_targets(q, (T,), ssr_target=1.0, anchor_power=0.0, sigma_0=atf)
+        t1 = marking_targets(q, (T,), ssr_target=1.0, **kw)  # type: ignore[arg-type]
         assert t1.vol_var[0] == pytest.approx(0.25 * r.vol_var, rel=1e-5)
         assert t1.spot_vol_covar[0] == pytest.approx(0.5 * r.spot_vol_covar, rel=1e-5)
 
@@ -885,6 +904,7 @@ def test_historical_targets() -> None:
         assert ts.spot_vol_covar[j] == pytest.approx(sr.ssr * ts.sigma_0 * skw[j], rel=1e-12)
         assert ts.spot_vol_covar_se[j] == pytest.approx(abs(sr.se * ts.sigma_0 * skw[j]), rel=1e-12)
         assert vv.se > 0 and sr.se > 0
+    assert np.allclose(ts.correl_target, ts.spot_vol_covar / ts.vovol, rtol=1e-12)
     assert len(ts.flags) == 2
     assert "windows vol 250 / ssr 60" in ts.flags[0] and str(hist.dates[-1].date()) in ts.flags[0]
     assert "sigma_0" in ts.flags[1] and "no one-month pillar" in ts.flags[1]

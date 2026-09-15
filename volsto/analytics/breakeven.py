@@ -87,12 +87,11 @@ the market's) the sensitivities keep their log-sensitivities and scale with the 
 rescaled: eq. 8.54 holds at the order-zero VS vol and the gate below measured the plain
 order-one skew within 0.6–7% of the simulated skew at every node (ν 0.5–1.74) while a
 ``(σ̂_VS/σ̂)³`` rescale moved it the wrong way by +5–10% (ν 0.5), +16–29% (ν 1) and +47–84%
-(ν 1.74) — the rescale was removed after that measurement.  Consequence for the break-even
-fitter's marking mode: the first-order ``SSR = SpotVolCovar/(σ_0 Skew)`` of a naked kernel is
-``(σ̂/σ̂_VS) R^{order one}`` with ``R^{order one} ∈ [1, 2]`` (eq. 9.21, ``→ 2`` as ``T → 0``), so an
-``ssr_target = 1`` with a ±10% market-skew guard is infeasible at short maturities for any
-diffusive model (measured on the reference SSVI: k1 → 20, |ρ_SXi| → 1, both guards binding, the
-SSR dial inert) — recorded for the owner in :mod:`volsto.calibration.fit_2f` and SPEC §15.
+(ν 1.74) — the rescale was removed after that measurement.  The first-order ``SSR =
+SpotVolCovar/(σ_0 Skew)`` of a naked kernel is ``(σ̂/σ̂_VS) R^{order one}`` with ``R^{order one} ∈
+[1, 2]`` (eq. 9.21, ``→ 2`` as ``T → 0``); the P1 marking calibration of
+:mod:`volsto.calibration.fit_2f` adds the leverage's spot sensitivity to it (eq. 12.52) and
+reports where its targets bind (SPEC §15 Part 3).
 
 **Accuracy (naked model, measured in ``tests/test_breakeven.py::test_engine_gate_analytic_vs_
 simulation``, Table 8.2 correlations, flat 20% curve, 100k paths, first order with the

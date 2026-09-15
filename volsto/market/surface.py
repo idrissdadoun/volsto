@@ -629,6 +629,21 @@ def delta_sigma_from_config(
         pillars, i, slope = tuple(p["pillars"]), int(p["index"]), float(p["slope"])
         k_cap = float(p.get("k_cap", 0.5))  # rotation around the money, saturating in the wings
         return lambda k, T: slope * saturated_k(k, k_cap) * tent(T, pillars, i)
+    if kind == "rotation":
+        # the desk's rotation (SPEC §15 Part 3, shadow-rotation greek): ``size`` rotas, one rota
+        # being an ATM-skew move of ``2/sqrt(T)`` vol points per unit log-moneyness (``2/sqrt(T)
+        # ln(110/90)`` vol points of 90/110 skew, 0.57 at 6M), the maturity floored at ``t_min``,
+        # saturating beyond ``k_cap``; positive size steepens (puts up, calls down)
+        size, t_min = float(p["size"]), float(p["t_min"])
+        k_cap = float(p.get("k_cap", 0.5))
+        if t_min <= 0:
+            raise ValueError("rotation needs a positive t_min")
+
+        def ds_rot(k: FloatArray, T: FloatArray) -> FloatArray:
+            T_ = np.maximum(np.asarray(T, dtype=np.float64), t_min)
+            return np.asarray(-size * 0.02 / np.sqrt(T_) * saturated_k(k, k_cap), dtype=np.float64)
+
+        return ds_rot
     if kind == "curvature_tent":
         pillars, i, curv = tuple(p["pillars"]), int(p["index"]), float(p["curv"])
         k_cap = float(p.get("k_cap", 0.5))

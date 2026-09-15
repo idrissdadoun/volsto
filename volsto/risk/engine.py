@@ -197,18 +197,23 @@ class _Counter:
 
 
 class LSVBuilder:
-    """LSV models from states through the leverage cache (SPEC v2 §7.1)."""
+    """LSV models from states through the leverage cache (SPEC v2 §7.1); with
+    ``allow_calibrate=False`` a missing entry raises :class:`~volsto.calibration.cache.
+    CacheMissError` (tests and viewers never calibrate)."""
 
-    def __init__(self, cache: LeverageCache, base: RiskState) -> None:
+    def __init__(
+        self, cache: LeverageCache, base: RiskState, *, allow_calibrate: bool = True
+    ) -> None:
         self.cache = cache
         self.base = base
+        self.allow_calibrate = bool(allow_calibrate)
         self._counter = _Counter()
         self._models: dict[tuple[str, str, tuple[float, ...] | None], Model] = {}
         self.base_model = self._recalibrated(base)
 
     def _recalibrated(self, state: RiskState) -> LSV:
         miss = not self.cache.has(state.spec)
-        model, _ = self.cache.get_or_calibrate(state.spec)
+        model, _ = self.cache.get_or_calibrate(state.spec, allow_calibrate=self.allow_calibrate)
         self._counter.add(state.key, miss)
         return model
 

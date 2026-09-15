@@ -31,13 +31,13 @@ spec:
     gamma: 0.5
     max_maturity: 10.0
   model:
-    nu: 2.5082710031510658
-    theta: 0.08259124880012231
-    k1: 5.503911254345549
+    nu: 2.5000000001526193
+    theta: 0.08124520512680758
+    k1: 7.753721113785216
     k2: 0.2
-    rho12: -0.008628056925320274
-    rho_SX1: -0.9999620218447381
-    rho_SX2: -0.0
+    rho12: 0.9999998350213791
+    rho_SX1: -0.9999999993122146
+    rho_SX2: -0.999999855451465
   particle:
     n_particles: 200000
     horizon: 3.0
@@ -82,6 +82,7 @@ spec:
   local_vol: null
   perturbation: null
 fit:
+  label: reference_ssr1.5_eps0.05
   config:
     pillars:
     - 0.25
@@ -89,24 +90,30 @@ fit:
     - 1.0
     - 2.0
     - 3.0
+    - 5.0
+    - 10.0
+    mat_min: 0.25
+    smooth_breakeven: true
+    sabrw_power: 1.0
+    atf_ref: 0.3
     k2: 0.2
     k1_bounds:
     - 0.3
     - 20.0
     k1_min_gap: 0.05
     k1_grid: 25
-    skew_weight: 0.1
-    ssr_measure: lsv
-    ssr_tol: 0.05
-    clamp_to_attainable: false
-    term_structure: atmf
-    lv_ssr: order1
-    weights_ssr: uniform
+    skew_mode: twopoint
+    skew_eps:
+    - 0.05
+    - 0.05
+    skew_pillars:
+    - 1.0
+    - 5.0
+    skew_weight: 1.0
+    weights_covar: relative
     weights_volvar: relative
-    volvar_target: achieved
-    sigma_hat_prefactor: market
+    term_structure: atmf
     nu_cap: 2.5
-    nu_flag: 2.5
     chi_bounds:
     - -0.99
     - 0.99
@@ -116,46 +123,23 @@ fit:
     n_ts: 64
     n_quad_ts: 32
     n_inner_ts: 24
-  ssr_target: 1.0
-  ssr_fitted:
-  - 1.0
-  - 1.0
-  - 1.0
-  - 1.0
-  - 1.0
-  anchor_power: 1.0
+  ssr_target: 1.5
   breakeven:
-    k1: 5.503911254345549
+    k1: 7.753721113785216
     k2: 0.2
-    omega1: 5.000189897988284
-    omega2: 0.4501504126404758
-    lambda1: -5.0
-    lambda2: -0.0
-    chi: -0.9899999999997288
-  message: 'ssr_target=1.000 below attainable floor 1.352 at skew_weight=0.1; not
-    clamped (clamp_to_attainable=False): fitted at 1.000, achieved 1.538.'
-  pillars:
-  - 0.25
-  - 0.5
-  - 1.0
-  - 2.0
-  - 3.0
-  ssr_achieved_lsv:
-  - 2.298836489170369
-  - 1.7696310163174513
-  - 1.3337809127549234
-  - 1.148207694408336
-  - 1.138700399960948
-  ssr_achieved_naked_vs_market:
-  - 1.8929778722290656
-  - 1.66954574612146
-  - 1.2633313584606425
-  - 0.8866809658583737
-  - 0.7037415274404459
-  skew_gap_rel:
-  - 0.17828680840835154
-  - 0.2095273861363487
-  - 0.07344926075496883
-  - -0.13628450328776698
-  - -0.25162357061144447
-  leverage_proxy_mean_abs_L_minus_1: 0.18004486137457076
+    omega1: 4.593774031217506
+    omega2: 0.4062260306614025
+    lambda1: -4.593774028057975
+    lambda2: -0.40622597194202487
+    chi: -0.989998327847676
+  status: binding
+  messages:
+  - 'skew constraint binds at T=5 (upper edge: naked skew = (1-0.05) x Skew_SABR =
+    -0.13472): naked skew -0.13472 vs market -0.14181 (-5.0%, eps 0.05); SpotVolCovar
+    achieved vs target: 0.25y -0.34643/-0.21782 (+59.0%), 0.5y -0.19898/-0.15550 (+28.0%),
+    1y -0.11948/-0.10891 (+9.7%), 2y -0.07732/-0.07487 (+3.3%), 3y -0.06048/-0.05963
+    (+1.4%), 5y -0.04426/-0.04434 (-0.2%), 10y -0.02699/-0.02917 (-7.5%)'
+  - nu at cap 2.5; first-order break-even engine ~15% biased beyond ~4; raise only
+    if stage-3 simulation validates (step 2 box |lambda1|+|lambda2| <= 2 nu_cap)
+  surface: reference
+  skew_eps: 0.05

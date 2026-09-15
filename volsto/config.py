@@ -729,13 +729,15 @@ class SurfacePerturbation:
     ``kind`` and the YAML-safe ``params`` are hashed into the leverage cache key, so every
     recalibrating bump is a cache entry.  Kinds (built in :func:`volsto.market.surface.
     perturbed_surface`): ``parallel`` (size), ``tent`` (pillars, index, size), ``skew_tent``
-    (pillars, index, slope: ``slope · k · tent``), ``curvature_tent`` (pillars, index, curv:
-    ``curv · k² · tent``), ``shift_k`` (delta: ``σ(k + delta, T) − σ(k, T)``, the sticky-strike
-    regime), ``atm_shift`` (delta, factor: ``factor · s_T · delta`` with ``s_T`` the base ATM skew,
-    the sticky-skew / sticky-local-vol regimes), ``total_variance`` (eps, t_lo, t_hi: the
-    forward-variance bucket bump ``w → w + eps ∫_{bucket ∩ [0,T]} ξ₀``), ``roll`` (dt: the surface
-    held in (K, absolute expiry) seen ``dt`` later), ``table`` (ks, ts, values: bilinear ``δσ``),
-    ``composite`` (items: list of perturbation mappings, summed).
+    (pillars, index, slope: ``slope · k · tent``), ``curvature_tent`` (pillars, index, curv: ``curv
+    · k² · tent``), ``rotation`` (size, t_min, k_cap: ``−size · 0.02/sqrt(max(T, t_min)) · k_cap
+    tanh(k/k_cap)``, the desk rota of the shadow-rotation greek), ``shift_k`` (delta: ``σ(k + delta,
+    T) − σ(k, T)``, the sticky-strike regime), ``atm_shift`` (delta, factor: ``factor · s_T ·
+    delta`` with ``s_T`` the base ATM skew, the sticky-skew / sticky-local-vol regimes),
+    ``total_variance`` (eps, t_lo, t_hi: the forward-variance bucket bump ``w → w + eps ∫_{bucket ∩
+    [0,T]} ξ₀``), ``roll`` (dt: the surface held in (K, absolute expiry) seen ``dt`` later),
+    ``table`` (ks, ts, values: bilinear ``δσ``), ``composite`` (items: list of perturbation
+    mappings, summed).
     """
 
     kind: str

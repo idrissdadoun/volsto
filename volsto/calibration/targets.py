@@ -1,95 +1,93 @@
-"""Break-even targets for the two-factor fit (SPEC §15 Part 3, M7 addendum): the SABR
-reduction of a surface pillar and the two target modes.
+"""Break-even targets of the P1 (two-factor LSV) marking calibration (SPEC §15 Part 3, owner's
+"M7 Part 3 FINAL" specification): the SABR reduction of a surface pillar (step 0), the
+SABR break-evens (step 1) and the historical alternative.
 
-**SABR reduction** (per pillar ``T``, lognormal SABR at order one in ``ν``, Hagan): from the
-surface's ATM level ``atf = σ̂(k = 0)``, ATM slope ``skew = ∂σ̂/∂k`` and curvature ``curv =
-∂²σ̂/∂k²`` in log-moneyness ``k = ln(K/F)``::
+**Step 0 — SABR reduction per pillar** (library conventions; the owner: "this library is its
+OWN system ... its own conventions", no production value to match).  Maturities are ACT/365
+years (``T_365 = T``); log-moneyness ``k = ln(K/F)``.  From the surface, per pillar ``T``, the
+library's 365-day quotes (``x = k/√T`` the normalised log-moneyness)::
 
-    ν_SABR = sqrt(6 skew² + 3 atf curv),   ρ_SABR = 2 skew / ν_SABR,   Skew_SABR = ½ ρ_SABR ν_SABR
+    Atf_365    = 100 σ̂(0, T)                      (vol points)
+    Smile_365  = 100 · 2 · ∂σ̂/∂x = 100 · 2 √T · ∂σ̂/∂k
+    Convex_365 = 100 · ∂²σ̂/∂x² = 100 · T · ∂²σ̂/∂k²
 
-(``σ̂(k) ≈ atf + ½ ρ ν k + (2 − 3ρ²) ν² / (12 atf) k²`` inverts to exactly these; ``ν_SABR`` is
-the lognormal vol of vol of the SABR ATM vol — the ``ν`` of ``dα = ν α dZ``, the same ``ν`` as
-Bergomi's for a 1F model with ``k → 0`` — and ``Skew_SABR`` reproduces the surface skew by
-construction, in vol per unit log-strike, the units of book eq. 8.54).  The slope is the
-surface's analytic ``atm_skew`` when it has one, the curvature the central difference of
-half-width ``h`` in ``k`` (default ``1e-3``: the ``k → 0`` curvature, consistent with the
-analytic slope; on the reference SSVI ``h = 0.02`` overstates it by 2.5x at 1M and 1.6x at 3M,
-muted to 1.5% / 0.6% on ``ν_SABR`` because the radicand is skew-dominated at ``ρ ≈ −0.8``; the
-value used is recorded in :attr:`SabrPillar.h`).  Flags, never silent: a negative radicand (a
-smile too flat for its skew) gives NaN; ``|ρ_SABR| > 1`` is clipped; a surface without an
-analytic ``atm_skew`` gets both derivatives from the stencil, which is meaningless on a
-piecewise-linear grid (a :class:`~volsto.market.surface.GridSurface` with an ATM knot measures
-the kink: curvature growing like ``1/h``); pillars with ``ν_SABR² T > SABR_FINITE_T_LIMIT`` are
-flagged because the ``T → 0`` reduction ignores Hagan's finite-``T`` correction (measured bias
-on ``ν_SABR``: −0.7% at 3M and −2.7% at 1y for ``(ν, ρ) = (0.5, −0.9)``, +12% at 3M and +50% at
-1y for ``(2.5, +0.3)``; ``ρ_SABR`` is unaffected).  *Convention to confirm (owner):* accept the
-order-one reduction on its domain ``ν_SABR² T ≲ 1`` (0.6–0.8 on the reference surface at every
-pillar), or invert the full Hagan ATM formula per pillar.
+converted to physical with the owner's formulas::
 
-**Marking mode** (default): the correlation comes from SABR, the SSR is a dial, the vol of
-vol is the *output* of the SABR level, the anchoring and the dial::
+    atf_T = Atf_365 / 100
+    smi_T = Smile_365 / (100 · 2 · √T)               = ∂σ̂/∂k           (the ATM skew)
+    cvx_T = Convex_365 / (100 · T · (atf_T/atf_ref)^p) = ∂²σ̂/∂k² (atf_ref/atf_T)^p
 
-    A(T)                   = (atf(3M) / atf(T))^p               anchor_power p (1 = 3M anchoring)
-    vovol_target(T)        = ½ ssr(T) atf(T) ν_SABR(T) A(T)     absolute vol of the ATMF vol
-    SpotVolCovar_target(T) = ssr(T) σ_0 Skew_SABR(T)     (correl cancels: it enters vovol only)
-    VolVar_target(T)       = vovol_target(T)²
-    skew_target(T)         = Skew_SABR(T)
+``atf_ref = 0.3`` and ``p = SabrW_Power`` (config, default 1 — the library's convexity-rescaling
+convention; ``p = 0`` is the plain Hagan inversion).  Then::
 
-so that a model matching these has ``SSR_T = SpotVolCovar/(σ_0 Skew) = ssr(T)`` and the
-spot/vol correlation ``ρ_SABR σ_0/atf`` at every dial value.  **The ½ is not a ν-versus-ω
-conversion** (``ν_SABR`` already is a vol of vol): it is the value at which ``ssr = 2`` — the
-``T → 0`` SSR of *every* diffusive model (book ``R_0 = 2``; SPEC Part 1 ``R_1w = 1.999 ± 0.016``)
-— reproduces the smile's own dynamics exactly: a 1F Bergomi model with ``k → 0`` that reproduces
-a SABR pillar satisfies ``VolVar_target`` and ``SpotVolCovar_target`` at ``ssr = 2`` to 1e-12
-(``tests/test_breakeven.py::test_marking_targets_sabr_consistency_at_ssr_2``).  At ``ssr = 1``
-(the sticky-strike marking policy) both targets are therefore **half** the diffusive
-short-maturity dynamics of the smile: the vol of vol demanded is ``½ atf ν_SABR`` and the
-spot/vol covariance ``σ_0 Skew``, whereas the smallest value any diffusive model with the
-market skew can show at 1M is about ``2 σ_0 Skew`` (engine SSR of the pure-SV kernels at 1M:
-1.96 / 1.89 for 1F / 2F, 2.5–2.6 for the cached LSVs at 3M).  *Convention to confirm
-(owner):* whether the dial is meant relative to the diffusive short-``T`` value (then write it
-``ssr/2`` with ``ssr = 2`` at ``T → 0``) or as an absolute SSR (then the short pillars are
-infeasible for a diffusive model and should be weighted down or excluded); both halves come
-from the same dial.  :meth:`TargetSet.policy_check` compares ``vovol_target/ssr`` with the desk
-policy ``½ VoV_SABR atf(3M)/atf(T)`` under the two readings of ``VoV_SABR`` — absolute
-(``ν_SABR atf``, which the formula above reproduces exactly at ``p = 1``) and lognormal
-(``ν_SABR``, off by the factor ``1/atf(T)``) — from the stored 3M anchor, and, given the desk's
-own ``VoV_SABR`` per pillar, reports ``VoV_SABR/ν_SABR`` (1 → lognormal ν-like, ``atf`` →
-absolute, 2 → ω-like); without the desk's number the ``reading`` column is an identity check of
-the formula only (``"absolute"`` at ``p = 1``), not a discrimination between conventions.
+    ν_SABR(T)    = sqrt(6 smi_T² + 3 atf_T cvx_T)          lognormal vol of vol of the ATM vol
+    VoV_SABR(T)  = atf_T ν_SABR(T)                          ABSOLUTE vol of vol (confirmed)
+    Corr_SABR(T) = 2 smi_T / ν_SABR(T)                      (= ρ_SABR, negative for equities)
+    Skew_SABR(T) = smi_T
 
-**Historical mode**: ``VolVar_target(T) = (atf(T) volvol_hist(T))²`` (the lognormal vol of the
-VS vol of the M7 Part 2 estimator as the ATMF vol's, order one), ``SpotVolCovar_target(T) =
-SSR_hist(T) σ_0 skew_market(T)`` and ``skew_target = skew_market`` at the pricing date, with the
-estimators' standard errors carried.
+*Reading of the owner's formulas (flagged in the report):* written with ``smi, cvx`` in the
+units above, ``sqrt(6 smi² + 3 atf cvx)`` is the lognormal ``ν_SABR`` (Hagan β = 1 at order one:
+``σ̂(k) ≈ atf + ½ρν k + (2 − 3ρ²)ν²/(12 atf) k²`` inverts to exactly this at ``p = 0``); the owner's
+confirmed fact "VoV_SABR is the ABSOLUTE vol of vol (ν_SABR · atf)" is the same formula in
+absolute smile units ``smi_abs = atf smi``, ``cvx_abs = atf² cvx``, and the owner's ``Corr_SABR =
+−2 smi / VoV_SABR`` is that formula with the smile quoted positive for a put skew (``smi_abs =
+−atf ∂σ̂/∂k``).  The library keeps ``Skew_SABR = ∂σ̂/∂k`` (negative), the units of the naked
+model skew of book eq. 8.54 it is compared with, and ``Corr_SABR = ρ_SABR``.  With ``p = 1`` the
+curvature term ``3 atf cvx = 3 atf_ref ∂²σ̂/∂k²`` no longer depends on ``atf``; against ``p = 0``
+it moves ``ν_SABR`` by +0.4% to +0.5% on the reference SSVI (``atf`` 0.20–0.22, positive ATM
+curvature) and by −2.5% to −3.8% on SPX 2022-12-30 (negative ATM vol curvature at ``h = 1e-3``),
+``Corr_SABR`` by −0.004 / −0.02 to −0.03 (measured in
+``tests/test_breakeven.py::test_sabr_reduction``).  The slope is the surface's analytic
+``atm_skew`` when it has one, the curvature the central difference of half-width ``h`` (default
+``1e-3``: the ``k → 0`` curvature; ``h = 0.02`` overstates it by 2.5× at 1M on the reference
+SSVI).  Flags, never silent: negative radicand (NaN), ``|Corr_SABR| > 1`` (clipped), no
+analytic ``atm_skew`` (central differences), ``ν_SABR² T > 1`` (the ``T → 0`` reduction ignores
+Hagan's finite-``T`` correction).
 
-**σ_0** is the ATMF vol at :data:`SIGMA0_MATURITY` (one month) in both modes — the market
-proxy of SPEC §15's ``σ_0 = L(0, S_0) sqrt(ξ_0^0)``, the instantaneous spot vol (0.2200 against
-0.2194 for the cached 2F LSV on the reference SSVI), the same ``σ_0`` the engine
-:mod:`volsto.analytics.breakeven` defaults to; a history without a one-month pillar gets the
-ATM vol interpolated across its pillars (flat outside) with a flag naming it, never a silent
-nearest pillar.  Checked by ``tests/test_breakeven.py`` (``test_sabr_reduction``,
+**Step 1 — break-even targets** (marking mode, the default)::
+
+    VoV_BE(T)  = (atf_3M / atf_T)^q · (ssr_target(T) / 2) · VoV_SABR(T)       q = anchor_power = 1
+    Corr_BE(T) = Corr_SABR(T)
+    SpotVolCovar_target(T) = Corr_BE(T) · VoV_BE(T)
+    VolVar_target(T)       = VoV_BE(T)²
+
+*Rationale:* SABR-implied dynamics are SSR = 2 (``Corr_SABR · VoV_SABR = 2 atf Skew_SABR``: a 1F
+Bergomi model with ``k → 0`` matching the pillar meets both targets at ``ssr = 2``, checked to
+1e-5 in ``tests/test_breakeven.py``); ``ssr_target = 1`` marks sticky-strike by halving
+``VoV_SABR``.  The SSR the targets imply is ``SpotVolCovar_target / (σ_0 Skew_SABR) = ssr_target
+· atf_3M / σ_0`` before smoothing (``σ_0 = atf_1M``): 0.955 ssr on the reference SSVI, 1.084 ssr
+on SPX 2022-12-30; SmoothBreakEven moves it by less than 1% (0.947–0.962 and 1.083–1.085 at ssr
+1, :meth:`TargetSet.ssr_implied`).  ``ssr_target`` enters ``VoV_BE`` only; it is not a
+model-realised SSR target (the calibrated LSV's numerical SSR is a stage-3 diagnostic of
+:mod:`volsto.calibration.fit_2f`).  3M anchoring and **SmoothBreakEven** regularise the VoV term
+structure: with ``smooth_breakeven=True`` (default) ``ln VoV_BE`` is replaced by its least-squares
+polynomial in ``ln T`` of degree ``min(2, n − 2)`` over the ``n`` pillars (no smoothing below three
+pillars, flagged); the raw curve is kept (:attr:`TargetSet.vov_be_raw`) and the largest relative
+adjustment is flagged.  The correlation is not smoothed.  *SmoothBreakEven is the library's own
+definition* (the owner named the switch, not its form).  **MatMin**: pillars below ``mat_min``
+(default 3M, the owner's ``removeVolatilityPillarsBelow``) are dropped with a flag, as are pillars
+beyond the surface's ``max_maturity``; the default pillars run 3M–10Y.
+
+**σ_0** is the ATMF vol at :data:`SIGMA0_MATURITY` (one month) in both modes (the market proxy
+of ``σ_0 = L(0, S_0) sqrt(ξ_0^0)``; 0.2200 against 0.2194 for the cached 2F LSV on the reference
+SSVI); a history without a one-month pillar gets the ATM vol interpolated across its pillars with
+a flag.
+
+**Historical mode** (non-default alternative, the marked-vs-historical model-reserve study):
+``VolVar_target(T) = (atf(T) volvol_hist(T))²``, ``SpotVolCovar_target(T) = SSR_hist(T) σ_0
+skew_market(T)``, ``Corr_BE = SpotVolCovar_target / sqrt(VolVar_target)``, ``skew_target =
+skew_market`` at the pricing date, with the estimators' standard errors carried; pillars below
+``mat_min`` dropped.
+
+**Market term structures.**  The P1 break-even of :mod:`volsto.calibration.fit_2f` needs the
+market ATM skew and ATMF vol on ``(0, T]``: marking mode reads them from the surface
+(:meth:`TargetSet.market_skew`, :meth:`TargetSet.atmf_curve`); historical mode has the pillars
+only (``term_structure_source == "pillars"``; the fitter interpolates the skew residual between
+pillars, :func:`pillar_power_law_skew` extends the market skew for reporting).
+
+Checked by ``tests/test_breakeven.py`` (``test_sabr_reduction``,
 ``test_marking_targets_and_policy_check``, ``test_marking_targets_sabr_consistency_at_ssr_2``,
-``test_historical_targets``).
-
-**Correlation target and market term structures** (added for the soft-skew fitter of
-:mod:`volsto.calibration.fit_2f`, M7 Part 3 redesign).  ``correl_target`` is ``ρ_SABR(T)`` per
-pillar in marking mode (the owner's ``correl_target(T) = ρ_SABR(T)``); in historical mode, where
-no SABR reduction exists, it is the value the targets imply in the same normalisation,
-``SpotVolCovar_target · atf · A / (σ_0 · vovol_target)`` (which returns ``ρ_SABR`` exactly on
-marking targets, since ``SpotVolCovar/vovol = σ_0 ρ_SABR / (atf A)``).  The ``lsv`` measure of the
-fitter needs the market ATM skew and ATMF vol on ``(0, T]``, not only at the pillars
-(:meth:`TargetSet.market_skew`, :meth:`TargetSet.atmf_curve`): marking mode reads them from the
-surface (analytic ``atm_skew`` when available, else the ``h`` central difference); historical
-mode interpolates the pillar values — the skew as a **power law in T** between pillars
-(log-log linear) and beyond them with the end segments' exponents clipped to
-:data:`SKEW_EXPONENT_BOUNDS` (:func:`pillar_power_law_skew`; ``term_structure_source`` says
-so and the fitter flags it), the ATMF vol through the pillar total variances with a flat vol
-before the first pillar.  :meth:`TargetSet.with_ssr_target` rebuilds the SSR-dependent targets
-at another dial value (the fitter's floor clamp): ``SpotVolCovar = ssr σ_0 Skew`` in both
-modes, ``vovol = ½ ssr atf ν_SABR A`` in marking mode, the historical ``VolVar`` unchanged (it
-does not depend on the SSR).  Checked by
-``tests/test_fit_2f.py::test_target_term_structures_and_with_ssr``.
+``test_historical_targets``) and ``tests/test_fit_2f.py::test_breakeven_targets_final``.
 """
 
 from __future__ import annotations
@@ -106,14 +104,23 @@ from volsto.market.varswap import ForwardVarianceCurve
 
 FloatArray = NDArray[np.float64]
 
+#: the owner's pillar set (3M–10Y, "break-even used to 10Y")
 DEFAULT_TARGET_PILLARS: tuple[float, ...] = (0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0)
 ANCHOR_MATURITY = 0.25
+#: MatMin / removeVolatilityPillarsBelow: pillars below are dropped (owner default 3M)
+DEFAULT_MAT_MIN = 0.25
 #: the maturity whose ATMF vol is the market proxy of ``σ_0`` (one month)
 SIGMA0_MATURITY = 1.0 / 12.0
+#: ``atf_ref`` of the convexity rescaling ``(atf/atf_ref)^SabrW_Power``
+DEFAULT_ATF_REF = 0.3
+#: ``SabrW_Power`` (library convention, default 1)
+DEFAULT_SABRW_POWER = 1.0
 #: pillars with ``ν_SABR² T`` above this are flagged (the ``T → 0`` reduction, module docstring)
 SABR_FINITE_T_LIMIT = 1.0
 #: default half-width in log-moneyness of the curvature stencil (the ``k → 0`` curvature)
 SABR_CURVATURE_H = 1e-3
+#: the largest relative SmoothBreakEven adjustment reported without a flag
+SMOOTH_FLAG_REL = 0.05
 #: relative tolerance of the policy-check readings
 _POLICY_RTOL = 1e-9
 #: relative tolerance of the ``VoV_SABR / ν_SABR`` classification
@@ -126,6 +133,10 @@ SKEW_EXPONENT_BOUNDS: tuple[float, float] = (0.0, 0.75)
 
 @dataclass(frozen=True)
 class SabrPillar:
+    """Step 0 of one pillar (module docstring).  ``skew`` is ``smi_T = ∂σ̂/∂k``, ``curv`` the raw
+    ``∂²σ̂/∂k²``, ``cvx`` the rescaled ``curv (atf_ref/atf)^p``, ``nu_sabr`` the lognormal
+    ``sqrt(6 smi² + 3 atf cvx)`` and ``rho_sabr`` ``Corr_SABR`` (clipped to [−1, 1])."""
+
     T: float
     atf: float
     skew: float
@@ -134,11 +145,35 @@ class SabrPillar:
     rho_sabr: float
     flags: tuple[str, ...] = ()
     h: float = float("nan")
+    cvx: float = float("nan")
+    sabrw_power: float = DEFAULT_SABRW_POWER
+    atf_ref: float = DEFAULT_ATF_REF
+
+    @property
+    def vov_sabr(self) -> float:
+        """``VoV_SABR = atf ν_SABR`` (absolute)."""
+        return self.atf * self.nu_sabr
+
+    @property
+    def corr_sabr(self) -> float:
+        return self.rho_sabr
 
     @property
     def skew_sabr(self) -> float:
-        """``½ ρ_SABR ν_SABR`` (= ``skew`` unless ``ρ`` was clipped)."""
-        return 0.5 * self.rho_sabr * self.nu_sabr
+        """``Skew_SABR = smi_T`` (the market ATM skew)."""
+        return self.skew
+
+    @property
+    def atf_365(self) -> float:
+        return 100.0 * self.atf
+
+    @property
+    def smile_365(self) -> float:
+        return float(100.0 * 2.0 * np.sqrt(self.T) * self.skew)
+
+    @property
+    def convex_365(self) -> float:
+        return 100.0 * self.T * self.curv
 
 
 def surface_atm_derivatives(
@@ -157,16 +192,49 @@ def surface_atm_derivatives(
     return atf, skew, curv, analytic
 
 
-def sabr_reduce(surface: Any, T: float, h: float = SABR_CURVATURE_H) -> SabrPillar:
-    """The SABR reduction of one pillar (module docstring) with its flags."""
-    atf, skew, curv, analytic = surface_atm_derivatives(surface, T, h)
+def sabr_from_365(
+    T: float,
+    atf_365: float,
+    smile_365: float,
+    convex_365: float,
+    *,
+    sabrw_power: float = DEFAULT_SABRW_POWER,
+    atf_ref: float = DEFAULT_ATF_REF,
+) -> tuple[float, float, float]:
+    """The owner's conversion of the 365-day quotes to physical ``(atf, smi, cvx)``."""
+    atf = atf_365 / 100.0
+    smi = smile_365 / (100.0 * 2.0 * np.sqrt(T))
+    cvx = convex_365 / (100.0 * T * (atf / atf_ref) ** sabrw_power)
+    return float(atf), float(smi), float(cvx)
+
+
+def sabr_reduce(
+    surface: Any,
+    T: float,
+    h: float = SABR_CURVATURE_H,
+    *,
+    sabrw_power: float = DEFAULT_SABRW_POWER,
+    atf_ref: float = DEFAULT_ATF_REF,
+) -> SabrPillar:
+    """Step 0 of one pillar (module docstring) with its flags."""
+    if atf_ref <= 0:
+        raise ValueError("atf_ref must be positive")
+    atf0, skew0, curv0, analytic = surface_atm_derivatives(surface, T, h)
     flags: list[str] = []
     if not analytic:
         flags.append(
             f"skew and curvature by central differences of half-width {h:g} (no analytic "
             "atm_skew): unreliable on an interpolated grid"
         )
-    rad = 6.0 * skew * skew + 3.0 * atf * curv
+    atf, skew, cvx = sabr_from_365(
+        float(T),
+        100.0 * atf0,
+        100.0 * 2.0 * np.sqrt(T) * skew0,
+        100.0 * T * curv0,
+        sabrw_power=sabrw_power,
+        atf_ref=atf_ref,
+    )
+    rad = 6.0 * skew * skew + 3.0 * atf * cvx
     if rad <= 0:
         flags.append("negative radicand: smile too flat for its skew (nu_sabr NaN)")
         nu = float("nan")
@@ -182,7 +250,34 @@ def sabr_reduce(surface: Any, T: float, h: float = SABR_CURVATURE_H) -> SabrPill
                 f"nu_sabr^2 T = {nu * nu * T:.2f} > {SABR_FINITE_T_LIMIT:g}: the T -> 0 SABR "
                 "reduction ignores Hagan's finite-T correction (nu_sabr biased)"
             )
-    return SabrPillar(float(T), atf, skew, curv, nu, rho, tuple(flags), float(h))
+    return SabrPillar(
+        float(T),
+        atf,
+        skew,
+        float(curv0),
+        nu,
+        rho,
+        tuple(flags),
+        float(h),
+        cvx,
+        float(sabrw_power),
+        float(atf_ref),
+    )
+
+
+def smooth_breakeven_curve(pillars: FloatArray, vov: FloatArray) -> tuple[FloatArray, int]:
+    """SmoothBreakEven (module docstring): ``ln VoV`` fitted by a polynomial in ``ln T`` of
+    degree ``min(2, n − 2)``; returns ``(smoothed, degree)``, the input and degree ``−1`` below
+    three pillars."""
+    p = np.asarray(pillars, dtype=np.float64)
+    v = np.asarray(vov, dtype=np.float64)
+    if p.size < 3:
+        return v.copy(), -1
+    if np.any(~np.isfinite(v)) or np.any(v <= 0):
+        raise ValueError("SmoothBreakEven needs finite positive VoV values")
+    deg = min(2, p.size - 2)
+    c = np.polyfit(np.log(p), np.log(v), deg)
+    return np.asarray(np.exp(np.polyval(c, np.log(p))), dtype=np.float64), deg
 
 
 def _curve(x: float | Mapping[float, float] | Callable[[float], float], T: float) -> float:
@@ -199,11 +294,15 @@ def _close(a: float, b: float, rtol: float) -> bool:
     return bool(np.isfinite(a) and np.isfinite(b) and abs(a - b) <= rtol * max(abs(b), 1e-300))
 
 
+SsrInput = float | Sequence[float] | FloatArray | Mapping[float, float] | Callable[[float], float]
+
+
 @dataclass(frozen=True)
 class TargetSet:
-    """Break-even targets per pillar (absolute vol units, see the module docstring).
-    ``atf_anchor`` is the ATMF vol at :data:`ANCHOR_MATURITY` used by ``anchor`` (marking mode;
-    NaN in historical mode)."""
+    """Break-even targets per pillar (absolute vol units, module docstring).  ``vovol`` is
+    ``VoV_BE`` (smoothed when ``smooth_breakeven``), ``vov_be_raw`` before smoothing,
+    ``correl_target`` ``Corr_BE``; ``atf_anchor`` the 3M ATMF vol of the anchoring (NaN in
+    historical mode)."""
 
     mode: str
     pillars: FloatArray
@@ -228,15 +327,36 @@ class TargetSet:
     atm_vol_fn: Callable[[FloatArray], FloatArray] | None = field(
         default=None, repr=False, compare=False
     )
+    vov_be_raw: FloatArray = field(default_factory=lambda: np.zeros(0))
+    smooth_breakeven: bool = False
+    smooth_degree: int = -1
+    mat_min: float = 0.0
+    sabrw_power: float = float("nan")
+    atf_ref: float = float("nan")
 
     @property
     def term_structure_source(self) -> str:
         """``"surface"`` when the market skew / ATMF vol on ``(0, T]`` come from the surface,
-        ``"pillar power law"`` when they are interpolated from the pillars (module docstring)."""
-        return "surface" if self.skew_fn is not None else "pillar power law"
+        ``"pillars"`` otherwise (historical mode)."""
+        return "surface" if self.skew_fn is not None else "pillars"
+
+    @property
+    def vov_sabr(self) -> FloatArray:
+        return (
+            np.array([s.vov_sabr for s in self.sabr])
+            if self.sabr
+            else np.full_like(self.pillars, np.nan)
+        )
+
+    @property
+    def ssr_implied(self) -> FloatArray:
+        """``SpotVolCovar_target / (σ_0 skew_target)``: ``ssr_target · atf_3M / σ_0`` in marking
+        mode (module docstring), ``SSR_hist`` in historical mode."""
+        return np.asarray(self.spot_vol_covar / (self.sigma_0 * self.skew_target))
 
     def market_skew(self, t: FloatArray | float) -> FloatArray:
-        """Market ATM skew ``∂σ̂/∂k`` at maturities ``t > 0`` (module docstring)."""
+        """Market ATM skew ``∂σ̂/∂k`` at maturities ``t > 0`` (surface, else the pillar power
+        law of :func:`pillar_power_law_skew`)."""
         t_ = np.atleast_1d(np.asarray(t, dtype=np.float64))
         if np.any(t_ <= 0):
             raise ValueError("maturities must be positive")
@@ -246,9 +366,9 @@ class TargetSet:
 
     def atmf_curve(self, t_max: float) -> ForwardVarianceCurve:
         """The ATMF total-variance curve ``σ̂_t² t`` as a :class:`ForwardVarianceCurve` to
-        ``t_max`` (so ``xi0(t) = σ²(t) = d(σ̂_t² t)/dt``, book p. 475): the surface's ATMF vols on
-        a weekly grid (denser in the first month) in marking mode, the pillar ATMF vols with a
-        flat vol before the first pillar and beyond the last in historical mode."""
+        ``t_max`` (so ``xi0(t) = d(σ̂_t² t)/dt``, book p. 475): the surface's ATMF vols on a weekly
+        grid (denser in the first month) in marking mode, the pillar ATMF vols with a flat vol
+        before the first pillar and beyond the last in historical mode."""
         if self.atm_vol_fn is not None:
             short = np.array([1.0, 2.0, 3.0, 5.0, 10.0, 15.0, 22.0]) / 365.0
             weekly = np.arange(1, int(np.ceil(52 * t_max)) + 2) / 52.0
@@ -268,48 +388,50 @@ class TargetSet:
         W = np.maximum.accumulate(W + 1e-12 * np.arange(W.size))
         return ForwardVarianceCurve(mats, W)
 
-    def with_ssr_target(
-        self,
-        ssr_target: (
-            float | Sequence[float] | FloatArray | Mapping[float, float] | Callable[[float], float]
-        ),
-    ) -> TargetSet:
-        """The same targets at another SSR dial (module docstring): ``SpotVolCovar = ssr σ_0
-        Skew``; marking ``vovol = ½ ssr atf ν_SABR A`` (``VolVar = vovol²``); historical
-        ``VolVar`` unchanged.  ``ssr_target`` is a scalar, one value per pillar, a mapping
-        ``T → value`` (interpolated) or a callable."""
-        if isinstance(ssr_target, (Mapping,)) or callable(ssr_target):
-            ssr = np.array([_curve(ssr_target, float(T)) for T in self.pillars])
-        else:
-            arr = np.asarray(ssr_target, dtype=np.float64)
-            ssr = np.full(self.pillars.size, float(arr)) if arr.ndim == 0 else arr.copy()
-        if ssr.shape != self.pillars.shape:
-            raise ValueError("ssr_target must be a scalar or one value per pillar")
-        svc = ssr * self.sigma_0 * self.skew_target
+    def with_ssr_target(self, ssr_target: SsrInput) -> TargetSet:
+        """The same targets at another ``ssr_target`` (scalar, one value per pillar, mapping
+        ``T → value`` interpolated, or callable): marking ``VoV_BE`` rebuilt (and re-smoothed),
+        ``SpotVolCovar = Corr_BE VoV_BE``; historical ``SpotVolCovar = ssr σ_0 skew``, ``VolVar``
+        unchanged."""
+        ssr = _ssr_array(ssr_target, self.pillars)
         if self.mode == "marking" and self.sabr:
-            nu = np.array([s.nu_sabr for s in self.sabr])
-            vovol = 0.5 * ssr * self.atf * nu * self.anchor
-        else:
-            vovol = self.vovol.copy()
-        return replace(self, spot_vol_covar=svc, vovol=vovol, vol_var=vovol * vovol, ssr_target=ssr)
+            raw = self.anchor * 0.5 * ssr * self.vov_sabr
+            vov = smooth_breakeven_curve(self.pillars, raw)[0] if self.smooth_breakeven else raw
+            return replace(
+                self,
+                ssr_target=ssr,
+                vov_be_raw=raw,
+                vovol=vov,
+                vol_var=vov * vov,
+                spot_vol_covar=self.correl_target * vov,
+            )
+        svc = ssr * self.sigma_0 * self.skew_target
+        with np.errstate(divide="ignore", invalid="ignore"):
+            correl = svc / self.vovol
+        return replace(self, ssr_target=ssr, spot_vol_covar=svc, correl_target=correl)
 
     def frame(self) -> pd.DataFrame:
-        d = {
+        d: dict[str, Any] = {
             "T": self.pillars,
             "atf": self.atf,
             "skew_target": self.skew_target,
             "ssr_target": self.ssr_target,
-            "vovol_target": self.vovol,
+            "ssr_implied": self.ssr_implied,
+            "vov_be": self.vovol,
             "spot_vol_covar_target": self.spot_vol_covar,
             "spot_vol_covar_se": self.spot_vol_covar_se,
             "vol_var_target": self.vol_var,
             "vol_var_se": self.vol_var_se,
         }
         if self.correl_target.size == self.pillars.size:
-            d["correl_target"] = self.correl_target
+            d["corr_be"] = self.correl_target
         if self.sabr:
+            d["vov_be_raw"] = self.vov_be_raw
             d["nu_sabr"] = np.array([s.nu_sabr for s in self.sabr])
+            d["vov_sabr"] = self.vov_sabr
             d["rho_sabr"] = np.array([s.rho_sabr for s in self.sabr])
+            d["smile_365"] = np.array([s.smile_365 for s in self.sabr])
+            d["convex_365"] = np.array([s.convex_365 for s in self.sabr])
             d["anchor"] = self.anchor
         return pd.DataFrame(d)
 
@@ -317,22 +439,18 @@ class TargetSet:
         self,
         vov_sabr: Mapping[float, float] | Callable[[float], float] | None = None,
     ) -> pd.DataFrame:
-        """Marking mode: ``vovol_target / ssr`` against the marking policy ``½ VoV_SABR
-        atf(3M)/atf(T)`` (the stored 3M anchor) under the two readings of ``VoV_SABR``
-        (absolute ``ν_SABR atf``; lognormal ``ν_SABR``); ``reading`` names the one the target
-        formula reproduces to :data:`_POLICY_RTOL` relative (``"absolute"`` at ``p = 1``,
-        ``"neither"`` at other anchoring powers — an identity check of the formula, not a
-        discrimination between conventions), ``mismatch_lognormal`` the factor ``1/atf(T)``
-        by which the other differs.  With the desk's ``VoV_SABR`` per pillar (a mapping ``T →
-        value``, interpolated, or a callable) the columns ``vov_sabr``, ``vov_over_nu`` and
-        ``vov_reading`` classify it: ``"lognormal"`` (``VoV/ν_SABR ≈ 1``), ``"absolute"``
-        (``≈ atf(T)``), ``"omega"`` (``≈ 2``) within :data:`_VOV_RTOL`, else ``"unknown"``.
-        Raises in historical mode."""
+        """Marking mode: the raw (unsmoothed) ``VoV_BE / ssr`` against the policy ``½ VoV_SABR
+        atf(3M)/atf(T)`` under the two readings of ``VoV_SABR`` — absolute (``ν_SABR atf``,
+        reproduced exactly at ``anchor_power = 1``) and lognormal (``ν_SABR``, off by
+        ``1/atf(T)``); ``reading`` names the one reproduced to :data:`_POLICY_RTOL`.  With the
+        desk's ``VoV_SABR`` per pillar the columns ``vov_sabr``, ``vov_over_nu`` and
+        ``vov_reading`` classify it (``"lognormal"`` ≈ 1, ``"absolute"`` ≈ atf, ``"omega"`` ≈ 2,
+        else ``"unknown"``).  Raises in historical mode."""
         if self.mode != "marking" or not self.sabr:
             raise ValueError("policy_check applies to marking-mode targets")
         atf3 = self.atf_anchor
         rows = []
-        for s, vv, ssr in zip(self.sabr, self.vovol, self.ssr_target):
+        for s, vv, ssr in zip(self.sabr, self.vov_be_raw, self.ssr_target):
             at_unit = vv / ssr if ssr != 0 else np.nan
             policy_abs = 0.5 * s.nu_sabr * atf3
             policy_ln = 0.5 * s.nu_sabr * atf3 / s.atf
@@ -368,41 +486,85 @@ class TargetSet:
         return pd.DataFrame(rows)
 
 
-def marking_targets(
-    surface: Any,
-    pillars: Sequence[float] = DEFAULT_TARGET_PILLARS,
-    *,
-    ssr_target: float | Mapping[float, float] | Callable[[float], float] = 1.0,
-    anchor_power: float = 1.0,
-    h: float = SABR_CURVATURE_H,
-    sigma_0: float | None = None,
-) -> TargetSet:
-    """Marking-mode targets from a surface (module docstring).  ``pillars`` beyond the
-    surface's ``max_maturity`` are dropped with a flag; ``sigma_0`` defaults to the surface's
-    ATMF vol at :data:`SIGMA0_MATURITY`."""
+def _ssr_array(ssr_target: SsrInput, pillars: FloatArray) -> FloatArray:
+    if isinstance(ssr_target, Mapping) or callable(ssr_target):
+        ssr = np.array([_curve(ssr_target, float(T)) for T in pillars])
+    else:
+        arr = np.asarray(ssr_target, dtype=np.float64)
+        ssr = np.full(pillars.size, float(arr)) if arr.ndim == 0 else arr.copy()
+    if ssr.shape != pillars.shape:
+        raise ValueError("ssr_target must be a scalar, one value per pillar, a mapping or callable")
+    if not np.all(np.isfinite(ssr)) or np.any(ssr <= 0):
+        raise ValueError("ssr_target must be finite and positive")
+    return np.asarray(ssr, dtype=np.float64)
+
+
+def _filter_pillars(
+    pillars: Sequence[float], mat_min: float, tmax: float | None
+) -> tuple[FloatArray, list[str]]:
     ps = np.asarray(sorted(float(t) for t in pillars), dtype=np.float64)
     flags: list[str] = []
-    tmax = getattr(surface, "max_maturity", None)
+    below = ps < float(mat_min) - 1e-12
+    if below.any():
+        flags.append(
+            f"pillars below mat_min {mat_min:g} dropped (removeVolatilityPillarsBelow): "
+            f"{ps[below].tolist()}"
+        )
+        ps = ps[~below]
     if tmax is not None:
         keep = ps <= float(tmax) + 1e-9
         if not keep.all():
             flags.append(f"pillars beyond max_maturity {tmax:g} dropped: {ps[~keep].tolist()}")
             ps = ps[keep]
     if ps.size == 0:
-        raise ValueError("no pillar inside the surface's maturity range")
-    sabr = tuple(sabr_reduce(surface, float(T), h) for T in ps)
+        raise ValueError("no pillar inside the surface's maturity range and above mat_min")
+    return ps, flags
+
+
+def marking_targets(
+    surface: Any,
+    pillars: Sequence[float] = DEFAULT_TARGET_PILLARS,
+    *,
+    ssr_target: SsrInput = 1.0,
+    anchor_power: float = 1.0,
+    h: float = SABR_CURVATURE_H,
+    sigma_0: float | None = None,
+    mat_min: float = DEFAULT_MAT_MIN,
+    smooth_breakeven: bool = True,
+    sabrw_power: float = DEFAULT_SABRW_POWER,
+    atf_ref: float = DEFAULT_ATF_REF,
+) -> TargetSet:
+    """Marking-mode targets from a surface (steps 0 and 1 of the module docstring).
+    ``ssr_target`` is a scalar, one value per retained pillar, a mapping ``T → value``
+    (interpolated) or a callable; ``sigma_0`` defaults to the surface's ATMF vol at
+    :data:`SIGMA0_MATURITY`."""
+    ps, flags = _filter_pillars(pillars, mat_min, getattr(surface, "max_maturity", None))
+    sabr = tuple(
+        sabr_reduce(surface, float(T), h, sabrw_power=sabrw_power, atf_ref=atf_ref) for T in ps
+    )
     for s in sabr:
         flags += [f"T={s.T:g}: {f}" for f in s.flags]
     atf = np.array([s.atf for s in sabr])
     atf3 = float(surface.atm_vol(ANCHOR_MATURITY))
     s0 = float(surface.atm_vol(SIGMA0_MATURITY)) if sigma_0 is None else float(sigma_0)
-    ssr = np.array([_curve(ssr_target, float(T)) for T in ps])
+    ssr = _ssr_array(ssr_target, ps)
     anchor = (atf3 / atf) ** float(anchor_power)
-    nu = np.array([s.nu_sabr for s in sabr])
+    vov_sabr = np.array([s.vov_sabr for s in sabr])
+    raw = anchor * 0.5 * ssr * vov_sabr
+    degree = -1
+    vov = raw.copy()
+    if smooth_breakeven:
+        vov, degree = smooth_breakeven_curve(ps, raw)
+        if degree < 0:
+            flags.append("SmoothBreakEven requested but fewer than three pillars: not smoothed")
+        else:
+            adj = float(np.max(np.abs(vov / raw - 1.0)))
+            if adj > SMOOTH_FLAG_REL:
+                flags.append(
+                    f"SmoothBreakEven moved VoV_BE by up to {adj:.1%} (degree {degree} in ln T)"
+                )
+    corr = np.array([s.rho_sabr for s in sabr])
     skew = np.array([s.skew_sabr for s in sabr])
-    vovol = 0.5 * ssr * atf * nu * anchor
-    svc = ssr * s0 * skew
-    rho = np.array([s.rho_sabr for s in sabr])
     fn = getattr(surface, "atm_skew", None)
     if callable(fn):
 
@@ -418,25 +580,31 @@ def marking_targets(
         return np.asarray(surface.atm_vol(t), dtype=np.float64)
 
     return TargetSet(
-        "marking",
-        ps,
-        s0,
-        atf,
-        skew,
-        svc,
-        vovol * vovol,
-        vovol,
-        ssr,
-        np.zeros(ps.size),
-        np.zeros(ps.size),
-        sabr,
-        float(anchor_power),
-        anchor,
-        tuple(flags),
-        atf3,
-        rho,
-        skew_fn,
-        atm_vol_fn,
+        mode="marking",
+        pillars=ps,
+        sigma_0=s0,
+        atf=atf,
+        skew_target=skew,
+        spot_vol_covar=corr * vov,
+        vol_var=vov * vov,
+        vovol=vov,
+        ssr_target=ssr,
+        spot_vol_covar_se=np.zeros(ps.size),
+        vol_var_se=np.zeros(ps.size),
+        sabr=sabr,
+        anchor_power=float(anchor_power),
+        anchor=anchor,
+        flags=tuple(flags),
+        atf_anchor=atf3,
+        correl_target=corr,
+        skew_fn=skew_fn,
+        atm_vol_fn=atm_vol_fn,
+        vov_be_raw=raw,
+        smooth_breakeven=bool(smooth_breakeven),
+        smooth_degree=int(degree),
+        mat_min=float(mat_min),
+        sabrw_power=float(sabrw_power),
+        atf_ref=float(atf_ref),
     )
 
 
@@ -448,21 +616,23 @@ def historical_targets(
     window_vol: int = 250,
     window_ssr: int = 60,
     sigma_0: float | None = None,
+    mat_min: float = 0.0,
 ) -> TargetSet:
     """Historical-mode targets from a :class:`~volsto.calibration.history.SurfaceHistory` at
     ``end`` (default: its last date): ``volvol_hist`` and ``SSR_hist`` of the Part 2 estimators,
-    the market skew and ATMF vol of the pricing date (module docstring).  ``sigma_0`` defaults
-    to the ATM vol at :data:`SIGMA0_MATURITY` — interpolated across the history's pillars with
-    a flag when one month is not a pillar."""
+    the market skew and ATMF vol of the pricing date (module docstring); ``pillars`` default to
+    the history's pillars at or above ``mat_min``.  ``sigma_0`` defaults to the ATM vol at
+    :data:`SIGMA0_MATURITY` — interpolated across the history's pillars with a flag when one
+    month is not a pillar."""
     e = history.date_index(end)
     end_ts = history.dates[e]
     hp = np.asarray(history.pillars, dtype=np.float64)
-    ps = hp if pillars is None else np.asarray(sorted(float(t) for t in pillars), dtype=np.float64)
+    ps, pflags = _filter_pillars(hp.tolist() if pillars is None else pillars, mat_min, None)
     atm = history.atm_vol.to_numpy()[e]
     skw = history.skew.to_numpy()[e]
     atf = np.array([atm[history.pillar_index(float(T))] for T in ps])
     skew = np.array([skw[history.pillar_index(float(T))] for T in ps])
-    flags = [f"windows vol {window_vol} / ssr {window_ssr}, end {end_ts.date()}"]
+    flags = [f"windows vol {window_vol} / ssr {window_ssr}, end {end_ts.date()}", *pflags]
     if sigma_0 is None:
         try:
             s0 = float(atm[history.pillar_index(SIGMA0_MATURITY)])
@@ -483,25 +653,27 @@ def historical_targets(
     ssr_se = np.array([r.se for r in sr])
     svc = ssr * s0 * skew
     with np.errstate(divide="ignore", invalid="ignore"):
-        correl = svc * atf / (s0 * vovol)
+        correl = svc / vovol
     return TargetSet(
-        "historical",
-        ps,
-        s0,
-        atf,
-        skew,
-        svc,
-        vovol * vovol,
-        vovol,
-        ssr,
-        np.abs(ssr_se * s0 * skew),
-        2.0 * vovol * vovol_se,
-        (),
-        float("nan"),
-        np.ones(ps.size),
-        tuple(flags),
-        float("nan"),
-        np.asarray(correl, dtype=np.float64),
+        mode="historical",
+        pillars=ps,
+        sigma_0=s0,
+        atf=atf,
+        skew_target=skew,
+        spot_vol_covar=svc,
+        vol_var=vovol * vovol,
+        vovol=vovol,
+        ssr_target=ssr,
+        spot_vol_covar_se=np.abs(ssr_se * s0 * skew),
+        vol_var_se=2.0 * vovol * vovol_se,
+        sabr=(),
+        anchor_power=float("nan"),
+        anchor=np.ones(ps.size),
+        flags=tuple(flags),
+        atf_anchor=float("nan"),
+        correl_target=np.asarray(correl, dtype=np.float64),
+        vov_be_raw=vovol.copy(),
+        mat_min=float(mat_min),
     )
 
 
@@ -511,11 +683,10 @@ def pillar_power_law_skew(
     t: FloatArray,
     exponent_bounds: tuple[float, float] = SKEW_EXPONENT_BOUNDS,
 ) -> FloatArray:
-    """The pillar skews extended to maturities ``t`` as a power law in ``T`` (module docstring):
-    ``ln|S|`` linear in ``ln T`` between pillars, ``|S(T)| = |S(T_end)| (T/T_end)^−γ`` beyond the
-    first / last pillar with ``γ`` the end segment's exponent clipped to ``exponent_bounds``; the
-    sign is the pillars' common sign (a sign change raises).  One pillar gives ``γ`` at the lower
-    bound (flat)."""
+    """The pillar skews extended to maturities ``t`` as a power law in ``T``: ``ln|S|`` linear in
+    ``ln T`` between pillars, ``|S(T)| = |S(T_end)| (T/T_end)^−γ`` beyond the first / last pillar
+    with ``γ`` the end segment's exponent clipped to ``exponent_bounds``; the sign is the
+    pillars' common sign (a sign change raises).  One pillar gives ``γ`` at the lower bound."""
     p = np.asarray(pillars, dtype=np.float64)
     s = np.asarray(skews, dtype=np.float64)
     t_ = np.atleast_1d(np.asarray(t, dtype=np.float64))
@@ -540,17 +711,22 @@ def pillar_power_law_skew(
 
 __all__ = [
     "ANCHOR_MATURITY",
+    "DEFAULT_ATF_REF",
+    "DEFAULT_MAT_MIN",
+    "DEFAULT_SABRW_POWER",
     "DEFAULT_TARGET_PILLARS",
     "MODES",
     "SABR_CURVATURE_H",
     "SABR_FINITE_T_LIMIT",
     "SIGMA0_MATURITY",
     "SKEW_EXPONENT_BOUNDS",
+    "SMOOTH_FLAG_REL",
     "SabrPillar",
     "TargetSet",
     "historical_targets",
     "marking_targets",
     "pillar_power_law_skew",
+    "sabr_from_365",
     "sabr_reduce",
-    "surface_atm_derivatives",
+    "smooth_breakeven_curve",
 ]
