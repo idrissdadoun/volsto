@@ -722,6 +722,21 @@ class Autocall(Product):
         ``put_loss = 1{no AC} 1{KI} g (K − S_T)⁺ / K`` (``g`` the ``final_redemption`` gate)."""
         return self._evaluate(paths, idx)[0]
 
+    def coupon_amounts(self, paths: PathSet, idx: FixingIndex) -> FloatArray:
+        """Per-path, per-observation-date coupon amounts (fraction of notional, undiscounted,
+        the memory catch-up included), shape ``(n_paths, N)`` — the ``extra["coupons"]`` of
+        :meth:`_evaluate_levels` that :meth:`_evaluate_smart` derives its memory state from,
+        which :meth:`statistics` does not expose.  The hedge state of a Phoenix
+        (:func:`volsto.hedging.state.hedge_state`) reads its memory feature from it.  A fixed
+        gap shifts the levels as :meth:`_evaluate` does; the smart gap's memory state is the
+        unshifted pass-1 one.  Test: ``tests/test_hedging.py::test_hedge_basis_and_state_features``.
+        """
+        if self.gap is not None and not self.gap.smart:
+            f = 1.0 + self.gap.fixed_shift
+            ac = np.broadcast_to(self.autocall_levels * f, (paths.n_paths, self.n_dates)).copy()
+            return self._evaluate_levels(paths, idx, ac, LevelFactors(fixed=f))[3]["coupons"]
+        return self._evaluate_levels(paths, idx, None, None)[3]["coupons"]
+
     def leg_payoffs(self, paths: PathSet, idx: FixingIndex) -> dict[str, FloatArray]:
         """Discounted per-path leg cash flows (notional included): ``autocall_i``, ``bond``,
         ``coupon``, ``put`` and, for the European knock-in, ``put_vanilla`` / ``put_digital``

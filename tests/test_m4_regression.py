@@ -209,9 +209,9 @@ def test_headline_regression_on_placeholder_surface() -> None:
     result = run_headline(models, sim)
     table = result.table.set_index("model")
     for name, baseline in PLACEHOLDER_BASELINES.items():
-        row = table.loc[name]
         for key, (value, _se_base) in baseline.items():
-            new, se = float(row[key]), float(row[key + "_stderr"])
+            vals = table.loc[name, [key, key + "_stderr"]].to_numpy(dtype=float)
+            new, se = float(vals[0]), float(vals[1])
             if key.startswith("cliquet") or key == "vko_30":
                 floor = 0.02  # % of notional
             elif key.endswith("_p_ko") or key.startswith("vko_ratio_"):

@@ -368,11 +368,12 @@ class ConditionalPricer:
         init=False, repr=False, default_factory=dict
     )
     fits: dict[tuple[int, float], Fit] = field(init=False, repr=False, default_factory=dict)
-    states: dict[tuple[int, float], HedgeState] = field(
-        init=False, repr=False, default_factory=dict
-    )
     notes: list[str] = field(init=False, default_factory=list)
     n_simulations: int = field(init=False, default=0)
+    #: set by :meth:`release`: the resident sets are gone, the footprint they had is kept
+    released: bool = field(init=False, default=False)
+    released_bytes: int = field(init=False, default=0)
+    released_streamed_bytes: int = field(init=False, default=0)
     #: the spot Brownian of the pricing draws at the record columns (``None`` when no control
     #: applies: control off, no controllable bump or no object with a proxy)
     brownian: ShadowBrownian | None = field(init=False, repr=False, default=None)
@@ -557,12 +558,18 @@ class ConditionalPricer:
     @property
     def memory_bytes(self) -> int:
         """Footprint of the resident path sets (the base set and every bumped set kept in
-        memory; a streamed set counts in :attr:`streamed_bytes` instead)."""
+        memory; a streamed set counts in :attr:`streamed_bytes` instead); after
+        :meth:`release`, the footprint the pricer had."""
+        if self.released:
+            return self.released_bytes
         return sum(self._set_bytes(p) for p in [self.paths, *self.bumped_paths.values()])
 
     @property
     def streamed_bytes(self) -> int:
-        """On-disk footprint of the streamed bumped sets (0 unless ``stream_bumps``)."""
+        """On-disk footprint of the streamed bumped sets (0 unless ``stream_bumps``); after
+        :meth:`release`, the footprint they had."""
+        if self.released:
+            return self.released_streamed_bytes
         total = 0
         for files in self.streamed.values():
             for f in files.values():
@@ -578,6 +585,31 @@ class ConditionalPricer:
         self.streamed = {}
         if d is not None:
             shutil.rmtree(d, ignore_errors=True)
+
+    def release(self) -> int:
+        """Free the memory of a pricer the hedge loop has **replaced** (a recalibration rebuilt
+        the pricing model and its pricer): the base and bumped path sets, the hybrid payoff
+        cache and the shadow Brownian draws are dropped and the
+        streamed sets removed (:meth:`close`).  What the end of a run still reads stays: the
+        fits (coefficients, control-variate reductions), the payoffs (:meth:`value_at_zero`)
+        and, through :attr:`memory_bytes` / :attr:`streamed_bytes`, the footprint the pricer
+        had.  Returns the bytes released.  Idempotent; the pricer cannot regress a new date
+        afterwards.  Measured need: the study-C autocall run (10 objects, 6 path sets of
+        2·10⁴ paths, 5.2 GB per pricer) grew by one full pricer per refit — 26 GB resident on
+        a 24 GB laptop after two refits."""
+        if self.released:
+            return 0
+        n = self.memory_bytes
+        self.released_bytes = n
+        self.released_streamed_bytes = self.streamed_bytes
+        self.released = True
+        self.bumped_paths = {}
+        self.hybrids = {}
+        self.shadow_vols = {}
+        self.brownian = None
+        del self.paths
+        self.close()
+        return n
 
     def __del__(self) -> None:  # best effort: a failed __post_init__ has no stream_path
         try:
@@ -758,7 +790,6 @@ class ConditionalPricer:
         if key in self.fits:
             return self.fits[key]
         feats, hs = self.features(obj_index, self.paths, t)
-        self.states[key] = hs
         for note in hs.notes:
             if note not in self.notes:
                 self.notes.append(note)

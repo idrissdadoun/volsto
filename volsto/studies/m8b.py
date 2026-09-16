@@ -138,6 +138,7 @@ from volsto.engine.mc import MonteCarlo
 from volsto.engine.paths import PathSet
 from volsto.hedging.hedger import (
     FREQUENCIES,
+    MAX_HALVINGS,
     SPOT_BUMP,
     TENT_SIZE,
     VOL_BUMP,
@@ -239,6 +240,13 @@ STUDY_C_RULE_SKEW_PILLARS: tuple[float, float] = (1.0, 3.0)
 #: world anticipates itself), +2 / +3 rota clear both thresholds; the proxy noise at 2e4 paths is
 #: 0.001-0.003 (0.002-0.005 at 4e3)
 STUDY_C_SKEW_MOVE_THRESHOLD = 0.005
+
+#: the studies rebalance on the frequency grid only (:class:`~volsto.hedging.hedger.Schedule`
+#: ``product_fixings``): the M8 default adds every product fixing as a rebalancing date, which
+#: turns the "weekly" 3y Phoenix (757 daily knock-in fixings) into a daily hedge — 900 dates and
+#: 1560 s per run against 156 dates for the autocall (measured, study B); the knock-in state at
+#: a weekly date includes every fixing up to it
+STUDY_PRODUCT_FIXINGS = False
 
 SIM_DT_MAX = 1.0 / 52.0
 #: production leverage convention (SPEC §11, owner decision at the M4b acceptance)
@@ -575,6 +583,19 @@ def first_order_agreement(
         return float("nan"), False, z
     ratio = float(recal_pnl_total) / float(static_prediction)
     return ratio, bool(abs(ratio - 1.0) <= FIRST_ORDER_TOLERANCE), z
+
+
+def ratio_stderr(num: float, num_se: float, den: float, den_se: float) -> float:
+    """Delta-method standard error of ``num / den`` for two Monte Carlo estimates with
+    independent errors: ``|num / den| · sqrt((se_num / num)² + (se_den / den)²)`` (NaN when
+    either estimate is 0 or not finite).  The study-C runs at different rotas share the world
+    seed, so their errors are positively correlated and this figure is conservative for the
+    ``nonlinearity`` ratio; the static greek is an independent run.  Test:
+    ``tests/test_m8b.py::test_tables_from_synthetic_results``."""
+    num, den = float(num), float(den)
+    if num == 0.0 or den == 0.0 or not (np.isfinite(num) and np.isfinite(den)):
+        return float("nan")
+    return float(abs(num / den) * np.hypot(float(num_se) / num, float(den_se) / den))
 
 
 def nonlinearity(pnl_rota: float, rota: float, pnl_one: float) -> float:
@@ -1222,7 +1243,7 @@ def make_hedger(task: Task, env: StudyEnvironment) -> tuple[Hedger, Product, dic
     h = cls(
         ctx,
         world,
-        Schedule(task.frequency),
+        Schedule(task.frequency, product_fixings=STUDY_PRODUCT_FIXINGS),
         Costs(),
         recalibration=rule,
         sim=env.sim(task.frequency),
@@ -1432,11 +1453,26 @@ def required_states(
         if t.startswith("skew_T:"):
             T = float(t.split(":")[1])
             pillars = tuple(sorted(set(RISK_PILLARS) | {T}))
-            pert = SurfacePerturbation(
-                "skew_tent",
-                {"pillars": pillars, "index": pillars.index(T), "slope": skew_slope(TENT_SIZE)},
-            )
-            out.append((f"{t} tent (+halvings if the check fails)", base.with_perturbation(pert)))
+            # the hedger halves a tent that fails the surface's arbitrage checks (at most
+            # MAX_HALVINGS times) and calibrates the size that passes: the state the run will
+            # ask for is the first cached one along that sequence (a run has been through the
+            # checks before), else the nominal size is the best guess
+            states = []
+            for k in range(MAX_HALVINGS + 1):
+                size = TENT_SIZE * 0.5**k
+                pert = SurfacePerturbation(
+                    "skew_tent",
+                    {"pillars": pillars, "index": pillars.index(T), "slope": skew_slope(size)},
+                )
+                states.append((k, base.with_perturbation(pert)))
+            cached = next((ks for ks in states if env.cache.has(ks[1].spec)), None)
+            if cached is not None:
+                k, st = cached
+                lab = f"{t} tent" + (f" (halved {k}x, cached)" if k else "")
+            else:
+                k, st = states[0]
+                lab = f"{t} tent (+halvings if the check fails)"
+            out.append((lab, st))
         if t.startswith("param:"):
             out.append((f"{t} (two states)", base))
     regime = getattr(strategy, "delta_regime", "model")
@@ -1496,7 +1532,9 @@ def calibration_seconds(cache: LeverageCache, n_particles: int) -> float:
 def project(tasks: Sequence[Task], env: StudyEnvironment) -> Projection:
     """The projected wall clock of a task list (module docstring, *Budget*); the hedger's
     probe runs on the pricing model (the world of study C is approximated by the pricing model
-    for the grid — the shock adds two slices)."""
+    for the grid — the shock adds two slices) with the strategy's bump targets when every state
+    they need is cached (a dry run never calibrates: a task with a missing state is probed
+    without its bumps and the projection says so)."""
     if not tasks:
         return Projection("-", 0, 0.0, {}, 0.0, [], [])
     study = tasks[0].study
@@ -1511,25 +1549,36 @@ def project(tasks: Sequence[Task], env: StudyEnvironment) -> Projection:
         h = Hedger(
             ctx,
             ctx.model,
-            Schedule(task.frequency),
+            Schedule(task.frequency, product_fixings=STUDY_PRODUCT_FIXINGS),
             Costs(),
             sim=env.sim(task.frequency),
             world_paths=env.cfg.n_world,
             verbose=False,
         )
         strategy = build_strategy(task, product, h)
+        need = required_states(task, env, strategy)
+        miss_here = [lab for lab, st in need if not env.cache.has(st.spec)]
         mk = (task.pricing, task.product, strategy.name, task.frequency)
         if mk not in memo:
             objects: list[Product] = [product] + [
                 i.product for i in strategy.instruments if i.product is not None
             ]
-            dates = Schedule(task.frequency).build(product)
+            dates = Schedule(task.frequency, product_fixings=STUDY_PRODUCT_FIXINGS).build(product)
             grid = union_grid([ctx.model], objects, dates, h.sim)
-            memo[mk] = h.projected_wall_clock(product, strategy, grid, n_pricing_models(strategy))
+            bumps: list[Bump] = []
+            if not miss_here:
+                regime = getattr(strategy, "delta_regime", "model")
+                for name in strategy.target_names:
+                    b = ctx.bump(name, delta_regime=regime)
+                    if b is not None:
+                        bumps.append(b)
+            elif "probe without bump targets where a leverage is missing" not in notes:
+                notes.append("probe without bump targets where a leverage is missing")
+            memo[mk] = h.projected_wall_clock(
+                product, strategy, grid, n_pricing_models(strategy), bumps
+            )
         secs = memo[mk]
         total += secs
-        need = required_states(task, env, strategy)
-        miss_here = [lab for lab, st in need if not env.cache.has(st.spec)]
         for lab, st in need:
             if not env.cache.has(st.spec):
                 missing.setdefault(st.key, lab)
@@ -1735,10 +1784,12 @@ def _regime_ref(reg: Sequence[Mapping[str, Any]]) -> str:
 def table_B(
     results: Iterable[TaskResult], skipped: Sequence[Mapping[str, Any]] = ()
 ) -> pd.DataFrame:
-    """Study B: per world × product the **desk** leakage (mean ± se; ``leakage_se_incl_v0`` adds
-    the pricing error of ``V₀`` in quadrature — the hedged mean is measured against the run's own
-    ``V₀`` estimate), std, q05 / q95, the static spread (marked − world price at ``t = 0``), the
-    dynamic leakage (leakage − static spread), the leakage **relative to the ``same`` world** of
+    """Study B: per world × product the **desk** leakage (mean ± se; ``leakage_desk_incl_v0``
+    repeats it with the pricing error of ``V₀`` added in quadrature to its se — the hedged mean
+    is measured against the run's own ``V₀`` estimate), std, q05 / q95 (± the distribution
+    table's quantile se), the static spread (marked − world price at ``t = 0``), the dynamic
+    leakage (leakage − static spread, se in quadrature), the leakage **relative to the ``same``
+    world** of
     the product (the engine's own baseline: pricing error plus the hedge legs' regression drift —
     the model reserve is the difference), the regime means (desk sign) and the top attribution
     terms (desk sign); the gated rows."""
@@ -1748,6 +1799,8 @@ def table_B(
     for r in res:
         dm, dse = r.desk_mean()
         sp = r.static_spread
+        nan2 = (float("nan"), float("nan"))
+        q05, q95 = r.quantiles.get("q05", nan2), r.quantiles.get("q95", nan2)
         base = same.get(r.product)
         vs_same = (
             (dm - base.desk_mean()[0], float(np.hypot(dse, base.mean[1])))
@@ -1761,17 +1814,22 @@ def table_B(
                 "status": r.status,
                 "unit": r.unit,
                 "leakage_desk": dm,
-                "leakage_se": dse,
-                "leakage_se_incl_v0": float(np.hypot(dse, r.value_0[1])),
+                "leakage_desk_se": dse,
+                "leakage_desk_incl_v0": dm,
+                "leakage_desk_incl_v0_se": float(np.hypot(dse, r.value_0[1])),
                 "leakage_vs_same": vs_same[0],
                 "leakage_vs_same_se": vs_same[1],
                 "std": r.std[0],
                 "std_se": r.std[1],
-                "q05_desk": -r.quantiles.get("q95", (float("nan"), 0.0))[0],
-                "q95_desk": -r.quantiles.get("q05", (float("nan"), 0.0))[0],
+                # the desk is short: its q05 is minus the hedger's q95 (same se)
+                "q05_desk": -q95[0],
+                "q05_desk_se": q95[1],
+                "q95_desk": -q05[0],
+                "q95_desk_se": q05[1],
                 "static_spread": sp[0] if sp else float("nan"),
                 "static_spread_se": sp[1] if sp else float("nan"),
                 "dynamic_leakage": (dm - sp[0]) if sp else float("nan"),
+                "dynamic_leakage_se": float(np.hypot(dse, sp[1])) if sp else float("nan"),
                 "value_0": r.value_0[0],
                 "value_0_se": r.value_0[1],
                 "regimes_desk": _regime_ref(r.regimes),
@@ -1807,8 +1865,8 @@ def table_C(
     """Study C: per product × rota × recalibration the recalibration P&L (desk convention, total
     ± se and the number of refits), the static prediction ``desk_pnl_shadow × rota`` (the M7
     greek under the same policy; ``desk_pnl_usual × rota`` for the ``none`` rows, against the
-    total hedged desk P&L), the ratio, the 30% flag and z at every rota, and the nonlinearity
-    at +2 / +3 against the +1 row."""
+    total hedged desk P&L), the ratio (± its delta-method se, :func:`ratio_stderr`), the 30%
+    flag and z at every rota, and the nonlinearity at +2 / +3 against the +1 row (± se)."""
     static = static or {}
     res = [r for r in results if r.study == "C"]
     by_key = {(r.product, r.policy, r.rota): r for r in res}
@@ -1836,11 +1894,16 @@ def table_C(
             else (float("nan"), False, float("nan"))
         )
         one = by_key.get((r.product, r.policy, 1.0))
-        base_val = (
-            one.desk_recal_total()[0]
+        base_val, base_se = (
+            one.desk_recal_total()
             if (one and r.policy != "none")
-            else (one.desk_mean()[0] if one else float("nan"))
+            else (one.desk_mean() if one else (float("nan"), float("nan")))
         )
+        if r.rota != 1.0:
+            nonlin = nonlinearity(simulated, r.rota, base_val)
+            nonlin_se = ratio_stderr(simulated, sim_se, r.rota * base_val, r.rota * base_se)
+        else:
+            nonlin, nonlin_se = 0.0, 0.0
         rows.append(
             {
                 "product": r.product,
@@ -1861,9 +1924,11 @@ def table_C(
                 "static_se": pred_se,
                 "prediction_of": pred_name + " x rota",
                 "ratio": ratio,
+                "ratio_se": ratio_stderr(simulated, sim_se, pred, pred_se) if sp else float("nan"),
                 "within_30pct": within,
                 "z": z,
-                "nonlinearity": nonlinearity(simulated, r.rota, base_val) if r.rota != 1.0 else 0.0,
+                "nonlinearity": nonlin,
+                "nonlinearity_se": nonlin_se,
                 "skew_6m_base_vp": r.world_meta.get("skew_90_110_6m_base_vp"),
                 "skew_6m_rotated_vp": r.world_meta.get("skew_90_110_6m_rotated_vp"),
                 "n_paths": r.n_paths_world,
@@ -1950,9 +2015,10 @@ TABLE_HEADERS: dict[str, str] = {
         "`dynamic_leakage` = leakage - static spread, `leakage_vs_same` = leakage minus the "
         "product's leakage under world (i) `same` (the engine's own baseline: the pricing error "
         "of V0 and the regression drift of the hedge legs; the model reserve of a world is this "
-        "difference); `leakage_se_incl_v0` folds the V0 pricing error into the se; quantiles are "
-        "of the desk P&L; units per row (% of notional; KO var in vol points of vega notional = "
-        "variance P&L / 2 K_vol)."
+        "difference); `leakage_desk_incl_v0` repeats the leakage with the V0 pricing error folded "
+        "into its se; quantiles are of the desk P&L (± the quantile se of the distribution "
+        "table); every `<x>_se` is the standard error of `<x>`; units per row (% of notional; "
+        "KO var in vol points of vega notional = variance P&L / 2 K_vol)."
     ),
     "C": (
         "Study C — shadow rotation as P&L: pricing = the marking fit, world = the skew-shock "
@@ -1962,8 +2028,9 @@ TABLE_HEADERS: dict[str, str] = {
         "the desk is short), per refit date in `recal_by_date_desk`; `static_prediction` = the M7 "
         "greek's desk_pnl_shadow x rota under the same policy (desk_pnl_usual x rota against the "
         "total hedged desk P&L on the `none` rows, a reference only); `ratio` = simulated / "
-        "static, `within_30pct` the first-order test at +1 rota, `nonlinearity` = "
-        "P&L(rota)/(rota x P&L(+1)) - 1."
+        "static (`ratio_se`: delta method, independent errors), `within_30pct` the first-order "
+        "test at +1 rota, `nonlinearity` = P&L(rota)/(rota x P&L(+1)) - 1 (`nonlinearity_se`: "
+        "delta method; the rota runs share the world seed, so it is conservative)."
     ),
     "D": (
         "Study D — delta-regime P&L: world = pricing (2F), delta only under each §7.2 regime; "

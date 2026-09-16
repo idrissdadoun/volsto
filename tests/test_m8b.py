@@ -299,7 +299,24 @@ def test_table_builders_on_synthetic_results(tmp_path: Path) -> None:
     # the model reserve reads off the difference to the engine's own baseline (world 'same')
     assert row["leakage_vs_same"] == pytest.approx(0.25)
     assert row["leakage_vs_same_se"] == pytest.approx(math.hypot(0.02, 0.01))
-    assert row["leakage_se_incl_v0"] == pytest.approx(math.hypot(0.02, 0.01))
+    assert row["leakage_desk_incl_v0_se"] == pytest.approx(math.hypot(0.02, 0.01))
+    assert row["leakage_desk_incl_v0"] == pytest.approx(row["leakage_desk"])
+    assert row["leakage_desk_se"] == pytest.approx(0.02)
+    assert row["dynamic_leakage_se"] == pytest.approx(math.hypot(0.02, row["static_spread_se"]))
+    assert row["q05_desk_se"] == pytest.approx(0.01) and row["q95_desk_se"] == pytest.approx(0.01)
+    # every Monte Carlo column of table B carries its `<x>_se` twin (the viewer's stderr walk)
+    mc_cols = [
+        "leakage_desk",
+        "leakage_desk_incl_v0",
+        "leakage_vs_same",
+        "std",
+        "q05_desk",
+        "q95_desk",
+        "static_spread",
+        "dynamic_leakage",
+        "value_0",
+    ]
+    assert all(f"{c}_se" in tb.columns for c in mc_cols), tb.columns.tolist()
     assert tb[tb["world"] == "same"].iloc[0]["leakage_vs_same"] == pytest.approx(0.0)
     assert row["q05_desk"] == pytest.approx(-0.2) and row["q95_desk"] == pytest.approx(0.2)
     assert "product residual: +0.8000" in row["attribution_top_desk"]
@@ -334,6 +351,11 @@ def test_table_builders_on_synthetic_results(tmp_path: Path) -> None:
         }
     }
     tc = table_C(rc, static)
+    assert {"ratio_se", "nonlinearity_se"} <= set(tc.columns)
+    ok_rows = tc[tc["ratio"].notna()]
+    assert (ok_rows["ratio_se"] > 0).all(), ok_rows[["ratio", "ratio_se"]]
+    two = tc[(tc["rota"] != 1.0) & tc["nonlinearity"].notna()]
+    assert (two["nonlinearity_se"] >= 0).all()
     r1 = tc[(tc["rota"] == 1.0) & (tc["recalibration"] == "sabr_linked")].iloc[0]
     r2 = tc[(tc["rota"] == 2.0) & (tc["recalibration"] == "sabr_linked")].iloc[0]
     r3 = tc[(tc["rota"] == 3.0) & (tc["recalibration"] == "sabr_linked")].iloc[0]

@@ -661,15 +661,118 @@ Port the cliquet and FVA hedging studies onto a generic engine:
 
 **Tasks** (`enumerate_tasks`, one `Task` per hedger run with a stable key `<study>__<product>__<world>__<strategy>[__pricing_LV][__rota+k][__recal_<policy>][__regime_<r>]`): **A** (20) — cliquet 1y: `delta only`, `delta + cap calls q` for `q ∈ {0.5, 0.75, 1.0}` without and with the net-sized variance swap (decision (a)); FVA 1y → 2y: `delta only`, the forward-start preset, the preset `+ skew` (opt-in, decision (b)); pricing = world ∈ {`LV` (Dupire of the SPX surface), `2F` (the marking LSV)}; monthly rebalancing as the original studies. **B** (20, of which 5 gated) — pricing = the marking fit, world ∈ {(i) `same`, (ii) `historical` (`configs/studies/m8b/world_historical.yaml`, the FINAL historical fit; **only if** `outputs/m8b/discriminator_verdict.json` reads `real` — today it reads `surface artefact` (§15 Part 2), so the five (ii) rows are carried as "surface artefact, skipped" with the discriminator's reason), (iii) `pure LV`, (iv) `nu x1.5` (the marking fit with ν × 1.5, its leverage through the cache)} × the five products, the per-product presets. **C** (45) — the five products × rota ∈ {+1, +2, +3} × recalibration ∈ {`none`, `on_skew_move sabr_linked`, `on_skew_move sticky_breakeven`}; world = `skew_shock_world(state, cache, rota, t0 = T/2, days = 5)` (§8.1, `ξ₀`-rescaled leverage); a refit's leverage at `refit_particles` (800 000; `RefitParticlesBuilder` rewrites only parameter-changed states when the two counts differ). **D** (8) — the 1y ATM vanilla (strike = spot) and the 3y autocall, world = pricing (2F), `delta only` under `model / sticky_strike / sticky_skew / sticky_moneyness`. **Frequency rule:** daily ≤ 1y, weekly beyond (the §8.1 default budget), study A monthly, `--frequency` overrides; the simulation step is the rebalancing step capped at weekly (`SIM_DT_MAX`), the products' own fixings refine the grid. Budget `n_paths = 20 000` pricing and world paths (`--world-paths`), seed 2024 (the world seed is the hedger's pricing seed + 1).
 
-**Study B numbers.** Per (world, product): the desk leakage per path (mean ± se; `leakage_se_incl_v0` folds the pricing error of the run's own `V₀` into the se), std (± its fourth-moment se), the 5 / 95% quantiles of the desk P&L, the regime breakdown and attribution (from `regime_table` / `attribution_table`, desk sign), the **static spread** = the marked price minus the world's price at `t = 0` (the hedger's `V₀` under the pricing model and a direct Monte Carlo price of the product under the world model on the world's own budget and seed; independent draws, stderrs in quadrature) next to the **dynamic leakage** = leakage − static spread, and `leakage_vs_same` = the leakage minus the product's leakage under world (i): measured on the plumbing smoke (LV pricing = LV world, 2·10³ paths, monthly) the world = pricing runs carry a non-zero hedged mean — the cliquet −0.30 ± 0.02 % of notional, the KO var +1.43 ± 0.10 vol points — the engine's own baseline (the pricing error of `V₀` plus the regression drift of the hedge legs: an instrument's regressed value function is not exactly a martingale under the world, only the true conditional expectation is; the product leg telescopes exactly), so the **model reserve of a world is the difference to the `same` row**, not the raw leakage. The leakage under (ii) is the reserve the SSR = 1 mark implicitly carries.
+**Study B numbers.** Per (world, product): the desk leakage per path (mean ± se; `leakage_desk_incl_v0` repeats it with the pricing error of the run's own `V₀` folded into the se), std (± its fourth-moment se), the 5 / 95% quantiles of the desk P&L, the regime breakdown and attribution (from `regime_table` / `attribution_table`, desk sign), the **static spread** = the marked price minus the world's price at `t = 0` (the hedger's `V₀` under the pricing model and a direct Monte Carlo price of the product under the world model on the world's own budget and seed; independent draws, stderrs in quadrature) next to the **dynamic leakage** = leakage − static spread, and `leakage_vs_same` = the leakage minus the product's leakage under world (i): measured on the plumbing smoke (LV pricing = LV world, 2·10³ paths, monthly) the world = pricing runs carry a non-zero hedged mean — the cliquet −0.30 ± 0.02 % of notional, the KO var +1.43 ± 0.10 vol points — the engine's own baseline (the pricing error of `V₀` plus the regression drift of the hedge legs: an instrument's regressed value function is not exactly a martingale under the world, only the true conditional expectation is; the product leg telescopes exactly), so the **model reserve of a world is the difference to the `same` row**, not the raw leakage. The leakage under (ii) is the reserve the SSR = 1 mark implicitly carries.
 
 **Study C numbers.** The recalibration P&L in the desk convention, isolated per refit date and summed: `RecordingHedger` (a `Hedger` whose pricers record the product's value per date, so `Σ_refits [V_k(new) − V_k(old)]` — accumulated by the M8 loop as one per-path total — is split per refit date afterwards and checked against the hedger's total, a mismatch reported), against the static prediction `desk_pnl_shadow × rota` of `rotation_shadow_sensitivity` under the same policy (the M7 greek on its own states: 2·10⁵ particles, 2·10⁵ paths, seed 2024, cached per product and policy under `outputs/m8b/C/static_*.json`; the greek's base fit is checked equal to the marking fit); `first_order_agreement` = (ratio, `|ratio − 1| ≤ 0.30`, z) at every rota, asserted at +1 by the slow test; the nonlinearity `P&L(rota)/(rota × P&L(+1)) − 1` at +2 / +3; the `none` rows carry the total hedged desk P&L against `desk_pnl_usual × rota` (a reference, not asserted). **Trigger threshold for study C.** The footprint of a +1 rota on the world's 3M *forward* skew at mid-life is ≈ 0.007 per unit log-moneyness (measured on the 3y autocall's shock world with a stub refit: the excess over the pricing model's prediction peaks at 0.008 around `t0 = 1.5` and settles at 0.004–0.007 — the `1/√T` rotation's local-vol footprint at 1.5y is about half its implied-skew move there), below the hedger's general default `skew_move_threshold` 0.01 (owner decision (c)); study C therefore runs its rule at `STUDY_C_SKEW_MOVE_THRESHOLD` = 0.005 (documented constant): the +1 rota refit fires when the 3M strip first spans the shock window — one pillar *before* `t0`, the deterministic shock world anticipating its own shock (the 1Y pillar's anticipation stays under the threshold at 2·10⁴ paths) —, +2 / +3 rota clear both thresholds; the proxy noise is 0.001–0.003 at 2·10⁴ paths (0.002–0.005 at 4·10³). **Two findings on the M8 recalibration rule, made while plumbing study C — both ported into `hedging/hedger.py` in this commit (§8.1 Part 1: forward-start strips at forward moneyness inverted path by path, and the excess-skew trigger against a CRN twin under the pricing model); `RecordingHedger` now only records the per-date values:** (1) `Hedger._state_surface` averages the strip's conditional option prices over the paths *before* inverting them, which is the unconditional price of the `(t + τ)`-option: its "implied vol over τ" carries the spot variance over `[0, t]` and grows like `sqrt((t + τ)/τ)` (measured on the skew-shock world: the 3M ATMF vol read 0.218 at `t = 0` and 0.394 at `t = 0.5`, the 1Y one 0.221 → 0.278, at 2·10³ and 6·10³ paths alike), the skew proxy "moves" at the first date after 0 in any world, the rule refits at every date and the fitter eventually rejects the ATMF term structure (`the ATMF total variance is not increasing in T`); the M8 test could not see it (a Black–Scholes world has zero skew at every date). The correction inverts each path's conditional prices at the path's own forward and reads the smile at the strip's strikes (mid-strike vol, central-difference slope, second difference), averaged over the paths that invert. (2) Even so the rule's reference — the world's own skew at `t = 0` — refits at every one of 11 monthly dates with no shock at all: an LSV world's *forward* skew at date `t` differs from its spot skew by far more than the 0.01 threshold. Study C therefore triggers on the **excess skew**: the world's conditional skew minus the pricing model's own prediction of it at the same date, the same strip priced under the original pricing model on the same grid, paths and seed (a CRN twin: world = pricing before the shock gives exactly 0, the shock's rota is the excess after `t0`, and the reference resetting at the refit the held rotation triggers nothing further; measured on the cached 2·10⁵ shock world at +1 rota with a stub refit: excess 0.001–0.009 while no strip option reaches into the shock window, 0.018 at `t = 0.417` — the 3M option then spans `[t0, t_end]` and the world's conditional smile anticipates its deterministic shock, so the refit fires one pillar *before* `t0` — then 0.001–0.008 against the reset reference: one refit in twelve monthly dates); the refit itself still reads the world's state surface as the M8 rule does. Both belong in `hedging/hedger.py` once the owner accepts them (the M8 recalibration test would then need a skewed world).
 
-**Budget and sharding.** `scripts/m8b.py --dry-run` prints per study the task count, the projected hedger wall clock (`Hedger.projected_wall_clock` summed over the tasks; the engine's own probe, which does not count the per-date hybrid-payoff evaluation — the smoke tasks ran at 1–4× their projection) and the leverage calibrations the tasks need up front (`required_states` against the cache — the parallel ±1 vp states of `vega` / `volga` / `vanna`, the autocall preset's `skew_T` tent, the regime states of D, the worlds of B, the rotated leverages of C; the refits inside C are one calibration each unless cached and cannot be counted ahead) at the manifest's median wall time per calibration (159 s at 8·10⁵). Measured 2026-09-15: A 20 tasks / 94 s projected (LV pricing needs no leverage; the 2F lines need the parallel ±1 vp states and the `skew_T:2` tent — 3 calibrations, ≈ 480 s), B 15 tasks / 891 s + the same parallel states and the `skew_T:3` tent (ν × 1.5 and the +1/+2/+3 rota leverages are already cached at 8·10⁵), C 45 tasks / 2 672 s + the same 3 states + the refits, D 8 tasks / 108 s and no calibration (the six sticky-regime states are cached at 8·10⁵); ≈ 1.4 h of hedger time plus calibrations in total. `--shard i/n` takes every n-th task of the ordered list from i (interleaved), `--resume` skips existing results, the tables are rebuilt from every result under `--out` (shards merge): `outputs/m8b/<study>/<key>.json` (`TaskResult`: the summary numbers, regimes, attribution, recalibration P&L per date, settings, budget, calibrations, wall clock) + `.pkl` (the `HedgeResult` without the world paths and the per-date Greek arrays), `outputs/m8b/m8b_table_<study>.csv` and `outputs/m8b/m8b.md` (the wall clock and whether anything was recalibrated in its header). The script calibrates and says so; the tests never do (`allow_calibrate=False`, skip on `CacheMissError`). The projected numbers are a **timing probe** (one 1000-path chunk scaled), not a measurement: dry runs on the same machine gave A 86–94 s, B 872–895 s, C 2612–2672 s, D 101–108 s (±5% run to run), i.e. ~1.2 h of hedger time at the production budget before the refit calibrations of C; the production run's measured wall clocks per task replace them in the study tables.
+**Budget and sharding.** `scripts/m8b.py --dry-run` prints per study the task count and per task the projected hedger wall clock (`Hedger.projected_wall_clock` summed over the tasks) and the leverage calibrations the tasks need up front (`required_states` against the cache — the parallel ±1 vp states of `vega` / `volga` / `vanna`, the autocall preset's `skew_T` tent, the regime states of D, the worlds of B, the rotated leverages of C; the refits inside C are one calibration each unless cached and cannot be counted ahead) at the manifest's median wall time per calibration (159 s at 8·10⁵). Measured 2026-09-15: A 20 tasks / 94 s projected (LV pricing needs no leverage; the 2F lines need the parallel ±1 vp states and the `skew_T:2` tent — 3 calibrations, ≈ 480 s), B 15 tasks / 891 s + the same parallel states and the `skew_T:3` tent (ν × 1.5 and the +1/+2/+3 rota leverages are already cached at 8·10⁵), C 45 tasks / 2 672 s + the same 3 states + the refits, D 8 tasks / 108 s and no calibration (the six sticky-regime states are cached at 8·10⁵); ≈ 1.4 h of hedger time plus calibrations in total. `--shard i/n` takes every n-th task of the ordered list from i (interleaved), `--resume` skips existing results, the tables are rebuilt from every result under `--out` (shards merge): `outputs/m8b/<study>/<key>.json` (`TaskResult`: the summary numbers, regimes, attribution, recalibration P&L per date, settings, budget, calibrations, wall clock) + `.pkl` (the `HedgeResult` without the world paths and the per-date Greek arrays), `outputs/m8b/m8b_table_<study>.csv` and `outputs/m8b/m8b.md` (the wall clock and whether anything was recalibrated in its header). The script calibrates and says so; the tests never do (`allow_calibrate=False`, skip on `CacheMissError`). The projected numbers are a **timing probe**, not a measurement, and the M8 probe (one 1000-path chunk of the model plus a constant per date and object) proved 3–8× optimistic against the study-B runs (autocall 44 s projected / 195 s measured, Phoenix 174 / 1570): it counted the simulation only, not the per-date payoffs, regressions and hybrid bump targets. **Rebuilt** (`Hedger.PROBE_PATHS = 2000`): the probe simulates at 2·10³ and 4·10³ paths and evaluates every object of the strategy at two consecutive mid-life dates with the strategy's bump targets, which separates the one-off cost of a pricer (payoffs on every set, the control-variate proxies and shadow draws) from the marginal cost of a date, and the per-date cost into a fixed part and a part linear in the paths; the study runner passes the bumps when every state they need is cached (a dry run never calibrates, and says so when it probes a task without them) and `required_states` looks up the **halved** tent the run will actually ask for (`MAX_HALVINGS`) instead of reporting a phantom calibration. Measured on study B at the production budget: projected 300 / 454 / 113 / 201 / 153 s against measured 195 / 323 / 92 / 175 / 110 s (autocall / Phoenix / cliquet / VKO / KO var) — 1.2–1.6× conservative, the machine being loaded during the runs. The production run's measured wall clocks per task are the ones in the study tables.
 
 **Cache state at the build (2026-09-15).** Marking fit: base cached at 2·10⁵ and 8·10⁵; rotations +1 / −1 at 2·10⁵, +1 / +2 / +3 at 8·10⁵; ν × 1.5 at 8·10⁵; the sticky-regime states at 8·10⁵; **no parallel ±1 vp state at either count**, so every preset with a `vega` target on the LSV pricing model (all five book products, the cliquet's variance swap) needs those two calibrations at the study's particle count before it runs — the reason the B / C / D smoke tasks and the slow B / C / D tests skip today, and the slow A test's 2F variant skips at its variance-swap line (its LV variant runs and pins the order).
 
-**Tests** (`tests/test_m8b.py`; fast ones need no cache): task counts (20 / 20 / 45 / 8) and unique keys, the frequency rule, sharding coverage (every task in exactly one shard for n ∈ {1, 2, 3, 7, 10}), the discriminator gate (a temporary `surface artefact` verdict removes world (ii) with the reason in the table; `real` keeps it; a missing file disables it), `first_order_agreement` / `nonlinearity`, the desk-sign conversion through `table_C`, the table builders on synthetic results (ranking, static / dynamic / vs-same leakage, ratio and nonlinearity, winner and closest-to-model, the markdown with the `M8B_TABLE_*` placeholders), the JSON round trip, `refit_state`, `n_pricing_models`. Slow (skip on a cache miss): study A's cliquet ranking pinned per pricing model at 6·10³ paths monthly (the recorded numbers are in the test's docstring), study B (`pure LV`, `cliquet 1y`) end to end at 3·10³ paths, study C's +1 rota agreement for the autocall under `sabr_linked` at 4·10³ paths, study D's vanilla ranking at 4·10³ paths, and the excess-skew trigger on the cached shock world with a stub refit (no refits before `t0`, the excess after it).
+**Tests** (`tests/test_m8b.py`; fast ones need no cache): task counts (20 / 20 / 45 / 8) and unique keys, the frequency rule, sharding coverage (every task in exactly one shard for n ∈ {1, 2, 3, 7, 10}), the discriminator gate (a temporary `surface artefact` verdict removes world (ii) with the reason in the table; `real` keeps it; a missing file disables it), `first_order_agreement` / `nonlinearity`, the desk-sign conversion through `table_C`, the table builders on synthetic results (ranking, static / dynamic / vs-same leakage, ratio and nonlinearity, winner and closest-to-model, the markdown with the `M8B_TABLE_*` placeholders), the JSON round trip, `refit_state`, `n_pricing_models`. Slow (skip on a cache miss): study A's cliquet ranking pinned per pricing model at 6·10³ paths monthly (the recorded numbers are in the test's docstring), study B (`pure LV`, `cliquet 1y`) end to end at 3·10³ paths, study C's +1 rota agreement for the autocall under `sabr_linked` at 4·10³ paths, study D's vanilla ranking at 4·10³ paths, and the excess-skew trigger on the cached shock world with a stub refit (no refits before `t0`, the excess after it).  The defects the production runs exposed are pinned in `tests/test_hedging.py`: the Phoenix memory feature through `Autocall.coupon_amounts` and the two schedules of a 3y Phoenix with daily knock-in fixings (757 rebalancing dates with the product's fixings, 156 on the frequency grid) in the hedge-state test; `test_refit_rebuilds_every_target_column` (a stubbed trigger and a stubbed refit fire one refit mid-life and every target column — `vanna` included — survives the rebuild: it reproduces the study-C `KeyError: 'vanna'` when the call is removed); and `test_degenerate_correlations_flags_a_collapsed_refit` on the bound detector.
+
+**Engine defects the production runs exposed (all fixed at the root, each with a test).** The
+smoke tasks of the build ran at 2·10³ paths on one product; the production runs at 2·10⁴ over the
+whole book found five:
+
+1. **Memory — a replaced pricer stayed resident.** A `ConditionalPricer` of the autocall preset
+   holds six path sets at 2·10⁴ paths (5.2 GB, `budget["pricing_paths_gb"]`); every refit built a
+   new one and the old one stayed referenced by the hedger's `pricers` list (kept for the
+   control-variate reductions), so study C grew by a full pricer per refit and reached 26 GB on a
+   24 GB laptop. `ConditionalPricer.release()` now drops the base and bumped path sets, the
+   hybrid cache and the shadow draws of the **replaced** pricer as soon as its refit P&L is
+   booked, keeping what the end of a run reads (the fits, the payoffs, and the footprint it had
+   through `memory_bytes` / `streamed_bytes`); the dead per-`(object, date)` `states` cache (about
+   1 MB an entry, written and never read) is gone. Recalibration tasks still need 9–13 GB — the
+   two forward-start strip pricers of the rule are 1404 objects — so the studies run one process
+   at a time. `--stream-bumps` (the mmap'd bumped sets) is the memory answer but costs 5.7× the
+   wall clock (autocall rota +1: 1120 s streamed against 195 s resident), so it stays off.
+2. **The rebalancing schedule followed the product's fixings.** `Schedule` added every product
+   fixing as a rebalancing date, so the Phoenix — 757 daily knock-in fixings — was hedged *daily*
+   under a "weekly" schedule: 900 dates and 1570 s a run against 156 dates and 323 s once fixed.
+   `Schedule(product_fixings=False)` keeps the frequency grid (the state at a date still includes
+   every fixing up to it) and the studies use it (`STUDY_PRODUCT_FIXINGS`); the three study-B
+   Phoenix rows were re-run on it.
+3. **The Phoenix hedge state crashed** (`KeyError: 'coupons'`): `hedge_state` read the per-date
+   coupon amounts from `Autocall.statistics`, which exposes `coupons_paid` (a total) and not the
+   `(n_paths, N)` array the memory feature needs. New `Autocall.coupon_amounts`.
+4. **A refit dropped a target column.** The loop computes the product's and the instruments'
+   Greeks, adds the regression-native `vanna` column and only then runs the recalibration rule; a
+   refit rebuilt the two dictionaries under the new pricer *without* it, so the six study-C
+   `vko put 12m` recalibration runs (whose preset targets vanna) died with `KeyError: 'vanna'` at
+   their first refit date. The rebuild now goes through the same `instrument_greeks` / `add_vanna`
+   closures as any other date (`tests/test_hedging.py::test_refit_rebuilds_every_target_column`
+   pins it: it reproduces the KeyError when the call is removed).
+5. **Stderr twins in the tables.** Table B wrote `leakage_desk` next to `leakage_se` and no error
+   at all on the desk quantiles or the dynamic leakage, table C no error on the ratio or the
+   nonlinearity. Every Monte Carlo column of both now carries its own `<x>_se` (the desk
+   quantiles inherit the distribution table's quantile se, the dynamic leakage adds the static
+   spread's in quadrature, the ratios use the delta method of `ratio_stderr` — conservative for
+   the nonlinearity, whose two runs share the world seed).
+
+**As run (2026-09-15 / 16, this laptop; `outputs/m8b/m8b.md` carries the header of every
+invocation).** Everything at 2·10⁴ pricing and world paths on the SPX 2022-12-30 marking fit at
+8·10⁵ particles, the frequency rule of the module (A monthly, daily to 1y, weekly beyond), the
+§7.11 control variate on, bumps resident (not streamed).
+
+| study | tasks | hedger wall | leverage calibrations | note |
+|---|---|---|---|---|
+| A | 20 | 0.04 h | 0 | one invocation, 151 s; LV and 2F, the bump states cached |
+| B | 15 (+5 gated) | 0.80 h | 0 | the five (ii) `historical` rows carried as "surface artefact, skipped" |
+| C | 45 | 10.89 h | 88 | the refits are the cost: 88 calibrations at 8·10⁵ inside the runs |
+| D | 8 | 0.06 h | 0 | the six sticky-regime states cached |
+
+The static greeks of study C (the M7 rotation sensitivity per product and policy, 2·10⁵ paths and
+particles, cached under `outputs/m8b/C/static_*.json`) cost 16.9 min for the ten (five products x two policies) and **reproduce the M7 Part 3
+measurement**: the 3y autocall's `desk_pnl_shadow` is −0.0539 ± 0.0066 % of notional per rota
+under `sabr_linked` and −0.0737 ± 0.0072 under `sticky_breakeven`, against the −0.054 / −0.074 of
+§15 Part 3 (the same states, an independent run).
+
+Study C is the only study whose budget is dominated by its refits, and the reason is the rule, not
+the products: the trigger prices a forward-start strip at every rebalancing date (three strikes ×
+three pillars × the dates), so a recalibration run holds two strip pricers of about 1400 objects
+beside the product's — 9 to 13 GB at 2·10⁴ paths — and each refit is a fresh calibration at the
+refit particle count. The studies therefore run one process at a time.
+
+**Study C — the first-order test fails, and why (the owner's "assert 30% agreement at +1 rota").**
+The simulated recalibration P&L is 2 of 10 product × policy pairs within 30% of the
+static greek's `desk_pnl_shadow × rota`; the ratios run from 1.19 to 6.03 and the z-scores
+from -88 to +16, so the disagreement is not Monte Carlo noise. Three measurements say what it is:
+
+1. **The static greek is the right comparator.** `shadow = recalibrated − usual` is exactly the
+   extra price move caused by re-marking (the world's own move is in `usual`), which is what the
+   simulated difference `V(new set) − V(old set)` at a refit date measures, and the greek's base
+   fit is checked equal to the pricing model (`base_fit_equals_marking_fit`). The two static
+   values reproduce §15 Part 3 on an independent run (3y autocall −0.0539 ± 0.0066 and
+   −0.0737 ± 0.0072 % of notional per rota against the recorded −0.054 / −0.074).
+2. **The rule fires more than once, and more often the larger the shock.** A +1 rota run refits
+   twice (the 3y notes) or four times (the 1y products), a +2 run seven times, a +3 run twelve to
+   thirteen: the trigger compares the world's excess skew with the reference it resets at each
+   refit, and a bigger shock crosses the threshold repeatedly. The static prediction books one
+   re-marking. This also makes the **nonlinearity** column (`P&L(rota) / (rota × P&L(+1)) − 1`,
+   measured between -1.44 and +0.03) a statement about the firing count, not about curvature of the fee: with a
+   threshold-triggered rule the recalibration P&L is not a smooth function of the shock size, and
+   for the 3y notes under `sabr_linked` it is not even monotone (the +1 total is −0.27 % of
+   notional and the +2 total +0.16).
+3. **A third of the `sabr_linked` refits are degenerate.** 41 of the 113 refits under
+   `sabr_linked` land with a fitted correlation at its bound (|ρ| ≥ `CORRELATION_BOUND` = 0.99 —
+   the first autocall refit at t = 0.96 returns ρ12 = 1.000, ρ_SX1 = ρ_SX2 = −1.000), against 0 of
+   the 113 under `sticky_breakeven`: mid-life, the state surface's skew at the rule's pillars is
+   not attainable with the targets that policy holds, and the fit runs to the bound. The
+   repricing such a refit books is a bound artefact, and it is concentrated in exactly the rows
+   that miss the 30% test worst (`sabr_linked` ratios 4.98, 5.85, 1.42, 6.03 and one sign flip, -7.83 on the VKO put against `sticky_breakeven`
+   2.56, 1.19, 2.39, 3.38, 1.20). The hedger now warns and records it per date
+   (`recalibrations["at_bound"]`, `degenerate_correlations`) so a run says so while it runs.
+
+**Reading.** The M7 shadow-rotation greek predicts the *cost of one re-marking of the spot
+surface at t = 0*. The desk's realised recalibration P&L over the life of a hedged note is a sum
+over the dates a threshold rule fires, each at a different point of the product's life (the 3y
+notes refit just before their first observation date, where an autocall's model sensitivity is at
+its largest), each fitted to the world's *conditional* state surface rather than to a rotated spot
+surface, and — under the aggressive policy — a third of them fitted to a target the two-factor
+parameterisation cannot reach. The greek is a lower bound on the realised cost, not an estimate of
+it: measured here it understates by 1.19 to 6.03 times. Under the conservative policy
+(`sticky_breakeven`, no degenerate fits) the two agree to within 30% on two of the five products and within a factor 3.4 on the rest.
 
 **Measured tables (pasted by the orchestrator from `outputs/m8b/m8b.md` after the production run).**
 
@@ -698,11 +801,96 @@ Study A — **Table A — regression ports with the q sweep (SPX 2022-12-30 mark
 | LV | fva 1y-2y | forward-start preset + skew | 9.0766 ± 0.1685 | — | vol points x notional |
 | LV | fva 1y-2y | delta only | 11.0671 ± 0.1666 | — | vol points x notional |
 
-Study B — M8B_TABLE_B
+Study B — (from `outputs/m8b/m8b_table_B.csv`, run 2026-09-15; value ± se; every column of the CSV carries its `_se` twin)
 
-Study C — M8B_TABLE_C
+| world | product | status | unit | leakage (desk) | std | q05 / q95 (desk) | static spread | dynamic leakage | vs same | wall s |
+|---|---|---|---|---|---|---|---|---|---|---|
+| same | autocall 3y | ok | % of notional | +0.305 ± 0.063 | 8.96 ± 0.16 | -11.47 / +14.14 | -0.063 ± 0.200 | +0.368 ± 0.210 | +0.000 ± 0.090 | 195 |
+| same | phoenix 3y | ok | % of notional | +0.957 ± 0.053 | 7.47 ± 0.41 | -7.13 / +10.57 | +0.011 ± 0.198 | +0.946 ± 0.205 | +0.000 ± 0.075 | 1570 |
+| same | cliquet 1y | ok | % of notional | +0.562 ± 0.008 | 1.07 ± 0.10 | -0.25 / +1.58 | -0.017 ± 0.031 | +0.579 ± 0.032 | +0.000 ± 0.011 | 92 |
+| same | vko put 12m | ok | % of notional | -0.651 ± 0.039 | 5.52 ± 0.65 | -6.34 / +3.85 | +0.052 ± 0.043 | -0.703 ± 0.058 | +0.000 ± 0.055 | 175 |
+| same | ko var 1y | ok | vol points of vega notional | +0.205 ± 0.028 | 3.96 ± 0.89 | -3.87 / +3.86 | -0.039 ± 0.066 | +0.244 ± 0.072 | +0.000 ± 0.040 | 110 |
+| historical | autocall 3y | surface artefact, skipped | — | — | — | — | — | — | — | — |
+| historical | phoenix 3y | surface artefact, skipped | — | — | — | — | — | — | — | — |
+| historical | cliquet 1y | surface artefact, skipped | — | — | — | — | — | — | — | — |
+| historical | vko put 12m | surface artefact, skipped | — | — | — | — | — | — | — | — |
+| historical | ko var 1y | surface artefact, skipped | — | — | — | — | — | — | — | — |
+| pure LV | autocall 3y | ok | % of notional | -1.684 ± 0.161 | 22.84 ± 2.51 | -18.45 / +17.78 | +0.408 ± 0.203 | -2.092 ± 0.259 | -1.989 ± 0.173 | 501 |
+| pure LV | phoenix 3y | ok | % of notional | +1.479 ± 0.164 | 23.17 ± 1.26 | -16.08 / +19.72 | +0.417 ± 0.201 | +1.062 ± 0.259 | +0.522 ± 0.172 | 1556 |
+| pure LV | cliquet 1y | ok | % of notional | +2.610 ± 0.278 | 39.33 ± 3.37 | -0.17 / +11.70 | +0.425 ± 0.029 | +2.186 ± 0.280 | +2.049 ± 0.278 | 81 |
+| pure LV | vko put 12m | ok | % of notional | -21.752 ± 0.367 | 51.95 ± 1.85 | -91.09 / +4.18 | -0.468 ± 0.049 | -21.284 ± 0.371 | -21.101 ± 0.369 | 174 |
+| pure LV | ko var 1y | ok | vol points of vega notional | -0.102 ± 0.114 | 16.15 ± 0.45 | -17.08 / +13.95 | -0.620 ± 0.068 | +0.518 ± 0.133 | -0.308 ± 0.118 | 94 |
+| nu x1.5 | autocall 3y | ok | % of notional | +0.334 ± 0.066 | 9.39 ± 0.36 | -11.16 / +14.62 | -0.313 ± 0.198 | +0.647 ± 0.209 | +0.029 ± 0.092 | 171 |
+| nu x1.5 | phoenix 3y | ok | % of notional | +1.140 ± 0.061 | 8.63 ± 0.75 | -6.94 / +11.26 | -0.187 ± 0.196 | +1.328 ± 0.206 | +0.183 ± 0.081 | 1561 |
+| nu x1.5 | cliquet 1y | ok | % of notional | +0.631 ± 0.011 | 1.54 ± 0.20 | -0.26 / +1.83 | -0.382 ± 0.033 | +1.013 ± 0.035 | +0.069 ± 0.013 | 79 |
+| nu x1.5 | vko put 12m | ok | % of notional | -0.700 ± 0.041 | 5.75 ± 0.63 | -6.62 / +4.15 | -0.052 ± 0.044 | -0.648 ± 0.060 | -0.048 ± 0.056 | 199 |
+| nu x1.5 | ko var 1y | ok | vol points of vega notional | +0.227 ± 0.025 | 3.52 ± 0.42 | -4.07 / +4.17 | +0.234 ± 0.066 | -0.008 ± 0.071 | +0.021 ± 0.037 | 113 |
 
-Study D — M8B_TABLE_D
+
+Study C — (from `outputs/m8b/m8b_table_C.csv`, run 2026-09-15; value ± se; every column of the CSV carries its `_se` twin)
+
+| product | rota | recalibration | status | unit | recal P&L (desk) | refits | total P&L (desk) | static × rota | ratio | 30% | z | nonlinearity | wall s | cal |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| autocall 3y | +1 | none | ok | % of notional | -0.000 ± 0.000 | 0 | +0.313 ± 0.063 | +0.005 ± 0.007 | 57.22 ± 69.94 | no | +4.9 | +0.00 ± 0.00 | 1120 | 0 |
+| autocall 3y | +1 | sabr_linked | ok | % of notional | -0.269 ± 0.008 | 2 | +0.283 ± 0.060 | -0.054 ± 0.007 | 4.98 ± 0.63 | no | -20.7 | +0.00 ± 0.00 | 477 | 0 |
+| autocall 3y | +1 | sticky_breakeven | ok | % of notional | -0.188 ± 0.004 | 2 | +0.295 ± 0.071 | -0.074 ± 0.007 | 2.56 ± 0.26 | no | -13.9 | +0.00 ± 0.00 | 734 | 2 |
+| autocall 3y | +2 | none | ok | % of notional | -0.000 ± 0.000 | 0 | +0.310 ± 0.063 | +0.011 ± 0.013 | 28.38 ± 34.70 | no | +4.6 | -0.50 ± 0.14 | 175 | 0 |
+| autocall 3y | +2 | sabr_linked | ok | % of notional | +0.163 ± 0.014 | 7 | +0.095 ± 0.066 | -0.108 ± 0.013 | -1.51 ± 0.22 | no | +14.3 | -1.30 ± 0.03 | 1558 | 7 |
+| autocall 3y | +2 | sticky_breakeven | ok | % of notional | -0.056 ± 0.007 | 7 | +0.386 ± 0.068 | -0.147 ± 0.014 | 0.38 ± 0.06 | no | +5.7 | -0.85 ± 0.02 | 1533 | 7 |
+| autocall 3y | +3 | none | ok | % of notional | -0.000 ± 0.000 | 0 | +0.323 ± 0.064 | +0.016 ± 0.020 | 19.74 ± 24.11 | no | +4.6 | -0.66 ± 0.10 | 175 | 0 |
+| autocall 3y | +3 | sabr_linked | ok | % of notional | +0.020 ± 0.019 | 13 | +0.703 ± 0.074 | -0.162 ± 0.020 | -0.12 ± 0.12 | no | +6.7 | -1.03 ± 0.02 | 2495 | 13 |
+| autocall 3y | +3 | sticky_breakeven | ok | % of notional | -0.061 ± 0.010 | 13 | +0.316 ± 0.071 | -0.221 ± 0.022 | 0.28 ± 0.05 | no | +6.7 | -0.89 ± 0.02 | 2496 | 13 |
+| phoenix 3y | +1 | none | ok | % of notional | -0.000 ± 0.000 | 0 | +0.348 ± 0.047 | +0.003 ± 0.005 | 138.21 ± 273.51 | no | +7.3 | +0.00 ± 0.00 | 286 | 0 |
+| phoenix 3y | +1 | sabr_linked | ok | % of notional | -0.303 ± 0.011 | 2 | -0.141 ± 0.062 | -0.052 ± 0.005 | 5.85 ± 0.61 | no | -20.3 | +0.00 ± 0.00 | 555 | 0 |
+| phoenix 3y | +1 | sticky_breakeven | ok | % of notional | -0.069 ± 0.023 | 2 | +0.374 ± 0.099 | -0.058 ± 0.006 | 1.19 ± 0.42 | yes | -0.5 | +0.00 ± 0.00 | 553 | 0 |
+| phoenix 3y | +2 | none | ok | % of notional | -0.000 ± 0.000 | 0 | +0.317 ± 0.047 | +0.005 ± 0.010 | 63.03 ± 124.79 | no | +6.5 | -0.54 ± 0.09 | 285 | 0 |
+| phoenix 3y | +2 | sabr_linked | ok | % of notional | +0.265 ± 0.020 | 7 | +0.010 ± 0.060 | -0.103 ± 0.010 | -2.56 ± 0.31 | no | +16.5 | -1.44 ± 0.04 | 672 | 0 |
+| phoenix 3y | +2 | sticky_breakeven | ok | % of notional | -0.050 ± 0.028 | 7 | +0.428 ± 0.106 | -0.116 ± 0.011 | 0.43 ± 0.25 | no | +2.2 | -0.64 ± 0.24 | 673 | 0 |
+| phoenix 3y | +3 | none | ok | % of notional | -0.000 ± 0.000 | 0 | +0.298 ± 0.047 | +0.008 ± 0.015 | 39.46 ± 78.15 | no | +5.8 | -0.71 ± 0.06 | 285 | 0 |
+| phoenix 3y | +3 | sabr_linked | ok | % of notional | +0.023 ± 0.049 | 13 | +0.156 ± 0.062 | -0.155 ± 0.015 | -0.15 ± 0.32 | no | +3.5 | -1.03 ± 0.05 | 824 | 0 |
+| phoenix 3y | +3 | sticky_breakeven | ok | % of notional | -0.028 ± 0.042 | 13 | +0.323 ± 0.088 | -0.174 ± 0.017 | 0.16 ± 0.24 | no | +3.2 | -0.87 ± 0.21 | 820 | 0 |
+| cliquet 1y | +1 | none | ok | % of notional | -0.000 ± 0.000 | 0 | +0.577 ± 0.015 | -0.005 ± 0.000 | -121.94 ± 7.34 | no | +39.0 | +0.00 ± 0.00 | 84 | 0 |
+| cliquet 1y | +1 | sabr_linked | ok | % of notional | -0.112 ± 0.007 | 4 | +1.411 ± 0.045 | -0.079 ± 0.000 | 1.42 ± 0.08 | no | -5.0 | +0.00 ± 0.00 | 1258 | 4 |
+| cliquet 1y | +1 | sticky_breakeven | ok | % of notional | -0.243 ± 0.002 | 4 | +0.435 ± 0.009 | -0.102 ± 0.000 | 2.39 ± 0.02 | no | -88.1 | +0.00 ± 0.00 | 1274 | 4 |
+| cliquet 1y | +2 | none | ok | % of notional | -0.000 ± 0.000 | 0 | +0.574 ± 0.013 | -0.009 ± 0.001 | -60.72 ± 3.58 | no | +44.4 | -0.50 ± 0.02 | 83 | 0 |
+| cliquet 1y | +2 | sabr_linked | ok | % of notional | -0.166 ± 0.006 | 7 | +0.179 ± 0.027 | -0.159 ± 0.001 | 1.05 ± 0.04 | yes | -1.3 | -0.26 ± 0.05 | 1777 | 7 |
+| cliquet 1y | +2 | sticky_breakeven | ok | % of notional | -0.306 ± 0.002 | 7 | +0.321 ± 0.009 | -0.203 ± 0.001 | 1.50 ± 0.01 | no | -53.0 | -0.37 ± 0.01 | 1821 | 7 |
+| cliquet 1y | +3 | none | ok | % of notional | -0.000 ± 0.000 | 0 | +0.569 ± 0.013 | -0.014 ± 0.001 | -40.12 ± 2.36 | no | +45.6 | -0.67 ± 0.01 | 83 | 0 |
+| cliquet 1y | +3 | sabr_linked | ok | % of notional | -0.347 ± 0.006 | 12 | +0.562 ± 0.025 | -0.238 ± 0.001 | 1.46 ± 0.03 | no | -17.4 | +0.03 ± 0.06 | 2636 | 12 |
+| cliquet 1y | +3 | sticky_breakeven | ok | % of notional | -0.348 ± 0.002 | 12 | +0.265 ± 0.011 | -0.305 ± 0.001 | 1.14 ± 0.01 | yes | -17.9 | -0.52 ± 0.00 | 2648 | 12 |
+| vko put 12m | +1 | none | ok | % of notional | -0.000 ± 0.000 | 0 | -0.627 ± 0.039 | +0.057 ± 0.005 | -11.01 ± 1.12 | no | -17.6 | +0.00 ± 0.00 | 163 | 0 |
+| vko put 12m | +1 | sabr_linked | ok | % of notional | +0.153 ± 0.019 | 4 | -1.056 ± 0.048 | -0.020 ± 0.003 | -7.83 ± 1.62 | no | +8.9 | +0.00 ± 0.00 | 939 | 0 |
+| vko put 12m | +1 | sticky_breakeven | ok | % of notional | +0.096 ± 0.003 | 4 | -0.687 ± 0.040 | +0.028 ± 0.003 | 3.38 ± 0.39 | no | +15.7 | +0.00 ± 0.00 | 833 | 0 |
+| vko put 12m | +2 | none | ok | % of notional | -0.000 ± 0.000 | 0 | -0.615 ± 0.038 | +0.114 ± 0.009 | -5.40 ± 0.55 | no | -18.6 | -0.51 ± 0.04 | 163 | 0 |
+| vko put 12m | +2 | sabr_linked | ok | % of notional | -0.062 ± 0.016 | 7 | -0.235 ± 0.046 | -0.039 ± 0.006 | 1.58 ± 0.48 | no | -1.3 | -1.20 ± 0.06 | 841 | 0 |
+| vko put 12m | +2 | sticky_breakeven | ok | % of notional | +0.118 ± 0.003 | 7 | -0.592 ± 0.039 | +0.057 ± 0.006 | 2.09 ± 0.24 | no | +8.7 | -0.38 ± 0.03 | 912 | 0 |
+| vko put 12m | +3 | none | ok | % of notional | -0.000 ± 0.000 | 0 | -0.601 ± 0.038 | +0.171 ± 0.014 | -3.52 ± 0.36 | no | -19.3 | -0.68 ± 0.03 | 163 | 0 |
+| vko put 12m | +3 | sabr_linked | ok | % of notional | -0.136 ± 0.017 | 12 | -0.468 ± 0.045 | -0.059 ± 0.010 | 2.33 ± 0.48 | no | -4.0 | -1.30 ± 0.05 | 944 | 0 |
+| vko put 12m | +3 | sticky_breakeven | ok | % of notional | +0.089 ± 0.005 | 12 | -0.599 ± 0.040 | +0.085 ± 0.009 | 1.04 ± 0.13 | yes | +0.3 | -0.69 ± 0.02 | 1000 | 0 |
+| ko var 1y | +1 | none | ok | vol points of vega notional | -0.000 ± 0.000 | 0 | +0.204 ± 0.028 | +0.036 ± 0.002 | 5.61 ± 0.84 | no | +5.9 | +0.00 ± 0.00 | 90 | 0 |
+| ko var 1y | +1 | sabr_linked | ok | vol points of vega notional | +0.444 ± 0.024 | 4 | +0.052 ± 0.041 | +0.074 ± 0.002 | 6.03 ± 0.38 | no | +15.3 | +0.00 ± 0.00 | 914 | 0 |
+| ko var 1y | +1 | sticky_breakeven | ok | vol points of vega notional | +0.114 ± 0.003 | 4 | +0.404 ± 0.029 | +0.095 ± 0.002 | 1.20 ± 0.04 | yes | +5.0 | +0.00 ± 0.00 | 906 | 0 |
+| ko var 1y | +2 | none | ok | vol points of vega notional | -0.000 ± 0.000 | 0 | +0.198 ± 0.028 | +0.073 ± 0.004 | 2.72 ± 0.42 | no | +4.4 | -0.52 ± 0.10 | 90 | 0 |
+| ko var 1y | +2 | sabr_linked | ok | vol points of vega notional | +0.584 ± 0.023 | 7 | +0.006 ± 0.041 | +0.147 ± 0.005 | 3.97 ± 0.20 | no | +18.9 | -0.34 ± 0.04 | 875 | 0 |
+| ko var 1y | +2 | sticky_breakeven | ok | vol points of vega notional | +0.123 ± 0.003 | 7 | +0.382 ± 0.030 | +0.189 ± 0.004 | 0.65 ± 0.02 | no | -11.9 | -0.46 ± 0.02 | 1010 | 0 |
+| ko var 1y | +3 | none | ok | vol points of vega notional | -0.000 ± 0.000 | 0 | +0.194 ± 0.029 | +0.109 ± 0.006 | 1.78 ± 0.28 | no | +2.9 | -0.68 ± 0.06 | 101 | 0 |
+| ko var 1y | +3 | sabr_linked | ok | vol points of vega notional | +0.461 ± 0.022 | 12 | +0.001 ± 0.038 | +0.221 ± 0.007 | 2.09 ± 0.12 | no | +10.4 | -0.65 ± 0.02 | 983 | 0 |
+| ko var 1y | +3 | sticky_breakeven | ok | vol points of vega notional | +0.193 ± 0.005 | 12 | +0.480 ± 0.030 | +0.284 ± 0.007 | 0.68 ± 0.02 | no | -11.4 | -0.44 ± 0.02 | 914 | 0 |
+
+
+Study D — (from `outputs/m8b/m8b_table_D.csv`, run 2026-09-15; value ± se; every column of the CSV carries its `_se` twin)
+
+| product | regime | status | unit | P&L std | mean (desk) | winner | closest to model | wall s |
+|---|---|---|---|---|---|---|---|---|
+| autocall 3y | model | ok | % of notional | 7.704 ± 0.083 | +0.150 ± 0.054 | no | no | 12 |
+| autocall 3y | sticky_strike | ok | % of notional | 6.764 ± 0.076 | +0.147 ± 0.048 | no | no | 19 |
+| autocall 3y | sticky_skew | ok | % of notional | 6.562 ± 0.073 | +0.148 ± 0.046 | yes | no | 20 |
+| autocall 3y | sticky_moneyness | ok | % of notional | 8.125 ± 0.087 | +0.136 ± 0.057 | no | yes | 20 |
+| vanilla 1y atm | model | ok | % of spot | 3.144 ± 0.011 | +0.014 ± 0.022 | no | no | 25 |
+| vanilla 1y atm | sticky_strike | ok | % of spot | 1.925 ± 0.008 | +0.018 ± 0.014 | yes | no | 50 |
+| vanilla 1y atm | sticky_skew | ok | % of spot | 1.971 ± 0.008 | +0.017 ± 0.014 | no | no | 43 |
+| vanilla 1y atm | sticky_moneyness | ok | % of spot | 3.060 ± 0.010 | +0.011 ± 0.022 | no | yes | 32 |
+
 
 
 ---

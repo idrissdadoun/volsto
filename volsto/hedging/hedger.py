@@ -120,11 +120,16 @@ class Schedule:
     ``after_fixing > 0`` places such a date that much later instead (one business day is 1/252 —
     the setting the fitted-gradient delta estimator needed, its derivative being unidentified
     when every path has the same in-period return).  ``t = 0`` stays; nothing is placed at or
-    beyond the maturity."""
+    beyond the maturity.  ``product_fixings=False`` keeps the frequency grid only (a fixing
+    that lies on the grid is still a rebalancing date; the state at a date includes every
+    fixing up to it, so a knock-in monitored daily is seen at the next grid date): the M8b
+    studies use it — a Phoenix with 757 daily knock-in fixings would otherwise rebalance
+    daily under a "weekly" schedule (900 dates, 1560 s per run against 156 dates)."""
 
     frequency: str = "daily"
     dates: tuple[float, ...] | None = None
     after_fixing: float = 0.0
+    product_fixings: bool = True
 
     def __post_init__(self) -> None:
         if self.dates is None and self.frequency not in FREQUENCIES:
@@ -142,7 +147,8 @@ class Schedule:
             base = np.linspace(0.0, T, n + 1)
         fix = np.asarray(product.fixing_times, dtype=np.float64)
         fix = fix[(fix > _TOL) & (fix < T - _TOL)]
-        cand = np.unique(np.concatenate([base, fix, np.asarray(extra, dtype=np.float64), [0.0]]))
+        added = fix if self.product_fixings else np.zeros(0)
+        cand = np.unique(np.concatenate([base, added, np.asarray(extra, dtype=np.float64), [0.0]]))
         out = []
         for d in cand:
             if d <= _TOL:
@@ -641,29 +647,91 @@ class Hedger:
         ]
         return PathSet.concat(parts)
 
+    #: paths of the projection probe (probed at this count and at twice it: the per-date cost
+    #: is split into a fixed part and a part linear in the paths; small probes over-estimate the
+    #: slope — numpy is less efficient per element at 10³ than at 4·10⁴ rows — so the probe is
+    #: 2·10³ / 4·10³ paths, a few seconds per product)
+    PROBE_PATHS = 2000
+
     def projected_wall_clock(
-        self, product: Product, strategy: Strategy, grid: TimeGrid, n_models: int
+        self,
+        product: Product,
+        strategy: Strategy,
+        grid: TimeGrid,
+        n_models: int,
+        bumps: Sequence[Bump] = (),
     ) -> float:
-        """Seconds: one 1000-path chunk of the pricing model on the grid, scaled."""
-        n_probe = 1000
-        probe = SimConfig(
-            n_paths=n_probe,
-            chunk_size=n_probe,
-            seed=self.sim.seed,
-            dt_max=self.sim.dt_max,
-            antithetic=self.sim.antithetic,
-        )
-        draws = GaussianDraws(
-            probe.seed, n_probe, grid.n_steps, self.context.model.n_brownians, probe.antithetic
-        )
-        t0 = time.perf_counter()
-        self.context.model.simulate_chunk(grid, draws, 0, n_probe, probe.scheme)
-        per_path = (time.perf_counter() - t0) / n_probe
+        """Projected seconds of :meth:`run`: the **simulation** cost from one
+        :attr:`PROBE_PATHS`-path chunk of the pricing model on the grid (per path, times the
+        ``n_models`` pricing sets and the world set) plus the **per-date** cost measured on a
+        probe pricer of the same size — every object of the strategy fitted and evaluated at one
+        mid-life date with the given ``bumps`` (the hybrid bump targets, the regressions and the
+        state features, a Phoenix's knock-in scan included) — scaled to the pricing plus world
+        path counts and the number of rebalancing dates.  ``bumps`` are the strategy's target
+        bumps when the caller can build them without calibrating (the study runner passes them
+        when every state is cached); without them the per-date cost is that of the value and
+        spot targets only.  The M8 model (a constant per path, date and object) projected the
+        3y autocall 3x and the Phoenix 8x short of the measured wall clock (study B, 2·10⁴
+        paths, weekly); the probe measures what the loop does."""
+        n_probe = self.PROBE_PATHS
         n_w = self.world_paths or self.sim.n_paths
+        dates = self.schedule.build(product)
+        n_dates = int(dates.size)
+        objects: list[Product] = [product] + [
+            i.product for i in strategy.instruments if i.product is not None
+        ]
+        kinds = ["value", "delta", *(b.name for b in bumps)]
+        # two consecutive mid-life dates: the first carries the one-off costs of a pricer (the
+        # payoffs of every object on every set, the control-variate proxies and shadow draws,
+        # the first hybrid targets), the second is the marginal cost of a date in the loop;
+        # probed at two path counts, the per-date cost splits into a fixed part (Python and
+        # regression set-up per date and object) and a part linear in the paths
+        i_mid = n_dates // 2
+        t_first = float(dates[i_mid]) if n_dates else 0.0
+        t_second = float(dates[min(i_mid + 1, n_dates - 1)]) if n_dates else 0.0
+        per_path = 0.0
+        one_off = 0.0
+        per_date: dict[int, float] = {}
+        for n in (n_probe, 2 * n_probe):
+            probe = SimConfig(
+                n_paths=n,
+                chunk_size=n,
+                seed=self.sim.seed,
+                dt_max=self.sim.dt_max,
+                antithetic=self.sim.antithetic,
+            )
+            draws = GaussianDraws(
+                probe.seed, n, grid.n_steps, self.context.model.n_brownians, probe.antithetic
+            )
+            t0 = time.perf_counter()
+            self.context.model.simulate_chunk(grid, draws, 0, n, probe.scheme)
+            per_path = (time.perf_counter() - t0) / n
+            t1 = time.perf_counter()
+            pr = ConditionalPricer(
+                self.context.model,
+                objects,
+                grid,
+                probe,
+                tuple(bumps),
+                self.degree,
+                control_variate=self.control_variate,
+                surface=self.context.surface,
+            )
+            for j in range(len(objects)):
+                pr.evaluate(j, t_first, pr.paths, kinds)
+            t2 = time.perf_counter()
+            if n_dates > 1:
+                for j in range(len(objects)):
+                    pr.evaluate(j, t_second, pr.paths, kinds)
+            per_date[n] = time.perf_counter() - t2
+            # the probe's own simulations (base, spot up / down, one set per bump) are the
+            # per-path cost; what remains of the first date is the one-off cost of a pricer
+            one_off = max(t2 - t1 - per_path * n * (3 + len(bumps)) - per_date[n], 0.0) / n
         sims = per_path * (self.sim.n_paths * n_models + n_w)
-        n_obj = 1 + len(strategy.instruments)
-        n_dates = self.schedule.build(product).size
-        regress = n_dates * n_obj * (self.sim.n_paths + n_w) * 40 * 1e-8
+        n_loop = self.sim.n_paths + n_w
+        slope = max(per_date[2 * n_probe] - per_date[n_probe], 0.0) / n_probe
+        fixed = max(per_date[n_probe] - slope * n_probe, 0.0)
+        regress = one_off * n_loop + n_dates * (fixed + slope * n_loop)
         return float(sims + regress)
 
     # -- run -----------------------------------------------------------------------------------
@@ -922,6 +990,50 @@ class Hedger:
                 }
             return out
 
+        def instrument_greeks(
+            pr: ConditionalPricer, t: float, active: Sequence[bool]
+        ) -> list[dict[str, FloatArray]]:
+            """The instruments' Greeks at ``t`` under ``pr`` (an inactive instrument is zero)."""
+            out: list[dict[str, FloatArray]] = []
+            for j in range(n_i):
+                oi = obj_index[j]
+                if oi is None:
+                    out.append(spot_greeks(t))
+                elif active[j]:
+                    out.append(values_at(pr, oi, t, kinds))
+                else:
+                    out.append({kk: np.zeros(n_w) for kk in kinds})
+            return out
+
+        def add_vanna(
+            pr: ConditionalPricer,
+            t: float,
+            prod: dict[str, FloatArray],
+            inst_g: list[dict[str, FloatArray]],
+            active: Sequence[bool],
+        ) -> None:
+            """The vanna column of the product (or the net object) and of every instrument, from
+            the gradient of the fitted vega polynomial in ``ln S``.  Called on every date **and
+            again after a recalibration**, which rebuilds ``prod`` / ``inst_g`` under the new
+            pricer: the M8b study-C VKO put runs (whose preset targets vanna) failed with
+            ``KeyError: 'vanna'`` at the first refit date because the rebuilt dictionaries were
+            handed to the solve without it."""
+            if "vanna" not in strategy.target_names:
+                return
+            g_obj = 0 if net_index is None else net_index
+            fit = pr.fit(g_obj, t)
+            feats, _ = pr.features(g_obj, world, t)
+            s_t = np.exp(world.log_spot_at(idx[t]))
+            prod["vanna"] = fit.gradient("vega", feats, 0) / s_t
+            for j in range(n_i):
+                oi = obj_index[j]
+                if oi is None or not active[j] or j in net_legs:
+                    inst_g[j]["vanna"] = np.zeros(n_w)
+                else:
+                    f_ = pr.fit(oi, t)
+                    ff, _ = pr.features(oi, world, t)
+                    inst_g[j]["vanna"] = f_.gradient("vega", ff, 0) / s_t
+
         def spot_greeks(t: float) -> dict[str, FloatArray]:
             s_t = np.exp(world.log_spot_at(idx[t]))
             scale = spot_inst.scale(t, fc)
@@ -955,20 +1067,7 @@ class Hedger:
                     inst_g.append({kk: np.zeros(n_w) for kk in kinds})
             prod = netted(cur_pricer, t, prod, inst_g)
             # vanna from the vega polynomial gradient in ln S
-            if "vanna" in strategy.target_names:
-                g_obj = 0 if net_index is None else net_index
-                fit = cur_pricer.fit(g_obj, t)
-                feats, _ = cur_pricer.features(g_obj, world, t)
-                s_t = np.exp(world.log_spot_at(idx[t]))
-                prod["vanna"] = fit.gradient("vega", feats, 0) / s_t
-                for j in range(n_i):
-                    oi = obj_index[j]
-                    if oi is None or not active[j] or j in net_legs:
-                        inst_g[j]["vanna"] = np.zeros(n_w)
-                    else:
-                        f_ = cur_pricer.fit(oi, t)
-                        ff, _ = cur_pricer.features(oi, world, t)
-                        inst_g[j]["vanna"] = f_.gradient("vega", ff, 0) / s_t
+            add_vanna(cur_pricer, t, prod, inst_g, active)
             # recalibration
             if rule is not None and world_skew_pricer is not None:
                 skew_now = self._world_skew(world_skew_pricer, kdx, t, rule, world)
@@ -981,23 +1080,21 @@ class Hedger:
                     if new_ctx is not None:
                         n_refits += 1
                         cache_hits += int(hit)
+                        # the replaced pricer is read once more (V_k(old) is in ``prod``
+                        # already) and released: its path sets would otherwise stay resident
+                        # for the rest of the run, one full pricer per refit
+                        old_pricer = cur_pricer
                         new_pricer = self._pricer(new_ctx.model, objects, grid, bumps)
                         pricers.append(new_pricer)
                         new_prod, _ = new_pricer.evaluate(0, t, world, ["value"])
                         d_recal = new_prod["value"] - prod["value"]
                         pnl_recal += np.where(alive, d_recal, 0.0)
                         cur_pricer = new_pricer
+                        old_pricer.release()
                         prod, hs = cur_pricer.evaluate(0, t, world, kinds)
-                        inst_g = []
-                        for j in range(n_i):
-                            oi = obj_index[j]
-                            if oi is None:
-                                inst_g.append(spot_greeks(t))
-                            elif active[j]:
-                                inst_g.append(values_at(cur_pricer, oi, t, kinds))
-                            else:
-                                inst_g.append({kk: np.zeros(n_w) for kk in kinds})
+                        inst_g = instrument_greeks(cur_pricer, t, active)
                         prod = netted(cur_pricer, t, prod, inst_g)
+                        add_vanna(cur_pricer, t, prod, inst_g, active)
                         skew_ref = skew_now
                         did = True
                 recal_rows.append(
@@ -1008,6 +1105,13 @@ class Hedger:
                         "policy": rule.policy,
                         "recalibrated": did,
                         "params": None if not did else repr(cur_pricer.model),
+                        # the refit's own log row carries the flag (absent when the rule's
+                        # refit hook is stubbed, as the loop tests do)
+                        "at_bound": (
+                            str(rule.log_rows[-1].get("at_bound", ""))
+                            if did and rule.log_rows
+                            else ""
+                        ),
                     }
                 )
             # strategy
@@ -1321,6 +1425,19 @@ class Hedger:
             )
             params = fit_2f(targets, xi0, cfg).params
         changes = {f.name: float(getattr(params, f.name)) for f in dataclasses.fields(params)}
+        at_bound = degenerate_correlations(changes)
+        if at_bound:
+            msg = (
+                f"recalibration at t={t:g} ({rule.policy}): the refit lands with "
+                + ", ".join(f"{k} = {v:+.4f}" for k, v in at_bound.items())
+                + f" (|rho| >= {CORRELATION_BOUND}): the state surface's skew at "
+                f"{tuple(rule.pillars)} is not attainable with the held targets and the fit runs "
+                "to the correlation bound — the repricing it books is a bound artefact, not a "
+                "measurement of the desk's re-marking"
+            )
+            log.warning(msg)
+            if msg not in ctx.notes:
+                ctx.notes.append(msg)
         new_state = _with_params(ctx.state, changes)
         if hasattr(ctx.builder, "has"):
             hit = bool(ctx.builder.has(new_state))
@@ -1337,9 +1454,30 @@ class Hedger:
                 "params": repr(params),
                 "cache_hit": hit,
                 "held": "; ".join(held_flags),
+                "at_bound": "; ".join(f"{k}={v:+.4f}" for k, v in at_bound.items()),
             }
         )
         return PricingContext(model, new_state, ctx.builder, ctx.surface, ctx.label), hit
+
+
+#: a fitted correlation at least this large in absolute value is a degenerate two-factor set
+#: (perfectly correlated factors): the M7 marking work guards ``rho12`` for the same reason
+#: (§15 Part 3), and 32 of the 90 ``sabr_linked`` refits of the M8b study-C runs landed here
+#: while none of the 90 ``sticky_breakeven`` refits did
+CORRELATION_BOUND = 0.99
+
+
+def degenerate_correlations(changes: Mapping[str, float]) -> dict[str, float]:
+    """The fitted correlations at their bound (``|rho| >= CORRELATION_BOUND``), empty when the
+    set is non-degenerate.  A refit that lands here prices the product under perfectly correlated
+    factors, so the recalibration P&L it books says more about the policy's attainability than
+    about the re-marking; :meth:`Hedger._recalibrate` warns and records it per date
+    (``recalibrations["at_bound"]``)."""
+    return {
+        k: float(v)
+        for k, v in changes.items()
+        if k.startswith("rho") and abs(float(v)) >= CORRELATION_BOUND
+    }
 
 
 def _with_params(state: RiskState, changes: Mapping[str, float]) -> RiskState:

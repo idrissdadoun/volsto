@@ -31,6 +31,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from numpy.typing import NDArray
 from scipy.stats import norm
 
 from volsto.calibration.cache import CacheMissError, LeverageCache
@@ -56,9 +57,9 @@ from volsto.hedging.strategies import PRESETS
 from volsto.market.bs import black_price
 from volsto.market.curves import ForwardCurve
 from volsto.models.bs import BlackScholes
-from volsto.products.autocall import Autocall
+from volsto.products.autocall import Autocall, Phoenix
 from volsto.products.barrier import KnockOutOption
-from volsto.products.base import Portfolio
+from volsto.products.base import Portfolio, daily_schedule
 from volsto.products.cliquet import AdditiveCliquet
 from volsto.products.conditional_variance import KnockOutVarianceSwap, UpVar
 from volsto.products.forward_start import ForwardStartOption
@@ -66,6 +67,8 @@ from volsto.products.vanilla import DigitalOption, EuropeanOption
 from volsto.products.variance import FVA, VarianceSwap, VolSwap
 from volsto.products.vko import VolKnockOutPut
 from volsto.risk.engine import RiskState
+
+FloatArray = NDArray[np.float64]
 
 ROOT = Path(__file__).resolve().parents[1]
 MKT = MarketConfig(100.0, CurveConfig((1.0,), (0.02,)), CurveConfig((1.0,), (0.01,)))
@@ -201,6 +204,54 @@ def test_hedge_basis_and_state_features(bs: BlackScholes, fc: ForwardCurve) -> N
     ac = products[-2]
     hs2 = hedge_state(ac, paths, idx, 0.5)
     assert hs2.alive.all() and hs2.names == ("ki", "memory")
+    # a Phoenix with memory past its first observation date: the memory feature is the missed
+    # coupon amount still recoverable (0.06 per missed coupon), read through
+    # Autocall.coupon_amounts — the M8b study-B Phoenix runs failed here with KeyError
+    # 'coupons' (statistics() exposes coupons_paid, not the per-date amounts)
+    ph = Phoenix(
+        (1.0, 2.0, 3.0),
+        disc,
+        spot_reference=100.0,
+        coupon=0.06,
+        coupon_barrier=0.7,
+        memory=True,
+        ki_level=0.6,
+        ki_type="european",
+        autocall_barriers=1.0,
+        final_redemption="knock_in",
+    )
+    g2 = union_grid([bs], [ph], np.array([1.5, 2.5]), SIM_SMALL)
+    paths2 = mc.simulate(bs, g2)
+    idx2 = g2.fixing_index
+    for t in (0.5, 1.5, 2.5):
+        hs3 = hedge_state(ph, paths2, idx2, t)
+        assert hs3.names == ("ki", "memory") and np.all(np.isfinite(hs3.features))
+    # the schedule: every product fixing is a rebalancing date by default; product_fixings=False
+    # keeps the frequency grid (the M8b studies' weekly 3y Phoenix with daily knock-in fixings)
+    ph_daily = Phoenix(
+        (1.0, 2.0, 3.0),
+        disc,
+        spot_reference=100.0,
+        coupon=0.06,
+        coupon_barrier=0.7,
+        memory=True,
+        ki_level=0.6,
+        ki_type="american",
+        ki_monitoring="discrete",
+        ki_fixing_times=daily_schedule(3.0, 252),
+        autocall_barriers=1.0,
+        final_redemption="knock_in",
+    )
+    weekly = Schedule("weekly").build(ph_daily)
+    grid_only = Schedule("weekly", product_fixings=False).build(ph_daily)
+    assert weekly.size > 700 and grid_only.size == 156
+    assert np.all(np.isin(np.array([1.0, 2.0]), grid_only))
+    hs3 = hedge_state(ph, paths2, idx2, 1.5)
+    s1 = np.exp(paths2.log_spot_at(idx2.indices(np.array([1.0]))))[:, 0]
+    assert np.array_equal(hs3.alive, s1 < 100.0)
+    missed = hs3.alive & (s1 < 70.0)
+    assert missed.any() and np.allclose(hs3.features[missed, 1], 0.06)
+    assert np.all(hs3.features[hs3.alive & ~missed, 1] == 0.0)
 
 
 def test_conditional_pricer_bs(bs: BlackScholes, fc: ForwardCurve) -> None:
@@ -385,8 +436,10 @@ def test_layer_a_residual_vanishes_when_spanned(bs: BlackScholes, fc: ForwardCur
     r = h.run(port, strat)
     res = r.residual
     for g in ("delta", "vega", "vanna"):
-        ratio = res[f"residual:{g}"] / np.maximum(res[f"exposure:{g}"], 1e-12)
-        print(g, np.round(ratio.to_numpy(), 4))
+        ratio: FloatArray = np.asarray(
+            res[f"residual:{g}"] / np.maximum(res[f"exposure:{g}"], 1e-12), dtype=np.float64
+        )
+        print(g, np.round(ratio, 4))
         assert (ratio < 0.02).all(), (g, ratio.tolist())
     q = r.quantities
     # at t = 0 every feature is constant, the fitted vega is a constant and its gradient (vanna)
@@ -677,6 +730,103 @@ def test_recalibration_pnl_zero_without_skew_move(fc: ForwardCurve) -> None:
     assert np.all(r2.pnl_recalibration == 0.0)  # same parameters: nothing to reprice
 
 
+def test_refit_rebuilds_every_target_column(bs: BlackScholes, fc: ForwardCurve) -> None:
+    """A refit must leave the solve the **same target columns** as any other date.  The loop
+    computes the product's and the instruments' Greeks, adds the regression-native ``vanna``
+    column, and only then runs the recalibration rule; a refit rebuilds the two dictionaries
+    under the new pricer, and before this test that rebuild dropped ``vanna`` — the six M8b
+    study-C ``vko put 12m`` recalibration runs (whose preset targets vanna) died with
+    ``KeyError: 'vanna'`` at their first refit date.
+
+    The real trigger needs an LSV pricing state whose parallel ±1 vp leverages are in the cache
+    (tests never calibrate), so the rule's two hooks are stubbed here: the world's excess skew
+    grows linearly with the date index (the trigger fires once, at the second date) and the
+    "refit" returns a Black-Scholes context at a 2 vol point higher level — no calibration, and
+    a repricing large enough that the recalibration P&L is unmistakably non-zero."""
+    disc = fc.rate_curve
+    opt = EuropeanOption(100.0, 1.0, 1, disc)
+    inst = [
+        Spot(),
+        Vanilla(strike=100.0, maturity=1.0, cp=1, discount=disc, name="c100"),
+        Vanilla(strike=90.0, maturity=1.0, cp=-1, discount=disc, name="p90"),
+    ]
+    strat = GreekTargetStrategy(
+        (Target("delta"), Target("vega"), Target("vanna")), inst, ridge=1e-10, name="span"
+    )
+    rule = RecalibrationRule(pillars=(0.25, 0.5), skew_move_threshold=0.05, h=0.05)
+    h = Hedger(
+        PricingContext.from_model(bs),
+        bs,
+        Schedule("monthly"),
+        Costs(),
+        recalibration=rule,
+        sim=SIM,
+        world_paths=SIM.n_paths,
+        verbose=False,
+    )
+    refit_ctx = PricingContext.from_model(BlackScholes(bs.vol + 0.02, fc))
+    calls: list[float] = []
+
+    def fake_skew(pr: object, kdx: int, t: float, rule_: object, world: object) -> FloatArray:
+        # 0 at t = 0, then a step the rule sees once: it refits at the second date and resets
+        # its reference there, so the constant level triggers nothing afterwards
+        return np.array([0.0 if kdx == 0 else 0.1])
+
+    def fake_refit(
+        t: float, pr: object, kdx: int, rule_: object, world: object
+    ) -> tuple[PricingContext, bool]:
+        calls.append(t)
+        return refit_ctx, True
+
+    h._world_skew = fake_skew  # type: ignore[method-assign,assignment]
+    h._recalibrate = fake_refit  # type: ignore[method-assign,assignment]
+    r = h.run(opt, strat)
+    print(r.recalibrations)
+    assert len(calls) == 1 and r.budget["refits"] == 1.0
+    fired = r.recalibrations.loc[r.recalibrations["recalibrated"].astype(bool), "t"].tolist()
+    assert fired == [pytest.approx(r.dates[1])]
+    # the refit repriced the option 2 vol points higher: a non-zero recalibration P&L, and every
+    # target still solved at that date (a dropped column would have raised KeyError)
+    assert np.all(r.pnl_recalibration != 0.0)
+    q = r.quantities
+    at_refit = q.loc[np.isclose(q["t"], r.dates[1])]
+    assert not at_refit.empty
+    for name in ("c100", "p90"):
+        assert np.isfinite(at_refit[f"q_mean:{name}"]).all()
+    res = r.residual
+    row = res.loc[np.isclose(res["t"], r.dates[1])].iloc[0]
+    for g in ("delta", "vega", "vanna"):
+        assert np.isfinite(row[f"residual:{g}"])
+
+
+def test_degenerate_correlations_flags_a_collapsed_refit() -> None:
+    """A refit that lands with a correlation at its bound is a degenerate two-factor set: the
+    hedger records it per date (``recalibrations["at_bound"]``) and warns, so a recalibration
+    P&L booked under perfectly correlated factors is visible in the run rather than found by
+    reading the fitted parameters afterwards.  Measured on the M8b study-C runs: 32 of the 90
+    ``sabr_linked`` refits land here (the mid-life state-surface skew is not attainable with the
+    held targets), none of the 90 ``sticky_breakeven`` ones."""
+    from volsto.hedging.hedger import CORRELATION_BOUND, degenerate_correlations
+
+    sane = {"nu": 2.44, "theta": 0.11, "k1": 8.8, "rho12": 0.41, "rho_SX1": -0.92, "rho_SX2": -0.73}
+    assert degenerate_correlations(sane) == {}
+    collapsed = {
+        "nu": 2.40,
+        "theta": 0.077,
+        "k1": 8.58,
+        "rho12": 0.9999999955,
+        "rho_SX1": -0.9999999998,
+        "rho_SX2": -0.9999999973,
+    }
+    flagged = degenerate_correlations(collapsed)
+    assert set(flagged) == {"rho12", "rho_SX1", "rho_SX2"}
+    assert all(abs(v) >= CORRELATION_BOUND for v in flagged.values())
+    # a non-correlation parameter never flags, and the bound is inclusive
+    assert degenerate_correlations({"nu": 3.5, "rho12": CORRELATION_BOUND}) == {
+        "rho12": CORRELATION_BOUND
+    }
+
+
 def test_recalibration_rule_policy_and_held_targets() -> None:
     """``RecalibrationRule.policy`` is validated against the shadow-rotation policies and the
     shared :func:`held_targets` holds exactly what each policy says: nothing under
@@ -762,10 +912,12 @@ def test_regime_delta_bump_reanchors_at_the_bumped_spot(fc: ForwardCurve) -> Non
         per_path = 0.5 * (per_path[0::2] + per_path[1::2])
     d0, se_h = float(per_path.mean()), float(per_path.std(ddof=1) / np.sqrt(per_path.size))
     assert np.allclose(d_ss[0], d0, atol=1e-9), (float(d_ss[0].mean()), d0)
+    state = ctx.state
+    assert state is not None
     engine = RiskEngine(
-        LVBuilder(ctx.state), SimConfig(n_paths=20_000, chunk_size=20_000, seed=12, dt_max=1 / 52)
+        LVBuilder(state), SimConfig(n_paths=20_000, chunk_size=20_000, seed=12, dt_max=1 / 52)
     )
-    d_ref, _ = delta_gamma(engine, opt, ctx.state, "sticky_strike")
+    d_ref, _ = delta_gamma(engine, opt, state, "sticky_strike")
     se = float(np.hypot(se_h, d_ref.stderr))
     print(
         f"t=0 sticky-strike delta: hedger {d0:.4f} +/- {se_h:.4f}, M5 delta_gamma "
@@ -773,7 +925,7 @@ def test_regime_delta_bump_reanchors_at_the_bumped_spot(fc: ForwardCurve) -> Non
     )
     assert abs(d0 - d_ref.value) < 3 * se, (d0, d_ref.value, se)
     assert 0.3 < d0 < 0.9
-    d_ref_m, _ = delta_gamma(engine, opt, ctx.state, "model")
+    d_ref_m, _ = delta_gamma(engine, opt, state, "model")
     m0 = float(d_m[0].mean())
     print(
         f"t=0 model delta: hedger {m0:.4f}, M5 delta_gamma {d_ref_m.value:.4f} "

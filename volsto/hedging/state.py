@@ -256,7 +256,7 @@ def hedge_state(product: Product, paths: PathSet, idx: FixingIndex, t: float) ->
         ki = product._breached_by(paths, idx, t).astype(np.float64)
         memory = np.zeros(n)
         if product.is_phoenix and product.memory and past.size:
-            coupons = product.statistics(paths, idx)["coupons"]
+            coupons = product.coupon_amounts(paths, idx)
             memory = product._memory_at(product._memory_state_by_date(coupons), obs, t)
         feats = np.column_stack([ki, memory])
         settled = _terminated(paths, idx, product, alive, t)

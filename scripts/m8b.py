@@ -126,6 +126,8 @@ def print_projection(studies: list[str], lists: dict[str, TaskList], cfg: StudyC
             )
             continue
         print("[m8b] " + pr.summary(), flush=True)
+        for row in pr.per_task:
+            print(f"[m8b]     {row['key']}: projected {row['projected_seconds']:.0f} s", flush=True)
         for key, lab in pr.missing_keys.items():
             print(f"[m8b]     calibration needed: {lab} ({key[:12]})", flush=True)
         if tl.skipped:
