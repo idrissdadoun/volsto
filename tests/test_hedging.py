@@ -15,6 +15,12 @@ wall-clock assertion.  Every P&L figure carries its standard error.
 * early termination (autocall, knock-out) unwinds: no positions after the termination date;
 * recalibration P&L = 0 when the world has no skew move (Black–Scholes world, LSV pricing set);
   the rule's ``policy`` validated and the shared ``held_targets`` holding what each policy says;
+* the rebuilt recalibration refit (2026-09-16): the lean strip pricer reads state surfaces
+  bit-identical to the full pricer's at equal path counts, the strips run at their own
+  ``strip_paths`` and are read before the product's pricer exists (the loop reads precomputed
+  surfaces); the guarded correlation fallback on a synthetic degenerate target set; the
+  ``|Corr_BE|`` cap; the named study-C pinning case reproduced bit for bit at 2·10⁴ strip paths
+  (pinned, step-0 flags recorded) and cleared by the rebuilt rule (slow, cached leverages);
 * the §7.2 delta regimes as hedging deltas: the sticky-strike regime delta at ``t = 0`` equals the
   M5 ``delta_gamma`` estimator (the spot-kind bump re-anchored at the bumped spot);
 * ``stream_bumps``: streamed and in-memory bumped sets give identical P&L, the scratch directory
@@ -27,7 +33,9 @@ wall-clock assertion.  Every P&L figure carries its standard error.
 from __future__ import annotations
 
 import dataclasses
+import re
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -696,7 +704,10 @@ def test_recalibration_pnl_zero_without_skew_move(fc: ForwardCurve) -> None:
     surface = ctx.surface
     disc = surface.forward_curve.rate_curve
     opt = EuropeanOption(float(surface.forward_curve.spot), 0.5, 1, disc)
-    rule = RecalibrationRule(pillars=(0.25, 0.5), skew_move_threshold=0.05, h=0.05)
+    # the strips at the world's own path count: the counts of the measured behaviour below
+    rule = RecalibrationRule(
+        pillars=(0.25, 0.5), skew_move_threshold=0.05, h=0.05, strip_paths=8_000
+    )
     sim = SimConfig(n_paths=8_000, chunk_size=8_000, seed=5, dt_max=1.0 / 52.0)
     h = Hedger(
         ctx,
@@ -718,7 +729,11 @@ def test_recalibration_pnl_zero_without_skew_move(fc: ForwardCurve) -> None:
     # the mismatched pair: the model's predicted forward-skew decay is a surprise to the rule
     world = BlackScholes(0.2, surface.forward_curve)
     stub = RecalibrationRule(
-        pillars=(0.25, 0.5), skew_move_threshold=0.05, h=0.05, refit=lambda surf, params: params
+        pillars=(0.25, 0.5),
+        skew_move_threshold=0.05,
+        h=0.05,
+        refit=lambda surf, params: params,
+        strip_paths=8_000,
     )
     h2 = Hedger(
         ctx, world, Schedule("monthly"), Costs(), recalibration=stub, sim=sim, world_paths=8_000
@@ -753,7 +768,9 @@ def test_refit_rebuilds_every_target_column(bs: BlackScholes, fc: ForwardCurve) 
     strat = GreekTargetStrategy(
         (Target("delta"), Target("vega"), Target("vanna")), inst, ridge=1e-10, name="span"
     )
-    rule = RecalibrationRule(pillars=(0.25, 0.5), skew_move_threshold=0.05, h=0.05)
+    rule = RecalibrationRule(
+        pillars=(0.25, 0.5), skew_move_threshold=0.05, h=0.05, strip_paths=SIM.n_paths
+    )
     h = Hedger(
         PricingContext.from_model(bs),
         bs,
@@ -803,9 +820,10 @@ def test_degenerate_correlations_flags_a_collapsed_refit() -> None:
     """A refit that lands with a correlation at its bound is a degenerate two-factor set: the
     hedger records it per date (``recalibrations["at_bound"]``) and warns, so a recalibration
     P&L booked under perfectly correlated factors is visible in the run rather than found by
-    reading the fitted parameters afterwards.  Measured on the M8b study-C runs: 32 of the 90
-    ``sabr_linked`` refits land here (the mid-life state-surface skew is not attainable with the
-    held targets), none of the 90 ``sticky_breakeven`` ones."""
+    reading the fitted parameters afterwards.  Measured on the M8b study-C runs of 2026-09-15:
+    41 of the 113 ``sabr_linked`` refits land here, none of the 113 ``sticky_breakeven`` ones
+    (the cause — an unconverged strip curvature firing step 0's radicand guard — is pinned by
+    ``test_named_pinning_case_and_the_rebuilt_refit``)."""
     from volsto.hedging.hedger import CORRELATION_BOUND, degenerate_correlations
 
     sane = {"nu": 2.44, "theta": 0.11, "k1": 8.8, "rho12": 0.41, "rho_SX1": -0.92, "rho_SX2": -0.73}
@@ -830,31 +848,46 @@ def test_degenerate_correlations_flags_a_collapsed_refit() -> None:
 def test_recalibration_rule_policy_and_held_targets() -> None:
     """``RecalibrationRule.policy`` is validated against the shadow-rotation policies and the
     shared :func:`held_targets` holds exactly what each policy says: nothing under
-    ``sabr_linked``; the five break-even arrays under ``sticky_breakeven`` (the skew constraint
-    follows the moved surface); the skew reference too under ``sticky_breakeven_skew``; the
-    policy's flag appended; mismatched pillars raise.  Targets read from the placeholder surface
-    (no calibration), the "moved" set the same targets with every array scaled."""
+    ``sabr_linked``; ``spot_vol_covar`` and ``correl_target`` under ``sticky_breakeven`` (the
+    skew constraint, the ATMF vols and the variance targets — which the marking fitter derives —
+    follow the moved surface; owner's decision of 2026-09-16, the effective set is checked in
+    ``tests/test_shadow_rotation.py``); the skew reference too under ``sticky_breakeven_skew``;
+    the policy's flag appended; mismatched pillars and historical targets raise.  Targets read
+    from the placeholder surface (no calibration), the "moved" set the same targets with every
+    array scaled.  The rule's new settings default to the named constants."""
     from volsto.risk.shadow_rotation import RECALIBRATION_POLICIES, held_targets
 
     with pytest.raises(ValueError):
         RecalibrationRule(policy="sticky_everything")
     with pytest.raises(ValueError):
         RecalibrationRule(skew_move_threshold=0.0)
+    with pytest.raises(ValueError):
+        RecalibrationRule(strip_paths=1)
+    with pytest.raises(ValueError):
+        RecalibrationRule(correlation_cap=1.5)
     rule = RecalibrationRule(policy="sticky_breakeven")
     assert rule.sticky and rule.skew_move_threshold == 0.01 and rule.base_fit is None
+    from volsto.hedging.hedger import DEFAULT_STRIP_PATHS, REFIT_CORRELATION_CAP
+
+    assert rule.strip_paths == DEFAULT_STRIP_PATHS == 80_000
+    assert rule.correlation_cap == REFIT_CORRELATION_CAP == 0.97
     assert not RecalibrationRule().sticky and set(RECALIBRATION_POLICIES) >= {rule.policy}
     from volsto.calibration.fit_2f import marking_targets_for
 
     ctx = _lv_context()
     base = marking_targets_for(ctx.surface, rule.config(), ssr_target=rule.ssr_target)
-    held_names = ("spot_vol_covar", "vol_var", "vovol", "vov_be_raw", "correl_target")
+    held_names = ("spot_vol_covar", "correl_target")
+    free_names = ("vol_var", "vovol", "vov_be_raw")
     moved = dataclasses.replace(
-        base, **{k: getattr(base, k) * 1.5 for k in (*held_names, "skew_target", "atf")}
+        base,
+        **{k: getattr(base, k) * 1.5 for k in (*held_names, *free_names, "skew_target", "atf")},
     )
     assert held_targets(moved, base, "sabr_linked") is moved
     sb = held_targets(moved, base, "sticky_breakeven")
     for k in held_names:
         assert np.array_equal(getattr(sb, k), getattr(base, k)), k
+    for k in free_names:
+        assert np.array_equal(getattr(sb, k), getattr(moved, k)), k
     assert np.array_equal(sb.skew_target, moved.skew_target) and np.array_equal(sb.atf, moved.atf)
     assert sb.flags[-1].startswith("sticky_breakeven:") and len(sb.flags) == len(moved.flags) + 1
     sbs = held_targets(moved, base, "sticky_breakeven_skew")
@@ -863,6 +896,358 @@ def test_recalibration_rule_policy_and_held_targets() -> None:
     other = dataclasses.replace(base, pillars=base.pillars + 0.5)
     with pytest.raises(ValueError):
         held_targets(moved, other, "sticky_breakeven")
+    with pytest.raises(ValueError):
+        held_targets(dataclasses.replace(moved, mode="historical"), base, "sticky_breakeven")
+
+
+# --------------------------------------------------------------------------------------------
+# the rebuilt recalibration refit (owner's decision of 2026-09-16)
+# --------------------------------------------------------------------------------------------
+
+_RULE_PILLARS = (0.25, 1.0, 3.0)
+_RULE_ATF = np.array([0.225, 0.236, 0.240])
+_RULE_SKEW = np.array([-0.548, -0.293, -0.180])
+#: the named study-C state's curvature read at 2·10⁴ strip paths (rounded): step 0 guards all
+_CURV_GUARDED = np.array([-1.219, -0.529, -0.343])
+#: a regular smile: Corr_SABR −0.779 / −0.753 / −0.736, no guard
+_CURV_REGULAR = np.array([0.2, 0.1, 0.05])
+#: a 3M curvature whose Corr_SABR is −0.983, unguarded (beyond the cap, inside [−1, 1])
+_CURV_STEEP_3M = -0.62
+
+
+def _rule_for(policy: str = "sabr_linked", **kw: object) -> RecalibrationRule:
+    from volsto.calibration.fit_2f import BreakEvenFitConfig
+
+    cfg = BreakEvenFitConfig(pillars=_RULE_PILLARS, mat_min=0.0, skew_pillars=(1.0, 3.0))
+    return RecalibrationRule(
+        pillars=_RULE_PILLARS, fit_config=cfg, policy=policy, ssr_target=1.0, **kw  # type: ignore[arg-type]
+    )
+
+
+def _state(fc: ForwardCurve, curv: FloatArray) -> object:
+    from volsto.hedging.hedger import _StateSurface
+
+    return _StateSurface(np.array(_RULE_PILLARS), _RULE_ATF, _RULE_SKEW, np.asarray(curv), fc)
+
+
+def test_refit_targets_guarded_fallback_on_a_synthetic_set(fc: ForwardCurve) -> None:
+    """:func:`refit_targets` on a synthetic state surface whose curvature fires step 0's radicand
+    guard at every pillar (the named study-C read, rounded): ``Corr_SABR`` is clipped to exactly
+    −1 everywhere, the step-0 flags are kept, and the base fit's ``correl_target`` is held for the
+    date (``fallback_applied``) — every other target is the state surface's own.  On a regular
+    surface nothing falls back and no base fit is needed; a degenerate date without a base fit,
+    or with mismatched pillars, raises.  Under ``sticky_breakeven`` the fallback is recorded and
+    the value is the one the policy holds anyway."""
+    from volsto.calibration.fit_2f import marking_targets_for
+    from volsto.hedging.hedger import refit_targets, step0_degenerate_pillars
+
+    rule = _rule_for()
+    bad, good = _state(fc, _CURV_GUARDED), _state(fc, _CURV_REGULAR)
+    base = marking_targets_for(good, rule.config(), ssr_target=1.0)
+    plain = marking_targets_for(bad, rule.config(), ssr_target=1.0)
+    assert step0_degenerate_pillars(plain) == _RULE_PILLARS
+    assert all(s.radicand_guarded for s in plain.sabr)
+    assert np.array_equal(plain.correl_target, -np.ones(3))
+    assert step0_degenerate_pillars(base) == ()
+    rt = refit_targets(bad, rule, base)
+    print("fallback:", rt.step0_pillars, rt.correl_read, "->", rt.targets.correl_target)
+    assert rt.fallback_applied and not rt.corr_capped and rt.held == ()
+    assert rt.step0_pillars == _RULE_PILLARS
+    assert np.array_equal(rt.correl_read, -np.ones(3))
+    assert np.array_equal(rt.targets.correl_target, base.correl_target)
+    assert sum("radicand guard fired" in f for f in rt.step0_flags) == 3
+    assert sum("clipped" in f for f in rt.step0_flags) == 3
+    assert rt.step0_flags == plain.flags
+    assert any(f.startswith("guarded fallback") for f in rt.targets.flags)
+    for name in ("spot_vol_covar", "vol_var", "vovol", "skew_target", "atf"):
+        assert np.array_equal(getattr(rt.targets, name), getattr(plain, name)), name
+    regular = refit_targets(good, rule, None)
+    assert not regular.fallback_applied and not regular.corr_capped
+    assert regular.step0_pillars == ()
+    assert np.array_equal(regular.targets.correl_target, base.correl_target)
+    with pytest.raises(ValueError):
+        refit_targets(bad, rule, None)
+    shifted = dataclasses.replace(base, pillars=base.pillars + 0.5)
+    with pytest.raises(ValueError):
+        refit_targets(bad, rule, shifted)
+    sticky = refit_targets(bad, _rule_for("sticky_breakeven"), base)
+    assert sticky.fallback_applied and sticky.held and sticky.held[0].startswith("sticky")
+    assert np.array_equal(sticky.targets.correl_target, base.correl_target)
+    assert np.array_equal(sticky.targets.spot_vol_covar, base.spot_vol_covar)
+    with pytest.raises(ValueError):
+        refit_targets(good, _rule_for("sticky_breakeven"), None)
+
+
+def test_refit_correlation_cap(fc: ForwardCurve) -> None:
+    """``|correl_target| <= correlation_cap`` on every refit (:data:`REFIT_CORRELATION_CAP`
+    0.97): a regular (unguarded) 3M pillar reading ``Corr_SABR = −0.983`` is capped to −0.97
+    with ``corr_capped`` recorded and only ``correl_target`` touched; a cap of 1 leaves it; the
+    cap applies after the guarded fallback (a cap of 0.5 clips the held base values too)."""
+    from volsto.calibration.fit_2f import marking_targets_for
+    from volsto.hedging.hedger import REFIT_CORRELATION_CAP, refit_targets
+
+    curv = _CURV_REGULAR.copy()
+    curv[0] = _CURV_STEEP_3M
+    steep = _state(fc, curv)
+    rule = _rule_for()
+    plain = marking_targets_for(steep, rule.config(), ssr_target=1.0)
+    assert not any(s.radicand_guarded for s in plain.sabr)
+    assert -0.995 < plain.correl_target[0] < -REFIT_CORRELATION_CAP
+    assert np.all(np.abs(plain.correl_target[1:]) < REFIT_CORRELATION_CAP)
+    rt = refit_targets(steep, rule, None)
+    print("cap:", rt.correl_read, "->", rt.targets.correl_target)
+    assert rt.corr_capped and not rt.fallback_applied
+    assert rt.targets.correl_target[0] == -REFIT_CORRELATION_CAP
+    assert np.array_equal(rt.targets.correl_target[1:], plain.correl_target[1:])
+    assert np.array_equal(rt.correl_read, plain.correl_target)
+    assert any(f.startswith("|Corr_BE| capped at 0.97") for f in rt.targets.flags)
+    for name in ("spot_vol_covar", "vol_var", "skew_target", "atf"):
+        assert np.array_equal(getattr(rt.targets, name), getattr(plain, name)), name
+    uncapped = refit_targets(steep, _rule_for(correlation_cap=1.0), None)
+    assert not uncapped.corr_capped
+    assert np.array_equal(uncapped.targets.correl_target, plain.correl_target)
+    base = marking_targets_for(_state(fc, _CURV_REGULAR), rule.config(), ssr_target=1.0)
+    both = refit_targets(_state(fc, _CURV_GUARDED), _rule_for(correlation_cap=0.5), base)
+    assert both.fallback_applied and both.corr_capped
+    assert np.array_equal(both.targets.correl_target, np.clip(base.correl_target, -0.5, 0.5))
+
+
+def _full_strip_pricers(h: Hedger, dates: FloatArray, rule: RecalibrationRule) -> tuple:  # type: ignore[type-arg]
+    """The strip pricers as the hedger built them before 2026-09-16 (full
+    :class:`ConditionalPricer`, three simulations, hybrid-CRN) at the world's path count."""
+    objs = h._strip_objects(dates, rule)
+    g = union_grid([h.world], objs, dates, h.sim)
+    wsim = h._world_sim()
+    kw = dict(seed=wsim.seed + 7, control_variate=False)
+    world = ConditionalPricer(h.world, objs, g, wsim, (), h.degree, **kw)  # type: ignore[arg-type]
+    twin = ConditionalPricer(h.context.model, objs, g, wsim, (), h.degree, **kw)  # type: ignore[arg-type]
+    return world, twin
+
+
+def test_strip_surfaces_bit_identical_own_path_count_and_read_first() -> None:
+    """The recalibration strips (2026-09-16 rebuild): (a) the lean strip pricer's state surfaces
+    — the world strip's and the twin's, at every date — are **bit-identical** to the full
+    pricer's the hedger used before, at equal path counts, for a two-factor world (LSV world, LV
+    pricing) and a factor-less one (LV world, LSV pricing), and hold a fraction of its memory;
+    (b) the strip pricers get ``rule.strip_paths`` (world strip and twin alike, same seed),
+    independent of ``world_paths``; (c) in a run the loop reads precomputed surfaces: every
+    strip read happens before the product's pricer is built, two per date, and the recorded
+    trigger values equal the excess skew of the pre-rebuild full pricers; the budget and settings
+    carry the strip count while the world keeps its own.  Cached 2F leverage (skipped when
+    absent); a stub refit returns the base parameters (no calibration)."""
+    lsv, lv = _lsv_context("2f"), _lv_context()
+    disc = lsv.surface.forward_curve.rate_curve
+    opt = EuropeanOption(float(lsv.surface.forward_curve.spot), 0.5, 1, disc)
+    sim = SimConfig(n_paths=4_000, chunk_size=1_500, seed=5, dt_max=1.0 / 52.0)
+    for label, pricing, world in (
+        ("LV pricing, LSV world", lv, lsv.model),
+        ("LSV, LV", lsv, lv.model),
+    ):
+        rule = RecalibrationRule(pillars=(0.25, 0.5), h=0.05, strip_paths=sim.n_paths)
+        h = Hedger(
+            pricing,
+            world,
+            Schedule("monthly"),
+            Costs(),
+            recalibration=rule,
+            sim=sim,
+            world_paths=sim.n_paths,
+            verbose=False,
+        )
+        dates = h.schedule.build(opt)
+        ss = h.strip_surfaces(dates, rule)
+        old_w, old_t = _full_strip_pricers(h, dates, rule)
+        for k, t in enumerate(dates):
+            a, at = h._state_surface(old_w, k, float(t), rule), h._state_surface(
+                old_t, k, float(t), rule
+            )
+            for f in ("atf", "skew", "curv"):
+                assert np.array_equal(getattr(a, f), getattr(ss.world[k], f)), (label, k, f)
+                assert np.array_equal(getattr(at, f), getattr(ss.twin[k], f)), (label, k, f)
+        print(
+            f"{label}: {dates.size} dates identical; lean strip {ss.world_bytes / 1e6:.1f} MB "
+            f"against the full pricer's resident paths {old_w.memory_bytes / 1e6:.1f} MB"
+        )
+        assert ss.n_paths == sim.n_paths and 0 < ss.world_bytes < old_w.memory_bytes
+        # (b) the strips' own count
+        own = dataclasses.replace(rule, strip_paths=2_000)
+        pw = h._world_skew_pricer(dates, own)
+        pt = h._twin_skew_pricer(pw)
+        assert pw.sim.n_paths == pt.sim.n_paths == pw.paths.n_paths == 2_000
+        assert pt.seed == pw.seed == h._world_sim().seed + 7 and pt.model is h.context.model
+        assert h._world_sim().n_paths == sim.n_paths
+    # (c) the loop, on the LSV-pricing pair (the stub refit rebuilds from the cache)
+    old_excess = [
+        h._state_surface(old_w, k, float(t), rule).skew
+        - h._state_surface(old_t, k, float(t), rule).skew
+        for k, t in enumerate(dates)
+    ]
+    events: list[str] = []
+    for n_strip in (sim.n_paths, 2_000):
+        events.clear()
+        stub = RecalibrationRule(
+            pillars=(0.25, 0.5),
+            h=0.05,
+            skew_move_threshold=0.05,
+            refit=lambda surf, params: params,
+            strip_paths=n_strip,
+        )
+        hr = Hedger(
+            lsv,
+            lv.model,
+            Schedule("monthly"),
+            Costs(),
+            recalibration=stub,
+            sim=sim,
+            world_paths=sim.n_paths,
+            verbose=False,
+        )
+        hr._state_surface = _spy(hr._state_surface, "read", events)  # type: ignore[method-assign]
+        hr._pricer = _spy(hr._pricer, "pricer", events)  # type: ignore[method-assign]
+        r = hr.run(opt, GreekTargetStrategy((Target("delta"),), [Spot()], name="delta"))
+        first = events.index("pricer")
+        # two reads per date (world + twin) plus the projection probe's four (two strip models
+        # at two probe sizes), all before the product's pricer; none in the loop
+        assert events[:first] == ["read"] * (2 * r.dates.size + 4)
+        assert "read" not in events[first:]
+        assert r.budget["strip_paths"] == n_strip and r.settings["strip_paths"] == n_strip
+        assert r.n_paths == sim.n_paths and r.settings["n_paths_world"] == sim.n_paths
+        assert r.budget["strip_world_gb"] > 0 and r.budget["strip_twin_gb"] > 0
+        for col in ("fallback_applied", "corr_capped", "step0_flags", "at_bound"):
+            assert col in r.recalibrations
+        print(f"strip_paths {n_strip}: moves {r.recalibrations['skew_move'].round(4).tolist()}")
+        if n_strip == sim.n_paths:
+            # the recorded trigger is the pre-rebuild one, date by date
+            ref = old_excess[0]
+            moves = []
+            for k, e in enumerate(old_excess):
+                moves.append(float(np.max(np.abs(e - ref))))
+                if bool(r.recalibrations["recalibrated"].iloc[k]):
+                    ref = e
+            assert np.array_equal(r.recalibrations["skew_move"].to_numpy(), np.array(moves))
+
+
+def _spy(fn: Any, tag: str, events: list[str]) -> Any:
+    """``fn`` logging ``tag`` into ``events`` at every call."""
+
+    def wrapped(*a: Any, **k: Any) -> Any:
+        events.append(tag)
+        return fn(*a, **k)
+
+    return wrapped
+
+
+class _NoCalibrationBuilder:
+    """A pricing-context builder that returns the pricing model for any parameter set: lets
+    :meth:`Hedger._recalibrate` run to its log row without a leverage calibration."""
+
+    def __init__(self, model: object) -> None:
+        self.model = model
+
+    def has(self, state: object) -> bool:
+        return False
+
+    def build(self, state: object, mode: str) -> object:
+        return self.model
+
+
+@pytest.mark.slow
+def test_named_pinning_case_and_the_rebuilt_refit() -> None:
+    """The named M8b study-C pinning case (autocall 3y, +1 rota, ``sabr_linked``, the refit at
+    ``t = 0.9615`` — rebalancing date 50 — on the production task's hedger, 2·10⁴ pricing and
+    world paths, seed 2024), reproduced bit for bit from the diagnosis of 2026-09-16:
+
+    * at **2·10⁴ strip paths** the world's state surface reads curvature −1.2194 / −0.5288 /
+      −0.3430, step 0's radicand guard fires at every pillar and clips ``Corr_SABR`` to −1, and
+      the pre-rebuild refit (the plain marking targets) lands on the collapsed set
+      ``ρ12 = +1, ρ_SX1 = ρ_SX2 = −1`` with ν = 2.397492534477822 — the stored run's refit;
+      the rebuilt refit on the same surface records the step-0 flags and ``fallback_applied``
+      (the base fit's −0.904 / −0.901 / −0.903 held) and is not pinned (ρ_SX1 −0.9627, ρ_SX2
+      −0.8253, ρ12 +0.7385; ``k1`` unchanged: step 2 untouched);
+    * at **8·10⁴ strip paths** (study C's rule) the curvature reads −0.5852 / +0.1876 / +0.7086,
+      no pillar is guarded, nothing falls back or caps (3M ``Corr_BE`` −0.963) and the fit is
+      regular (ρ_SX1 −0.7027, ρ_SX2 −0.4242, ρ12 −0.3397).
+
+    Leverages from the cache (skipped when absent); nothing calibrated — the refit's model
+    rebuild is stubbed.  No wall-clock assertion (measured about 15 s + 20 s)."""
+    from volsto.calibration.fit_2f import fit_2f, fit_2f_marking, marking_targets_for
+    from volsto.hedging.hedger import degenerate_correlations, step0_degenerate_pillars
+    from volsto.market.varswap import xi0_curve
+    from volsto.studies import m8b
+
+    cfg = m8b.StudyConfig(allow_calibrate=False, verbose=False)
+    try:
+        env = m8b.StudyEnvironment(cfg)
+        task = next(
+            t
+            for t in m8b.enumerate_tasks("C", cfg).tasks
+            if t.product == "autocall 3y" and t.rota == 1.0 and t.policy == "sabr_linked"
+        )
+        h, product, _ = m8b.make_hedger(task, env)
+    except CacheMissError as exc:
+        pytest.skip(f"cached leverage absent (tests never calibrate): {exc}")
+    rule = h.recalibration
+    assert rule is not None and rule.strip_paths == m8b.STUDY_C_STRIP_PATHS == 80_000
+    assert h.world_paths == 20_000 and h.sim.n_paths == 20_000
+    ctx = h.context
+    assert ctx.state is not None and ctx.surface is not None
+    h.pricing = PricingContext(
+        ctx.model, ctx.state, _NoCalibrationBuilder(ctx.model), ctx.surface, ctx.label
+    )
+    dates = h.schedule.build(product)
+    kdx = 50
+    t = float(dates[kdx])
+    assert t == pytest.approx(0.9615384615384616, abs=1e-12)
+    base = fit_2f_marking(ctx.surface, rule.config(), ssr_target=rule.ssr_target)
+    xi0 = xi0_curve(ctx.surface, float(min(ctx.surface.max_maturity, 3.0 + t)))
+    rho = ("rho12", "rho_SX1", "rho_SX2")
+
+    def params_of(p: object) -> dict[str, float]:
+        return {k: float(getattr(p, k)) for k in ("nu", "theta", "k1", *rho)}
+
+    seen: dict[int, dict[str, float]] = {}
+    for n_strip in (20_000, m8b.STUDY_C_STRIP_PATHS):
+        r = dataclasses.replace(rule, strip_paths=n_strip, log_rows=[], base_fit=base)
+        ss = h.strip_surfaces(dates, r, only=[kdx], twin=False)
+        surf = ss.world[kdx]
+        plain = marking_targets_for(surf, r.config(), ssr_target=r.ssr_target)
+        old = params_of(fit_2f(plain, xi0, r.config()).params)
+        h._recalibrate(t, ss, kdx, r, None)  # type: ignore[arg-type]
+        row = r.log_rows[-1]
+        new = {k: float(v) for k, v in re.findall(r"(\w+)=(-?[0-9.eE+-]+)", row["params"])}
+        print(
+            f"{n_strip} strip paths: curv {surf.curv.round(6).tolist()}, guarded "
+            f"{step0_degenerate_pillars(plain)}; pre-rebuild refit {old}; rebuilt {row}"
+        )
+        seen[n_strip] = new
+        if n_strip == 20_000:
+            assert surf.curv == pytest.approx(
+                [-1.2194074887483242, -0.5288025125503116, -0.3430201166014236], rel=1e-9
+            )
+            assert step0_degenerate_pillars(plain) == (0.25, 1.0, 3.0)
+            assert set(degenerate_correlations(old)) == set(rho)
+            assert old["nu"] == pytest.approx(2.397492534477822, rel=1e-9)
+            assert old["rho12"] > 0.9999999 and old["rho_SX1"] < -0.9999999
+            assert row["fallback_applied"] is True and row["corr_capped"] is False
+            assert row["step0_flags"].count("radicand guard fired") == 3
+            assert row["step0_flags"].count("clipped") == 3
+            assert row["at_bound"] == ""
+            assert not degenerate_correlations(new)
+            assert new["rho_SX1"] == pytest.approx(-0.9627077471675081, rel=1e-6)
+            assert new["rho_SX2"] == pytest.approx(-0.8252817617585934, rel=1e-6)
+            assert new["rho12"] == pytest.approx(0.7384591347868525, rel=1e-6)
+            assert new["k1"] == pytest.approx(old["k1"], rel=1e-9)
+        else:
+            assert surf.curv == pytest.approx(
+                [-0.5852113321785415, 0.1875746367112767, 0.7085993844002169], rel=1e-9
+            )
+            assert step0_degenerate_pillars(plain) == ()
+            assert row["fallback_applied"] is False and row["corr_capped"] is False
+            assert row["step0_flags"].count("radicand guard") == 0 and row["at_bound"] == ""
+            assert {k: new[k] for k in old} == pytest.approx(old, rel=1e-12)
+            assert new["rho_SX1"] == pytest.approx(-0.7027186096481359, rel=1e-6)
+            assert new["rho_SX2"] == pytest.approx(-0.424203795732525, rel=1e-6)
+            assert new["rho12"] == pytest.approx(-0.3397429452709632, rel=1e-6)
 
 
 def test_regime_delta_bump_reanchors_at_the_bumped_spot(fc: ForwardCurve) -> None:

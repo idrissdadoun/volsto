@@ -20,11 +20,17 @@ recalibration rule.
 4. with a :class:`RecalibrationRule` the world's conditional skew at each date is measured, the P1
    set refit when it moved by more than ``skew_move_threshold`` under the rule's ``policy``
    (:data:`~volsto.risk.shadow_rotation.RECALIBRATION_POLICIES`: ``"sabr_linked"`` refits every
-   target on the state surface; ``"sticky_breakeven"`` holds the break-even targets at the base
-   fit's values and lets only the skew constraint follow the state surface;
+   target on the state surface; ``"sticky_breakeven"`` holds the SpotVolCovar and correlation
+   targets at the base fit's values and lets the skew constraint follow the state surface;
    ``"sticky_breakeven_skew"`` holds the skew reference too) and the pricing model rebuilt through
    the leverage cache (hit rate reported); the **recalibration P&L** is ``V_k(new set) − V_k(old
-   set)`` at the same world state, isolated as its own leg.
+   set)`` at the same world state, isolated as its own leg.  The rule's state surfaces are read
+   from forward-start strips at their own path count (``RecalibrationRule.strip_paths``) and
+   **precomputed for every date before the loop** (:class:`StripSurfaces`): each strip pricer is
+   released as soon as its surfaces are read, so no strip coexists with the hedge loop; the
+   refit's correlation target is guarded (:func:`refit_targets`: the base fit's correlation held
+   on a date whose step-0 reduction is degenerate, ``|Corr_BE|`` capped at
+   :data:`REFIT_CORRELATION_CAP`).
 
 Total P&L per path ``= product leg + Σ hedge legs − costs``; the zero-cost total is reported next
 to it (costs are additive).  The product leg sums to ``payoff − V₀`` exactly on every path
@@ -35,7 +41,10 @@ simulation per bumped model (``1 + 2`` spot bumps ``+`` one or two per target bu
 ``n_paths`` paths over the grid, one world simulation, and ``n_dates × n_objects`` regressions
 of ``O(n_paths × n_basis²)``; the estimate scales a one-chunk timing.  Long runs are shard-able by
 path blocks (the M9 ``--shard`` form): ``world_paths`` and ``world_seed`` select the block.
-**Memory:** the bumped path sets are kept for the hybrid targets (``budget["pricing_paths_gb"]``);
+The recalibration strips are projected separately (:meth:`Hedger.projected_strip_seconds`, at
+``strip_paths``).  **Memory:** the bumped path sets are kept for the hybrid targets
+(``budget["pricing_paths_gb"]``; the strips' resident footprint before their release is
+``budget["strip_world_gb"]`` / ``budget["strip_twin_gb"]``);
 ``stream_bumps=True`` writes them to a scratch directory (``scratch_dir``, the ``VOLSTO_SCRATCH``
 variable or the system temp) and memory-maps them back per date instead
 (``budget["streamed_paths_gb"]``; :class:`~volsto.hedging.pricing.ConditionalPricer`), passed to
@@ -53,19 +62,19 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pandas as pd
 from numpy.typing import NDArray
 
 from volsto.config import SimConfig, SurfacePerturbation
-from volsto.engine.grid import TimeGrid
+from volsto.engine.grid import FixingIndex, TimeGrid
 from volsto.engine.paths import PathSet
 from volsto.engine.rng import GaussianDraws
 from volsto.hedging.controls import MIN_SHADOW_VOL
 from volsto.hedging.instruments import Spot, deduplicate_names, expand_rolls
-from volsto.hedging.pricing import Bump, ConditionalPricer, union_grid
+from volsto.hedging.pricing import Bump, ConditionalPricer, ObjectPayoffs, union_grid
 from volsto.hedging.strategies import (
     DELTA_REGIMES,
     GreekTargetStrategy,
@@ -82,6 +91,9 @@ from volsto.risk.greeks import _spot_state
 from volsto.risk.ladders import PILLARS as RISK_PILLARS
 from volsto.risk.ladders import bucket_epsilon
 from volsto.risk.shadow_rotation import RECALIBRATION_POLICIES, held_targets
+
+if TYPE_CHECKING:
+    from volsto.calibration.targets import TargetSet
 
 log = logging.getLogger(__name__)
 
@@ -100,6 +112,29 @@ SPOT_BUMP = 0.01
 SKEW_MOVE_THRESHOLD = 0.01
 #: the state surface logs when fewer than this fraction of the paths invert to a finite vol
 STATE_SURFACE_MIN_INVERTED = 0.99
+#: default ``RecalibrationRule.strip_paths``: the path count of the forward-start strips the rule
+#: reads its state surfaces from, independent of the hedger's world paths.  The strip's ATM level
+#: and skew converge fast but its curvature — a second difference over ``h² = 0.0025`` of three
+#: regressed conditional prices — does not: measured on the M8b study-C 3y autocall shock world
+#: (+1 rota, t = 0.9615, pillars 3M / 1Y / 3Y) it reads −1.22 / −0.53 / −0.34 at 2·10⁴ paths
+#: against −0.56 / +0.39 / +0.56 at 1.6·10⁵, step 0's radicand guard fires at all three pillars
+#: at 2·10⁴, at one at 4·10⁴ and at none from 8·10⁴ (owner's decision of 2026-09-16: 8·10⁴).
+#: That holds for that state only.  On the 1y daily VKO put shock world (+3 rota) the 3M pillar's
+#: curvature is still unconverged at 8·10⁴: 136 of the 252 dates read a degenerate step 0 on the
+#: world strip, three of the four refit dates that used the guarded fallback clear only at 3.2·10⁵,
+#: and one refit lands at the correlation bound with no step-0 flag (ρ_SX1 = −0.9944 at
+#: t = 0.7302; regular at 3.2·10⁵) — at this count the guarded fallback, not the path count, is
+#: what protects the short pillar (M8b verification, 2026-09-16)
+DEFAULT_STRIP_PATHS = 80_000
+#: the largest ``|Corr_BE|`` a refit may target (:func:`refit_targets`).  At ``Corr_BE = −1`` the
+#: marking VolVar target is ``SpotVolCovar²`` and, with ``λ1, λ2`` of the same sign, the fully
+#: collapsed set ``ρ_SX1 = ρ_SX2 = −1, ρ12 = +1`` is step 3's exact minimiser.  Measured on the
+#: named study-C state (autocall 3y, +1 rota, t = 0.9615, 2·10⁴ strip paths): a cap of 0.975
+#: still returns ``ρ_SX1 = −0.9904`` (beyond :data:`CORRELATION_BOUND`), 0.97 returns
+#: −0.988 / −0.939 / +0.907, and the cap costs nothing in step 2 (``λ``, ``k1``, the achieved
+#: skew gaps and SpotVolCovar misses unchanged; ν +0.9%).  A converged 3M read sits at −0.955
+#: (1.6·10⁵ strip paths), inside the cap
+REFIT_CORRELATION_CAP = 0.97
 #: halvings of a tent / forward-variance bump that fails the surface's arbitrage checks before
 #: giving up — the M5 ``RiskEngine.max_halvings`` default (a +1 vp skew tent at the 2y pillar
 #: breaks the calendar condition on the placeholder surface: halved once it passes)
@@ -406,26 +441,48 @@ class PricingContext:
 @dataclass
 class RecalibrationRule:
     """``"on_skew_move"`` (module docstring): at each rebalancing date the world's conditional
-    ATM skew at the ``pillars`` (tenors from the date) is measured by regressing a three-strike
-    vanilla strip under the **world** model on the world state; when it moved by more than
-    ``skew_move_threshold`` (vol per unit log-moneyness, any pillar; default
-    :data:`SKEW_MOVE_THRESHOLD`) since the last refit the P1 set is refit on the state surface
-    (:func:`~volsto.calibration.fit_2f.fit_2f` on
-    :func:`~volsto.calibration.targets.marking_targets` of a quadratic-smile state surface) under
-    ``policy`` (:data:`~volsto.risk.shadow_rotation.RECALIBRATION_POLICIES`, the semantics of
+    smile at the ``pillars`` (tenors from the date) is read from a three-strike forward-start
+    strip regressed under the **world** model (:meth:`Hedger._state_surface`), and the trigger is
+    its ATM skew in excess of the pricing model's own prediction (a CRN twin strip,
+    :meth:`Hedger._world_skew`); when the excess moved by more than ``skew_move_threshold`` (vol
+    per unit log-moneyness, any pillar; default :data:`SKEW_MOVE_THRESHOLD`) since the last refit
+    the P1 set is refit on the state surface (:func:`~volsto.calibration.fit_2f.fit_2f` on the
+    targets of :func:`refit_targets`) under ``policy``
+    (:data:`~volsto.risk.shadow_rotation.RECALIBRATION_POLICIES`, the semantics of
     :func:`~volsto.risk.shadow_rotation.refit_on_rotated`): ``"sabr_linked"`` refits every target
-    on the state surface; ``"sticky_breakeven"`` holds the break-even targets (``spot_vol_covar``,
-    ``vol_var``, ``vovol``, ``vov_be_raw``, ``correl_target``) at the **base** fit's values and
-    lets only the skew constraint follow the state surface; ``"sticky_breakeven_skew"`` holds the
-    two-point skew reference too (:func:`~volsto.risk.shadow_rotation.held_targets`).  The base
-    fit is ``base_fit`` (a :class:`~volsto.calibration.fit_2f.FitResult`); when ``None`` under a
-    sticky policy the hedger computes the marking fit of the pricing surface once, at the first
+    on the state surface; ``"sticky_breakeven"`` holds ``spot_vol_covar`` and ``correl_target`` at
+    the **base** fit's values and lets the skew constraint (and the ATMF vols) follow the state
+    surface; ``"sticky_breakeven_skew"`` holds the two-point skew reference too
+    (:func:`~volsto.risk.shadow_rotation.held_targets`).
+
+    **The strips** run at ``strip_paths`` (default :data:`DEFAULT_STRIP_PATHS`), for the world
+    strip and its twin alike and independent of ``Hedger.world_paths``; their state surfaces are
+    precomputed for every date before the hedge loop (:class:`StripSurfaces`) and the refit reads
+    the same surface the trigger read.
+
+    **The refit's correlation target** (:func:`refit_targets`).  Step 0's radicand guard
+    (:func:`~volsto.calibration.targets.sabr_reduce`) is correct for a genuinely negative ATM
+    curvature, but it must not fire on Monte Carlo noise: once it fires ``Corr_SABR`` is
+    ``2 smi/(√3|smi|)`` clipped to ``∓1`` whatever the smile, ``sabr_linked`` then targets
+    ``Corr_BE = −1`` and the collapsed set ``ρ_SX1 = ρ_SX2 = −1, ρ12 = +1`` is step 3's exact
+    minimiser (measured on 41 of the 113 ``sabr_linked`` refits of the 2026-09-15 study-C runs,
+    whose strips ran at 2·10⁴ paths).  Two things protect the refit from that: the strip path
+    count (the curvature converges) and the cap ``|Corr_BE| <= correlation_cap`` (default
+    :data:`REFIT_CORRELATION_CAP`, every refit, recorded as ``corr_capped``); the last belt is
+    the **guarded fallback** — on a date where step 0's guard fired or its ``rho`` clip applied
+    at any fitted pillar, the base fit's ``correl_target`` is held for that date only (recorded
+    as ``fallback_applied``).  The skew target is not the problem (the two-point QP is feasible
+    at the pinned dates) and is not relaxed.
+
+    The base fit is ``base_fit`` (a :class:`~volsto.calibration.fit_2f.FitResult`); when
+    ``None`` the hedger computes the marking fit of the pricing surface once, before the first
     rebalancing date, with the rule's config and ``ssr_target``
-    (:func:`~volsto.calibration.fit_2f.fit_2f_marking`), stores it here and logs it.  The pricing
-    model is rebuilt with the new parameters through the cache (``builder``); the reference skew
-    is the world's own at ``t = 0``, so a world without a skew move never recalibrates.  ``refit``
-    may replace the fit call (``(state_surface, base_params) -> params``; the policy is then the
-    callable's business).  ``log_rows`` records every refit with its policy.
+    (:func:`~volsto.calibration.fit_2f.fit_2f_marking`) — under every policy, since the
+    guarded fallback needs it under ``sabr_linked`` too —, stores it here and logs it.  The
+    pricing model is rebuilt with the new parameters through the cache (``builder``).  ``refit``
+    may replace the fit call (``(state_surface, base_params) -> params``; the policy, the
+    fallback and the cap are then the callable's business).  ``log_rows`` records every refit
+    with its policy, its step-0 flags, ``fallback_applied``, ``corr_capped`` and ``at_bound``.
     """
 
     pillars: tuple[float, ...] = (0.25, 1.0)
@@ -438,12 +495,18 @@ class RecalibrationRule:
     policy: str = "sabr_linked"
     base_fit: Any | None = None
     log_rows: list[dict[str, Any]] = field(default_factory=list)
+    strip_paths: int = DEFAULT_STRIP_PATHS
+    correlation_cap: float = REFIT_CORRELATION_CAP
 
     def __post_init__(self) -> None:
         if self.policy not in RECALIBRATION_POLICIES:
             raise ValueError(f"policy must be one of {RECALIBRATION_POLICIES}")
         if not (self.skew_move_threshold > 0.0):
             raise ValueError("skew_move_threshold must be positive")
+        if int(self.strip_paths) != self.strip_paths or self.strip_paths < 2:
+            raise ValueError("strip_paths must be an integer of at least 2")
+        if not (0.0 < self.correlation_cap <= 1.0):
+            raise ValueError("correlation_cap must be in (0, 1]")
 
     @property
     def sticky(self) -> bool:
@@ -493,6 +556,219 @@ class _StateSurface:
 
     def atm_skew(self, T: Any) -> FloatArray:
         return self._interp(self.skew, T)
+
+
+@dataclass
+class _StripPricer(ConditionalPricer):
+    """A :class:`~volsto.hedging.pricing.ConditionalPricer` for the recalibration strips, lean in
+    memory and time, whose ``value`` regressions are **identical** to the full pricer's on the same
+    grid, model, seed and paths (``tests/test_hedging.py`` checks it bit for bit):
+
+    * only the base model is simulated — the strips read values, never the CRN spot bumps, so the
+      two bumped simulations (and their path sets) of the full pricer are skipped; the delta
+      estimator is ``"gradient"`` with ``hybrid_bumps=False``, so no hybrid path set or hybrid
+      payoff matrix is ever built (the value regression shares nothing with the delta targets:
+      same design matrix, its own right-hand side);
+    * the paths are simulated chunk by chunk on the full grid, every object's payoff taken on the
+      chunk, and only what a strip regression reads is kept: ``ln S`` and the factors at
+      ``keep_times`` (the rebalancing dates whose objects the pricer carries — a forward-start
+      option at its own start date has the hedge state ``(started = 1, u_start = 0)``);
+      ``variance`` / ``int_var`` / ``sum_sq`` are zero-memory placeholders and :attr:`idx` maps
+      the kept dates to the kept columns;
+    * ``date_slots`` maps a rebalancing-date index to the block of the pricer's objects (three
+      strikes per pillar, in order) — a pricer may carry a subset of the dates.
+
+    Measured need (M8b study C): at 2·10⁴ paths the full strip pricer of a 1y daily product (2268
+    objects, 756 record columns) held its three path sets, three payoff matrices and three dates
+    of hybrid payoffs — the larger part of the 9–13 GB of a recalibration run."""
+
+    keep_times: tuple[float, ...] = ()
+    date_slots: dict[int, int] = field(default_factory=dict)
+    #: seconds spent simulating and taking payoffs in :meth:`_simulate` (the projection's probe)
+    timing: dict[str, float] = field(init=False, default_factory=dict)
+    _index: FixingIndex | None = field(init=False, default=None, repr=False)
+    _owned_bytes: int = field(init=False, default=0)
+
+    def _simulate(self) -> None:
+        full = self.grid.fixing_index
+        draws = GaussianDraws(
+            self.sim.seed if self.seed is None else self.seed,
+            self.sim.n_paths,
+            self.grid.n_steps,
+            self.model.n_brownians,
+            self.sim.antithetic,
+        )
+        times = np.asarray(sorted(set(float(t) for t in self.keep_times)), dtype=np.float64)
+        if times.size == 0:
+            raise ValueError("a strip pricer needs the dates it is read at (keep_times)")
+        cols = full.indices(times)
+        n, n_obj, nf = self.sim.n_paths, len(self.objects), self.model.n_factors
+        pay = np.empty((n, n_obj))
+        ls = np.empty((n, times.size))
+        fac = np.empty((n, times.size, nf))
+        t_sim = t_pay = 0.0
+        for p0, p1 in self.sim.chunk_ranges(self.grid.n_records, nf):
+            t0 = time.perf_counter()
+            ps = self.model.simulate_chunk(self.grid, draws, p0, p1, self.sim.scheme)
+            t1 = time.perf_counter()
+            for j, obj in enumerate(self.objects):
+                pay[p0:p1, j] = obj.payoff(ps, full)
+            t_pay += time.perf_counter() - t1
+            t_sim += t1 - t0
+            ls[p0:p1] = ps.log_spot[:, cols]
+            fac[p0:p1] = ps.factors[:, cols, :]
+            del ps
+        self.timing = {"simulate": t_sim, "payoff": t_pay}
+        # the columns a strip regression never reads: read-only zero views, no memory
+        zero = np.broadcast_to(np.zeros(1), (n, times.size))
+        self.paths = PathSet(times, ls, zero, fac, zero, zero)
+        self._index = FixingIndex(times)
+        self._owned_bytes = int(pay.nbytes + ls.nbytes + fac.nbytes)
+        self.n_simulations = 1
+        self.bump_shifts = {}
+        self.bump_keys = ()
+        self.bumped_paths = {}
+        self.streamed = {}
+        self.payoffs = [ObjectPayoffs(pay[:, j], pay[:, j], pay[:, j], {}) for j in range(n_obj)]
+        # the spot bumps are never simulated: the delta / gamma targets the regression carries
+        # along are zero (``p_up = p_dn = base``) and never read
+        self._s_up = self.model.spot * float(np.exp(self.spot_size))
+        self._s_dn = self.model.spot * float(np.exp(-self.spot_size))
+
+    @property
+    def idx(self) -> Any:
+        assert self._index is not None
+        return self._index
+
+    @property
+    def memory_bytes(self) -> int:
+        """The kept payoff matrix and date columns (after :meth:`release`, what they were)."""
+        return self.released_bytes if self.released else self._owned_bytes
+
+    def release(self) -> int:
+        """:meth:`ConditionalPricer.release` plus the payoffs and fits: a strip is read once,
+        before the hedge loop, and nothing reads it afterwards."""
+        n = super().release()
+        self.payoffs = []
+        self.fits = {}
+        return n
+
+    def slot(self, kdx: int) -> int:
+        """The object block of rebalancing date ``kdx``."""
+        if kdx not in self.date_slots:
+            raise KeyError(f"the strip pricer does not carry rebalancing date {kdx}")
+        return self.date_slots[kdx]
+
+
+@dataclass
+class StripSurfaces:
+    """The recalibration rule's state surfaces per rebalancing-date index, precomputed before the
+    hedge loop (:meth:`Hedger.strip_surfaces`): ``world[k]`` read from the world strip, ``twin[k]``
+    from the pricing model's CRN twin (empty when not computed), both at ``n_paths`` strip
+    paths; ``world_bytes`` / ``twin_bytes`` the resident footprint each strip pricer had before
+    it was released, ``seconds`` the wall clock of the whole precomputation."""
+
+    dates: FloatArray
+    n_paths: int
+    world: dict[int, _StateSurface] = field(default_factory=dict)
+    twin: dict[int, _StateSurface] = field(default_factory=dict)
+    world_bytes: int = 0
+    twin_bytes: int = 0
+    seconds: float = 0.0
+
+    def excess_skew(self, kdx: int) -> FloatArray:
+        """The world's skew at date ``kdx`` minus the pricing model's prediction of it."""
+        return np.asarray(self.world[kdx].skew - self.twin[kdx].skew, dtype=np.float64)
+
+
+def step0_degenerate_pillars(targets: TargetSet) -> tuple[float, ...]:
+    """The fitted pillars whose step-0 SABR reduction is degenerate: the radicand guard fired
+    (:attr:`~volsto.calibration.targets.SabrPillar.radicand_guarded`) or ``rho_SABR`` was
+    clipped to ``±1`` (a clipped value is exactly ``±1``; a non-finite one — a negative radicand
+    with the guard disabled — counts too)."""
+    return tuple(
+        float(s.T)
+        for s in targets.sabr
+        if s.radicand_guarded or not np.isfinite(s.rho_sabr) or abs(float(s.rho_sabr)) >= 1.0
+    )
+
+
+@dataclass(frozen=True)
+class RefitTargets:
+    """What :func:`refit_targets` hands the fit, with its provenance: ``step0_pillars`` (the
+    degenerate pillars), ``step0_flags`` (the target set's flags as read), ``held`` (the policy's
+    note), ``fallback_applied`` (the base fit's ``correl_target`` held for this date),
+    ``corr_capped`` (the cap bit at some pillar), ``correl_read`` (``Corr_BE`` as read, before
+    the policy, the fallback and the cap)."""
+
+    targets: TargetSet
+    step0_pillars: tuple[float, ...]
+    step0_flags: tuple[str, ...]
+    held: tuple[str, ...]
+    fallback_applied: bool
+    corr_capped: bool
+    correl_read: FloatArray
+
+
+def refit_targets(
+    surface: Any, rule: RecalibrationRule, base_targets: TargetSet | None
+) -> RefitTargets:
+    """The marking targets a recalibration refits to (:class:`RecalibrationRule`, *The refit's
+    correlation target*), in this order: the targets read on ``surface``
+    (:func:`~volsto.calibration.fit_2f.marking_targets_for` with the rule's config and
+    ``ssr_target``); the policy's holding (:func:`~volsto.risk.shadow_rotation.held_targets`);
+    the **guarded fallback** — when step 0 is degenerate at any fitted pillar
+    (:func:`step0_degenerate_pillars`) the base fit's ``correl_target`` is held (a no-op in value
+    under the sticky policies, which hold it already; recorded all the same); the **cap**
+    ``|correl_target| <= rule.correlation_cap``.  Only ``correl_target`` is touched by the last two
+    (measured on the named study-C state: holding it removes the pinning and leaves step 2 —
+    ``λ``, ``k1``, the achieved skew and SpotVolCovar — unchanged).  ``base_targets`` is needed
+    under a sticky policy and whenever the fallback fires (``ValueError`` otherwise; the pillars
+    must match).  Checked by ``tests/test_hedging.py``."""
+    from volsto.calibration.fit_2f import marking_targets_for
+
+    targets = marking_targets_for(surface, rule.config(), ssr_target=rule.ssr_target)
+    flags = tuple(targets.flags)
+    read = np.array(targets.correl_target, dtype=np.float64)
+    degenerate = step0_degenerate_pillars(targets)
+    held: tuple[str, ...] = ()
+    if rule.sticky:
+        if base_targets is None:
+            raise ValueError(
+                f"recalibration policy {rule.policy!r} needs the base fit's targets (the hedger "
+                "computes the base fit before the first rebalancing date)"
+            )
+        targets = held_targets(targets, base_targets, rule.policy)
+        held = tuple(targets.flags[len(flags) :])
+    fallback = bool(degenerate)
+    if fallback:
+        if base_targets is None:
+            raise ValueError(
+                f"step 0 is degenerate at {degenerate} and no base fit is available for the "
+                "guarded correlation fallback"
+            )
+        b = base_targets
+        if targets.pillars.shape != b.pillars.shape or not np.allclose(targets.pillars, b.pillars):
+            raise ValueError("the guarded fallback needs the same fitted pillars on both surfaces")
+        targets = dataclasses.replace(
+            targets,
+            correl_target=np.array(b.correl_target, dtype=np.float64),
+            flags=(
+                *targets.flags,
+                f"guarded fallback: step 0 degenerate at T={list(degenerate)} (radicand guard or "
+                "rho clip): Corr_BE held at the base fit's values for this date",
+            ),
+        )
+    cap = float(rule.correlation_cap)
+    ct = np.asarray(targets.correl_target, dtype=np.float64)
+    capped = bool(np.any(np.abs(ct) > cap))
+    if capped:
+        targets = dataclasses.replace(
+            targets,
+            correl_target=np.clip(ct, -cap, cap),
+            flags=(*targets.flags, f"|Corr_BE| capped at {cap:g}: {np.round(ct, 4).tolist()}"),
+        )
+    return RefitTargets(targets, degenerate, flags, held, fallback, capped, read)
 
 
 # --------------------------------------------------------------------------------------------
@@ -589,7 +865,6 @@ class Hedger:
     verbose: bool = True
     stream_bumps: bool = False
     scratch_dir: str | Path | None = None
-    _twin: ConditionalPricer | None = field(default=None, init=False, repr=False)
     control_variate: bool = True
 
     def __post_init__(self) -> None:
@@ -825,14 +1100,23 @@ class Hedger:
         grid = union_grid([ctx.model, self.world], objects, dates, self.sim)
         n_models = 3 + sum(1 + (b.dn is not None) for b in bumps)
         projected = self.projected_wall_clock(product, strategy, grid, n_models)
+        rule = self.recalibration
+        if rule is not None:
+            projected += self.projected_strip_seconds(product, rule, dates)
         if self.verbose:
+            strip = (
+                "" if rule is None else f" + two recalibration strips of {rule.strip_paths} paths"
+            )
             print(
                 f"[hedger] {product!r} | strategy {strategy.name}: {dates.size} dates, "
                 f"{len(objects)} priced objects, {n_models} pricing simulations of "
-                f"{self.sim.n_paths} paths + {self.world_paths or self.sim.n_paths} world paths; "
-                f"projected wall clock {projected:.0f} s",
+                f"{self.sim.n_paths} paths + {self.world_paths or self.sim.n_paths} world paths"
+                f"{strip}; projected wall clock {projected:.0f} s",
                 flush=True,
             )
+        # the recalibration strips first, each released as soon as its surfaces are read: no
+        # strip pricer ever coexists with the product's pricer or the world paths
+        strips = None if rule is None else self.strip_surfaces(dates, rule)
         t0 = time.perf_counter()
         pricer = self._pricer(ctx.model, objects, grid, bumps)
         pricers = [pricer]
@@ -857,6 +1141,7 @@ class Hedger:
                 projected,
                 n_models,
                 dict(preset_kwargs),
+                strips,
             )
         finally:
             for p in pricers:
@@ -898,9 +1183,11 @@ class Hedger:
         projected: float,
         n_models: int,
         preset_kwargs: dict[str, Any],
+        strips: StripSurfaces | None = None,
     ) -> HedgeResult:
         """The rebalancing loop of :meth:`run` (split so the scratch directories of every pricer
-        built — the recalibration rebuilds included — are removed whatever happens)."""
+        built — the recalibration rebuilds included — are removed whatever happens); ``strips``
+        the recalibration rule's precomputed state surfaces."""
         ctx = self.context
         T = float(product.maturity)
         fc = ctx.forward_curve
@@ -933,16 +1220,17 @@ class Hedger:
         cache_hits = 0
         skew_ref: FloatArray | None = None
         rule = self.recalibration
-        world_skew_pricer = None
-        self._twin = None
         if rule is not None:
-            world_skew_pricer = self._world_skew_pricer(dates, rule, grid, world)
-            pricers.append(world_skew_pricer)
-            self._twin = self._twin_skew_pricer(world_skew_pricer)
-            pricers.append(self._twin)
-            if rule.sticky and rule.base_fit is None and ctx.surface is not None:
-                # the base marking fit the sticky policies hold their targets at: computed once,
-                # at the first rebalancing date, from the pricing surface with the rule's config
+            if strips is None:
+                strips = self.strip_surfaces(dates, rule)
+            if (
+                rule.base_fit is None
+                and ctx.surface is not None
+                and (rule.sticky or rule.refit is None)
+            ):
+                # the base marking fit the sticky policies hold their targets at, and the
+                # guarded fallback's correlation under every policy: computed once, before the
+                # first rebalancing date, from the pricing surface with the rule's config
                 from volsto.calibration.fit_2f import fit_2f_marking
 
                 t_fit = time.perf_counter()
@@ -1069,14 +1357,14 @@ class Hedger:
             # vanna from the vega polynomial gradient in ln S
             add_vanna(cur_pricer, t, prod, inst_g, active)
             # recalibration
-            if rule is not None and world_skew_pricer is not None:
-                skew_now = self._world_skew(world_skew_pricer, kdx, t, rule, world)
+            if rule is not None and strips is not None:
+                skew_now = self._world_skew(strips, kdx, t, rule, world)
                 if skew_ref is None:
                     skew_ref = skew_now
                 moved = float(np.max(np.abs(skew_now - skew_ref)))
                 did = False
                 if moved > rule.skew_move_threshold and n_refits < rule.max_refits:
-                    new_ctx, hit = self._recalibrate(t, world_skew_pricer, kdx, rule, world)
+                    new_ctx, hit = self._recalibrate(t, strips, kdx, rule, world)
                     if new_ctx is not None:
                         n_refits += 1
                         cache_hits += int(hit)
@@ -1097,6 +1385,9 @@ class Hedger:
                         add_vanna(cur_pricer, t, prod, inst_g, active)
                         skew_ref = skew_now
                         did = True
+                # the refit's own log row carries the flags (absent when the rule's refit hook
+                # is stubbed, as the loop tests do)
+                last = rule.log_rows[-1] if did and rule.log_rows else {}
                 recal_rows.append(
                     {
                         "t": t,
@@ -1105,13 +1396,10 @@ class Hedger:
                         "policy": rule.policy,
                         "recalibrated": did,
                         "params": None if not did else repr(cur_pricer.model),
-                        # the refit's own log row carries the flag (absent when the rule's
-                        # refit hook is stubbed, as the loop tests do)
-                        "at_bound": (
-                            str(rule.log_rows[-1].get("at_bound", ""))
-                            if did and rule.log_rows
-                            else ""
-                        ),
+                        "at_bound": str(last.get("at_bound", "")),
+                        "step0_flags": str(last.get("step0_flags", "")),
+                        "fallback_applied": bool(last.get("fallback_applied", False)),
+                        "corr_capped": bool(last.get("corr_capped", False)),
                     }
                 )
             # strategy
@@ -1192,6 +1480,11 @@ class Hedger:
             "refits": float(n_refits),
             "cache_hit_rate": float(cache_hits / n_refits) if n_refits else float("nan"),
         }
+        if strips is not None:
+            budget["strip_paths"] = float(strips.n_paths)
+            budget["strip_seconds"] = float(strips.seconds)
+            budget["strip_world_gb"] = float(strips.world_bytes / 1e9)
+            budget["strip_twin_gb"] = float(strips.twin_bytes / 1e9)
         # the §7.11 control's median variance reduction over dates and controlled objects
         # (NaN when nothing was controlled: control off, no surface-driven bump or no proxy)
         reductions = [r for p in pricers for r in p.cv_reductions()]
@@ -1247,6 +1540,8 @@ class Hedger:
                 "recalibration": None if rule is None else "on_skew_move",
                 "recalibration_policy": None if rule is None else rule.policy,
                 "skew_move_threshold": None if rule is None else rule.skew_move_threshold,
+                "strip_paths": None if rule is None else int(rule.strip_paths),
+                "correlation_cap": None if rule is None else float(rule.correlation_cap),
                 "stream_bumps": self.stream_bumps,
                 "scratch_dir": None if self.scratch_dir is None else str(self.scratch_dir),
                 "control_variate": self.control_variate,
@@ -1261,20 +1556,25 @@ class Hedger:
 
     # -- recalibration internals -------------------------------------------------------------
 
-    def _world_skew_pricer(
-        self, dates: FloatArray, rule: RecalibrationRule, grid: TimeGrid, world: PathSet
-    ) -> ConditionalPricer:
-        """The skew strip under the **world** model: at every rebalancing date ``t`` and pillar
-        ``τ`` three forward-start options ``(S_{t+τ}/S_t − e^{k})^±`` at ``k ∈ {−h, 0, +h}`` —
-        struck at the *forward moneyness of each path* (a vanilla struck at ``F(T) e^{k}`` would
-        sit anywhere from far below to far above a path's own forward at ``t``; inverting it at
-        the path's forward mixes moneyness across paths).  Their conditional values at ``t`` are
-        homogeneous in ``S_t`` and invert path by path to the world's conditional smile at ``t``
-        (:meth:`_state_surface`).  No bumps, no control variate; streamed like the other pricers."""
+    #: strip objects per pillar: the three strikes ``k ∈ {−h, 0, +h}``
+    STRIP_STRIKES = 3
+
+    def _strip_sim(self, rule: RecalibrationRule) -> SimConfig:
+        """The world simulation settings (:meth:`_world_sim`) at ``rule.strip_paths`` paths —
+        identical to the world's when the counts are equal."""
+        wsim = self._world_sim()
+        n = int(rule.strip_paths)
+        if n % 2 and wsim.antithetic:
+            raise ValueError("strip_paths must be even with antithetic draws")
+        return dataclasses.replace(wsim, n_paths=n, chunk_size=min(self.sim.chunk_size, n))
+
+    def _strip_objects(self, dates: FloatArray, rule: RecalibrationRule) -> list[Product]:
+        """The forward-start strip of every date (module docstring of the rule): per date ``t``,
+        pillar ``τ`` and ``k ∈ {−h, 0, +h}`` the option ``(S_{t+τ}/S_t − e^{k})^±`` (a put below
+        the money, a call at and above), in that order."""
         from volsto.products.forward_start import ForwardStartOption
 
-        fc = self.world.forward_curve
-        disc = fc.rate_curve
+        disc = self.world.forward_curve.rate_curve
         objs: list[Product] = []
         for t in dates:
             for tau in rule.pillars:
@@ -1284,26 +1584,51 @@ class Hedger:
                             float(t), float(t) + tau, float(np.exp(k)), 1 if k >= 0 else -1, disc
                         )
                     )
+        return objs
+
+    def _world_skew_pricer(
+        self, dates: FloatArray, rule: RecalibrationRule, only: Sequence[int] | None = None
+    ) -> _StripPricer:
+        """The skew strip under the **world** model at ``rule.strip_paths`` paths: at every
+        rebalancing date ``t`` and pillar ``τ`` three forward-start options
+        ``(S_{t+τ}/S_t − e^{k})^±`` at ``k ∈ {−h, 0, +h}`` — struck at the *forward moneyness of
+        each path* (a vanilla struck at ``F(T) e^{k}`` would sit anywhere from far below to far
+        above a path's own forward at ``t``; inverting it at the path's forward mixes moneyness
+        across paths).  Their conditional values at ``t`` are homogeneous in ``S_t`` and invert
+        path by path to the world's conditional smile at ``t`` (:meth:`_state_surface`).  No
+        bumps, no control variate, a lean pricer (:class:`_StripPricer`).  ``only`` restricts
+        the priced objects to those dates' (the grid — hence every path — is the full strip's
+        either way)."""
+        objs = self._strip_objects(dates, rule)
         g = union_grid([self.world], objs, dates, self.sim)
-        wsim = self._world_sim()
-        return ConditionalPricer(
+        per = len(rule.pillars) * self.STRIP_STRIKES
+        sel = list(range(dates.size)) if only is None else sorted({int(k) for k in only})
+        if any(k < 0 or k >= dates.size for k in sel):
+            raise ValueError("only: rebalancing-date indices out of range")
+        kept = [o for k in sel for o in objs[k * per : (k + 1) * per]]
+        wsim = self._strip_sim(rule)
+        return _StripPricer(
             self.world,
-            objs,
+            kept,
             g,
             wsim,
             (),
             self.degree,
             seed=wsim.seed + 7,
-            stream_bumps=self.stream_bumps,
-            scratch_dir=self.scratch_dir,
+            delta_estimator="gradient",
+            hybrid_bumps=False,
             control_variate=False,
+            keep_times=tuple(float(dates[k]) for k in sel),
+            date_slots={k: i for i, k in enumerate(sel)},
         )
 
-    def _twin_skew_pricer(self, strip: ConditionalPricer) -> ConditionalPricer:
-        """The same strip under the **pricing** model on the same grid, paths and seed (a CRN
-        twin): the pricing model's own prediction of the conditional smile at every date, so the
-        recalibration trigger reads the world's skew *in excess* of it (:meth:`_world_skew`)."""
-        return ConditionalPricer(
+    def _twin_skew_pricer(self, strip: _StripPricer) -> _StripPricer:
+        """The same strip under the **pricing** model on the same grid, path count and seed (a
+        CRN twin): the pricing model's own prediction of the conditional smile at every date, so
+        the recalibration trigger reads the world's skew *in excess* of it
+        (:meth:`_world_skew`).  ``strip`` may already be released (its objects, grid and
+        settings are what is read)."""
+        return _StripPricer(
             self.context.model,
             list(strip.objects),
             strip.grid,
@@ -1311,37 +1636,124 @@ class Hedger:
             (),
             self.degree,
             seed=strip.seed,
-            stream_bumps=self.stream_bumps,
-            scratch_dir=self.scratch_dir,
+            delta_estimator="gradient",
+            hybrid_bumps=False,
             control_variate=False,
+            keep_times=strip.keep_times,
+            date_slots=dict(strip.date_slots),
         )
 
+    def strip_surfaces(
+        self,
+        dates: FloatArray,
+        rule: RecalibrationRule,
+        *,
+        only: Sequence[int] | None = None,
+        twin: bool = True,
+    ) -> StripSurfaces:
+        """Every date's state surface (:class:`StripSurfaces`), one strip at a time: the world
+        strip is built, read at every date (``only``: those date indices) and released, then the
+        pricing model's twin (unless ``twin=False``) the same way.  The strips' only output is a
+        few numbers per date (the ATMF vol, skew and curvature per pillar), so the hedge loop
+        never holds a strip pricer; the peak is one strip's payoff matrix plus one simulation
+        chunk (``StripSurfaces.world_bytes``)."""
+        t0 = time.perf_counter()
+        sel = list(range(dates.size)) if only is None else sorted({int(k) for k in only})
+        out = StripSurfaces(np.asarray(dates, dtype=np.float64), int(rule.strip_paths))
+        pr = self._world_skew_pricer(dates, rule, sel)
+        out.world = {k: self._state_surface(pr, k, float(dates[k]), rule) for k in sel}
+        out.world_bytes = pr.release()
+        if twin:
+            tw = self._twin_skew_pricer(pr)
+            out.twin = {k: self._state_surface(tw, k, float(dates[k]), rule) for k in sel}
+            out.twin_bytes = tw.release()
+            del tw
+        del pr
+        out.seconds = time.perf_counter() - t0
+        if self.verbose:
+            print(
+                f"[hedger] recalibration strips: {len(sel)} dates x {len(rule.pillars)} pillars "
+                f"at {out.n_paths} paths (world{' + twin' if twin else ''}) in "
+                f"{out.seconds:.0f} s; resident before release {out.world_bytes / 1e9:.2f} + "
+                f"{out.twin_bytes / 1e9:.2f} GB",
+                flush=True,
+            )
+        return out
+
+    def projected_strip_seconds(
+        self, product: Product, rule: RecalibrationRule, dates: FloatArray | None = None
+    ) -> float:
+        """Projected seconds of :meth:`strip_surfaces` for ``product`` at ``rule.strip_paths``:
+        per strip model (the world, then the pricing model for the twin) the simulation and
+        payoff cost measured on a lean probe strip carrying two mid-life dates at
+        :attr:`PROBE_PATHS` and twice that (the full strip's grid), the per-date read (nine
+        regressions and per-path inversions) split into a fixed part and a part linear in the
+        paths, scaled to the strip's path count, object count and dates."""
+        dates = self.schedule.build(product) if dates is None else np.asarray(dates)
+        n_dates = int(dates.size)
+        if n_dates == 0:
+            return 0.0
+        per = len(rule.pillars) * self.STRIP_STRIKES
+        n_obj = n_dates * per
+        n_strip = int(rule.strip_paths)
+        i_mid = n_dates // 2
+        sel = sorted({i_mid, min(i_mid + 1, n_dates - 1)})
+        total = 0.0
+        for model_is_world in (True, False):
+            read: dict[int, float] = {}
+            sim_pp = pay_pp = 0.0
+            for n in (self.PROBE_PATHS, 2 * self.PROBE_PATHS):
+                probe_rule = dataclasses.replace(rule, strip_paths=n, log_rows=[])
+                pr = self._world_skew_pricer(dates, probe_rule, sel)
+                if not model_is_world:
+                    pr = self._twin_skew_pricer(pr)
+                sim_pp = pr.timing["simulate"] / n
+                pay_pp = pr.timing["payoff"] / (n * len(pr.objects))
+                t0 = time.perf_counter()
+                self._state_surface(pr, sel[-1], float(dates[sel[-1]]), probe_rule)
+                read[n] = time.perf_counter() - t0
+                pr.release()
+            n1, n2 = self.PROBE_PATHS, 2 * self.PROBE_PATHS
+            slope = max(read[n2] - read[n1], 0.0) / n1
+            fixed = max(read[n1] - slope * n1, 0.0)
+            total += sim_pp * n_strip + pay_pp * n_strip * n_obj
+            total += n_dates * (fixed + slope * n_strip)
+        return float(total)
+
     def _state_surface(
-        self, pr: ConditionalPricer, kdx: int, t: float, rule: RecalibrationRule, world: PathSet
+        self,
+        pr: ConditionalPricer,
+        kdx: int,
+        t: float,
+        rule: RecalibrationRule,
+        world: PathSet | None = None,
     ) -> _StateSurface:
         """The conditional smile at ``t`` read **per path** from the strip of
-        :meth:`_world_skew_pricer` and averaged: each forward-start's regressed conditional value
-        (time-0 money) is taken
-        to time-``t`` money, inverted on the ratio (forward ``F(t + τ)/F(t)``, strike ``e^{k}``,
-        maturity ``τ``, discount ``DF(t + τ)/DF(t)``) and the ATMF vol, the central-difference
-        skew and the second-difference curvature across the three strikes are averaged over the
-        paths where the inversion is finite (a regressed value below intrinsic inverts to NaN and
-        is dropped; a kept fraction under :data:`STATE_SURFACE_MIN_INVERTED` is logged).  The M8
-        reading inverted the path-*averaged* price — the unconditional ``(t + τ)``-option, whose
-        "vol over τ" carries the spot variance over ``[0, t]`` (measured: the 3M ATMF vol read
-        0.218 at ``t = 0`` and 0.394 at ``t = 0.5`` on a world without any shock, the factor
-        ``sqrt((t + τ)/τ)``), so the proxy moved at every date and the rule refit at every
-        date."""
+        :meth:`_world_skew_pricer` (or its twin) and averaged: each forward-start's regressed
+        conditional value (time-0 money) on the strip's own paths is taken to time-``t`` money,
+        inverted on the ratio (forward ``F(t + τ)/F(t)``, strike ``e^{k}``, maturity ``τ``,
+        discount ``DF(t + τ)/DF(t)``) and the ATMF vol, the central-difference skew and the
+        second-difference curvature across the three strikes are averaged over the paths where
+        the inversion is finite (a regressed value below intrinsic inverts to NaN and is dropped;
+        a kept fraction under :data:`STATE_SURFACE_MIN_INVERTED` is logged).  The M8 reading
+        inverted the path-*averaged* price — the unconditional ``(t + τ)``-option, whose "vol over
+        τ" carries the spot variance over ``[0, t]`` (measured: the 3M ATMF vol read 0.218 at
+        ``t = 0`` and 0.394 at ``t = 0.5`` on a world without any shock, the factor
+        ``sqrt((t + τ)/τ)``), so the proxy moved at every date and the rule refit at every date.
+        The curvature is the noisy part of this read (:data:`DEFAULT_STRIP_PATHS`).  ``pr`` is a
+        :class:`_StripPricer` (its date block by :meth:`_StripPricer.slot`) or a full pricer over
+        every date's strip in order; ``world`` is unused (kept for the hook's signature)."""
         from volsto.market.bs import implied_vol
 
         fc = self.world.forward_curve
         n_pill = len(rule.pillars)
+        slot = pr.slot(kdx) if isinstance(pr, _StripPricer) else kdx
         df_t = float(fc.rate_curve.df(t))
         h = float(rule.h)
         atf, skew, curv = [], [], []
         for pi, tau in enumerate(rule.pillars):
             T = t + tau
-            base_obj = kdx * n_pill * 3 + pi * 3
+            base_obj = slot * n_pill * self.STRIP_STRIKES + pi * self.STRIP_STRIKES
             f_ratio = float(fc.forward(T) / fc.forward(t))
             df = float(fc.rate_curve.df(T)) / df_t
             ivs = []
@@ -1376,60 +1788,62 @@ class Hedger:
         )
 
     def _world_skew(
-        self, pr: ConditionalPricer, kdx: int, t: float, rule: RecalibrationRule, world: PathSet
+        self, strips: StripSurfaces, kdx: int, t: float, rule: RecalibrationRule, world: PathSet
     ) -> FloatArray:
         """The world's conditional skew at ``t`` **in excess of the pricing model's own
         prediction** at the same date: the CRN twin strip (:meth:`_twin_skew_pricer`) is read
-        by :meth:`_state_surface` the same way and the rule triggers on the *change* of the
-        excess since the last refit (the reference is the excess at ``t = 0``, reset at each
-        refit).  An LSV world's forward skew at date ``t`` differs from its spot skew by far more
-        than the threshold with no shock at all (measured on the SPX marking fit: the M8 rule,
-        which compared the world's skew with its own ``t = 0`` value, refit at every one of 11
-        monthly dates), whereas the excess is exactly 0 under world = pricing (identical
-        simulations), the shock's rota shows up in it after the shock, and the held rotation
-        triggers no further refit once the reference has reset."""
-        twin = self._twin
-        assert twin is not None
-        sw = self._state_surface(pr, kdx, t, rule, world)
-        sp = self._state_surface(twin, kdx, t, rule, world)
-        return np.asarray(sw.skew - sp.skew, dtype=np.float64)
+        by :meth:`_state_surface` the same way (both precomputed, :meth:`strip_surfaces`) and the
+        rule triggers on the *change* of the excess since the last refit (the reference is the
+        excess at ``t = 0``, reset at each refit).  An LSV world's forward skew at date ``t``
+        differs from its spot skew by far more than the threshold with no shock at all (measured
+        on the SPX marking fit: the M8 rule, which compared the world's skew with its own
+        ``t = 0`` value, refit at every one of 11 monthly dates), whereas the excess is exactly 0
+        under world = pricing (identical simulations), the shock's rota shows up in it after the
+        shock, and the held rotation triggers no further refit once the reference has reset."""
+        return strips.excess_skew(kdx)
 
     def _recalibrate(
-        self, t: float, pr: ConditionalPricer, kdx: int, rule: RecalibrationRule, world: PathSet
+        self, t: float, strips: StripSurfaces, kdx: int, rule: RecalibrationRule, world: PathSet
     ) -> tuple[PricingContext | None, bool]:
+        """One refit at date ``t`` on the world's state surface of that date (the one the trigger
+        read): the targets of :func:`refit_targets` — the policy's holding, the **guarded
+        fallback** (step 0's radicand guard is right for a genuinely negative ATM curvature but
+        must not fire on Monte Carlo noise; the strip path count and the correlation cap are what
+        protect the refit from that, the fallback to the base fit's correlation is the last belt)
+        and the cap — fitted by :func:`~volsto.calibration.fit_2f.fit_2f`, the pricing model
+        rebuilt through the cache.  Logged in ``rule.log_rows`` with the step-0 flags,
+        ``fallback_applied``, ``corr_capped`` and a fitted correlation at its bound (warned)."""
         ctx = self.context
         if ctx.state is None or ctx.builder is None:
             ctx.notes.append("recalibration rule needs an LSV pricing state: skipped")
             return None, False
-        surf = self._state_surface(pr, kdx, t, rule, world)
-        from volsto.calibration.fit_2f import fit_2f, marking_targets_for
+        surf = strips.world[kdx]
+        from volsto.calibration.fit_2f import fit_2f
         from volsto.market.varswap import xi0_curve
 
         cfg = rule.config()
-        held_flags: tuple[str, ...] = ()
-        # the step-0 provenance of the state surface read at this date (radicand guard, rho
-        # clip): recorded per refit, since it is what decides whether the refit is degenerate
-        targets_flags: tuple[str, ...] = ()
+        prov: RefitTargets | None = None
         if rule.refit is not None:
             params = rule.refit(surf, ctx.state.spec.model)
         else:
-            targets = marking_targets_for(surf, cfg, ssr_target=rule.ssr_target)
-            targets_flags = tuple(targets.flags)
-            if rule.sticky:
-                if rule.base_fit is None:
-                    raise ValueError(
-                        f"recalibration policy {rule.policy!r} needs base_fit (the hedger computes "
-                        "it at the first rebalancing date from the pricing surface)"
-                    )
-                n_flags = len(targets.flags)
-                targets = held_targets(targets, rule.base_fit.targets, rule.policy)
-                held_flags = tuple(targets.flags[n_flags:])
+            base = None if rule.base_fit is None else rule.base_fit.targets
+            prov = refit_targets(surf, rule, base)
+            targets = prov.targets
             xi0 = xi0_curve(
                 ctx.surface, float(min(ctx.surface.max_maturity, max(targets.pillars) + t))
             )
             params = fit_2f(targets, xi0, cfg).params
         changes = {f.name: float(getattr(params, f.name)) for f in dataclasses.fields(params)}
         at_bound = degenerate_correlations(changes)
+        step0 = () if prov is None else prov.step0_flags
+        guards = (
+            ""
+            if prov is None
+            else (
+                f"; guarded fallback {'applied' if prov.fallback_applied else 'not needed'}, "
+                f"|Corr_BE| cap {'applied' if prov.corr_capped else 'not binding'}"
+            )
+        )
         if at_bound:
             msg = (
                 f"recalibration at t={t:g} ({rule.policy}): the refit lands with "
@@ -1437,11 +1851,11 @@ class Hedger:
                 + f" (|rho| >= {CORRELATION_BOUND}) — a degenerate two-factor set, so the "
                 "repricing it books is not a measurement of the desk's re-marking. "
                 "Step-0 flags of the state surface read at this date: "
-                + ("; ".join(targets_flags) if targets_flags else "none")
-                + ". (Measured cause on the M8b study-C runs: the strip's curvature read is "
-                "unconverged at the world path count, step 0's radicand guard fires and clips "
-                "Corr_SABR to -1, and the pinned set is then step 3's exact minimiser; the skew "
-                "target itself is attainable.)"
+                + ("; ".join(step0) if step0 else "none")
+                + guards
+                + ". (Measured mechanism on the 2026-09-15 study-C runs: an unconverged strip "
+                "curvature fires step 0's radicand guard, Corr_SABR clips to -1 and the collapsed "
+                "set is step 3's exact minimiser; the skew target is attainable.)"
             )
             log.warning(msg)
             if msg not in ctx.notes:
@@ -1461,9 +1875,17 @@ class Hedger:
                 "policy": rule.policy,
                 "params": repr(params),
                 "cache_hit": hit,
-                "held": "; ".join(held_flags),
+                "held": "" if prov is None else "; ".join(prov.held),
                 "at_bound": "; ".join(f"{k}={v:+.4f}" for k, v in at_bound.items()),
-                "step0_flags": "; ".join(targets_flags),
+                "step0_flags": "; ".join(step0),
+                "step0_pillars": "" if prov is None else repr(list(prov.step0_pillars)),
+                "fallback_applied": False if prov is None else prov.fallback_applied,
+                "corr_capped": False if prov is None else prov.corr_capped,
+                "correl_read": "" if prov is None else repr(np.round(prov.correl_read, 6).tolist()),
+                "correl_target": (
+                    "" if prov is None else repr(np.round(prov.targets.correl_target, 6).tolist())
+                ),
+                "curv": repr(np.round(surf.curv, 6).tolist()),
             }
         )
         return PricingContext(model, new_state, ctx.builder, ctx.surface, ctx.label), hit
@@ -1503,7 +1925,10 @@ def realised_spot(world: PathSet, idx: Any, T: float, fc: Any) -> FloatArray:
 
 
 __all__ = [
+    "CORRELATION_BOUND",
+    "DEFAULT_STRIP_PATHS",
     "FREQUENCIES",
+    "REFIT_CORRELATION_CAP",
     "SKEW_MOVE_THRESHOLD",
     "SPOT_BUMP",
     "TENT_SIZE",
@@ -1513,6 +1938,11 @@ __all__ = [
     "Hedger",
     "PricingContext",
     "RecalibrationRule",
+    "RefitTargets",
     "Schedule",
+    "StripSurfaces",
+    "degenerate_correlations",
     "realised_spot",
+    "refit_targets",
+    "step0_degenerate_pillars",
 ]

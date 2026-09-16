@@ -9,9 +9,13 @@ states of ``scripts/m7_p1_marking.py`` are read from the cache with ``allow_cali
   trip back to the base surface;
 * the refit under the two owner policies (``sabr_linked``, ``sticky_breakeven``) and the
   implementer's variant (``sticky_breakeven_skew``): on SPX 2022-12-30 the SABR-linked targets'
-  ``Skew_SABR`` moves by ∓ one rota, the sticky targets hold ``VoV_BE`` / ``Corr_BE`` at the base
-  values (the variant also the two-point skew reference), the round-trip surface refits to the base
-  parameters, ν rises with the rotation under both policies, an unknown policy raises;
+  ``Skew_SABR`` moves by ∓ one rota, the sticky targets hold ``SpotVolCovar`` / ``Corr_BE`` at the
+  base values (the variant also the two-point skew reference), the round-trip surface refits to
+  the base parameters, ν rises with the rotation under both policies, an unknown policy raises;
+* ``sticky_breakeven``'s definition (owner's decision of 2026-09-16): the effective held set is
+  ``{spot_vol_covar, correl_target}`` — the former five-array holding and the two-array one feed
+  identical fits, each of the two moves the fit on its own, the three variance arrays alone are
+  inert in marking mode;
 * the convention algebra on a synthetic report (no cache): ``fee = P1 − LV``, ``fee_* = P1_* −
   lv_rotation``, ``fee_shadow = recalibrated − usual`` exactly (the LV rotation cancels), every
   ``desk_pnl_*`` the exact negative of its ``fee_*`` with the same standard error, the frame rows
@@ -31,6 +35,7 @@ from __future__ import annotations
 import dataclasses
 import math
 from pathlib import Path
+from typing import Any, cast
 
 import numpy as np
 import pytest
@@ -107,7 +112,8 @@ def test_rota_units_and_surface_round_trip(ssvi) -> None:  # type: ignore[no-unt
             s = perturbed_surface(rotation_perturbation(size), base)  # arbitrage-checked
             for T in (0.05, 0.25, 0.5, 1.0, 2.0, 3.0):
                 assert float(s.atm_vol(T)) == pytest.approx(float(base.atm_vol(T)), abs=1e-15)
-                ds = float(s.atm_skew(T)) - float(atm_skew_numeric(base, T)[()])
+                # the rotated surface's own analytic ATM skew (not on the ImpliedSurface ABC)
+                ds = float(cast(Any, s).atm_skew(T)) - float(atm_skew_numeric(base, T)[()])
                 assert ds == pytest.approx(-size * rota_slope(T), rel=1e-5), (T, ds)
                 lo, hi = np.log(0.9), np.log(1.1)
                 d90 = float(s.implied_vol_k(lo, T) - s.implied_vol_k(hi, T)) - float(
@@ -126,9 +132,9 @@ def test_rota_units_and_surface_round_trip(ssvi) -> None:  # type: ignore[no-unt
 def test_rotated_refit_under_the_policies() -> None:
     """SPX 2022-12-30, ``(ssr 1, eps 0.10)``: the ±1 rota states and refits under each policy.
     SABR-linked: the rotated targets' ``Skew_SABR`` moves by ∓ one rota at every pillar and ``Corr_BE``
-    moves with it.  Sticky break-even: ``SpotVolCovar`` / ``VolVar`` / ``Corr_BE`` targets equal the
-    base fit's exactly, the two-point ``Skew_SABR`` reference is the rotated surface's; the variant
-    also holds that reference.  ν rises with the rotation under both owner policies (measured
+    moves with it.  Sticky break-even: ``SpotVolCovar`` / ``Corr_BE`` targets equal the base
+    fit's exactly, the two-point ``Skew_SABR`` reference and the (inert) variance targets are the
+    rotated surface's; the variant also holds that reference.  ν rises with the rotation under both owner policies (measured
     SABR-linked 1.736 / 1.940 / 2.155 and sticky 1.621 / 1.940 / 2.273 at −1 / 0 / +1 rota: the
     sticky refit moves ν more per rota); the ``+0.7`` then ``−0.7`` round-trip surface refits to the
     base parameters within 1e-4 relative; an unknown policy raises."""
@@ -152,10 +158,12 @@ def test_rotated_refit_under_the_policies() -> None:
     sticky_up = refit_on_rotated(rot_up, base, cfg, ssr_target=1.0, policy="sticky_breakeven")
     sticky_dn = refit_on_rotated(rot_dn, base, cfg, ssr_target=1.0, policy="sticky_breakeven")
     for f in (sticky_up, sticky_dn):
-        for name in ("spot_vol_covar", "vol_var", "vovol", "correl_target"):
+        for name in ("spot_vol_covar", "correl_target"):
             assert np.array_equal(getattr(f.targets, name), getattr(base.targets, name)), name
         assert any("sticky_breakeven" in fl for fl in f.targets.flags)
     assert np.allclose(sticky_up.targets.skew_target, up.targets.skew_target)  # rotated reference
+    for name in ("vol_var", "vovol"):  # the variance targets are the rotated surface's
+        assert np.array_equal(getattr(sticky_up.targets, name), getattr(up.targets, name)), name
     assert sticky_dn.params.nu < base.params.nu < sticky_up.params.nu
     print("sticky nu:", sticky_dn.params.nu, base.params.nu, sticky_up.params.nu)
     variant = refit_on_rotated(rot_up, base, cfg, ssr_target=1.0, policy="sticky_breakeven_skew")
@@ -175,6 +183,61 @@ def test_rotated_refit_under_the_policies() -> None:
         assert getattr(again.params, fld.name) == pytest.approx(
             getattr(base.params, fld.name), rel=1e-4, abs=1e-8
         )
+
+
+def test_sticky_breakeven_holds_the_effective_targets() -> None:
+    """``sticky_breakeven`` holds exactly the targets a marking fit reads (owner's decision of
+    2026-09-16; measured on SPX 2022-12-30 at +1 rota, ``(ssr 1, eps 0.10)``): the former holding
+    of five arrays (``spot_vol_covar``, ``vol_var``, ``vovol``, ``vov_be_raw``,
+    ``correl_target``) and :func:`held_targets`' two feed fits with **identical** parameters,
+    step-2 / step-3 objectives and table columns — all but ``volvar_target_requested``, which
+    only reports ``targets.vol_var`` —; holding the three variance arrays alone leaves the
+    parameters of the unheld (rotated) fit unchanged, so they are inert; holding
+    ``spot_vol_covar`` alone and ``correl_target`` alone each move the fit (``spot_vol_covar``
+    through step 2's ``k1``, ``correl_target`` through step 3), so the owner's shorthand "holds
+    the correlation target" is incomplete and the documented set is both.  Pure fits, no
+    simulation."""
+    from dataclasses import replace
+
+    from volsto.calibration.fit_2f import fit_2f, marking_targets_for
+    from volsto.market.varswap import xi0_curve
+    from volsto.risk.shadow_rotation import held_targets
+
+    spec = _spec("spx")
+    cfg = BreakEvenFitConfig(skew_eps=0.10)
+    base = fit_2f_marking(surface_of(RiskState(spec)), cfg, ssr_target=1.0)
+    rot = surface_of(RiskState(spec).with_perturbation(rotation_perturbation(1.0)))
+    moved = marking_targets_for(rot, cfg, ssr_target=1.0)
+    c = replace(cfg, pillars=tuple(float(t) for t in moved.pillars))
+    xi0 = xi0_curve(rot, float(min(rot.max_maturity, max(moved.pillars))))
+    b = base.targets
+
+    def fit_holding(*names: str):  # type: ignore[no-untyped-def]
+        return fit_2f(replace(moved, **{k: getattr(b, k).copy() for k in names}), xi0, c)
+
+    five = fit_holding("spot_vol_covar", "vol_var", "vovol", "vov_be_raw", "correl_target")
+    two = fit_2f(held_targets(moved, b, "sticky_breakeven"), xi0, c)
+    assert two.params == five.params
+    assert two.first.objective == five.first.objective
+    assert two.second.objective == five.second.objective
+    differing = [
+        col
+        for col in five.table
+        if not np.array_equal(five.table[col].to_numpy(), two.table[col].to_numpy())
+    ]
+    assert differing == ["volvar_target_requested"], differing
+    unheld = fit_holding()
+    assert fit_holding("vol_var", "vovol", "vov_be_raw").params == unheld.params
+    svc, cor = fit_holding("spot_vol_covar"), fit_holding("correl_target")
+    print(
+        f"unheld {unheld.params}\nsvc only {svc.params}\ncorr only {cor.params}\n"
+        f"sticky {two.params}"
+    )
+    for p in (svc.params, cor.params):
+        assert p != unheld.params and p != two.params
+    assert svc.params.k1 != unheld.params.k1 and cor.params.k1 == unheld.params.k1
+    with pytest.raises(ValueError):
+        held_targets(replace(moved, mode="historical"), b, "sticky_breakeven")
 
 
 def test_convention_algebra_on_a_synthetic_report() -> None:

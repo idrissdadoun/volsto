@@ -44,6 +44,7 @@ from volsto.studies.m8b import (
     DEFAULT_ROTATION_PATHS,
     RECALIBRATIONS_C,
     STUDIES,
+    STUDY_C_STRIP_PATHS,
     StudyConfig,
     StudyEnvironment,
     Task,
@@ -168,7 +169,8 @@ def main() -> None:
         f"{cfg.n_particles} particles ({cfg.refit_particles} for refits), seed {cfg.seed}, "
         f"frequency {cfg.frequency or 'rule (daily <= 1y, weekly beyond; A monthly)'}, "
         f"calibrate {'yes' if cfg.allow_calibrate else 'NO (skip on a cache miss)'}, "
-        f"stream_bumps {cfg.stream_bumps}, control_variate {cfg.control_variate}, out {cfg.out}",
+        f"stream_bumps {cfg.stream_bumps}, control_variate {cfg.control_variate}, out {cfg.out}; "
+        f"study C recalibration strips at {STUDY_C_STRIP_PATHS} paths",
         flush=True,
     )
     print(f"[m8b] discriminator gate for world (ii): {gate.verdict!r} — {gate.reason}", flush=True)
@@ -249,7 +251,8 @@ def main() -> None:
         f"budget: {cfg.n_paths} pricing paths, {cfg.n_world} world paths, {cfg.n_particles} "
         f"particles ({cfg.refit_particles} for refits), seed {cfg.seed}, frequency "
         f"{cfg.frequency or 'rule (daily <= 1y, weekly beyond; A monthly)'}, stream_bumps "
-        f"{cfg.stream_bumps}, control_variate {cfg.control_variate}",
+        f"{cfg.stream_bumps}, control_variate {cfg.control_variate}; study C recalibration "
+        f"strips at {STUDY_C_STRIP_PATHS} paths (world + twin)",
         f"pricing model: {cfg.marking_fit.name} at {cfg.n_particles} particles; world (ii) gate: "
         f"{gate.verdict!r} — {gate.reason}",
         f"static greeks of study C: {cfg.rotation_paths} paths, {cfg.rotation_particles} particles "

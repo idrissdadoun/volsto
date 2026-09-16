@@ -32,6 +32,8 @@ from volsto.studies.m8b import (
     ROTAS,
     STUDIES,
     STUDY_A_FREQUENCY,
+    STUDY_C_STRIP_PATHS,
+    TABLE_HEADERS,
     WORLDS_B,
     Gate,
     StudyConfig,
@@ -48,6 +50,8 @@ from volsto.studies.m8b import (
     parse_shard,
     product_maturity,
     refit_state,
+    refits_capped,
+    refits_fallback,
     run_task,
     save_result,
     shard,
@@ -282,6 +286,99 @@ def test_refits_at_bound_counts_pinned_refits() -> None:
     assert refits_at_bound(parsed) == 1  # only the fired, collapsed refit counts
 
 
+def test_refit_fallback_and_cap_counts_backfill_safe(tmp_path: Path) -> None:
+    """``refits_fallback`` / ``refits_capped`` count the fired refits whose recalibration row
+    carries ``fallback_applied`` / ``corr_capped`` (the rebuilt refit of 2026-09-16), ``-1`` for
+    a run recorded before the columns existed; a result JSON written before the fields existed
+    reads back with ``-1`` (backfill-safe), a new one round-trips its counts."""
+    import pandas as pd
+
+    assert refits_fallback(pd.DataFrame()) == 0 == refits_capped(pd.DataFrame())
+    new = pd.DataFrame(
+        {
+            "t": [0.5, 1.0, 1.5, 2.0],
+            "recalibrated": [True, False, True, True],
+            "fallback_applied": [True, True, False, True],  # the unfired row never counts
+            "corr_capped": [False, False, True, False],
+            "at_bound": ["", "", "", ""],
+        }
+    )
+    assert refits_fallback(new) == 2 and refits_capped(new) == 1
+    old = pd.DataFrame({"t": [0.5], "recalibrated": [True], "at_bound": [""]})
+    assert refits_fallback(old) == -1 and refits_capped(old) == -1
+    r = _synthetic("C", "cliquet 1y", world="skew shock", rota=3.0, policy="sabr_linked")
+    assert r.n_refits_fallback == -1 and r.n_refits_capped == -1
+    doc = r.to_dict()
+    for k in ("n_refits_fallback", "n_refits_capped"):
+        doc.pop(k)
+    assert TaskResult.from_dict(doc).n_refits_fallback == -1
+    r2 = dataclasses.replace(r, n_refits_fallback=2, n_refits_capped=1)
+    save_result(r2, None, tmp_path)
+    back = load_results(tmp_path, "C")[0]
+    assert back.n_refits_fallback == 2 and back.n_refits_capped == 1
+
+
+def test_study_c_rule_uses_its_own_strip_paths() -> None:
+    """Study C's rule (:func:`study_c_rule`) reads its strips at
+    :data:`STUDY_C_STRIP_PATHS` = 8·10⁴ (the owner's decision of 2026-09-16), independent of
+    the 2·10⁴ world paths, caps the refit correlation at 0.97 and keeps the documented pillars,
+    skew pillars and threshold.  The marking fit spec only (no leverage)."""
+    from volsto.hedging.hedger import REFIT_CORRELATION_CAP
+    from volsto.studies.m8b import (
+        STUDY_C_RULE_PILLARS,
+        STUDY_C_RULE_SKEW_PILLARS,
+        STUDY_C_SKEW_MOVE_THRESHOLD,
+        study_c_rule,
+    )
+
+    env = StudyEnvironment(StudyConfig(allow_calibrate=False, verbose=False))
+    for policy in ("sabr_linked", "sticky_breakeven"):
+        rule = study_c_rule(policy, env)
+        assert rule.policy == policy and rule.strip_paths == STUDY_C_STRIP_PATHS == 80_000
+        assert rule.correlation_cap == REFIT_CORRELATION_CAP == 0.97
+        assert rule.pillars == STUDY_C_RULE_PILLARS
+        assert rule.config().skew_pillars == STUDY_C_RULE_SKEW_PILLARS
+        assert rule.skew_move_threshold == STUDY_C_SKEW_MOVE_THRESHOLD
+    assert env.cfg.n_world == 20_000
+
+
+def test_projection_counts_the_strip_at_its_own_path_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The dry-run projection of study C adds the recalibration strips to the recalibration rows
+    only, probed with the rule at :data:`STUDY_C_STRIP_PATHS` (the hedger's probes stubbed: the
+    test checks the accounting, not the timing), once per product and frequency, and says so in
+    its notes.  Needs the cached pricing leverages (skipped when absent)."""
+    from volsto.hedging.hedger import Hedger
+
+    seen: list[int] = []
+
+    def fake_strip(self: Hedger, product: object, rule: object, dates: object = None) -> float:
+        seen.append(int(rule.strip_paths))  # type: ignore[attr-defined]
+        return 1000.0
+
+    monkeypatch.setattr(Hedger, "projected_wall_clock", lambda self, *a, **k: 10.0)
+    monkeypatch.setattr(Hedger, "projected_strip_seconds", fake_strip)
+    cfg = StudyConfig(allow_calibrate=False, verbose=False)
+    tasks = [t for t in enumerate_tasks("C", cfg, REAL).tasks if t.product == "cliquet 1y"]
+    try:
+        from volsto.studies.m8b import project
+
+        pr = project(tasks, StudyEnvironment(cfg))
+    except CacheMissError as exc:
+        pytest.skip(f"cached leverage absent (tests never calibrate): {exc}")
+    rows = {r["key"]: r for r in pr.per_task}
+    for t in tasks:
+        row = rows[t.key]
+        if t.policy == "none":
+            assert row["strip_seconds"] == 0.0 and row["projected_seconds"] == 10.0
+        else:
+            assert row["strip_seconds"] == 1000.0 and row["projected_seconds"] == 1010.0
+    assert seen == [STUDY_C_STRIP_PATHS]  # memoised per product and frequency
+    assert pr.hedger_seconds == pytest.approx(9 * 10.0 + 6 * 1000.0)
+    assert any(f"{STUDY_C_STRIP_PATHS} paths" in n for n in pr.notes), pr.notes
+
+
 def test_table_builders_on_synthetic_results(tmp_path: Path) -> None:
     res: list[TaskResult] = []
     # A: three strategies, two pricing models; the std sets the rank
@@ -369,6 +466,9 @@ def test_table_builders_on_synthetic_results(tmp_path: Path) -> None:
                 n_refits=1,
                 # the +2 row's refit pinned a correlation: the row is reported and marked
                 n_refits_at_bound=1 if rota == 2.0 else 0,
+                # the +3 row predates the fallback / cap record (-1); +1 and +2 recorded it
+                n_refits_fallback=-1 if rota == 3.0 else int(rota == 2.0),
+                n_refits_capped=-1 if rota == 3.0 else 0,
                 mean=(0.2, 0.01),
             )
         )
@@ -389,6 +489,12 @@ def test_table_builders_on_synthetic_results(tmp_path: Path) -> None:
     clean1 = tc[(tc["rota"] == 1.0) & (tc["recalibration"] == "sabr_linked")].iloc[0]
     assert pinned["refits_at_bound"] == 1 and bool(pinned["contaminated"])
     assert clean1["refits_at_bound"] == 0 and not bool(clean1["contaminated"])
+    assert {"refits_fallback", "refits_capped"} <= set(tc.columns)
+    assert pinned["refits_fallback"] == 1 and pinned["refits_capped"] == 0
+    assert clean1["refits_fallback"] == 0 and clean1["refits_capped"] == 0
+    old3 = tc[(tc["rota"] == 3.0) & (tc["recalibration"] == "sabr_linked")].iloc[0]
+    assert old3["refits_fallback"] == -1 and old3["refits_capped"] == -1
+    assert "refits_fallback" in TABLE_HEADERS["C"] and "80000 paths" in TABLE_HEADERS["C"]
     ok_rows = tc[tc["ratio"].notna()]
     assert (ok_rows["ratio_se"] > 0).all(), ok_rows[["ratio", "ratio_se"]]
     two = tc[(tc["rota"] != 1.0) & tc["nonlinearity"].notna()]
@@ -596,7 +702,10 @@ def test_study_c_excess_skew_trigger_fires_once_when_the_strip_first_spans_the_s
         env = StudyEnvironment(cfg)
         product = env.product("cliquet 1y")
         world, meta = env.shock_world(1.0, 0.5)
-        rule = RecalibrationRule(policy="sabr_linked", refit=lambda surf, params: params)
+        # the strips at the world's path count, as measured on 2026-09-15
+        rule = RecalibrationRule(
+            policy="sabr_linked", refit=lambda surf, params: params, strip_paths=4_000
+        )
         h = RecordingHedger(
             env.fresh_ctx("2F"),
             world,

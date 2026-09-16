@@ -20,15 +20,17 @@ common random numbers, every leverage through the cache:
 * *recalibrated rotation* — the surface rotated and the P1 set **refit** under a
   ``recalibration_policy`` (:data:`RECALIBRATION_POLICIES`): ``"sabr_linked"`` (the new marking
   policy: SABR reduction of the rotated surface → break-evens → refit with the same config and
-  ``ssr_target``) or ``"sticky_breakeven"`` (the old policy: ``VoV_BE`` and ``Corr_BE`` — hence
-  ``SpotVolCovar`` and ``VolVar`` targets — held at their pre-rotation values, the set recalibrated
-  to them on the rotated surface, whose skew term structure, two-point ``Skew_SABR`` and ATMF vols
-  are those of the rotated surface), or ``"sticky_breakeven_skew"`` (the implementer's
-  diagnostic variant, not one of the owner's two: the break-evens **and** the two-point
-  ``Skew_SABR`` reference of the constraint held at their pre-rotation values, so the naked
-  kernel is pinned to the old skew while the leverage absorbs the rotation — only the leverage
-  integrals of the P1 break-even see the rotated skew); the leverage recalibrated for the refit
-  set;
+  ``ssr_target``) or ``"sticky_breakeven"`` (the old policy: the ``SpotVolCovar`` target and the
+  correlation target ``Corr_BE`` held at their pre-rotation values, the set recalibrated to them
+  on the rotated surface, whose skew term structure, two-point ``Skew_SABR`` and ATMF vols are
+  those of the rotated surface; the variance targets — ``VolVar``, ``VoV_BE`` — are not held in
+  marking mode because the fitter derives them: step 3's VolVar target is
+  ``(SpotVolCovar_model / Corr_BE)²``, so holding ``Corr_BE`` is what holds it —
+  :func:`held_targets`), or ``"sticky_breakeven_skew"`` (the implementer's diagnostic variant,
+  not one of the owner's two: the same two targets **and** the two-point ``Skew_SABR`` reference
+  of the constraint held at their pre-rotation values, so the naked kernel is pinned to the old
+  skew while the leverage absorbs the rotation — only the leverage integrals of the P1
+  break-even see the rotated skew); the leverage recalibrated for the refit set;
 * *shadow* = recalibrated − usual, estimated path by path on the four states (the desk's
   uncomputed rotation risk: the part of the fee move that comes from the marking parameters
   following the skew);
@@ -345,40 +347,52 @@ def refit_on_rotated(
 
 
 def held_targets(targets: TargetSet, base_targets: TargetSet, policy: str) -> TargetSet:
-    """``targets`` (the break-even targets read on a moved surface — a rotated surface, or the
+    """``targets`` (the marking targets read on a moved surface — a rotated surface, or the
     hedger's world state surface) with the quantities a recalibration ``policy`` holds at the
-    **base** fit's values (:data:`RECALIBRATION_POLICIES`, module docstring): ``"sabr_linked"``
-    holds nothing (``targets`` returned unchanged); ``"sticky_breakeven"`` holds ``VoV_BE`` and
-    ``Corr_BE`` — ``spot_vol_covar``, ``vol_var``, ``vovol``, ``vov_be_raw``, ``correl_target`` —
-    so only the skew constraint (and the ATMF vols) follow the moved surface;
-    ``"sticky_breakeven_skew"`` holds the two-point ``Skew_SABR`` reference (``skew_target``) too.
-    The held pillars must match (the targets are per pillar); the policy's flag is appended to
-    ``flags`` as :func:`refit_on_rotated` does.  Used by :func:`refit_on_rotated`'s twin in the
-    hedger's :class:`~volsto.hedging.hedger.RecalibrationRule`."""
+    **base** fit's values (:data:`RECALIBRATION_POLICIES`, module docstring).
+
+    * ``"sabr_linked"`` holds nothing (``targets`` returned unchanged);
+    * ``"sticky_breakeven"`` holds ``spot_vol_covar`` (step 2's covariance target) and
+      ``correl_target`` (``Corr_BE``, from which step 3 builds its VolVar target
+      ``(SpotVolCovar_model / Corr_BE)²``), so the skew constraint and the ATMF vols follow the
+      moved surface.  The variance targets ``vol_var`` / ``vovol`` / ``vov_be_raw`` are **not**
+      held: in marking mode the fitter never reads them (``fit_2f`` derives the VolVar target;
+      ``vol_var`` only fills the reported ``volvar_target_requested`` column), so holding them
+      was inert — measured on SPX 2022-12-30 at +1 rota: the five-array and the two-array
+      holdings give identical parameters, and each of the two held arrays moves the fit on its
+      own (``tests/test_shadow_rotation.py``).  Owner's decision of 2026-09-16: the definition
+      names what the policy actually holds; no fitter support for held variance targets;
+    * ``"sticky_breakeven_skew"`` holds the two-point ``Skew_SABR`` reference (``skew_target``)
+      too.
+
+    Marking-mode targets only (``ValueError`` otherwise: a historical fit keeps its empirical
+    VolVar target, which this holding rule does not describe); the held pillars must match (the
+    targets are per pillar); the policy's flag is appended to ``flags``.  Shared by
+    :func:`refit_on_rotated` and the hedger's
+    :class:`~volsto.hedging.hedger.RecalibrationRule`."""
     if policy not in RECALIBRATION_POLICIES:
         raise ValueError(f"policy must be one of {RECALIBRATION_POLICIES}")
     if policy == "sabr_linked":
         return targets
+    if targets.mode != "marking" or base_targets.mode != "marking":
+        raise ValueError(f"{policy} holds marking-mode targets only")
     b = base_targets
     if targets.pillars.shape != b.pillars.shape or not np.allclose(targets.pillars, b.pillars):
         raise ValueError(f"{policy} needs the same fitted pillars on both surfaces")
     held: dict[str, Any] = {
         "spot_vol_covar": b.spot_vol_covar.copy(),
-        "vol_var": b.vol_var.copy(),
-        "vovol": b.vovol.copy(),
-        "vov_be_raw": b.vov_be_raw.copy(),
         "correl_target": b.correl_target.copy(),
     }
     note = (
-        "sticky_breakeven: VoV_BE and Corr_BE held at the base fit's values (the skew term "
+        "sticky_breakeven: SpotVolCovar and Corr_BE held at the base fit's values (the skew term "
         "structure, Skew_SABR of the two-point constraint and the ATMF vols are the moved "
-        "surface's)"
+        "surface's; the VolVar target follows from the held Corr_BE)"
     )
     if policy == "sticky_breakeven_skew":
         held["skew_target"] = b.skew_target.copy()
         note = (
-            "sticky_breakeven_skew: VoV_BE, Corr_BE and the two-point Skew_SABR reference held at "
-            "the base fit's values (only the leverage integrals see the moved skew)"
+            "sticky_breakeven_skew: SpotVolCovar, Corr_BE and the two-point Skew_SABR reference "
+            "held at the base fit's values (only the leverage integrals see the moved skew)"
         )
     return replace(targets, flags=(*targets.flags, note), **held)
 

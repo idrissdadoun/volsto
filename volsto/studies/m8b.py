@@ -69,14 +69,20 @@ product leg is ``payoff − V₀`` on every path, its recalibration P&L ``V(new)
   invisible to the M8 test because a Black–Scholes world has zero skew at every date; the
   per-path inversion here belongs in the hedger once accepted) **and triggers on the excess
   skew** — the world's conditional skew minus the pricing model's own prediction of it at the
-  same date on the same draws (:meth:`RecordingHedger._world_skew`): the M8 reference (the
+  same date on the same draws (:meth:`~volsto.hedging.hedger.Hedger._world_skew`): the M8
+  reference (the
   world's skew at ``t = 0``) refits at every date in any LSV world, whose forward skew differs
   from its spot skew by more than the threshold, so it cannot isolate a shock.  Measured on the
   cached 2·10⁵ shock world (+1 rota, cliquet, monthly, a stub refit): the excess is 0.001–0.009
   while no strip option reaches into the shock window, 0.018 at ``t = 0.417`` — the 3M option
   then spans ``[t0, t_end]`` and the world's conditional smile anticipates its deterministic
   shock, so the refit fires one pillar *before* ``t0`` — and 0.001–0.008 against the reset
-  reference afterwards: one refit in twelve dates.
+  reference afterwards: one refit in twelve dates.  The rule (:func:`study_c_rule`) reads its
+  strips at :data:`STUDY_C_STRIP_PATHS` (8·10⁴, independent of the world paths; precomputed and
+  released before the hedge loop) and its refit guards the correlation target
+  (:func:`~volsto.hedging.hedger.refit_targets`: the base fit's ``Corr_BE`` held on a date whose
+  step-0 reduction is degenerate, ``|Corr_BE|`` capped at 0.97), both counted per row
+  (``refits_fallback``, ``refits_capped``) next to ``refits_at_bound``.
 * **D — delta-regime P&L.**  The 1y ATM vanilla (strike = spot) and the 3y autocall, world =
   pricing (2F), ``delta only`` under the §7.2 regimes ``model / sticky_strike / sticky_skew /
   sticky_moneyness`` (:class:`~volsto.hedging.strategies.GreekTargetStrategy` with
@@ -140,6 +146,7 @@ from volsto.hedging.hedger import (
     CORRELATION_BOUND,
     FREQUENCIES,
     MAX_HALVINGS,
+    REFIT_CORRELATION_CAP,
     SPOT_BUMP,
     TENT_SIZE,
     VOL_BUMP,
@@ -241,6 +248,17 @@ STUDY_C_RULE_SKEW_PILLARS: tuple[float, float] = (1.0, 3.0)
 #: world anticipates itself), +2 / +3 rota clear both thresholds; the proxy noise at 2e4 paths is
 #: 0.001-0.003 (0.002-0.005 at 4e3)
 STUDY_C_SKEW_MOVE_THRESHOLD = 0.005
+#: study C: the path count of the recalibration rule's forward-start strips (the world strip and
+#: its pricing-model twin; ``RecalibrationRule.strip_paths``), independent of the 2·10⁴ world
+#: paths.  Owner's decision of 2026-09-16 on the pinning diagnosis: at 2·10⁴ strip paths the
+#: state surface's curvature is unconverged (3M / 1Y / 3Y −1.22 / −0.53 / −0.34 against
+#: −0.56 / +0.39 / +0.56 at 1.6·10⁵ on the named autocall state), step 0's radicand guard fires
+#: at every pillar and 41 of the 113 ``sabr_linked`` refits of the 2026-09-15 runs pinned their
+#: correlations; from 8·10⁴ no pillar is guarded on that named state and the fit is regular — but
+#: not everywhere: on the 1y daily VKO put world the 3M pillar still reads a degenerate step 0 on
+#: 136 of 252 dates at 8·10⁴ and the guarded fallback carries it (see
+#: :data:`~volsto.hedging.hedger.DEFAULT_STRIP_PATHS`)
+STUDY_C_STRIP_PATHS = 80_000
 
 #: the studies rebalance on the frequency grid only (:class:`~volsto.hedging.hedger.Schedule`
 #: ``product_fixings``): the M8 default adds every product fixing as a rebalancing date, which
@@ -741,6 +759,32 @@ def refits_at_bound(recalibrations: pd.DataFrame) -> int:
     return n
 
 
+def _refits_flagged(recalibrations: pd.DataFrame, column: str) -> int:
+    """How many fired refits carry ``column`` true; ``-1`` when the run did not record the
+    column (a run from before it existed)."""
+    if recalibrations.empty or "recalibrated" not in recalibrations:
+        return 0
+    if column not in recalibrations:
+        return -1
+    fired = recalibrations.loc[recalibrations["recalibrated"].astype(bool)]
+    return int(fired[column].fillna(False).astype(bool).sum())
+
+
+def refits_fallback(recalibrations: pd.DataFrame) -> int:
+    """How many of a run's refits used the guarded correlation fallback (step 0's radicand
+    guard or ``rho`` clip at some pillar of that date's state surface: the base fit's
+    ``correl_target`` held, :func:`~volsto.hedging.hedger.refit_targets`); ``-1`` when the run
+    predates the record."""
+    return _refits_flagged(recalibrations, "fallback_applied")
+
+
+def refits_capped(recalibrations: pd.DataFrame) -> int:
+    """How many of a run's refits had their correlation target capped at
+    :data:`~volsto.hedging.hedger.REFIT_CORRELATION_CAP`; ``-1`` when the run predates the
+    record."""
+    return _refits_flagged(recalibrations, "corr_capped")
+
+
 def recalibration_by_date(
     hedger: RecordingHedger, result: HedgeResult
 ) -> tuple[list[dict[str, float]], str | None]:
@@ -830,6 +874,10 @@ class TaskResult:
     #: refits whose fitted set has a correlation at its bound (-1: not recorded, a run from
     #: before the flag existed whose JSON was not backfilled)
     n_refits_at_bound: int = -1
+    #: refits that used the guarded correlation fallback / whose correlation target was capped
+    #: (-1: not recorded, a run from before the rebuilt refit of 2026-09-16)
+    n_refits_fallback: int = -1
+    n_refits_capped: int = -1
     world_value_0: tuple[float, float] | None = None
     static_spread: tuple[float, float] | None = None
     settings: dict[str, Any] = field(default_factory=dict)
@@ -1222,6 +1270,31 @@ def build_strategy(task: Task, product: Product, hedger: Hedger) -> Strategy:
     return default_strategy(product, pc)
 
 
+def study_c_rule(policy: str, env: StudyEnvironment) -> RecalibrationRule:
+    """Study C's recalibration rule under ``policy``: the simulated refit solves the SAME
+    constraint as the static greek's marking fit (SPX: the two-point skew constraint at 1Y / 3Y,
+    the 5Y pillar being beyond the snapshot), the rule reads the world's state surface at
+    :data:`STUDY_C_RULE_PILLARS` from strips of :data:`STUDY_C_STRIP_PATHS` paths, triggers at
+    :data:`STUDY_C_SKEW_MOVE_THRESHOLD` and caps the refit's correlation target at the hedger's
+    :data:`~volsto.hedging.hedger.REFIT_CORRELATION_CAP` (with the guarded fallback,
+    :func:`~volsto.hedging.hedger.refit_targets`)."""
+    rcfg = dataclasses.replace(
+        env.fit_spec.config,
+        pillars=STUDY_C_RULE_PILLARS,
+        mat_min=0.0,
+        skew_pillars=STUDY_C_RULE_SKEW_PILLARS,
+    )
+    return RecalibrationRule(
+        pillars=STUDY_C_RULE_PILLARS,
+        fit_config=rcfg,
+        policy=policy,
+        ssr_target=env.fit_spec.ssr_target,
+        skew_move_threshold=STUDY_C_SKEW_MOVE_THRESHOLD,
+        strip_paths=STUDY_C_STRIP_PATHS,
+        correlation_cap=REFIT_CORRELATION_CAP,
+    )
+
+
 def make_hedger(task: Task, env: StudyEnvironment) -> tuple[Hedger, Product, dict[str, Any]]:
     """The hedger, product and world metadata of a task (no run)."""
     cfg = env.cfg
@@ -1237,27 +1310,14 @@ def make_hedger(task: Task, env: StudyEnvironment) -> tuple[Hedger, Product, dic
         if task.policy != "none":
             if task.policy not in RECALIBRATION_POLICIES:
                 raise ValueError(f"policy must be 'none' or one of {RECALIBRATION_POLICIES}")
-            # the simulated refit solves the SAME constraint as the static greek's marking fit
-            # (SPX: the two-point skew constraint at 1Y / 3Y, the 5Y pillar being beyond the
-            # snapshot): the rule reads the world's state surface at STUDY_C_RULE_PILLARS
-            rcfg = dataclasses.replace(
-                env.fit_spec.config,
-                pillars=STUDY_C_RULE_PILLARS,
-                mat_min=0.0,
-                skew_pillars=STUDY_C_RULE_SKEW_PILLARS,
-            )
-            rule = RecalibrationRule(
-                pillars=STUDY_C_RULE_PILLARS,
-                fit_config=rcfg,
-                policy=task.policy,
-                ssr_target=env.fit_spec.ssr_target,
-                skew_move_threshold=STUDY_C_SKEW_MOVE_THRESHOLD,
-            )
+            rule = study_c_rule(task.policy, env)
             meta["rule_config"] = {
                 "pillars": list(STUDY_C_RULE_PILLARS),
                 "skew_pillars": list(STUDY_C_RULE_SKEW_PILLARS),
-                "skew_eps": rcfg.skew_eps,
+                "skew_eps": rule.config().skew_eps,
                 "skew_move_threshold": rule.skew_move_threshold,
+                "strip_paths": rule.strip_paths,
+                "correlation_cap": rule.correlation_cap,
                 "static_greek_config": "fit_2f_marking on the full snapshot surface, "
                 "BreakEvenFitConfig(skew_eps=fit spec's) with its skew pillars relocated to "
                 "the snapshot's last pillar (1Y / 3Y on SPX)",
@@ -1371,6 +1431,8 @@ def summarize(
         recal_by_date=recal_rows,
         n_refits=n_refits,
         n_refits_at_bound=refits_at_bound(result.recalibrations),
+        n_refits_fallback=refits_fallback(result.recalibrations),
+        n_refits_capped=refits_capped(result.recalibrations),
         world_value_0=world_v0,
         static_spread=spread,
         settings=_jsonable(result.settings),
@@ -1570,6 +1632,7 @@ def project(tasks: Sequence[Task], env: StudyEnvironment) -> Projection:
     missing: dict[str, str] = {}
     notes: list[str] = []
     memo: dict[tuple[str, str, str, str], float] = {}
+    strip_memo: dict[tuple[str, str], float] = {}
     total = 0.0
     for task in tasks:
         product = env.product(task.product)
@@ -1606,6 +1669,17 @@ def project(tasks: Sequence[Task], env: StudyEnvironment) -> Projection:
                 product, strategy, grid, n_pricing_models(strategy), bumps
             )
         secs = memo[mk]
+        strip_secs = 0.0
+        if task.study == "C" and task.policy not in (None, "none"):
+            # the recalibration rule's two strips (world + twin) at their own path count; the
+            # world strip is probed on the pricing model (the shock world has the same grid)
+            sk = (task.product, task.frequency)
+            if sk not in strip_memo:
+                strip_memo[sk] = h.projected_strip_seconds(
+                    product, study_c_rule(str(task.policy), env)
+                )
+            strip_secs = strip_memo[sk]
+            secs = secs + strip_secs
         total += secs
         for lab, st in need:
             if not env.cache.has(st.spec):
@@ -1614,6 +1688,7 @@ def project(tasks: Sequence[Task], env: StudyEnvironment) -> Projection:
             {
                 "key": task.key,
                 "projected_seconds": secs,
+                "strip_seconds": strip_secs,
                 "missing": miss_here,
                 "targets": list(strategy.target_names),
             }
@@ -1622,6 +1697,11 @@ def project(tasks: Sequence[Task], env: StudyEnvironment) -> Projection:
         notes.append(
             "each refit inside a recalibration run is one more calibration at "
             f"{env.cfg.refit_particles} particles unless cached (not counted ahead)"
+        )
+        notes.append(
+            "the recalibration rows count the rule's two strips at "
+            f"{STUDY_C_STRIP_PATHS} paths (world + pricing-model twin), "
+            f"{sum(r['strip_seconds'] for r in per_task):.0f} s in total"
         )
     if any(t.study == "A" and t.pricing == "LV" for t in tasks):
         notes.append("LV pricing needs no leverage")
@@ -1898,7 +1978,10 @@ def table_C(
     ``refits_at_bound`` / ``contaminated`` (:func:`refits_at_bound`): a row whose refits pinned
     a correlation prices under perfectly correlated factors and is **excluded from the study's
     conclusion** — the simulated shadow there measures the fitter railing as much as the cost of
-    re-marking (§8.2, owner's decision of 2026-09-16)."""
+    re-marking (§8.2, owner's decision of 2026-09-16); ``refits_fallback`` / ``refits_capped``
+    (:func:`refits_fallback`, :func:`refits_capped`): the refits of the row that held the base
+    fit's correlation target because step 0 was degenerate on that date's state surface, and
+    those whose correlation target was capped (``-1``: a run from before the record)."""
     static = static or {}
     res = [r for r in results if r.study == "C"]
     by_key = {(r.product, r.policy, r.rota): r for r in res}
@@ -1948,6 +2031,8 @@ def table_C(
                 "n_refits": r.n_refits,
                 "refits_at_bound": r.n_refits_at_bound,
                 "contaminated": r.n_refits_at_bound > 0,
+                "refits_fallback": r.n_refits_fallback,
+                "refits_capped": r.n_refits_capped,
                 "refit_dates": ";".join(f"{d['t']:.4g}" for d in r.recal_by_date),
                 "recal_by_date_desk": ";".join(
                     f"{-d['mean']:+.4f}+/-{d['stderr']:.4f}" for d in r.recal_by_date
@@ -2067,8 +2152,14 @@ TABLE_HEADERS: dict[str, str] = {
         "delta method; the rota runs share the world seed, so it is conservative). "
         "`refits_at_bound` counts the refits of the row that landed with a fitted correlation "
         "at its bound and `contaminated` marks the row: such rows are reported but EXCLUDED "
-        "from the study's conclusion, the marking fit being infeasible for the 2F "
-        "parameterisation at that mid-life state (owner's decision, 2026-09-16)."
+        "from the study's conclusion (owner's decision, 2026-09-16; measured cause on the "
+        "2026-09-15 runs: the rule's strip curvature unconverged at 2e4 paths fired step 0's "
+        "radicand guard, Corr_SABR clipped to -1 and the collapsed set was step 3's exact "
+        "minimiser). The rule's strips run at "
+        f"{STUDY_C_STRIP_PATHS} paths; `refits_fallback` counts the refits that held the base "
+        "fit's correlation target because step 0 was degenerate on that date's state surface, "
+        f"`refits_capped` those whose |Corr_BE| target was capped at {REFIT_CORRELATION_CAP:g} "
+        "(-1: not recorded, a run from before 2026-09-16)."
     ),
     "D": (
         "Study D — delta-regime P&L: world = pricing (2F), delta only under each §7.2 regime; "
