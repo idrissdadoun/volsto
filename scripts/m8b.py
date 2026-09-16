@@ -44,6 +44,7 @@ from volsto.studies.m8b import (
     DEFAULT_ROTATION_PATHS,
     RECALIBRATIONS_C,
     STUDIES,
+    STUDY_C_CURVATURE_H,
     STUDY_C_STRIP_PATHS,
     StudyConfig,
     StudyEnvironment,
@@ -62,6 +63,11 @@ from volsto.studies.m8b import (
     static_prediction,
     write_tables,
 )
+
+
+def _curv_h() -> str:
+    """Study C's curvature stencil as the report states it."""
+    return "= h (three strikes)" if STUDY_C_CURVATURE_H is None else f"{STUDY_C_CURVATURE_H:g}"
 
 
 def parse_args() -> argparse.Namespace:
@@ -170,7 +176,8 @@ def main() -> None:
         f"frequency {cfg.frequency or 'rule (daily <= 1y, weekly beyond; A monthly)'}, "
         f"calibrate {'yes' if cfg.allow_calibrate else 'NO (skip on a cache miss)'}, "
         f"stream_bumps {cfg.stream_bumps}, control_variate {cfg.control_variate}, out {cfg.out}; "
-        f"study C recalibration strips at {STUDY_C_STRIP_PATHS} paths",
+        f"study C recalibration strips at {STUDY_C_STRIP_PATHS} paths, forward-moneyness "
+        f"strikes, curvature stencil {_curv_h()}",
         flush=True,
     )
     print(f"[m8b] discriminator gate for world (ii): {gate.verdict!r} — {gate.reason}", flush=True)
@@ -252,7 +259,8 @@ def main() -> None:
         f"particles ({cfg.refit_particles} for refits), seed {cfg.seed}, frequency "
         f"{cfg.frequency or 'rule (daily <= 1y, weekly beyond; A monthly)'}, stream_bumps "
         f"{cfg.stream_bumps}, control_variate {cfg.control_variate}; study C recalibration "
-        f"strips at {STUDY_C_STRIP_PATHS} paths (world + twin)",
+        f"strips at {STUDY_C_STRIP_PATHS} paths (world + twin; forward-moneyness strikes, "
+        f"curvature stencil {_curv_h()}; delta control {cfg.control_delta})",
         f"pricing model: {cfg.marking_fit.name} at {cfg.n_particles} particles; world (ii) gate: "
         f"{gate.verdict!r} — {gate.reason}",
         f"static greeks of study C: {cfg.rotation_paths} paths, {cfg.rotation_particles} particles "

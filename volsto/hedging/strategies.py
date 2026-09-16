@@ -17,15 +17,18 @@ changes (stability, lower costs).  Target names are the sensitivities of the con
 engine (:mod:`volsto.hedging.pricing`): ``delta``, ``gamma`` (per unit spot, ``"model"`` regime;
 another delta regime — ``sticky_strike``, ``sticky_skew``, ``sticky_moneyness``,
 ``sticky_local_vol`` — replaces ``delta`` by the bump of that regime's surface move, §7.2, so the
-regime question becomes a P&L comparison), ``vega`` (parallel +1 vp of the pricing surface,
-leverage recalibrated), ``fwd_var:<lo>-<hi>`` (a forward-variance bucket, §7.5), ``skew_T:<T>`` /
-``curvature_T:<T>`` (the §7.6 tents at the risk pillars), ``vanna`` (``∂vega/∂ln S`` from the
-regressed vega polynomial), ``volga`` (second difference in the parallel vol), ``dX1`` / ``dX2``
-(the value gradient in the pricing factors), and ``param:<name>`` (a model-parameter bump, §7.9).
-Which of these the hedger can build depends on the pricing context (a Black–Scholes model offers
-``vega`` / ``volga`` through its own vol; surface bumps need a calibration state and the leverage
-cache); an unavailable target raises with the list of the available ones.  **Static legs**
-(``static``: instrument name → quantity, constant or a callable of ``t``) are held as given and
+regime question becomes a P&L comparison; ``min_variance`` replaces it by the pricing model's
+minimum-variance spot-only delta, the model delta plus the vol-correlation term
+:func:`~volsto.hedging.hedger.min_variance_delta`, the benchmark of M8b study D), ``vega`` (parallel
++1 vp of the pricing surface, leverage recalibrated), ``fwd_var:<lo>-<hi>`` (a forward-variance
+bucket, §7.5), ``skew_T:<T>`` / ``curvature_T:<T>`` (the §7.6 tents at the risk pillars), ``vanna``
+(``∂vega/∂ln S`` from the regressed vega polynomial), ``volga`` (second difference in the parallel
+vol), ``dX1`` / ``dX2`` (the value gradient in the pricing factors), and ``param:<name>`` (a
+model-parameter bump, §7.9). Which of these the hedger can build depends on the pricing context (a
+Black–Scholes model offers ``vega`` / ``volga`` through its own vol; surface bumps need a
+calibration state and the leverage cache); an unavailable target raises with the list of the
+available ones.  **Static legs** (``static``: instrument name → quantity, constant or a callable of
+``t``) are held as given and
 their sensitivities subtracted before the solve — the payoff-derived replication pieces (a
 digital's call spread, the cliquet's cap-call strip, a knock-in's in–out parity) live there.
 
@@ -112,7 +115,14 @@ DEFAULT_RIDGE = 1e-3
 #: an instrument's squared sensitivity below this fraction of its first-date cross-path level
 #: on a path makes it dead there (quantity 0): see GreekTargetStrategy.solve
 DEAD_SENSITIVITY = 1e-12
-DELTA_REGIMES = ("model", "sticky_strike", "sticky_skew", "sticky_moneyness", "sticky_local_vol")
+#: the §7.2 surface regimes: the delta is the CRN bump of the regime's moved surface, the leverage
+#: recalibrated (:meth:`~volsto.hedging.hedger.PricingContext.regime_delta_bump`)
+SURFACE_DELTA_REGIMES = ("sticky_strike", "sticky_skew", "sticky_moneyness", "sticky_local_vol")
+#: the minimum-variance spot-only delta of the pricing model (owner's decision of 2026-09-16, M8b
+#: study D): ``Δ_model + Σ_i (∂V/∂X_i) d⟨X_i, S⟩ / d⟨S, S⟩`` — no extra simulation, the value
+#: gradients of the regression (:func:`~volsto.hedging.hedger.min_variance_delta`)
+MIN_VARIANCE_REGIME = "min_variance"
+DELTA_REGIMES = ("model", *SURFACE_DELTA_REGIMES, MIN_VARIANCE_REGIME)
 #: default smoothing width of the digital call-spread replication (fraction of the level, §6.9)
 DEFAULT_DIGITAL_WIDTH = 0.02
 
@@ -804,7 +814,9 @@ def default_strategy(product: Product, ctx: PresetContext, **kwargs: Any) -> Gre
 __all__ = [
     "DEFAULT_DIGITAL_WIDTH",
     "DELTA_REGIMES",
+    "MIN_VARIANCE_REGIME",
     "PRESETS",
+    "SURFACE_DELTA_REGIMES",
     "CustomStrategy",
     "GreekTargetStrategy",
     "HedgeSolution",

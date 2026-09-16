@@ -15,6 +15,7 @@ import math
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from volsto.calibration.cache import CacheMissError
@@ -95,11 +96,12 @@ def test_task_enumeration_counts_keys_and_frequencies() -> None:
     c = enumerate_tasks("C", gate=REAL)
     d = enumerate_tasks("D", gate=REAL)
     # A: (7 cliquet + 3 FVA strategies) x 2 pricing models; B: 5 products x 4 worlds;
-    # C: 5 products x 3 rotas x 3 recalibrations; D: 2 products x 4 regimes
+    # C: 5 products x 3 rotas x 3 recalibrations; D: 2 products x (4 regimes + min_variance)
     assert len(a.tasks) == 2 * (1 + 2 * len(Q_SWEEP) + 3) == 20
     assert len(b.tasks) == len(BOOK) * len(WORLDS_B) == 20
     assert len(c.tasks) == len(BOOK) * len(ROTAS) * len(RECALIBRATIONS_C) == 45
-    assert len(d.tasks) == 2 * len(REGIMES_D) == 8
+    assert len(d.tasks) == 2 * len(REGIMES_D) == 10
+    assert REGIMES_D[-1] == "min_variance"
     for tl in (a, b, c, d):
         keys = [t.key for t in tl.tasks]
         assert len(set(keys)) == len(keys)
@@ -230,6 +232,9 @@ def test_n_pricing_models_counts_bump_simulations() -> None:
     assert n_pricing_models(GreekTargetStrategy((Target("delta"), Target("vanna")), [Spot()])) == 5
     r = GreekTargetStrategy((Target("delta"),), [Spot()], delta_regime="sticky_strike")
     assert n_pricing_models(r) == 5
+    # the minimum-variance delta needs no extra simulation (the value regression's gradients)
+    mv = GreekTargetStrategy((Target("delta"),), [Spot()], delta_regime="min_variance")
+    assert n_pricing_models(mv) == 3
 
 
 # --------------------------------------------------------------------------------------------
@@ -515,14 +520,11 @@ def test_table_builders_on_synthetic_results(tmp_path: Path) -> None:
         -0.02
     )
     assert rn["static_prediction"] == pytest.approx(0.0055)
-    # D: winner and closest-to-model
-    rd = [
-        _synthetic("D", "vanilla 1y atm", strategy="delta only", regime=reg, std=(s, 0.001))
-        for reg, s in zip(REGIMES_D, (0.100, 0.130, 0.090, 0.105))
-    ]
+    # D: the distance ranking against the min_variance row (the full check is
+    # test_table_d_distance_to_the_min_variance_delta)
+    rd = _synthetic_d()
     td = table_D(rd)
-    assert td.loc[td["winner"], "regime"].tolist() == ["sticky_skew"]
-    assert td.loc[td["closest_to_model"], "regime"].tolist() == ["sticky_moneyness"]
+    assert td.loc[td["distance_rank"] == 1, "regime"].tolist() == ["sticky_strike"]
     # the writers: CSVs, the markdown with the placeholders, the results round trip from disk
     tables = build_tables([*res, rb, rb_same, *rc, *rd], skipped, static)
     md = write_tables(
@@ -554,6 +556,237 @@ def test_task_result_json_round_trip(tmp_path: Path) -> None:
         b.world_value_0 == (0.5, 0.01) and b.quantiles == r.quantiles and b.world_meta["nu"] == 2.91
     )
     assert b.notes == r.notes and b.study == "B"
+
+
+#: study D synthetic rows: (regime, std, mean delta, lambda*) and the per-path mean deltas' offsets
+_D_ROWS = (
+    ("model", 3.14, 0.650, 0.824),
+    ("sticky_strike", 1.93, 0.598, 0.899),
+    ("sticky_skew", 1.97, 0.599, 0.897),
+    ("sticky_moneyness", 3.06, 0.645, 0.830),
+    ("min_variance", 1.73, 0.535, 0.990),
+)
+
+
+def _synthetic_d(paths: bool = True) -> list[TaskResult]:
+    """Five study-D rows on one product; with ``paths`` each carries per-path mean deltas that
+    share a common path noise (the rows share their world paths), so the paired se of the
+    distance is far below the quadrature one."""
+    rng = np.random.default_rng(1)
+    common = 0.05 * rng.standard_normal(2_000)
+    out = []
+    for reg, std, md, lam in _D_ROWS:
+        per_path = md + common + 0.001 * rng.standard_normal(common.size)
+        per_path += md - per_path.mean()  # the mean exactly md
+        r = _synthetic(
+            "D",
+            "vanilla 1y atm",
+            strategy="delta only",
+            regime=reg,
+            std=(std, 0.01),
+            unit="% of spot",
+            delta_diag={
+                "mean_delta": (md, 0.05 / np.sqrt(1_000)),
+                "lambda_star": (lam, 0.001),
+                "std_at_lambda": (0.9 * std, 0.01),
+                "mv_delta_implied": (lam * md, 0.001),
+            },
+        )
+        if paths:
+            r.delta_path_means = per_path
+        out.append(r)
+    return out
+
+
+def _cell(df: pd.DataFrame, row: str, col: str) -> float:
+    return float(np.asarray(df[col].to_numpy(dtype=np.float64))[list(df.index).index(row)])
+
+
+def test_table_d_distance_to_the_min_variance_delta(tmp_path: Path) -> None:
+    """Table D on synthetic rows (owner's decision of 2026-09-16, reference changed the same
+    day): the fifth row, the in-sample lambda* columns with their se twins, the COMMON
+    minimum-variance delta (the precision-weighted mean of the four regime rows' ``λ* × mean
+    delta``, se = the perfect-correlation bound ``Σ w σ / Σ w``, the min_variance row not in it),
+    ``distance_to_mv`` = mean delta minus that value (se in quadrature), the distance ranking
+    (min_variance = 0, shown but not ranked) next to the std ranking, the min_variance row's
+    validity flag (within :data:`MV_BENCHMARK_VALIDITY_NSE` se's) and its raw-gradient note, the
+    headline and the two-sided reading in the header, and the per-path sidecar round trip."""
+    from volsto.studies.m8b import (
+        MV_BENCHMARK_VALIDITY_NSE,
+        MV_RAW_GRADIENT_NOTE,
+        STUDY_D_HEADLINE,
+        STUDY_D_READING,
+        common_mv_delta,
+        delta_path_means,
+    )
+
+    rows = _synthetic_d()
+    implied = np.array([lam * md for reg, _, md, lam in _D_ROWS if reg != "min_variance"])
+    common = float(implied.mean())  # equal se's: the plain mean
+    td = table_D(rows)
+    assert td["regime"].tolist() == list(REGIMES_D)
+    for col in (
+        "mean_delta",
+        "distance_to_mv",
+        "lambda_star",
+        "std_at_lambda",
+        "mv_delta_implied",
+        "mv_common",
+    ):
+        assert col in td.columns and f"{col}_se" in td.columns
+        assert np.isfinite(td[col]).all() and np.isfinite(td[f"{col}_se"]).all()
+    assert "winner" not in td.columns and "closest_to_model" not in td.columns
+    by = td.set_index("regime")
+    assert np.allclose(td["mv_common"].to_numpy(dtype=float), common, rtol=0, atol=1e-15)
+    assert np.allclose(td["mv_common_se"].to_numpy(dtype=float), 0.001, rtol=0, atol=1e-15)
+    spread = td["mv_common_spread"].to_numpy(dtype=float)
+    assert np.allclose(spread, float(np.ptp(implied)), rtol=0, atol=1e-15)
+    assert (td["mv_common_rows"] == 4).all()
+    md_se = 0.05 / np.sqrt(1_000)
+    for reg, _, md, _ in _D_ROWS:
+        assert by.loc[reg, "distance_to_mv"] == pytest.approx(md - common, abs=1e-12), reg
+        assert _cell(by, reg, "distance_to_mv_se") == pytest.approx(float(np.hypot(md_se, 0.001)))
+    assert (td["distance_se_kind"] == "quadrature").all()
+    assert by["distance_rank"].to_dict() == {
+        "model": 4,
+        "sticky_strike": 1,
+        "sticky_skew": 2,
+        "sticky_moneyness": 3,
+        "min_variance": 0,
+    }
+    assert by["std_rank"].to_dict() == {
+        "min_variance": 1,
+        "sticky_strike": 2,
+        "sticky_skew": 3,
+        "sticky_moneyness": 4,
+        "model": 5,
+    }
+    assert by.loc["model", "mv_delta_implied"] == pytest.approx(0.824 * 0.650)
+    # the min_variance row: valid here (|z| < 1), its note empty; the regime rows carry no flag
+    z = (0.535 - common) / float(np.hypot(md_se, 0.001))
+    assert by.loc["min_variance", "mv_valid"] is True and abs(z) < 1.0
+    assert _cell(by, "min_variance", "mv_z") == pytest.approx(z)
+    assert by.loc["min_variance", "mv_note"] == ""
+    assert by.loc[list(REGIMES_D[:4]), "mv_valid"].isna().all()
+    assert STUDY_D_HEADLINE in TABLE_HEADERS["D"] and "IN-SAMPLE" in TABLE_HEADERS["D"]
+    assert STUDY_D_READING in TABLE_HEADERS["D"] and "COMMON" in TABLE_HEADERS["D"]
+    assert "NOT the minimum-variance spot-only hedge" in STUDY_D_HEADLINE
+    assert "BELOW the model delta" in STUDY_D_READING and "ABOVE it" in STUDY_D_READING
+    # the common value ignores the min_variance row's own implied value and weights by precision
+    moved = _synthetic_d()
+    moved[-1].delta_diag["mv_delta_implied"] = (0.9, 1e-6)
+    moved[0].delta_diag["mv_delta_implied"] = (0.60, 0.002)
+    ok = {r.regime: r for r in moved if r.regime is not None}
+    val, se, spread_w, n = common_mv_delta(ok)
+    w = np.array([1 / 0.002**2, 1e6, 1e6, 1e6])
+    v_rows = np.array([0.60, *implied[1:]])
+    sig = np.array([0.002, 0.001, 0.001, 0.001])
+    assert n == 4 and val == pytest.approx(float(np.sum(w * v_rows) / w.sum()))
+    assert se == pytest.approx(float(np.sum(w * sig) / w.sum()))
+    assert se > float(w.sum() ** -0.5)  # conservative: above the independent-rows se
+    assert spread_w == pytest.approx(float(np.ptp(v_rows)))
+    # an invalid benchmark row (its mean delta 0.01 above the common value, over 3 se) and the
+    # raw-gradient note of a run without a Black-Scholes proxy
+    bad = _synthetic_d()
+    bad[-1].delta_diag["mean_delta"] = (common + 0.01, 0.001)
+    bad[-1].notes = [f"{MV_RAW_GRADIENT_NOTE} for Autocall (no Black-Scholes proxy, ...)"]
+    tbad = table_D(bad).set_index("regime")
+    assert tbad.loc["min_variance", "mv_valid"] is False
+    assert _cell(tbad, "min_variance", "mv_z") > MV_BENCHMARK_VALIDITY_NSE
+    assert "raw regression gradients" in str(tbad.loc["min_variance", "mv_note"])
+    assert tbad["distance_rank"].to_dict() == by["distance_rank"].to_dict()
+    # a missing min_variance row: the regime rows keep their distances and ranks
+    tm = table_D(_synthetic_d()[:4]).set_index("regime")
+    assert tm.loc["min_variance", "status"] == "missing"
+    assert tm.loc["min_variance", "distance_rank"] == -1
+    assert tm.loc["sticky_strike", "distance_rank"] == 1 and tm.loc["model", "distance_rank"] == 4
+    assert tm.loc["sticky_strike", "std_rank"] == 1
+    # no regime row with an implied value: no common value, no distance
+    bare = _synthetic_d()
+    for r in bare[:4]:
+        del r.delta_diag["mv_delta_implied"]
+    tn = table_D(bare).set_index("regime")
+    assert (tn["distance_rank"] == -1).all() and tn["mv_common_rows"].eq(0).all()
+    assert bool(pd.isna(tn.loc["min_variance", "mv_valid"]))
+    # the per-path arrays round-trip through save_result / load_results (a sidecar .npy)
+    for r in rows:
+        save_result(r, None, tmp_path)
+    back = load_results(tmp_path, "D")
+    assert len(back) == 5 and all(b.delta_path_means is None for b in back)
+    assert all(Path(b.delta_paths_file).is_file() for b in back)
+    mv_back = next(b for b in back if b.regime == "min_variance")
+    arr = delta_path_means(mv_back)
+    written = rows[-1].delta_path_means
+    assert arr is not None and written is not None and np.array_equal(arr, written)
+    assert mv_back.delta_diag["lambda_star"] == (0.990, 0.001)
+    tb = table_D(back).set_index("regime")
+    assert tb.loc["model", "distance_to_mv"] == pytest.approx(by.loc["model", "distance_to_mv"])
+    assert tb["distance_rank"].to_dict() == by["distance_rank"].to_dict()
+
+
+def test_delta_diagnostics_recover_the_variance_minimising_scale() -> None:
+    """``delta_diagnostics`` on a synthetic run whose product leg is ``−0.8 ×`` its hedge leg
+    plus independent noise: ``λ* = 0.8`` within its bootstrap se, the std at ``λ*`` the noise's,
+    the relative delta ``S₀ Δ scale/100`` and ``λ* × mean delta``."""
+    import pandas as pd
+
+    from volsto.engine.paths import PathSet
+    from volsto.hedging.hedger import HedgeResult
+    from volsto.studies.m8b import delta_diagnostics
+
+    rng = np.random.default_rng(3)
+    n, n_dates = 4_000, 5
+    hedge = rng.standard_normal(n)
+    noise = 0.3 * rng.standard_normal(n)
+    product = -0.8 * hedge + noise
+    delta = 0.6 + 0.01 * rng.standard_normal((n_dates, n))
+    times = np.array([0.0, 1.0])
+    ps = PathSet(
+        times,
+        np.zeros((n, 2)),
+        np.zeros((n, 2)),
+        np.zeros((n, 2, 0)),
+        np.zeros((n, 2)),
+        np.zeros((n, 2)),
+    )
+    res = HedgeResult(
+        "p",
+        "s",
+        np.linspace(0, 0.8, n_dates),
+        ("spot",),
+        ("delta",),
+        product,
+        hedge[:, None],
+        np.zeros(n),
+        np.zeros(n),
+        np.full(n, np.nan),
+        1.0,
+        0.01,
+        pd.DataFrame(),
+        pd.DataFrame(),
+        pd.DataFrame(),
+        ps,
+        (),
+        pd.DataFrame(),
+        {},
+        greeks_by_date={"delta": delta},
+    )
+    spot, scale = 200.0, 100.0 / 200.0  # the vanilla convention: relative delta = delta
+    diag, per_path = delta_diagnostics(res, scale, spot)
+    lam, lam_se = diag["lambda_star"]
+    print(diag)
+    assert abs(lam - 0.8) < 4 * lam_se and 0 < lam_se < 0.02
+    s, s_se = diag["std_at_lambda"]
+    assert abs(s - 0.3 * scale) < 4 * s_se + 0.01 * scale
+    md, md_se = diag["mean_delta"]
+    assert md == pytest.approx(float(delta.mean())) and abs(md - 0.6) < 4 * md_se
+    assert per_path.shape == (n,) and np.allclose(per_path, delta.mean(axis=0))
+    mv, mv_se = diag["mv_delta_implied"]
+    assert mv == pytest.approx(lam * md) and mv_se > 0
+    diag2, _ = delta_diagnostics(res, 100.0, spot)  # notional convention: S0 x delta
+    assert diag2["mean_delta"][0] == pytest.approx(spot * md)
+    with pytest.raises(ValueError, match="per-date delta"):
+        delta_diagnostics(dataclasses.replace(res, greeks_by_date={}), scale, spot)
 
 
 # --------------------------------------------------------------------------------------------
@@ -759,6 +992,48 @@ def test_study_d_vanilla_regime_ranking(tmp_path: Path) -> None:
         pytest.skip(f"cached leverage absent (tests never calibrate): {exc}")
     td = table_D(results)
     print(
-        "D vanilla 1y:\n", td[["regime", "std", "std_se", "winner", "closest_to_model"]].to_string()
+        "D vanilla 1y:\n",
+        td[["regime", "std", "std_se", "std_rank", "distance_to_mv", "distance_rank"]].to_string(),
     )
-    assert np.isfinite(td["std"]).all() and td["winner"].sum() == 1
+    assert np.isfinite(td["std"]).all() and (td["std_rank"] == 1).sum() == 1
+    assert (td["distance_rank"] == 0).sum() == 1 and np.isfinite(td["distance_to_mv"]).all()
+
+
+#: the study-D case's in-sample variance-minimising delta (diagnosis of 2026-09-16: λ* × mean
+#: delta of the four regime rows, 0.5342–0.5377, on 2·10⁴ paths)
+MV_DELTA_2F = 0.535
+
+
+@pytest.mark.slow
+def test_study_d_min_variance_benchmark_2f(tmp_path: Path) -> None:
+    """The study-D vanilla case itself (1y ATM call, 2F marking LSV at 8·10⁵ particles from the
+    cache, daily, 2·10⁴ paths — never calibrating): the ``min_variance`` row's mean delta sits at
+    the in-sample λ*-implied minimum-variance delta (0.535, and the model row's own λ* × mean
+    delta; loose, stderr-based) and its hedged std at or below the best of the four regimes
+    (stderr-based)."""
+    cfg = _cfg(tmp_path, n_particles=800_000)
+    try:
+        env = StudyEnvironment(cfg)
+        tasks = [t for t in enumerate_tasks("D", cfg, REAL).tasks if t.product == "vanilla 1y atm"]
+        results = {}
+        for task in tasks:
+            res = run_task(task, cfg, env, save=False)
+            _skip_if(res)
+            results[task.regime] = res
+    except CacheMissError as exc:
+        pytest.skip(f"cached leverage absent (tests never calibrate): {exc}")
+    td = table_D(list(results.values()))
+    print(td.drop(columns=["reason"]).to_string())
+    assert env.calibrations == 0
+    mv = results["min_variance"]
+    md, md_se = mv.delta_diag["mean_delta"]
+    ref, ref_se = results["model"].delta_diag["mv_delta_implied"]
+    tol = 5.0 * float(np.hypot(md_se, ref_se)) + 0.01
+    assert abs(md - MV_DELTA_2F) < tol and abs(md - ref) < tol, (md, md_se, ref, ref_se)
+    best = min(REGIMES_D[:4], key=lambda k: results[k].std[0])
+    b = results[best]
+    assert mv.std[0] <= b.std[0] + 3.0 * float(np.hypot(mv.std[1], b.std[1])), (
+        mv.std,
+        best,
+        b.std,
+    )

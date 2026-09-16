@@ -83,10 +83,23 @@ product leg is ``payoff − V₀`` on every path, its recalibration P&L ``V(new)
   (:func:`~volsto.hedging.hedger.refit_targets`: the base fit's ``Corr_BE`` held on a date whose
   step-0 reduction is degenerate, ``|Corr_BE|`` capped at 0.97), both counted per row
   (``refits_fallback``, ``refits_capped``) next to ``refits_at_bound``.
-* **D — delta-regime P&L.**  The 1y ATM vanilla (strike = spot) and the 3y autocall, world =
+* **D — delta-regime P&L, read against the minimum-variance delta** (reinstated by the owner's
+  decision of 2026-09-16).  The 1y ATM vanilla (strike = spot) and the 3y autocall, world =
   pricing (2F), ``delta only`` under the §7.2 regimes ``model / sticky_strike / sticky_skew /
-  sticky_moneyness`` (:class:`~volsto.hedging.strategies.GreekTargetStrategy` with
-  ``delta_regime``); P&L std per regime, the winner and the regime closest to the model delta.
+  sticky_moneyness`` and the benchmark ``min_variance`` — the pricing model's minimum-variance
+  spot-only delta (:func:`~volsto.hedging.hedger.min_variance_delta`, the model delta plus the
+  vol-correlation term) — (:class:`~volsto.hedging.strategies.GreekTargetStrategy` with
+  ``delta_regime``).  **Headline:** the model delta is NOT the minimum-variance spot-only hedge
+  under its own model — the market is incomplete, the MV delta carries the vol-correlation term —
+  and the regimes rank by their distance to the common minimum-variance delta
+  (:data:`STUDY_D_HEADLINE`).  Per row (:func:`delta_diagnostics`): the P&L std, the mean delta,
+  the in-sample variance-minimising scale ``λ*`` of the row's hedge leg with the std at ``λ*`` and
+  the implied minimum-variance delta ``λ* × mean delta`` (in-sample: a benchmark, not a
+  strategy), and ``distance_to_mv`` = the row's mean delta minus the **common**
+  minimum-variance delta the four regime rows imply (:func:`common_mv_delta`); the
+  ``min_variance`` row is a fifth line with a validity flag (:func:`mv_benchmark_validity`).
+  The estimator's own cost is measured by
+  ``scripts/m8b_delta_estimator.py``.
 
 **Frequency rule** (:func:`frequency_for`): daily for maturities ≤ 1y, weekly beyond (the engine's
 default budget, SPEC §8.1); study A monthly; ``StudyConfig.frequency`` overrides.  The simulation
@@ -158,11 +171,13 @@ from volsto.hedging.hedger import (
     Schedule,
 )
 from volsto.hedging.instruments import Spot
-from volsto.hedging.pricing import Bump, ConditionalPricer, union_grid
+from volsto.hedging.pricing import DEFAULT_CONTROL_DELTA, Bump, ConditionalPricer, union_grid
 from volsto.hedging.report import attribution_table, distribution_table, regime_table
 from volsto.hedging.state import HedgeState
 from volsto.hedging.strategies import (
     DELTA_REGIMES,
+    MIN_VARIANCE_REGIME,
+    SURFACE_DELTA_REGIMES,
     GreekTargetStrategy,
     Strategy,
     Target,
@@ -225,8 +240,45 @@ Q_SWEEP: tuple[float, ...] = (0.5, 0.75, 1.0)
 #: study C shocks (rotas) and recalibration settings (``"none"`` = no rule)
 ROTAS: tuple[float, ...] = (1.0, 2.0, 3.0)
 RECALIBRATIONS_C: tuple[str, ...] = ("none", "sabr_linked", "sticky_breakeven")
-#: study D regimes (``sticky_local_vol`` is not in the owner's list)
-REGIMES_D: tuple[str, ...] = ("model", "sticky_strike", "sticky_skew", "sticky_moneyness")
+#: study D regimes (``sticky_local_vol`` is not in the owner's list) and the benchmark row, the
+#: minimum-variance delta (owner's decision of 2026-09-16: "the benchmark row as a fifth line")
+REGIMES_D: tuple[str, ...] = (
+    "model",
+    "sticky_strike",
+    "sticky_skew",
+    "sticky_moneyness",
+    MIN_VARIANCE_REGIME,
+)
+#: the study-D headline, in the owner's words (decision of 2026-09-16)
+STUDY_D_HEADLINE = (
+    "the model delta is NOT the minimum-variance spot-only hedge under its own model — "
+    "incomplete market, the MV delta carries the vol-correlation term — and for these products "
+    "sticky-strike and sticky-skew sit closest to it"
+)
+#: the measured two-sided reading of study D (2F, 2·10⁴ paths, 2026-09-16 measurement): the sign
+#: of the vol-correlation term follows the product's vega
+STUDY_D_READING = (
+    "for the 1y ATM call the minimum-variance delta lies BELOW the model delta (the "
+    "vol-correlation term is negative: the call is long vega and spot-vol correlation is "
+    "negative), for the 3y autocall ABOVE it (the note is short vol); in both cases "
+    "sticky-strike and sticky-skew sit closest to it"
+)
+#: the ``min_variance`` benchmark row is flagged valid (``mv_valid``) when its mean delta lies
+#: within this many standard errors (the two se's in quadrature) of the common
+#: minimum-variance delta the regime rows imply.  Measured (2026-09-16): the vanilla row at 2·10⁴
+#: pricing paths sits on the common value (0.5366 ± 0.0007 against 0.534–0.538), at 5·10³ it
+#: sits ~0.01 above it (0.5457 ± 0.0012 and 0.5476 ± 0.0012 against 0.533–0.540, over 4 se),
+#: and the autocall row (no Black–Scholes proxy: raw regression gradients) at 0.318 ± 0.002
+#: against 0.294–0.309
+MV_BENCHMARK_VALIDITY_NSE = 3.0
+#: the pricing note of a ``min_variance`` run whose factor gradients came from the raw value
+#: regression (:meth:`volsto.hedging.hedger.Hedger._run`, ``factor_gradients``)
+MV_RAW_GRADIENT_NOTE = "min_variance delta: no controlled value target"
+#: path-pair bootstrap draws (and seed) of the study-D delta diagnostics' standard errors
+#: (``λ*``, the std at ``λ*``, the implied minimum-variance delta): 200 resamples put the se's
+#: own relative error near 5%
+DELTA_DIAG_BOOTSTRAP = 200
+DELTA_DIAG_SEED = 11
 #: owner: "2e4 paths default"
 DEFAULT_N_PATHS = 20_000
 #: the largest simulation step (years): weekly, the M8 study-test step (``SIM_SMALL`` of
@@ -256,9 +308,18 @@ STUDY_C_SKEW_MOVE_THRESHOLD = 0.005
 #: at every pillar and 41 of the 113 ``sabr_linked`` refits of the 2026-09-15 runs pinned their
 #: correlations; from 8·10⁴ no pillar is guarded on that named state and the fit is regular — but
 #: not everywhere: on the 1y daily VKO put world the 3M pillar still reads a degenerate step 0 on
-#: 136 of 252 dates at 8·10⁴ and the guarded fallback carries it (see
+#: 136 of 252 dates at 8·10⁴ (133 after the forward-moneyness strip fix, 54 with a ±0.10
+#: curvature stencil) and the guarded fallback carries it (see
 #: :data:`~volsto.hedging.hedger.DEFAULT_STRIP_PATHS`)
 STUDY_C_STRIP_PATHS = 80_000
+#: study C: the half-width of the recalibration strip's curvature stencil
+#: (``RecalibrationRule.curvature_h``); ``None`` means equal to the strip's ``h`` (0.05), the
+#: three-strike strip.  THE OWNER'S CHOICE IS PENDING (2026-09-16): a wider stencil cuts the
+#: curvature's Monte Carlo noise (its error scales as ``1/(curvature_h √strip_paths)``) but
+#: smooths the curvature over the wings — measured on the pricing snapshot (SPX 2022-12-30),
+#: the 3M / 1Y / 3Y curvature read on the ``±0.10`` stencil exceeds the ``k → 0`` one by
+#: +0.066 / +0.016 / +0.004 (+0.016 / +0.004 / +0.001 at ``±0.05``)
+STUDY_C_CURVATURE_H: float | None = None
 
 #: the studies rebalance on the frequency grid only (:class:`~volsto.hedging.hedger.Schedule`
 #: ``product_fixings``): the M8 default adds every product fixing as a rebalancing date, which
@@ -318,6 +379,7 @@ class StudyConfig:
     allow_calibrate: bool = True
     stream_bumps: bool = False
     control_variate: bool = True
+    control_delta: bool = DEFAULT_CONTROL_DELTA
     rotation_particles: int = DEFAULT_ROTATION_PARTICLES
     rotation_paths: int = DEFAULT_ROTATION_PATHS
     marking_fit: Path = MARKING_FIT
@@ -718,8 +780,14 @@ class RecordingHedger(Hedger):
     created: list[_RecordingPricer] = field(default_factory=list, init=False, repr=False)
 
     def _pricer(
-        self, model: Model, objects: list[Product], grid: TimeGrid, bumps: Sequence[Bump]
+        self,
+        model: Model,
+        objects: list[Product],
+        grid: TimeGrid,
+        bumps: Sequence[Bump],
+        strategy: Strategy | None = None,
     ) -> ConditionalPricer:
+        mv = strategy is not None and strategy.delta_regime == MIN_VARIANCE_REGIME
         p = _RecordingPricer(
             model,
             objects,
@@ -730,6 +798,8 @@ class RecordingHedger(Hedger):
             stream_bumps=self.stream_bumps,
             scratch_dir=self.scratch_dir,
             control_variate=self.control_variate,
+            control_delta=self.control_delta,
+            control_value=bool(mv and self.control_variate),
             surface=self.context.surface,
         )
         self.created.append(p)
@@ -888,9 +958,26 @@ class TaskResult:
     wall_seconds: float = 0.0
     notes: list[str] = field(default_factory=list)
     world_meta: dict[str, Any] = field(default_factory=dict)
+    #: study D (:func:`delta_diagnostics`): ``mean_delta``, ``lambda_star``, ``std_at_lambda``,
+    #: ``mv_delta_implied`` as ``(value, se)`` — in-sample benchmarks
+    delta_diag: dict[str, tuple[float, float]] = field(default_factory=dict)
+    #: the ``.npy`` of the per-path time-averaged delta (study D; written by
+    #: :func:`save_result` next to the JSON, resolved by :func:`load_results`): paired
+    #: comparisons of two rows' deltas on their shared world paths (``distance_to_mv`` is read
+    #: against the common minimum-variance delta, :func:`common_mv_delta`, and does not use it);
+    #: empty when absent
+    delta_paths_file: str = ""
+    #: the per-path time-averaged delta itself (not serialised)
+    delta_path_means: FloatArray | None = field(default=None, repr=False, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = _jsonable(dataclasses.asdict(self))
+        d: dict[str, Any] = _jsonable(
+            {
+                f.name: getattr(self, f.name)
+                for f in dataclasses.fields(self)
+                if f.name != "delta_path_means"
+            }
+        )
         return d
 
     @classmethod
@@ -910,6 +997,7 @@ class TaskResult:
             if kw.get(k) is not None:
                 kw[k] = (_fl(kw[k][0]), _fl(kw[k][1]))
         kw["quantiles"] = {k: (_fl(v[0]), _fl(v[1])) for k, v in kw.get("quantiles", {}).items()}
+        kw["delta_diag"] = {k: (_fl(v[0]), _fl(v[1])) for k, v in kw.get("delta_diag", {}).items()}
         for k in ("rota", "wall_seconds", "scale"):
             if k in kw and kw[k] is not None:
                 kw[k] = _fl(kw[k])
@@ -955,6 +1043,88 @@ def _jsonable(x: Any) -> Any:
     return x
 
 
+#: suffix of a study-D result's per-path time-averaged delta, next to its JSON
+DELTA_PATHS_SUFFIX = ".delta.npy"
+
+
+def delta_path_means(res: TaskResult) -> FloatArray | None:
+    """A result's per-path time-averaged delta: the in-memory array, else the ``.npy`` its
+    ``delta_paths_file`` names (``None`` when neither is there)."""
+    if res.delta_path_means is not None:
+        return np.asarray(res.delta_path_means, dtype=np.float64)
+    if res.delta_paths_file and Path(res.delta_paths_file).is_file():
+        return np.asarray(np.load(res.delta_paths_file), dtype=np.float64)
+    return None
+
+
+def _pair_means(x: FloatArray) -> FloatArray:
+    """Means of consecutive path pairs (the world draws are antithetic pairs; pairing is valid
+    for independent paths too), a trailing odd path dropped."""
+    x = np.asarray(x, dtype=np.float64)
+    m = x.size // 2
+    return np.asarray(0.5 * (x[0 : 2 * m : 2] + x[1 : 2 * m : 2]), dtype=np.float64)
+
+
+def _pair_mean_se(x: FloatArray) -> tuple[float, float]:
+    """Mean and its standard error from the path pairs (:func:`_pair_means`)."""
+    pm = _pair_means(x)
+    if pm.size < 2:
+        return float(np.mean(x)), float("nan")
+    return float(np.mean(x)), float(pm.std(ddof=1) / np.sqrt(pm.size))
+
+
+def delta_diagnostics(
+    result: HedgeResult, scale: float, spot: float
+) -> tuple[dict[str, tuple[float, float]], FloatArray]:
+    """The study-D reading of one delta-only run (owner's decision of 2026-09-16), each as
+    ``(value, se)``, and the per-path time-averaged delta:
+
+    * ``mean_delta`` — the hedged ``delta`` over dates and world paths (terminated paths count as
+      0), as a **relative delta** ``S₀ Δ × scale / 100``: the value change in the table's unit
+      (÷ 100) per unit relative spot move — the plain per-unit-spot delta for the vanilla on one
+      share (``scale = 100/S₀``), ``S₀ Δ`` per unit notional for the autocall; se from the path
+      pairs;
+    * ``lambda_star`` — the in-sample variance-minimising scale of the row's hedge leg
+      ``λ* = −Cov(product leg, hedge leg)/Var(hedge leg)`` (the product leg: the P&L without the
+      hedge legs);
+    * ``std_at_lambda`` — the P&L std with the hedge leg scaled by ``λ*``;
+    * ``mv_delta_implied`` — ``λ* × mean_delta``, the minimum-variance delta the row implies.
+
+    ``λ*`` is fitted on the same paths it is scored on (in-sample): a benchmark the regime
+    ranking is read against, not a strategy.  The se's of the last three are path-pair bootstrap
+    standard deviations (:data:`DELTA_DIAG_BOOTSTRAP` resamples)."""
+    if "delta" not in result.greeks_by_date:
+        raise ValueError("delta_diagnostics needs the run's per-date delta (greeks_by_date)")
+    rel = float(spot) * float(scale) / 100.0
+    dmat = np.asarray(result.greeks_by_date["delta"], dtype=np.float64) * rel
+    per_path = np.asarray(dmat.mean(axis=0), dtype=np.float64)
+    hedge = np.asarray(result.pnl_hedges.sum(axis=1), dtype=np.float64) * scale
+    other = np.asarray(result.pnl_total, dtype=np.float64) * scale - hedge
+
+    def stats(o: FloatArray, h: FloatArray, d: FloatArray) -> tuple[float, float, float]:
+        var_h = float(h.var(ddof=1))
+        lam = -float(np.cov(o, h, ddof=1)[0, 1]) / var_h if var_h > 0.0 else float("nan")
+        return lam, float(np.std(o + lam * h, ddof=1)), lam * float(d.mean())
+
+    lam, s_lam, mv = stats(other, hedge, per_path)
+    n_pairs = per_path.size // 2
+    boot = np.full((DELTA_DIAG_BOOTSTRAP, 3), np.nan)
+    if n_pairs >= 2:
+        rng = np.random.default_rng(DELTA_DIAG_SEED)
+        for b in range(DELTA_DIAG_BOOTSTRAP):
+            pick = rng.integers(0, n_pairs, size=n_pairs)
+            ix = np.concatenate([2 * pick, 2 * pick + 1])
+            boot[b] = stats(other[ix], hedge[ix], per_path[ix])
+    se = boot.std(axis=0, ddof=1) if n_pairs >= 2 else np.full(3, np.nan)
+    out = {
+        "mean_delta": _pair_mean_se(per_path),
+        "lambda_star": (lam, float(se[0])),
+        "std_at_lambda": (s_lam, float(se[1])),
+        "mv_delta_implied": (mv, float(se[2])),
+    }
+    return out, per_path
+
+
 def result_paths(out: Path, task_or_key: Task | str, study: str | None = None) -> tuple[Path, Path]:
     key = task_or_key.key if isinstance(task_or_key, Task) else task_or_key
     st = task_or_key.study if isinstance(task_or_key, Task) else (study or key.split("__")[0])
@@ -965,6 +1135,10 @@ def result_paths(out: Path, task_or_key: Task | str, study: str | None = None) -
 def save_result(res: TaskResult, hedge: HedgeResult | None, out: Path) -> Path:
     jp, pp = result_paths(out, res.key, res.study)
     jp.parent.mkdir(parents=True, exist_ok=True)
+    if res.delta_path_means is not None:
+        dp = jp.with_suffix(DELTA_PATHS_SUFFIX)
+        np.save(dp, np.asarray(res.delta_path_means, dtype=np.float64))
+        res.delta_paths_file = dp.name
     jp.write_text(json.dumps(res.to_dict(), indent=1), encoding="utf-8")
     if hedge is not None:
         # without the world paths and the per-date Greek / move arrays (n_dates × n_paths each:
@@ -992,9 +1166,13 @@ def load_results(out: Path, study: str | None = None) -> list[TaskResult]:
             if p.name.startswith("static_") or p.name.startswith("_"):
                 continue
             try:
-                res.append(TaskResult.from_dict(json.loads(p.read_text(encoding="utf-8"))))
+                r = TaskResult.from_dict(json.loads(p.read_text(encoding="utf-8")))
             except (ValueError, TypeError, KeyError) as exc:
                 log.warning("skipping unreadable result %s: %s", p, exc)
+                continue
+            if r.delta_paths_file and not Path(r.delta_paths_file).is_absolute():
+                r.delta_paths_file = str(p.parent / r.delta_paths_file)
+            res.append(r)
     return res
 
 
@@ -1274,7 +1452,8 @@ def study_c_rule(policy: str, env: StudyEnvironment) -> RecalibrationRule:
     """Study C's recalibration rule under ``policy``: the simulated refit solves the SAME
     constraint as the static greek's marking fit (SPX: the two-point skew constraint at 1Y / 3Y,
     the 5Y pillar being beyond the snapshot), the rule reads the world's state surface at
-    :data:`STUDY_C_RULE_PILLARS` from strips of :data:`STUDY_C_STRIP_PATHS` paths, triggers at
+    :data:`STUDY_C_RULE_PILLARS` from strips of :data:`STUDY_C_STRIP_PATHS` paths (struck at
+    forward moneyness, the curvature on :data:`STUDY_C_CURVATURE_H`), triggers at
     :data:`STUDY_C_SKEW_MOVE_THRESHOLD` and caps the refit's correlation target at the hedger's
     :data:`~volsto.hedging.hedger.REFIT_CORRELATION_CAP` (with the guarded fallback,
     :func:`~volsto.hedging.hedger.refit_targets`)."""
@@ -1292,6 +1471,7 @@ def study_c_rule(policy: str, env: StudyEnvironment) -> RecalibrationRule:
         skew_move_threshold=STUDY_C_SKEW_MOVE_THRESHOLD,
         strip_paths=STUDY_C_STRIP_PATHS,
         correlation_cap=REFIT_CORRELATION_CAP,
+        curvature_h=STUDY_C_CURVATURE_H,
     )
 
 
@@ -1317,6 +1497,9 @@ def make_hedger(task: Task, env: StudyEnvironment) -> tuple[Hedger, Product, dic
                 "skew_eps": rule.config().skew_eps,
                 "skew_move_threshold": rule.skew_move_threshold,
                 "strip_paths": rule.strip_paths,
+                "strip_h": rule.h,
+                "curvature_h": rule.curvature_stencil,
+                "strip_strikes": "forward moneyness F(t+tau)/F(t) e^k",
                 "correlation_cap": rule.correlation_cap,
                 "static_greek_config": "fit_2f_marking on the full snapshot surface, "
                 "BreakEvenFitConfig(skew_eps=fit spec's) with its skew pillars relocated to "
@@ -1338,6 +1521,7 @@ def make_hedger(task: Task, env: StudyEnvironment) -> tuple[Hedger, Product, dic
         verbose=cfg.verbose,
         stream_bumps=cfg.stream_bumps,
         control_variate=cfg.control_variate,
+        control_delta=cfg.control_delta,
     )
     return h, product, dict(meta)
 
@@ -1403,6 +1587,10 @@ def summarize(
     )
     touched = max(keys_now - builder_before[0], 0)
     misses = max(miss_now - builder_before[1], 0)
+    diag: dict[str, tuple[float, float]] = {}
+    per_path: FloatArray | None = None
+    if task.study == "D" and "delta" in result.greeks_by_date:
+        diag, per_path = delta_diagnostics(result, scale, float(hedger.context.model.spot))
     return TaskResult(
         key=task.key,
         study=task.study,
@@ -1443,6 +1631,8 @@ def summarize(
         wall_seconds=float(wall),
         notes=notes,
         world_meta=_jsonable(meta),
+        delta_diag=diag,
+        delta_path_means=per_path,
     )
 
 
@@ -1513,7 +1703,7 @@ def n_pricing_models(strategy: Strategy) -> int:
             two += 1
         elif t.startswith(("fwd_var:", "skew_T:", "curvature_T:")):
             n += 1
-        elif t == "delta" and getattr(strategy, "delta_regime", "model") != "model":
+        elif t == "delta" and getattr(strategy, "delta_regime", "model") in SURFACE_DELTA_REGIMES:
             two += 1
     if "vanna" in names and "vega" not in names:
         two += 1
@@ -1566,7 +1756,7 @@ def required_states(
         if t.startswith("param:"):
             out.append((f"{t} (two states)", base))
     regime = getattr(strategy, "delta_regime", "model")
-    if "delta" in names and regime != "model":
+    if "delta" in names and regime in SURFACE_DELTA_REGIMES:
         for h in (SPOT_BUMP, -SPOT_BUMP):
             st, mode = spot_state(base, regime, h)
             if mode == "recalibrate":
@@ -2066,36 +2256,149 @@ def table_C(
     return df.sort_values(["_p", "rota", "_r"]).drop(columns=["_p", "_r"]).reset_index(drop=True)
 
 
+def common_mv_delta(rows: Mapping[str, TaskResult]) -> tuple[float, float, float, int]:
+    """The **common minimum-variance delta** of a study-D product: the precision-weighted mean of
+    the regime rows' in-sample implied minimum-variance deltas ``λ* × mean delta``
+    (:func:`delta_diagnostics`; the ``min_variance`` row excluded), as ``(value, se, spread,
+    n)`` — ``spread`` the largest minus the smallest row value, ``n`` the rows used (a row
+    without a finite value and a positive se is left out; NaN and 0 when none is left).
+
+    The rows share their world paths, so their implied values are positively correlated and the
+    independent-rows se ``(Σ w)^{-1/2}`` would understate the error; the se reported is the
+    perfect-correlation bound ``Σ w σ / Σ w`` (``w = 1/σ²``), which is conservative.  The
+    ``min_variance`` row itself is NOT the reference: it is not robust to the pricing path count
+    (:data:`MV_BENCHMARK_VALIDITY_NSE`)."""
+    nan = float("nan")
+    vals, ses = [], []
+    for regime, r in rows.items():
+        if regime == MIN_VARIANCE_REGIME or "mv_delta_implied" not in r.delta_diag:
+            continue
+        v, se = (float(x) for x in r.delta_diag["mv_delta_implied"])
+        if np.isfinite(v) and np.isfinite(se) and se > 0.0:
+            vals.append(v)
+            ses.append(se)
+    if not vals:
+        return nan, nan, nan, 0
+    v_ = np.asarray(vals)
+    s_ = np.asarray(ses)
+    w = 1.0 / (s_ * s_)
+    return (
+        float(np.sum(w * v_) / np.sum(w)),
+        float(np.sum(w * s_) / np.sum(w)),
+        float(v_.max() - v_.min()),
+        int(v_.size),
+    )
+
+
+def mv_benchmark_validity(
+    mv: TaskResult, common: tuple[float, float]
+) -> tuple[bool | None, float, str]:
+    """``(valid, z, note)`` of the ``min_variance`` row against the common minimum-variance delta
+    ``common = (value, se)``: ``z`` = (its mean delta − the common value) / the two se's in
+    quadrature, ``valid`` = ``|z| <= MV_BENCHMARK_VALIDITY_NSE`` (``None`` when either is
+    missing); ``note`` names a run whose factor gradients came from the raw value regression
+    (no Black–Scholes proxy for the controlled gradients: :data:`MV_RAW_GRADIENT_NOTE`)."""
+    note = (
+        "raw regression gradients (no Black-Scholes proxy for the controlled value target)"
+        if any(MV_RAW_GRADIENT_NOTE in n for n in mv.notes)
+        else ""
+    )
+    if "mean_delta" not in mv.delta_diag or not np.isfinite(common[0]):
+        return None, float("nan"), note
+    md, md_se = (float(x) for x in mv.delta_diag["mean_delta"])
+    se = float(np.hypot(md_se, common[1]))
+    if not (np.isfinite(md) and se > 0.0):
+        return None, float("nan"), note
+    z = (md - common[0]) / se
+    return bool(abs(z) <= MV_BENCHMARK_VALIDITY_NSE), float(z), note
+
+
 def table_D(results: Iterable[TaskResult]) -> pd.DataFrame:
-    """Study D: per product the P&L std per regime (with se), the winner (smallest std) and the
-    regime closest to the model delta's std."""
+    """Study D (owner's decision of 2026-09-16; :data:`TABLE_HEADERS` ``"D"``): per product one
+    row per regime of :data:`REGIMES_D`, the ``min_variance`` benchmark included as a fifth line
+    — the P&L std and its rank (``std_rank``, 1 = smallest among the ok rows), the desk mean, the
+    :func:`delta_diagnostics` columns (``mean_delta``, ``lambda_star``, ``std_at_lambda``,
+    ``mv_delta_implied``; in-sample), the product's **common minimum-variance delta**
+    ``mv_common`` (:func:`common_mv_delta` over the ok regime rows, with its se, its ``spread``
+    and the rows used), ``distance_to_mv`` = the row's mean delta minus ``mv_common`` (se: the
+    two in quadrature, ``distance_se_kind``) and the **distance ranking** ``distance_rank`` (1 =
+    closest among the ok regime rows; 0 on the ``min_variance`` row, whose distance is shown but
+    not ranked; −1 where no distance is available).  The ``min_variance`` row carries
+    ``mv_valid`` / ``mv_z`` / ``mv_note`` (:func:`mv_benchmark_validity`; empty on the regime
+    rows).  Before 2026-09-16 the distance was measured to the ``min_variance`` row's own mean
+    delta — not a robust reference (hedged std 2.756 ± 0.053 and 2.965 ± 0.068 at 5·10³ pricing
+    paths on two seeds, mean delta ~0.01 above the common value; on the autocall 0.318 against
+    0.294–0.309).  Every Monte Carlo column carries its ``_se`` twin."""
     res = [r for r in results if r.study == "D"]
+    nan = float("nan")
     rows = []
     for product in dict.fromkeys(r.product for r in res):
         rs = {r.regime: r for r in res if r.product == product and r.regime is not None}
         ok = {k: v for k, v in rs.items() if v.ok and np.isfinite(v.std[0])}
-        winner = min(ok, key=lambda k: ok[k].std[0]) if ok else ""
-        closest = ""
-        if "model" in ok:
-            others = {k: v for k, v in ok.items() if k != "model"}
-            if others:
-                closest = min(others, key=lambda k: abs(others[k].std[0] - ok["model"].std[0]))
+        by_std = sorted(ok, key=lambda k: ok[k].std[0])
+        mv = ok.get(MIN_VARIANCE_REGIME)
+        common, common_se, spread, n_common = common_mv_delta(ok)
+        dist: dict[str, tuple[float, float, str]] = {}
+        for k, v in ok.items():
+            if "mean_delta" in v.delta_diag and n_common:
+                md, md_se = (float(x) for x in v.delta_diag["mean_delta"])
+                dist[k] = (md - common, float(np.hypot(md_se, common_se)), "quadrature")
+            else:
+                dist[k] = (nan, nan, "")
+        valid, z, mv_note = (
+            (None, nan, "") if mv is None else mv_benchmark_validity(mv, (common, common_se))
+        )
+        ranked = sorted(
+            (k for k in ok if k != MIN_VARIANCE_REGIME and np.isfinite(dist[k][0])),
+            key=lambda k: abs(dist[k][0]),
+        )
         for regime in REGIMES_D:
             r = rs.get(regime)
+            dd = r.delta_diag if r is not None else {}
+
+            def pair(name: str, dd: Mapping[str, tuple[float, float]] = dd) -> tuple[float, float]:
+                return dd.get(name, (nan, nan))
+
+            d_val, d_se, d_kind = dist.get(regime, (nan, nan, ""))
+            is_mv = regime == MIN_VARIANCE_REGIME
+            if is_mv and regime in ok and np.isfinite(d_val):
+                d_rank = 0
+            elif regime in ranked:
+                d_rank = ranked.index(regime) + 1
+            else:
+                d_rank = -1
             rows.append(
                 {
                     "product": product,
                     "regime": regime,
                     "status": r.status if r else "missing",
                     "unit": r.unit if r else "",
-                    "std": r.std[0] if r else float("nan"),
-                    "std_se": r.std[1] if r else float("nan"),
-                    "desk_mean": r.desk_mean()[0] if r else float("nan"),
-                    "mean_se": r.mean[1] if r else float("nan"),
-                    "winner": regime == winner,
-                    "closest_to_model": regime == closest,
+                    "std": r.std[0] if r else nan,
+                    "std_se": r.std[1] if r else nan,
+                    "std_rank": by_std.index(regime) + 1 if regime in ok else -1,
+                    "desk_mean": r.desk_mean()[0] if r else nan,
+                    "mean_se": r.mean[1] if r else nan,
+                    "mean_delta": pair("mean_delta")[0],
+                    "mean_delta_se": pair("mean_delta")[1],
+                    "mv_common": common,
+                    "mv_common_se": common_se,
+                    "mv_common_spread": spread,
+                    "mv_common_rows": n_common,
+                    "distance_to_mv": d_val,
+                    "distance_to_mv_se": d_se,
+                    "distance_se_kind": d_kind,
+                    "distance_rank": d_rank,
+                    "mv_valid": (valid if is_mv else None),
+                    "mv_z": (z if is_mv else nan),
+                    "mv_note": (mv_note if is_mv else ""),
+                    "lambda_star": pair("lambda_star")[0],
+                    "lambda_star_se": pair("lambda_star")[1],
+                    "std_at_lambda": pair("std_at_lambda")[0],
+                    "std_at_lambda_se": pair("std_at_lambda")[1],
+                    "mv_delta_implied": pair("mv_delta_implied")[0],
+                    "mv_delta_implied_se": pair("mv_delta_implied")[1],
                     "n_paths": r.n_paths_world if r else 0,
-                    "wall_s": r.wall_seconds if r else float("nan"),
+                    "wall_s": r.wall_seconds if r else nan,
                     "reason": r.reason if r else "",
                 }
             )
@@ -2162,9 +2465,31 @@ TABLE_HEADERS: dict[str, str] = {
         "(-1: not recorded, a run from before 2026-09-16)."
     ),
     "D": (
-        "Study D — delta-regime P&L: world = pricing (2F), delta only under each §7.2 regime; "
-        "`winner` = smallest std, `closest_to_model` = the non-model regime whose std is nearest "
-        "the model delta's; vanilla in % of spot, autocall in % of notional."
+        "Study D — delta-regime P&L read against the minimum-variance delta (reinstated, owner's "
+        "decision of 2026-09-16): world = pricing (2F), delta only under each §7.2 regime and "
+        "the benchmark row `min_variance` (the pricing model's minimum-variance spot-only delta: "
+        "the model delta + Σ_i dV/dX_i · d<X_i,S>/d<S,S>). Headline: "
+        + STUDY_D_HEADLINE
+        + ". Measured reading: "
+        + STUDY_D_READING
+        + ". The reference is the COMMON minimum-variance delta `mv_common` the four regime rows "
+        "imply (the precision-weighted mean of their `mv_delta_implied`; se: the "
+        "perfect-correlation bound, conservative, the rows sharing their world paths; "
+        "`mv_common_spread` = the largest minus the smallest row value). The ranking is "
+        "`distance_rank` (1 = the regime whose `mean_delta` sits closest to `mv_common`; 0 = the "
+        "min_variance row, shown but not ranked; -1 = no distance), with `distance_to_mv` = mean "
+        "delta minus `mv_common` (se in quadrature); the std ranking stays visible as `std_rank` "
+        "(1 = smallest std). The `min_variance` row (the model delta + Σ_i dV/dX_i · "
+        "d<X_i,S>/d<S,S> on the pricing paths) is a fifth line with a validity flag: `mv_valid` "
+        "when its mean delta lies within "
+        f"{MV_BENCHMARK_VALIDITY_NSE:g} se of `mv_common` (`mv_z`); `mv_note` marks a run whose "
+        "dV/dX came from the raw value regression (no Black-Scholes proxy, e.g. the autocall). "
+        "`mean_delta` is the relative delta S0·Δ·scale/100 averaged over dates and paths (the "
+        "per-unit-spot delta for the vanilla on one share). IN-SAMPLE benchmarks, fitted on the "
+        "paths they are scored on: `lambda_star` = -Cov(product leg, hedge leg)/Var(hedge leg), "
+        "`std_at_lambda` the P&L std with the hedge leg scaled by it, `mv_delta_implied` = "
+        "lambda_star x mean_delta (path-pair bootstrap se's). `desk_mean` is the hedged mean for "
+        "the desk SHORT the product; vanilla in % of spot, autocall in % of notional."
     ),
 }
 
@@ -2244,7 +2569,11 @@ __all__ = [
     "DEFAULT_N_PARTICLES",
     "DEFAULT_N_PATHS",
     "DEFAULT_REFIT_PARTICLES",
+    "DELTA_DIAG_BOOTSTRAP",
+    "DELTA_PATHS_SUFFIX",
     "FIRST_ORDER_TOLERANCE",
+    "MV_BENCHMARK_VALIDITY_NSE",
+    "MV_RAW_GRADIENT_NOTE",
     "PRICING_A",
     "Q_SWEEP",
     "RECALIBRATIONS_C",
@@ -2253,6 +2582,9 @@ __all__ = [
     "SIM_DT_MAX",
     "STUDIES",
     "STUDY_A_FREQUENCY",
+    "STUDY_C_CURVATURE_H",
+    "STUDY_D_HEADLINE",
+    "STUDY_D_READING",
     "WORLDS_B",
     "Gate",
     "Projection",
@@ -2266,6 +2598,9 @@ __all__ = [
     "build_strategy",
     "build_tables",
     "calibration_seconds",
+    "common_mv_delta",
+    "delta_diagnostics",
+    "delta_path_means",
     "discriminator_gate",
     "enumerate_tasks",
     "first_order_agreement",
@@ -2274,6 +2609,7 @@ __all__ = [
     "load_static_predictions",
     "make_hedger",
     "markdown_table",
+    "mv_benchmark_validity",
     "n_pricing_models",
     "nonlinearity",
     "parse_shard",

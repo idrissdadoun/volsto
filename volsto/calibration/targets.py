@@ -162,6 +162,7 @@ class SabrPillar:
     sabrw_power: float = DEFAULT_SABRW_POWER
     atf_ref: float = DEFAULT_ATF_REF
     radicand_guarded: bool = False
+    skew_h: float | None = None
 
     @property
     def vov_sabr(self) -> float:
@@ -191,18 +192,30 @@ class SabrPillar:
 
 
 def surface_atm_derivatives(
-    surface: Any, T: float, h: float = SABR_CURVATURE_H
+    surface: Any, T: float, h: float = SABR_CURVATURE_H, skew_h: float | None = None
 ) -> tuple[float, float, float, bool]:
     """``(atf, ∂σ̂/∂k, ∂²σ̂/∂k², analytic_skew)`` at ``k = 0``: the surface's analytic
     ``atm_skew`` when it has one (``analytic_skew`` True), else the central difference of
-    half-width ``h``; the curvature always by the ``h`` stencil (module docstring)."""
+    half-width ``h``; the curvature always by the ``h`` stencil (module docstring).
+
+    ``skew_h`` (default ``None``: the behaviour above) is the **stencil-consistent read**: the
+    skew is the central difference of half-width ``skew_h`` even when the surface has an
+    analytic ``atm_skew`` (``analytic_skew`` False), so a surface is read the way a finite
+    strike strip reads a smile — the M8b recalibration rule's base fit on the pricing snapshot
+    (:meth:`volsto.hedging.hedger.RecalibrationRule.marking_targets`)."""
     k = np.array([-h, 0.0, h])
     v = np.asarray(surface.implied_vol_k(k, np.full(3, float(T))), dtype=np.float64)
     atf = float(v[1])
+    curv = float((v[2] - 2 * v[1] + v[0]) / (h * h))
+    if skew_h is not None:
+        if not skew_h > 0.0:
+            raise ValueError("skew_h must be positive")
+        ks = np.array([-skew_h, skew_h])
+        vs = np.asarray(surface.implied_vol_k(ks, np.full(2, float(T))), dtype=np.float64)
+        return atf, float((vs[1] - vs[0]) / (2 * skew_h)), curv, False
     fn = getattr(surface, "atm_skew", None)
     analytic = callable(fn)
     skew = float(np.asarray(fn(float(T)))) if callable(fn) else float((v[2] - v[0]) / (2 * h))
-    curv = float((v[2] - 2 * v[1] + v[0]) / (h * h))
     return atf, skew, curv, analytic
 
 
@@ -230,17 +243,24 @@ def sabr_reduce(
     sabrw_power: float = DEFAULT_SABRW_POWER,
     atf_ref: float = DEFAULT_ATF_REF,
     radicand_floor: float | None = DEFAULT_RADICAND_FLOOR,
+    skew_h: float | None = None,
 ) -> SabrPillar:
     """Step 0 of one pillar (module docstring) with its flags; ``radicand_floor`` is the guard
     ``c`` (the radicand floored at ``6 smi² (1 − c)``, logged and flagged when it fires; ``None``
-    disables it)."""
+    disables it); ``skew_h`` the stencil-consistent skew read of
+    :func:`surface_atm_derivatives` (``None``: unchanged)."""
     if atf_ref <= 0:
         raise ValueError("atf_ref must be positive")
     if radicand_floor is not None and not 0.0 <= radicand_floor < 1.0:
         raise ValueError("radicand_floor must be in [0, 1) or None")
-    atf0, skew0, curv0, analytic = surface_atm_derivatives(surface, T, h)
+    atf0, skew0, curv0, analytic = surface_atm_derivatives(surface, T, h, skew_h)
     flags: list[str] = []
-    if not analytic:
+    if skew_h is not None:
+        flags.append(
+            f"stencil-consistent read: skew by the central difference of half-width {skew_h:g}, "
+            f"curvature by that of half-width {h:g}"
+        )
+    elif not analytic:
         flags.append(
             f"skew and curvature by central differences of half-width {h:g} (no analytic "
             "atm_skew): unreliable on an interpolated grid"
@@ -295,6 +315,7 @@ def sabr_reduce(
         float(sabrw_power),
         float(atf_ref),
         guarded,
+        None if skew_h is None else float(skew_h),
     )
 
 
@@ -567,11 +588,15 @@ def marking_targets(
     sabrw_power: float = DEFAULT_SABRW_POWER,
     atf_ref: float = DEFAULT_ATF_REF,
     radicand_floor: float | None = DEFAULT_RADICAND_FLOOR,
+    skew_h: float | None = None,
 ) -> TargetSet:
     """Marking-mode targets from a surface (steps 0 and 1 of the module docstring).
     ``ssr_target`` is a scalar, one value per retained pillar, a mapping ``T → value``
     (interpolated) or a callable; ``sigma_0`` defaults to the surface's ATMF vol at
-    :data:`SIGMA0_MATURITY`."""
+    :data:`SIGMA0_MATURITY`.  ``skew_h`` (default ``None``: the M7 reading, unchanged) reads the
+    skew — the step-0 ``smi`` and the skew constraint's ``skew_fn`` alike — by the central
+    difference of half-width ``skew_h`` and the curvature by that of half-width ``h``: the
+    stencil of a finite strike strip (:func:`surface_atm_derivatives`)."""
     ps, flags = _filter_pillars(pillars, mat_min, getattr(surface, "max_maturity", None))
     sabr = tuple(
         sabr_reduce(
@@ -581,6 +606,7 @@ def marking_targets(
             sabrw_power=sabrw_power,
             atf_ref=atf_ref,
             radicand_floor=radicand_floor,
+            skew_h=skew_h,
         )
         for T in ps
     )
@@ -608,7 +634,7 @@ def marking_targets(
     corr = np.array([s.rho_sabr for s in sabr])
     skew = np.array([s.skew_sabr for s in sabr])
     fn = getattr(surface, "atm_skew", None)
-    if callable(fn):
+    if callable(fn) and skew_h is None:
 
         def skew_fn(t: FloatArray) -> FloatArray:
             return np.asarray(surface.atm_skew(t), dtype=np.float64)
@@ -616,7 +642,7 @@ def marking_targets(
     else:
 
         def skew_fn(t: FloatArray) -> FloatArray:
-            return np.array([surface_atm_derivatives(surface, float(x), h)[1] for x in t])
+            return np.array([surface_atm_derivatives(surface, float(x), h, skew_h)[1] for x in t])
 
     def atm_vol_fn(t: FloatArray) -> FloatArray:
         return np.asarray(surface.atm_vol(t), dtype=np.float64)

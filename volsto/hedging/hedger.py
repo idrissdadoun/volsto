@@ -32,6 +32,25 @@ recalibration rule.
    on a date whose step-0 reduction is degenerate, ``|Corr_BE|`` capped at
    :data:`REFIT_CORRELATION_CAP`).
 
+**Minimum-variance delta** (``delta_regime="min_variance"``, :func:`min_variance_delta`): the
+strategy's ``delta`` target — the product's and every priced instrument's — is replaced by the
+pricing model's minimum-variance spot-only delta, the model delta plus the vol-correlation term
+``Σ_i (∂V/∂X_i) d⟨X_i, S⟩/d⟨S, S⟩`` from the model's own SDE (:func:`spot_factor_projection`), the
+value gradients ``∂V/∂X_i`` of the regression; no extra simulation.  The gradients are read from
+the **controlled** value regression (``ConditionalPricer(control_value=True)``, the §7.11
+Black–Scholes shadow of the value target, whose conditional expectation depends on ``S_t`` only:
+the factor dependence stays, the spot-driven payoff noise goes) — measured on the M8b study-D
+vanilla, the raw value regression's gradients made the minimum-variance hedge WORSE than the
+model delta (P&L std 3.218 ± 0.029 against 3.144 ± 0.011 % of spot, the correction's cross-path
+std 0.16 at ``t = 0.1`` against a mean of −0.22; at ``t = 0`` the borrowed gradient had the wrong
+sign), the controlled one takes it to 1.736 ± 0.014 (the recorded run: 2·10⁴ paths, before the
+§7.11 coefficient fix of 2026-09-16; at 5·10³ pricing paths it measured 2.756 ± 0.053 and
+2.965 ± 0.068 on two seeds, worse than sticky-strike — the benchmark row is not robust to the
+pricing path count, and study D measures distances to the regimes' common λ*-implied value).  An
+object without a Black–Scholes proxy (autocall, cliquet) keeps the raw gradients, noted.  In an
+incomplete (stochastic-vol) pricing model the model delta is **not** the minimum-variance
+spot-only hedge even when world = pricing (M8b study D, owner's decision of 2026-09-16).
+
 Total P&L per path ``= product leg + Σ hedge legs − costs``; the zero-cost total is reported next
 to it (costs are additive).  The product leg sums to ``payoff − V₀`` exactly on every path
 (telescoping), so the hedged P&L's mean is the product's pricing error plus the hedging noise.
@@ -74,9 +93,18 @@ from volsto.engine.paths import PathSet
 from volsto.engine.rng import GaussianDraws
 from volsto.hedging.controls import MIN_SHADOW_VOL
 from volsto.hedging.instruments import Spot, deduplicate_names, expand_rolls
-from volsto.hedging.pricing import Bump, ConditionalPricer, ObjectPayoffs, union_grid
+from volsto.hedging.pricing import (
+    DEFAULT_CONTROL_DELTA,
+    VALUE_CV,
+    Bump,
+    ConditionalPricer,
+    ObjectPayoffs,
+    union_grid,
+)
 from volsto.hedging.strategies import (
     DELTA_REGIMES,
+    MIN_VARIANCE_REGIME,
+    SURFACE_DELTA_REGIMES,
     GreekTargetStrategy,
     HedgeSolution,
     PresetContext,
@@ -84,7 +112,9 @@ from volsto.hedging.strategies import (
     default_strategy,
 )
 from volsto.market.surface import ArbitrageError
-from volsto.models.base import Model
+from volsto.models.base import Model, ModelState
+from volsto.models.bergomi import BergomiSV
+from volsto.models.lsv import LSV
 from volsto.products.base import Portfolio, Product
 from volsto.risk.engine import BSBuilder, LSVBuilder, LVBuilder, RiskState, surface_of
 from volsto.risk.greeks import _spot_state
@@ -124,7 +154,12 @@ STATE_SURFACE_MIN_INVERTED = 0.99
 #: world strip, three of the four refit dates that used the guarded fallback clear only at 3.2·10⁵,
 #: and one refit lands at the correlation bound with no step-0 flag (ρ_SX1 = −0.9944 at
 #: t = 0.7302; regular at 3.2·10⁵) — at this count the guarded fallback, not the path count, is
-#: what protects the short pillar (M8b verification, 2026-09-16)
+#: what protects the short pillar (M8b verification, 2026-09-16).  After the forward-moneyness
+#: fix of the strip (same day) the count is 133 of 252 at ``h = 0.05`` and 54 of 252 with a
+#: ``±0.10`` curvature stencil (:attr:`RecalibrationRule.curvature_h`; strip phase 459 s and
+#: 751 s, world + twin); the pricing model's own twin strip (no shock) reads a degenerate 3M
+#: step 0 on 143 and 99 dates — the short pillar's conditional curvature is negative enough to
+#: fire the guard on many dates, not only noisy
 DEFAULT_STRIP_PATHS = 80_000
 #: the largest ``|Corr_BE|`` a refit may target (:func:`refit_targets`).  At ``Corr_BE = −1`` the
 #: marking VolVar target is ``SpotVolCovar²`` and, with ``λ1, λ2`` of the same sign, the fully
@@ -318,8 +353,12 @@ class PricingContext:
                 raise ValueError(f"{name}: the pricing model has {nf} factors")
             return None
         if name in ("delta", "gamma", "vanna"):
-            if name == "delta" and delta_regime != "model":
+            if name == "delta" and delta_regime in SURFACE_DELTA_REGIMES:
                 return self.regime_delta_bump(delta_regime)
+            if name == "delta" and delta_regime not in DELTA_REGIMES:
+                raise ValueError(f"delta_regime must be one of {DELTA_REGIMES}")
+            # "model" and "min_variance": the hybrid-CRN spot bumps (the latter adds the
+            # vol-correlation term from the value regression, min_variance_delta)
             return None
         if name in ("vega", "volga"):
             # what the §7.11 control needs to shadow the bump: the perturbed surfaces, or the
@@ -421,8 +460,15 @@ class PricingContext:
         raise ValueError(f"unknown target {name!r}; available: {self.available_targets()}")
 
     def regime_delta_bump(self, regime: str) -> Bump:
-        if regime not in DELTA_REGIMES:
-            raise ValueError(f"delta_regime must be one of {DELTA_REGIMES}")
+        """The spot-kind :class:`Bump` of a §7.2 surface regime (``SURFACE_DELTA_REGIMES``, or
+        ``"model"`` through the builder): the states moved by ``±SPOT_BUMP`` under the regime,
+        rebuilt (leverage recalibrated through the cache), with the moved states' surfaces for the
+        delta control's proxy vols."""
+        if regime != "model" and regime not in SURFACE_DELTA_REGIMES:
+            raise ValueError(
+                f"regime_delta_bump: {regime!r} is neither 'model' nor a surface regime "
+                f"{SURFACE_DELTA_REGIMES} (min_variance is not a bump: min_variance_delta)"
+            )
         if self.state is None:
             raise ValueError("a non-model delta regime needs a pricing state")
         h = SPOT_BUMP
@@ -430,7 +476,16 @@ class PricingContext:
         dn_state, mode_dn = _spot_state(self.state, regime, -h)
         up = self.builder.build(up_state, mode_up)
         dn = self.builder.build(dn_state, mode_dn)
-        return Bump("delta", up, dn, h, f"delta under the {regime} regime", kind="spot")
+        return Bump(
+            "delta",
+            up,
+            dn,
+            h,
+            f"delta under the {regime} regime",
+            kind="spot",
+            up_surface=surface_of(up_state),
+            dn_surface=surface_of(dn_state),
+        )
 
 
 # --------------------------------------------------------------------------------------------
@@ -458,7 +513,14 @@ class RecalibrationRule:
     **The strips** run at ``strip_paths`` (default :data:`DEFAULT_STRIP_PATHS`), for the world
     strip and its twin alike and independent of ``Hedger.world_paths``; their state surfaces are
     precomputed for every date before the hedge loop (:class:`StripSurfaces`) and the refit reads
-    the same surface the trigger read.
+    the same surface the trigger read.  The strip is struck at **forward** moneyness
+    (:meth:`Hedger._strip_objects`): the ATMF level and skew are read at forward log-moneyness
+    ``{−h, 0, +h}``, the curvature at ``{−curvature_h, 0, +curvature_h}`` (``curvature_h``
+    ``None``: equal to ``h``, the three-strike strip; otherwise two more strikes per pillar).
+    The curvature is a second difference whose Monte Carlo error scales as
+    ``1/(curvature_h √strip_paths)`` while its smoothing of the smile grows with
+    ``curvature_h``; the base fit reads the pricing snapshot on the same stencil
+    (:meth:`marking_targets`).
 
     **The refit's correlation target** (:func:`refit_targets`).  Step 0's radicand guard
     (:func:`~volsto.calibration.targets.sabr_reduce`) is correct for a genuinely negative ATM
@@ -497,6 +559,7 @@ class RecalibrationRule:
     log_rows: list[dict[str, Any]] = field(default_factory=list)
     strip_paths: int = DEFAULT_STRIP_PATHS
     correlation_cap: float = REFIT_CORRELATION_CAP
+    curvature_h: float | None = None
 
     def __post_init__(self) -> None:
         if self.policy not in RECALIBRATION_POLICIES:
@@ -507,6 +570,39 @@ class RecalibrationRule:
             raise ValueError("strip_paths must be an integer of at least 2")
         if not (0.0 < self.correlation_cap <= 1.0):
             raise ValueError("correlation_cap must be in (0, 1]")
+        if not (self.h > 0.0):
+            raise ValueError("h must be positive")
+        if self.curvature_h is not None and not (self.curvature_h > 0.0):
+            raise ValueError("curvature_h must be positive (or None: equal to h)")
+
+    @property
+    def curvature_stencil(self) -> float:
+        """The half-width of the curvature read: ``curvature_h``, or ``h`` when it is ``None``."""
+        return float(self.h if self.curvature_h is None else self.curvature_h)
+
+    def strip_log_moneyness(self) -> tuple[float, ...]:
+        """The strip's forward log-moneyness per pillar, in object order: ``(−h, 0, +h)``, then
+        ``(−curvature_h, +curvature_h)`` when the curvature stencil differs from ``h``."""
+        h, ch = float(self.h), self.curvature_stencil
+        return (-h, 0.0, h) if ch == h else (-h, 0.0, h, -ch, ch)
+
+    def marking_targets(self, surface: Any) -> TargetSet:
+        """The marking targets of ``surface`` read **on the strip's stencil**
+        (:func:`~volsto.calibration.fit_2f.marking_targets_for` with the rule's config and
+        ``ssr_target``, the skew by the central difference of half-width ``h`` and the curvature
+        by that of half-width :attr:`curvature_stencil`): the base fit on the pricing snapshot
+        and every refit on a state surface read the smile the same way, so a refit never sees a
+        move that is only a stencil mismatch.  On a state surface (a quadratic in ``k``) both
+        differences are exact."""
+        from volsto.calibration.fit_2f import marking_targets_for
+
+        return marking_targets_for(
+            surface,
+            self.config(),
+            ssr_target=self.ssr_target,
+            h=self.curvature_stencil,
+            skew_h=float(self.h),
+        )
 
     @property
     def sticky(self) -> bool:
@@ -714,9 +810,9 @@ def refit_targets(
     surface: Any, rule: RecalibrationRule, base_targets: TargetSet | None
 ) -> RefitTargets:
     """The marking targets a recalibration refits to (:class:`RecalibrationRule`, *The refit's
-    correlation target*), in this order: the targets read on ``surface``
-    (:func:`~volsto.calibration.fit_2f.marking_targets_for` with the rule's config and
-    ``ssr_target``); the policy's holding (:func:`~volsto.risk.shadow_rotation.held_targets`);
+    correlation target*), in this order: the targets read on ``surface`` on the strip's stencil
+    (:meth:`RecalibrationRule.marking_targets`); the policy's holding
+    (:func:`~volsto.risk.shadow_rotation.held_targets`);
     the **guarded fallback** — when step 0 is degenerate at any fitted pillar
     (:func:`step0_degenerate_pillars`) the base fit's ``correl_target`` is held (a no-op in value
     under the sticky policies, which hold it already; recorded all the same); the **cap**
@@ -725,9 +821,7 @@ def refit_targets(
     ``λ``, ``k1``, the achieved skew and SpotVolCovar — unchanged).  ``base_targets`` is needed
     under a sticky policy and whenever the fallback fires (``ValueError`` otherwise; the pillars
     must match).  Checked by ``tests/test_hedging.py``."""
-    from volsto.calibration.fit_2f import marking_targets_for
-
-    targets = marking_targets_for(surface, rule.config(), ssr_target=rule.ssr_target)
+    targets = rule.marking_targets(surface)
     flags = tuple(targets.flags)
     read = np.array(targets.correl_target, dtype=np.float64)
     degenerate = step0_degenerate_pillars(targets)
@@ -838,6 +932,80 @@ class HedgeResult:
 
 
 # --------------------------------------------------------------------------------------------
+# the minimum-variance delta
+# --------------------------------------------------------------------------------------------
+
+#: why a pricing model has no vol-correlation term (the note :func:`spot_factor_projection`
+#: returns for a factor-free model)
+COMPLETE_MARKET_NOTE = (
+    "min_variance delta: the pricing model {name} has no stochastic-vol factor, the market is "
+    "complete in the spot and the minimum-variance spot-only delta IS the model delta"
+)
+
+
+def spot_factor_projection(
+    model: Model, t: float, log_spot: FloatArray, factors: FloatArray
+) -> tuple[FloatArray, str | None]:
+    """``d⟨X_i, S⟩_t / d⟨S, S⟩_t`` per path, ``(n_paths, n_factors)``, from the pricing model's own
+    SDE, and a note (``None`` when the model has factors).
+
+    **Source.**  :class:`~volsto.models.bergomi.BergomiSV` and :class:`~volsto.models.lsv.LSV`
+    (SPEC §3.3, §3.5; ``bergomi_block``): the factors are unit-vol Ornstein–Uhlenbeck processes
+    ``dX^i = −k_i X^i dt + dW^i`` and the spot ``d ln S = (…) dt + σ_t dW^S`` with
+    ``σ_t² = L(t, S)² ξ_t^t`` (``L ≡ 1`` for the pure model) — the quantity
+    :meth:`~volsto.models.base.Model.instantaneous_variance` returns and
+    :attr:`PathSet.variance <volsto.engine.paths.PathSet>` records —, ``corr(dW^S, dW^i) = ρ_Si``
+    (``kernel.rho_s``).  Hence ``d⟨X_i, S⟩ = ρ_Si S σ_t dt``, ``d⟨S, S⟩ = S² σ_t² dt`` and
+
+        d⟨X_i, S⟩ / d⟨S, S⟩ = ρ_Si / (S_t σ_t).
+
+    ``σ_t`` is the **pricing** model's at the given state (its own leverage and forward
+    variance), so a world of another model is read through the desk's model.  A model without
+    factors (Black–Scholes, local vol) returns an empty projection and says why
+    (:data:`COMPLETE_MARKET_NOTE`); a model with factors whose spot-factor correlations the hedger
+    cannot read raises (never a silent model delta)."""
+    n = int(np.asarray(log_spot).shape[0])
+    nf = int(getattr(model, "n_factors", 0))
+    if nf == 0:
+        return np.zeros((n, 0)), COMPLETE_MARKET_NOTE.format(name=type(model).__name__)
+    kernel = model.kernel if isinstance(model, LSV) else model
+    if not isinstance(kernel, BergomiSV):
+        raise ValueError(
+            f"min_variance delta: the pricing model {type(model).__name__} has {nf} factor(s) but "
+            "no spot-factor correlation the hedger can read (Bergomi / LSV only)"
+        )
+    rho = np.asarray(kernel.rho_s, dtype=np.float64)
+    fac = np.asarray(factors, dtype=np.float64).reshape(n, nf)
+    ls = np.asarray(log_spot, dtype=np.float64)
+    state = ModelState(float(t), ls, np.zeros(n), fac)
+    var = np.asarray(model.instantaneous_variance(state), dtype=np.float64)
+    denom = np.exp(ls) * np.sqrt(np.maximum(var, 0.0))
+    safe = np.where(denom > 0.0, denom, 1.0)
+    proj = np.where(denom[:, None] > 0.0, rho[None, :] / safe[:, None], 0.0)
+    return np.asarray(proj, dtype=np.float64), None
+
+
+def min_variance_delta(
+    delta: FloatArray, value_gradients: FloatArray, projection: FloatArray
+) -> FloatArray:
+    """The minimum-variance spot-only delta (per unit spot, time-0 money)
+
+        Δ_MV = Δ_model + Σ_i (∂V/∂X_i) d⟨X_i, S⟩ / d⟨S, S⟩,
+
+    the ``Δ`` minimising the instantaneous variance of ``dV − Δ dS`` when ``V`` moves with the
+    spot and the factors, ``dV = Δ_model dS + Σ_i ∂V/∂X_i dX_i + (…) dt``.  ``value_gradients``
+    ``(n_paths, n_factors)`` are the regression's ``∂V/∂X_i``, ``projection`` the model's
+    :func:`spot_factor_projection`.  Without factors (``n_factors = 0``) it returns ``delta``
+    itself, exactly.  For a negative spot-vol correlation and a long-vega value the term is
+    negative: the minimum-variance delta sits below the model delta (M8b study D, the 1y ATM
+    call on the SPX marking fit: 17.6% below by the in-sample ``λ*`` probe)."""
+    d = np.asarray(delta, dtype=np.float64)
+    if projection.shape[1] == 0:
+        return d
+    return np.asarray(d + np.sum(value_gradients * projection, axis=1), dtype=np.float64)
+
+
+# --------------------------------------------------------------------------------------------
 # the hedger
 # --------------------------------------------------------------------------------------------
 
@@ -847,11 +1015,15 @@ class Hedger:
     """Module docstring.  ``pricing`` is a :class:`PricingContext` (or a bare model),
     ``world`` a model; ``sim`` the pricing configuration (paths, schedule, scheme), ``world_paths``
     the number of world paths (default ``sim.n_paths``); ``stream_bumps`` / ``scratch_dir`` and
-    ``control_variate`` (the §7.11 control on the difference for the surface-driven bump targets
-    of the objects with a Black–Scholes proxy, :mod:`volsto.hedging.controls`; its median
-    variance reduction over dates and controlled objects is ``budget["cv_reduction_median"]``)
-    are passed to every :class:`~volsto.hedging.pricing.ConditionalPricer` the run builds
-    (module docstring, *Memory*)."""
+    ``control_variate`` (the §7.11 control on the difference for the surface-driven bump targets of
+    the objects with a Black–Scholes proxy, :mod:`volsto.hedging.controls`; its median variance
+    reduction over dates and controlled objects is ``budget["cv_reduction_median"]``) and
+    ``control_delta`` (the same control on the hybrid-CRN / regime delta target,
+    :meth:`~volsto.hedging.pricing.ConditionalPricer.delta_control`; its median reduction is
+    ``budget["cv_delta_reduction_median"]``, the product's per date in ``residual``'s
+    ``cv_delta_reduction`` / ``cv_delta_reduction_se``) are passed to every
+    :class:`~volsto.hedging.pricing.ConditionalPricer` the run builds (module docstring,
+    *Memory*)."""
 
     pricing: PricingContext | Model
     world: Model
@@ -866,6 +1038,7 @@ class Hedger:
     stream_bumps: bool = False
     scratch_dir: str | Path | None = None
     control_variate: bool = True
+    control_delta: bool = DEFAULT_CONTROL_DELTA
 
     def __post_init__(self) -> None:
         if not isinstance(self.pricing, PricingContext):
@@ -990,6 +1163,7 @@ class Hedger:
                 tuple(bumps),
                 self.degree,
                 control_variate=self.control_variate,
+                control_delta=self.control_delta,
                 surface=self.context.surface,
             )
             for j in range(len(objects)):
@@ -1029,6 +1203,16 @@ class Hedger:
                 inst.cost = self.costs.spot_bps if isinstance(inst, Spot) else self.costs.vol_points
         roll_dates = [i.start for i in instruments if i.start > 0.0]
         dates = self.schedule.build(product, extra=roll_dates)
+        # the minimum-variance delta: checked before anything is simulated (a model with factors
+        # but no readable spot-factor correlation raises; a factor-free one says why the term
+        # vanishes)
+        if strategy.delta_regime == MIN_VARIANCE_REGIME:
+            s0 = np.full(1, np.log(float(ctx.model.spot)))
+            _, mv_note = spot_factor_projection(
+                ctx.model, 0.0, s0, np.zeros((1, int(ctx.model.n_factors)))
+            )
+            if mv_note is not None and mv_note not in strategy.notes:
+                strategy.notes.append(mv_note)
         # target bumps
         bumps: list[Bump] = []
         dropped: list[str] = []
@@ -1118,7 +1302,7 @@ class Hedger:
         # strip pricer ever coexists with the product's pricer or the world paths
         strips = None if rule is None else self.strip_surfaces(dates, rule)
         t0 = time.perf_counter()
-        pricer = self._pricer(ctx.model, objects, grid, bumps)
+        pricer = self._pricer(ctx.model, objects, grid, bumps, strategy)
         pricers = [pricer]
         t_price = time.perf_counter() - t0
         try:
@@ -1148,8 +1332,17 @@ class Hedger:
                 p.close()
 
     def _pricer(
-        self, model: Model, objects: list[Product], grid: TimeGrid, bumps: Sequence[Bump]
+        self,
+        model: Model,
+        objects: list[Product],
+        grid: TimeGrid,
+        bumps: Sequence[Bump],
+        strategy: Strategy | None = None,
     ) -> ConditionalPricer:
+        """The run's pricer; under the ``min_variance`` delta regime with the control variate
+        on it also fits the controlled value target (``control_value``) the factor gradients are
+        read from."""
+        mv = strategy is not None and strategy.delta_regime == MIN_VARIANCE_REGIME
         return ConditionalPricer(
             model,
             objects,
@@ -1160,6 +1353,8 @@ class Hedger:
             stream_bumps=self.stream_bumps,
             scratch_dir=self.scratch_dir,
             control_variate=self.control_variate,
+            control_delta=self.control_delta,
+            control_value=bool(mv and self.control_variate),
             surface=self.context.surface,
         )
 
@@ -1214,6 +1409,7 @@ class Hedger:
         kinds = list(dict.fromkeys(kinds))
         greeks_by_date: dict[str, list[FloatArray]] = {}
         moves: dict[str, list[FloatArray]] = {"dS": [], "dX1": [], "dX2": []}
+        mv_delta = strategy.delta_regime == MIN_VARIANCE_REGIME and "delta" in strategy.target_names
         spot_inst = Spot()
         n_dates = dates.size
         n_refits = 0
@@ -1234,12 +1430,19 @@ class Hedger:
                 from volsto.calibration.fit_2f import fit_2f_marking
 
                 t_fit = time.perf_counter()
+                # read on the strip's stencil (RecalibrationRule.marking_targets): the held
+                # targets and the fallback's correlation compare like for like with a refit's
                 rule.base_fit = fit_2f_marking(
-                    ctx.surface, rule.config(), ssr_target=rule.ssr_target
+                    ctx.surface,
+                    rule.config(),
+                    ssr_target=rule.ssr_target,
+                    h=rule.curvature_stencil,
+                    skew_h=float(rule.h),
                 )
                 msg = (
                     f"recalibration policy {rule.policy}: base marking fit computed from the "
-                    f"pricing surface at t = 0 ({rule.base_fit.status}, "
+                    f"pricing surface at t = 0 on the strip's stencil (skew h = {rule.h:g}, "
+                    f"curvature h = {rule.curvature_stencil:g}; {rule.base_fit.status}, "
                     f"{time.perf_counter() - t_fit:.1f} s): {rule.base_fit.params!r}"
                 )
                 log.info(msg)
@@ -1322,6 +1525,80 @@ class Hedger:
                     ff, _ = pr.features(oi, world, t)
                     inst_g[j]["vanna"] = f_.gradient("vega", ff, 0) / s_t
 
+        def factor_gradients(
+            pr: ConditionalPricer, obj: int, t: float, t_next: float | None
+        ) -> FloatArray:
+            """``∂V/∂X_i`` of object ``obj`` at ``t`` on the world paths, ``(n_w, n_factors)``,
+            from the gradient of the fitted value; zero on terminated paths.  A factor column the
+            fit dropped as constant across the pricing paths (``t = 0``: every path at one
+            state) borrows the alive-path mean of the next date's fitted gradient on the pricing
+            paths — an ``O(Δt)`` approximation, noted."""
+            nf = int(pr.model.n_factors)
+            fit = pr.fit(obj, t)
+            feats, hs = pr.features(obj, world, t)
+            out = np.zeros((n_w, nf))
+            if VALUE_CV not in fit.coefficients and nf:
+                note = (
+                    f"min_variance delta: no controlled value target for "
+                    f"{type(pr.objects[obj]).__name__} (no Black-Scholes proxy, the control "
+                    "variate off, or a forward start past T1): dV/dX from the raw value "
+                    "regression (measured 2x noisier on the 1y ATM call)"
+                )
+                if note not in run_notes:
+                    run_notes.append(note)
+            for i in range(1, nf + 1):
+                if i in fit.columns:
+                    kind = VALUE_CV if VALUE_CV in fit.coefficients else "value"
+                    out[:, i - 1] = fit.gradient(kind, feats, i)
+                elif t_next is not None:
+                    f2 = pr.fit(obj, t_next)
+                    pf, phs = pr.features(obj, pr.paths, t_next)
+                    kind = VALUE_CV if VALUE_CV in f2.coefficients else "value"
+                    g = f2.gradient(kind, pf, i)[phs.alive]
+                    out[:, i - 1] = float(g.mean()) if g.size else 0.0
+                    note = (
+                        f"min_variance delta at t = {t:g}: the factor state is constant across "
+                        "the pricing paths, dV/dX borrowed from the next date's fit (alive-path "
+                        "mean, O(dt))"
+                    )
+                    if note not in run_notes:
+                        run_notes.append(note)
+            if hs.any_terminated:
+                out[~hs.alive] = 0.0
+            return out
+
+        def apply_min_variance(
+            pr: ConditionalPricer,
+            t: float,
+            t_next: float | None,
+            prod: dict[str, FloatArray],
+            inst_g: list[dict[str, FloatArray]],
+            active: Sequence[bool],
+        ) -> None:
+            """``delta`` of the product (or the net object) and of every priced active
+            instrument replaced by its minimum-variance delta (:func:`min_variance_delta`); the
+            spot's is its own (no factor exposure).  Called on every date and again after a
+            recalibration (the rebuilt dictionaries, under the new pricing model)."""
+            if not mv_delta:
+                return
+            col = idx[t]
+            n_f = int(pr.model.n_factors)
+            fac = world.factors_at(col) if world.n_factors == n_f else np.zeros((n_w, n_f))
+            proj, _ = spot_factor_projection(pr.model, t, world.log_spot_at(col), fac)
+            if proj.shape[1] == 0:
+                return
+            g_obj = 0 if net_index is None else net_index
+            prod["delta"] = min_variance_delta(
+                prod["delta"], factor_gradients(pr, g_obj, t, t_next), proj
+            )
+            for j in range(n_i):
+                oi = obj_index[j]
+                if oi is None or not active[j] or j in net_legs:
+                    continue
+                inst_g[j]["delta"] = min_variance_delta(
+                    inst_g[j]["delta"], factor_gradients(pr, oi, t, t_next), proj
+                )
+
         def spot_greeks(t: float) -> dict[str, FloatArray]:
             s_t = np.exp(world.log_spot_at(idx[t]))
             scale = spot_inst.scale(t, fc)
@@ -1356,6 +1633,8 @@ class Hedger:
             prod = netted(cur_pricer, t, prod, inst_g)
             # vanna from the vega polynomial gradient in ln S
             add_vanna(cur_pricer, t, prod, inst_g, active)
+            t_after = t_next if kdx + 1 < n_dates else None
+            apply_min_variance(cur_pricer, t, t_after, prod, inst_g, active)
             # recalibration
             if rule is not None and strips is not None:
                 skew_now = self._world_skew(strips, kdx, t, rule, world)
@@ -1372,7 +1651,7 @@ class Hedger:
                         # already) and released: its path sets would otherwise stay resident
                         # for the rest of the run, one full pricer per refit
                         old_pricer = cur_pricer
-                        new_pricer = self._pricer(new_ctx.model, objects, grid, bumps)
+                        new_pricer = self._pricer(new_ctx.model, objects, grid, bumps, strategy)
                         pricers.append(new_pricer)
                         new_prod, _ = new_pricer.evaluate(0, t, world, ["value"])
                         d_recal = new_prod["value"] - prod["value"]
@@ -1383,6 +1662,7 @@ class Hedger:
                         inst_g = instrument_greeks(cur_pricer, t, active)
                         prod = netted(cur_pricer, t, prod, inst_g)
                         add_vanna(cur_pricer, t, prod, inst_g, active)
+                        apply_min_variance(cur_pricer, t, t_after, prod, inst_g, active)
                         skew_ref = skew_now
                         did = True
                 # the refit's own log row carries the flags (absent when the rule's refit hook
@@ -1450,6 +1730,11 @@ class Hedger:
                 qrow[f"q_std:{inst.name}"] = float(q[:, j].std())
             q_rows.append(qrow)
             rrow: dict[str, Any] = {"t": t, "alive": float(alive.mean())}
+            # the delta control's variance reduction on the product's (net object's) delta target
+            fit_g = cur_pricer.fit(0 if net_index is None else net_index, t)
+            if "delta" in fit_g.controlled:
+                rrow["cv_delta_reduction"] = fit_g.variance_reduction["delta"]
+                rrow["cv_delta_reduction_se"] = fit_g.variance_reduction_se["delta"]
             for gi, g in enumerate(sol.target_names):
                 rrow[f"residual:{g}"] = (
                     float(np.mean(np.abs(sol.residual[alive, gi]))) if alive.any() else 0.0
@@ -1498,6 +1783,17 @@ class Hedger:
             float(np.quantile(reductions, 0.75)) if reductions else float("nan")
         )
         budget["cv_reduction_se_median"] = float(np.median(red_ses)) if red_ses else float("nan")
+        # the delta control's (NaN when nothing was controlled: control off, no proxy)
+        d_red = [r for p in pricers for r in p.cv_reductions(delta=True)]
+        d_ses = [r for p in pricers for r in p.cv_reduction_ses(delta=True)]
+        budget["cv_delta_reduction_median"] = float(np.median(d_red)) if d_red else float("nan")
+        budget["cv_delta_reduction_q25"] = (
+            float(np.quantile(d_red, 0.25)) if d_red else float("nan")
+        )
+        budget["cv_delta_reduction_q75"] = (
+            float(np.quantile(d_red, 0.75)) if d_red else float("nan")
+        )
+        budget["cv_delta_reduction_se_median"] = float(np.median(d_ses)) if d_ses else float("nan")
         notes = tuple(
             dict.fromkeys(
                 [
@@ -1545,6 +1841,7 @@ class Hedger:
                 "stream_bumps": self.stream_bumps,
                 "scratch_dir": None if self.scratch_dir is None else str(self.scratch_dir),
                 "control_variate": self.control_variate,
+                "control_delta": self.control_delta,
                 # the preset's keyword arguments (run(product, q=0.5)), or those the strategy
                 # was built with by default_strategy when it is passed in
                 "preset_kwargs": dict(preset_kwargs)
@@ -1556,7 +1853,8 @@ class Hedger:
 
     # -- recalibration internals -------------------------------------------------------------
 
-    #: strip objects per pillar: the three strikes ``k ∈ {−h, 0, +h}``
+    #: strip objects per pillar of the three-strike strip ``k ∈ {−h, 0, +h}``
+    #: (:meth:`RecalibrationRule.strip_log_moneyness` carries two more when ``curvature_h != h``)
     STRIP_STRIKES = 3
 
     def _strip_sim(self, rule: RecalibrationRule) -> SimConfig:
@@ -1570,18 +1868,32 @@ class Hedger:
 
     def _strip_objects(self, dates: FloatArray, rule: RecalibrationRule) -> list[Product]:
         """The forward-start strip of every date (module docstring of the rule): per date ``t``,
-        pillar ``τ`` and ``k ∈ {−h, 0, +h}`` the option ``(S_{t+τ}/S_t − e^{k})^±`` (a put below
-        the money, a call at and above), in that order."""
+        pillar ``τ`` and forward log-moneyness ``k`` in
+        :meth:`RecalibrationRule.strip_log_moneyness` the option
+        ``(S_{t+τ}/S_t − m)^±`` struck at ``m = F(t+τ)/F(t) · e^{k}`` (a put below the money, a
+        call at and above), in that order.  The payoff's strike is relative to the SPOT at ``t``;
+        the forward ratio puts the strike at forward log-moneyness exactly ``k``.  (Before
+        2026-09-16 it was ``m = e^{k}`` — forward log-moneyness ``k − ln(F(t+τ)/F(t))`` — while
+        the reads were labelled at ``k``: at ``t = 0`` on the study-C pricing twin the "ATMF" vol
+        read 0.2225 / 0.2364 / 0.2373 at 3M / 1Y / 3Y, the snapshot's vol at the spot strike
+        0.2230 / 0.2368 / 0.2380 and its ATMF vol 0.2200 / 0.2275 / 0.2218.)"""
         from volsto.products.forward_start import ForwardStartOption
 
-        disc = self.world.forward_curve.rate_curve
+        fc = self.world.forward_curve
+        disc = fc.rate_curve
+        ks = rule.strip_log_moneyness()
         objs: list[Product] = []
         for t in dates:
             for tau in rule.pillars:
-                for k in (-rule.h, 0.0, rule.h):
+                f_ratio = float(fc.forward(float(t) + tau) / fc.forward(float(t)))
+                for k in ks:
                     objs.append(
                         ForwardStartOption(
-                            float(t), float(t) + tau, float(np.exp(k)), 1 if k >= 0 else -1, disc
+                            float(t),
+                            float(t) + tau,
+                            f_ratio * float(np.exp(k)),
+                            1 if k >= 0 else -1,
+                            disc,
                         )
                     )
         return objs
@@ -1590,18 +1902,18 @@ class Hedger:
         self, dates: FloatArray, rule: RecalibrationRule, only: Sequence[int] | None = None
     ) -> _StripPricer:
         """The skew strip under the **world** model at ``rule.strip_paths`` paths: at every
-        rebalancing date ``t`` and pillar ``τ`` three forward-start options
-        ``(S_{t+τ}/S_t − e^{k})^±`` at ``k ∈ {−h, 0, +h}`` — struck at the *forward moneyness of
-        each path* (a vanilla struck at ``F(T) e^{k}`` would sit anywhere from far below to far
-        above a path's own forward at ``t``; inverting it at the path's forward mixes moneyness
-        across paths).  Their conditional values at ``t`` are homogeneous in ``S_t`` and invert
-        path by path to the world's conditional smile at ``t`` (:meth:`_state_surface`).  No
-        bumps, no control variate, a lean pricer (:class:`_StripPricer`).  ``only`` restricts
-        the priced objects to those dates' (the grid — hence every path — is the full strip's
-        either way)."""
+        rebalancing date ``t`` and pillar ``τ`` the forward-start options of
+        :meth:`_strip_objects`, ``(S_{t+τ}/S_t − F(t+τ)/F(t) e^{k})^±`` — struck at the *forward
+        moneyness of each path* (a vanilla struck at ``F(T) e^{k}`` would sit anywhere from far
+        below to far above a path's own forward at ``t``; inverting it at the path's forward
+        mixes moneyness across paths).  Their conditional values at ``t`` are homogeneous in
+        ``S_t`` and invert path by path to the world's conditional smile at ``t``
+        (:meth:`_state_surface`).  No bumps, no control variate, a lean pricer
+        (:class:`_StripPricer`).  ``only`` restricts the priced objects to those dates' (the
+        grid — hence every path — is the full strip's either way)."""
         objs = self._strip_objects(dates, rule)
         g = union_grid([self.world], objs, dates, self.sim)
-        per = len(rule.pillars) * self.STRIP_STRIKES
+        per = len(rule.pillars) * len(rule.strip_log_moneyness())
         sel = list(range(dates.size)) if only is None else sorted({int(k) for k in only})
         if any(k < 0 or k >= dates.size for k in sel):
             raise ValueError("only: rebalancing-date indices out of range")
@@ -1686,14 +1998,14 @@ class Hedger:
         """Projected seconds of :meth:`strip_surfaces` for ``product`` at ``rule.strip_paths``:
         per strip model (the world, then the pricing model for the twin) the simulation and
         payoff cost measured on a lean probe strip carrying two mid-life dates at
-        :attr:`PROBE_PATHS` and twice that (the full strip's grid), the per-date read (nine
-        regressions and per-path inversions) split into a fixed part and a part linear in the
-        paths, scaled to the strip's path count, object count and dates."""
+        :attr:`PROBE_PATHS` and twice that (the full strip's grid), the per-date read (one
+        regression per pillar and strike and per-path inversions) split into a fixed part and a
+        part linear in the paths, scaled to the strip's path count, object count and dates."""
         dates = self.schedule.build(product) if dates is None else np.asarray(dates)
         n_dates = int(dates.size)
         if n_dates == 0:
             return 0.0
-        per = len(rule.pillars) * self.STRIP_STRIKES
+        per = len(rule.pillars) * len(rule.strip_log_moneyness())
         n_obj = n_dates * per
         n_strip = int(rule.strip_paths)
         i_mid = n_dates // 2
@@ -1731,14 +2043,16 @@ class Hedger:
         """The conditional smile at ``t`` read **per path** from the strip of
         :meth:`_world_skew_pricer` (or its twin) and averaged: each forward-start's regressed
         conditional value (time-0 money) on the strip's own paths is taken to time-``t`` money,
-        inverted on the ratio (forward ``F(t + τ)/F(t)``, strike ``e^{k}``, maturity ``τ``,
-        discount ``DF(t + τ)/DF(t)``) and the ATMF vol, the central-difference skew and the
-        second-difference curvature across the three strikes are averaged over the paths where
-        the inversion is finite (a regressed value below intrinsic inverts to NaN and is dropped;
-        a kept fraction under :data:`STATE_SURFACE_MIN_INVERTED` is logged).  The M8 reading
-        inverted the path-*averaged* price — the unconditional ``(t + τ)``-option, whose "vol over
-        τ" carries the spot variance over ``[0, t]`` (measured: the 3M ATMF vol read 0.218 at
-        ``t = 0`` and 0.394 at ``t = 0.5`` on a world without any shock, the factor
+        inverted on the ratio (forward ``F(t + τ)/F(t)``, strike ``F(t + τ)/F(t) e^{k}`` — the
+        strike the object carries, forward log-moneyness ``k`` —, maturity ``τ``, discount
+        ``DF(t + τ)/DF(t)``) and the ATMF vol (``k = 0``), the central-difference skew across
+        ``±h`` and the second-difference curvature across ``{−c, 0, +c}`` (``c`` the rule's
+        :attr:`~RecalibrationRule.curvature_stencil`) are averaged over the paths where every
+        strike's inversion is finite (a regressed value below intrinsic inverts to NaN and is
+        dropped; a kept fraction under :data:`STATE_SURFACE_MIN_INVERTED` is logged).  The M8
+        reading inverted the path-*averaged* price — the unconditional ``(t + τ)``-option, whose
+        "vol over τ" carries the spot variance over ``[0, t]`` (measured: the 3M ATMF vol read
+        0.218 at ``t = 0`` and 0.394 at ``t = 0.5`` on a world without any shock, the factor
         ``sqrt((t + τ)/τ)``), so the proxy moved at every date and the rule refit at every date.
         The curvature is the noisy part of this read (:data:`DEFAULT_STRIP_PATHS`).  ``pr`` is a
         :class:`_StripPricer` (its date block by :meth:`_StripPricer.slot`) or a full pricer over
@@ -1750,21 +2064,30 @@ class Hedger:
         slot = pr.slot(kdx) if isinstance(pr, _StripPricer) else kdx
         df_t = float(fc.rate_curve.df(t))
         h = float(rule.h)
+        ch = rule.curvature_stencil
+        ks = rule.strip_log_moneyness()
+        n_k = len(ks)
         atf, skew, curv = [], [], []
         for pi, tau in enumerate(rule.pillars):
             T = t + tau
-            base_obj = slot * n_pill * self.STRIP_STRIKES + pi * self.STRIP_STRIKES
+            base_obj = slot * n_pill * n_k + pi * n_k
             f_ratio = float(fc.forward(T) / fc.forward(t))
             df = float(fc.rate_curve.df(T)) / df_t
             ivs = []
-            for si, k in enumerate((-h, 0.0, h)):
+            for si, k in enumerate(ks):
+                strike = f_ratio * float(np.exp(k))
+                carried = float(getattr(pr.objects[base_obj + si], "strike", strike))
+                if abs(carried / strike - 1.0) > 1e-12:
+                    raise ValueError(
+                        f"strip object {base_obj + si} is struck at {carried:.6g}, not at forward "
+                        f"log-moneyness {k:+g} ({strike:.6g})"
+                    )
                 out, _ = pr.evaluate(base_obj + si, t, pr.paths, ["value"])
-                iv = implied_vol(
-                    out["value"] / df_t, f_ratio, float(np.exp(k)), tau, 1 if k >= 0 else -1, df
-                )
+                iv = implied_vol(out["value"] / df_t, f_ratio, strike, tau, 1 if k >= 0 else -1, df)
                 ivs.append(np.asarray(iv, dtype=np.float64))
-            lo, mid, hi = ivs
-            ok = np.isfinite(lo) & np.isfinite(mid) & np.isfinite(hi)
+            lo, mid, hi = ivs[:3]
+            c_lo, c_hi = (lo, hi) if n_k == 3 else (ivs[3], ivs[4])
+            ok = np.logical_and.reduce([np.isfinite(v) for v in ivs])
             if not ok.any():
                 raise ValueError(
                     f"state surface at t={t:g}, pillar {tau:g}: no path inverts to a finite vol"
@@ -1778,7 +2101,7 @@ class Hedger:
                 )
             atf.append(float(mid[ok].mean()))
             skew.append(float(((hi - lo)[ok] / (2.0 * h)).mean()))
-            curv.append(float(((hi - 2.0 * mid + lo)[ok] / (h * h)).mean()))
+            curv.append(float(((c_hi - 2.0 * mid + c_lo)[ok] / (ch * ch)).mean()))
         return _StateSurface(
             np.asarray(rule.pillars, dtype=np.float64),
             np.asarray(atf),
@@ -1925,6 +2248,7 @@ def realised_spot(world: PathSet, idx: Any, T: float, fc: Any) -> FloatArray:
 
 
 __all__ = [
+    "COMPLETE_MARKET_NOTE",
     "CORRELATION_BOUND",
     "DEFAULT_STRIP_PATHS",
     "FREQUENCIES",
@@ -1942,7 +2266,9 @@ __all__ = [
     "Schedule",
     "StripSurfaces",
     "degenerate_correlations",
+    "min_variance_delta",
     "realised_spot",
     "refit_targets",
+    "spot_factor_projection",
     "step0_degenerate_pillars",
 ]

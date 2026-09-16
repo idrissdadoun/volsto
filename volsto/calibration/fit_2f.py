@@ -2354,12 +2354,17 @@ def fit_2f_marking(
     h: float = SABR_CURVATURE_H,
     iterate_against_simulation: int = 0,
     assert_stage3: bool = True,
+    skew_h: float | None = None,
 ) -> FitResult:
     """Marking mode on a surface: targets by :func:`~volsto.calibration.targets.marking_targets`
     (the config's pillars, ``mat_min``, SmoothBreakEven, the radicand guard and step-0
-    conventions), ``ξ₀`` the surface's variance-swap strip to the last fitted pillar."""
+    conventions), ``ξ₀`` the surface's variance-swap strip to the last fitted pillar.
+    ``skew_h`` (default ``None``: the M7 marking fit, unchanged) is the stencil-consistent
+    argument of :func:`marking_targets_for`."""
     c = cfg or BreakEvenFitConfig()
-    targets = marking_targets_for(surface, c, ssr_target=ssr_target, anchor_power=anchor_power, h=h)
+    targets = marking_targets_for(
+        surface, c, ssr_target=ssr_target, anchor_power=anchor_power, h=h, skew_h=skew_h
+    )
     t_max = float(min(surface.max_maturity, max(targets.pillars)))
     xi0 = xi0_curve(surface, t_max)
     c = replace(c, pillars=tuple(float(t) for t in targets.pillars))
@@ -2391,8 +2396,16 @@ def marking_targets_for(
     ssr_target: SsrInput = 1.0,
     anchor_power: float = 1.0,
     h: float = SABR_CURVATURE_H,
+    skew_h: float | None = None,
 ) -> TargetSet:
-    """:func:`~volsto.calibration.targets.marking_targets` with the config's target settings."""
+    """:func:`~volsto.calibration.targets.marking_targets` with the config's target settings.
+
+    ``h`` is the curvature stencil's half-width; ``skew_h`` (default ``None``: the surface's
+    analytic ATM skew when it has one — the M7 reading, unchanged) reads the skew by the central
+    difference of that half-width instead.  Passing both reads a surface on the stencil of a
+    finite strike strip: the M8b recalibration rule's base fit does so on the pricing snapshot
+    with the strip's ``(h, curvature_h)`` so its held targets and a refit's compare like for
+    like (:meth:`volsto.hedging.hedger.RecalibrationRule.marking_targets`)."""
     return marking_targets(
         surface,
         cfg.pillars,
@@ -2404,6 +2417,7 @@ def marking_targets_for(
         sabrw_power=cfg.sabrw_power,
         atf_ref=cfg.atf_ref,
         radicand_floor=cfg.radicand_floor,
+        skew_h=skew_h,
     )
 
 

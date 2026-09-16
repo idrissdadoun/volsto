@@ -77,12 +77,20 @@ model-bump targets of the objects with a Black–Scholes proxy (:mod:`volsto.hed
 vanillas, digitals, forward starts before ``T1`` and portfolios of those) are controlled with the
 same payoff difference under a Black–Scholes **shadow** on the same spot normals (one per proxy
 vol, the pricing model's forward curve; the shadow's future spliced at ``t`` like the hybrid
-targets): ``y_i − β (c_i − E[c_i | state_i])`` with ``β = Cov(y, c)/Var(c)`` on the alive paths
-of the date and the conditional expectation the analytic Black value difference (exact for the
+targets): ``y_i − β (c_i − E[c_i | state_i])`` with ``β = Cov(y, c − E[c|state])/Var(c −
+E[c|state])`` on the alive paths of the date (the centred control's coefficient, so the
+reduction is ``≥ 1`` by construction — :meth:`ConditionalPricer.controlled_target`, fixed
+2026-09-16) and the conditional expectation the analytic Black value difference (exact for the
 shadow, so the regression stays unbiased whatever ``β``).  Applies to the surface-driven bumps
-only (:class:`Bump` carries the bumped surfaces or the flat vol shifts); the hybrid-CRN spot
-bumps and the parameter bumps are untouched.  ``Fit.variance_reduction`` / ``Fit.beta`` report
-it per bump, ``control_variate=False`` switches it off, and an object without a proxy is noted
+(:class:`Bump` carries the bumped surfaces or the flat vol shifts) and — ``control_delta``, the
+owner's decision of 2026-09-16, **off by default** (:data:`DEFAULT_CONTROL_DELTA`: measured to
+hurt the 2F study-D hedges) — to the **hybrid-CRN delta target** and a §7.2 regime's delta
+(:meth:`ConditionalPricer.delta_control`: the shadow payoff difference under ``S_t e^{±h}``,
+whose conditional expectation is the Black finite-difference delta at the leg's proxy vol; the
+regime's shadow reads the proxy vols of its moved surfaces); the gamma target and the parameter
+bumps are untouched.  ``Fit.variance_reduction`` / ``Fit.beta`` report it per bump (the delta
+control under ``"delta"``), ``control_variate=False`` switches every control off,
+``control_delta=False`` the delta control only, and an object without a proxy is noted
 once per class (cliquets, autocalls, barriers, variance products, accumulated-sum options).
 
 Checked by ``tests/test_hedging.py`` (``test_conditional_pricer_bs``: the regressed value and
@@ -156,8 +164,11 @@ class Bump:
     ``skew_T`` / ``curvature_T`` tents — the proxy vol of a leg moves by the bumped surface's
     vol minus the base surface's at the leg's ``(k, T)``), or, for a bare Black–Scholes pricing
     model whose vega bump is the flat ``±VOL_BUMP``, the flat shifts ``vol_shift_up`` /
-    ``vol_shift_dn``.  A model-parameter bump (``param:<name>``) or a spot-kind bump carries
-    neither and gets no control."""
+    ``vol_shift_dn``.  A model-parameter bump (``param:<name>``) carries neither and gets no
+    control.  A **spot-kind** bump (a §7.2 delta regime) may carry the moved states' surfaces
+    ``up_surface`` / ``dn_surface`` (both): the delta control
+    (:meth:`ConditionalPricer.delta_control`) then shadows it at the proxy vol the regime's
+    surface move gives the leg; without them it is controlled at the base proxy vol."""
 
     name: str
     up: Model
@@ -183,6 +194,10 @@ class Bump:
             raise ValueError("a one-sided bump cannot carry a dn surface or vol shift")
         if self.dn is not None and self.controllable and not self._has_dn_control:
             raise ValueError("a two-sided controllable bump needs the dn surface or vol shift too")
+        if self.kind == "spot" and (self.vol_shift_up is not None or self.vol_shift_dn is not None):
+            raise ValueError("a spot-kind bump carries the moved surfaces, not flat vol shifts")
+        if self.kind == "spot" and (self.up_surface is None) != (self.dn_surface is None):
+            raise ValueError("a spot-kind bump carries both moved surfaces or neither")
 
     @property
     def _has_dn_control(self) -> bool:
@@ -191,7 +206,8 @@ class Bump:
     @property
     def controllable(self) -> bool:
         """Whether the bump carries a Black–Scholes shadow (surfaces or flat vol shifts) — a
-        ``"model"`` or ``"second"`` kind; spot-kind bumps are never controlled."""
+        ``"model"`` or ``"second"`` kind; spot-kind bumps are controlled by the delta control
+        instead (:meth:`ConditionalPricer.delta_control`, ``control_delta``)."""
         return self.kind in ("model", "second") and (
             self.up_surface is not None or self.vol_shift_up is not None
         )
@@ -232,7 +248,8 @@ class Fit:
     ``delta`` and ``gamma`` — stored as the first and second derivatives in ``ln S_t``, converted
     per unit spot by :meth:`ConditionalPricer.evaluate` —, one per bump name), the feature
     standardisation, the kept columns and clip range, the spline knots, the alive paths' share
-    and the fit diagnostics.  The §7.11 control variate's report per bump name:
+    and the fit diagnostics.  The §7.11 control variate's report per bump name (the delta
+    control's under ``"delta"``):
     ``variance_reduction`` (``Var(y) / Var(y − β (c − E[c | state]))`` on the alive paths; 1.0
     when the bump was not controlled), ``beta`` (0.0 when not controlled) and the ``controlled``
     names."""
@@ -318,6 +335,24 @@ CLIP_QUANTILE = 0.001  # the basis is evaluated inside the pricing paths' [0.1%,
 # not a smoother (a ridge of 1e-3 x n_paths on the raw columns crushed the last spline pieces
 # and took the daily Black-Scholes delta hedge from 1.09x to 1.46x the exact-delta bound)
 DEFAULT_RIDGE = 1e-6
+#: default of ``ConditionalPricer.control_delta`` / ``Hedger.control_delta``: the §7.11 control on
+#: the hybrid-CRN delta target (and a §7.2 regime's delta) is OFF by default — the owner's rule of
+#: 2026-09-16 is "on by default only if it is measured to help and never to hurt", and it was
+#: measured to hurt.  M8b study-D vanilla (2F marking LSV, 2·10⁴ pricing and world paths, daily,
+#: the same world paths on and off; hedged std on/off with a path-pair bootstrap se): model
+#: 1.0019 ± 0.0007 and sticky_moneyness 1.0038 ± 0.0007 (worse), sticky_strike 0.9984 ± 0.0009,
+#: sticky_skew 0.9987 ± 0.0008, min_variance 0.9952 ± 0.0017 — although the delta target's own
+#: variance falls by a median 1.63 (inter-quartile 1.34–2.03) over the model row's dates.  Under
+#: Black–Scholes it helps: the daily 1y ATM call's hedged std over the analytic-delta hedge goes
+#: from 1.133 ± 0.006 to 1.074 ± 0.005 (``scripts/m8b_delta_estimator.py``).  Re-measured with the
+#: centred-control coefficient (same budget and paths, 337 s, no calibration): model 1.0018 ±
+#: 0.0007 and sticky_moneyness 1.0033 ± 0.0006 (still worse), sticky_strike 0.9979 ± 0.0008,
+#: sticky_skew 0.9982 ± 0.0007, min_variance 0.9954 ± 0.0016 — the default stays OFF
+DEFAULT_CONTROL_DELTA = False
+#: the name of the controlled value regression (:meth:`ConditionalPricer.value_control`): never
+#: used for the P&L (the ``value`` target stays the raw payoff, so ``t = 0`` is the Monte Carlo
+#: price on the draws), only for the factor gradients of the minimum-variance delta
+VALUE_CV = "value_cv"
 
 
 @dataclass
@@ -351,6 +386,14 @@ class ConditionalPricer:
     #: the §7.11 control variate on the difference for the surface-driven model bumps of the
     #: objects with a Black–Scholes proxy (:mod:`volsto.hedging.controls`; module docstring)
     control_variate: bool = True
+    #: the §7.11 control on the **delta** target (:meth:`delta_control`; needs
+    #: ``control_variate`` and the hybrid-CRN estimator): off switches the delta target back to
+    #: the raw CRN difference while the bump targets stay controlled
+    control_delta: bool = DEFAULT_CONTROL_DELTA
+    #: fit the controlled value target :data:`VALUE_CV` next to ``value`` (needs
+    #: ``control_variate``; the hedger turns it on for the ``min_variance`` delta regime only,
+    #: which reads its factor gradient from it — one extra shadow pass per object and date)
+    control_value: bool = False
     #: the base implied surface the proxy vols are read from (the pricing context's; a
     #: Black–Scholes pricing model uses its own ``vol`` instead; ``None`` without a state)
     surface: Any = None
@@ -381,6 +424,13 @@ class ConditionalPricer:
     proxies: dict[int, tuple[ProxyLeg, ...] | None] = field(
         init=False, repr=False, default_factory=dict
     )
+    #: per ``(object, spot-bump name)``: the legs' shadow vols ``(up, dn)`` of the delta control
+    #: (``"delta"`` for the hybrid-CRN spot bumps, else a §7.2 regime bump's name)
+    delta_vols: dict[tuple[int, str], tuple[FloatArray, FloatArray]] = field(
+        init=False, repr=False, default_factory=dict
+    )
+    #: per object: the legs' base proxy vols (the value control's)
+    base_vols: dict[int, FloatArray] = field(init=False, repr=False, default_factory=dict)
     #: per ``(object, bump name)``: the legs' shadow vols ``(base, up, dn)`` (``dn`` ``None`` for
     #: a one-sided bump); ``None`` when the bump cannot be shadowed for that object
     shadow_vols: dict[tuple[int, str], tuple[FloatArray, FloatArray, FloatArray | None] | None] = (
@@ -606,6 +656,8 @@ class ConditionalPricer:
         self.bumped_paths = {}
         self.hybrids = {}
         self.shadow_vols = {}
+        self.delta_vols = {}
+        self.base_vols = {}
         self.brownian = None
         del self.paths
         self.close()
@@ -651,8 +703,15 @@ class ConditionalPricer:
         :mod:`volsto.hedging.controls`); one note per object class without a proxy."""
         self.proxies = {}
         self.shadow_vols = {}
+        self.delta_vols = {}
+        self.base_vols = {}
         self.brownian = None
-        if not self.control_variate or not any(b.controllable for b in self.bumps):
+        spot_bumps = [b for b in self.bumps if b.kind == "spot"]
+        delta_on = bool(self.delta_controlled)
+        value_on = bool(self.control_variate and self.control_value)
+        if not self.control_variate or not (
+            any(b.controllable for b in self.bumps) or delta_on or value_on
+        ):
             return
         base_vol = float(self.model.vol) if hasattr(self.model, "vol") else None
         if base_vol is None and self.surface is None:
@@ -673,6 +732,16 @@ class ConditionalPricer:
             for b in self.bumps:
                 if b.controllable:
                     self.shadow_vols[(j, b.name)] = self._shadow_vols(legs, b, base_vol)
+            base = self._base_vols(legs, base_vol)
+            self.base_vols[j] = base
+            if delta_on:
+                # the hybrid-CRN spot bumps move the spot with the model held: the base vols
+                self.delta_vols[(j, "delta")] = (base, base)
+                for b in spot_bumps:
+                    self.delta_vols[(j, b.name)] = (
+                        self._moved_vols(legs, base, b.up_surface),
+                        self._moved_vols(legs, base, b.dn_surface),
+                    )
         if not any_proxy:
             return
         self.brownian = ShadowBrownian.from_draws(
@@ -689,10 +758,7 @@ class ConditionalPricer:
         """The legs' shadow vols under bump ``b``: base (the pricing model's own flat vol, else
         the base surface's vol at the leg's ``(k, T)``), up and dn (base + the bumped surface's
         vol minus the base surface's, or + the flat shift), floored at ``MIN_SHADOW_VOL``."""
-        if base_vol is not None:
-            base = np.full(len(legs), base_vol)
-        else:
-            base = np.array([leg.vol(self.surface) for leg in legs])
+        base = self._base_vols(legs, base_vol)
 
         def side(surface: Any, shift: float | None) -> FloatArray | None:
             if shift is not None:
@@ -709,6 +775,102 @@ class ConditionalPricer:
         if b.dn is not None and dn is None:
             return None
         return base, up, dn
+
+    def _base_vols(self, legs: Sequence[ProxyLeg], base_vol: float | None) -> FloatArray:
+        """The legs' base proxy vols: the pricing model's own flat vol, else the base surface's
+        vol at each leg's ``(k, T)``."""
+        if base_vol is not None:
+            return np.full(len(legs), base_vol)
+        return np.array([leg.vol(self.surface) for leg in legs])
+
+    def _moved_vols(self, legs: Sequence[ProxyLeg], base: FloatArray, surface: Any) -> FloatArray:
+        """The legs' proxy vols after a §7.2 regime's spot move: base + [moved surface vol −
+        base surface vol] at each leg's fixed strike (the moved surface is in the moved spot's
+        coordinates, so a fixed strike reads the regime's vol there), floored at
+        ``MIN_SHADOW_VOL``; the base vols when the bump carries no surface (a flat move: the
+        model regime)."""
+        if surface is None or self.surface is None:
+            return base
+        delta = np.array([leg.vol(surface) - leg.vol(self.surface) for leg in legs])
+        return np.asarray(np.maximum(base + delta, MIN_SHADOW_VOL))
+
+    @property
+    def delta_controlled(self) -> bool:
+        """Whether the delta control applies to this pricer's delta targets (``control_variate``
+        and ``control_delta`` on, the hybrid-CRN estimator: the plain bumped path of the
+        ``"gradient"`` estimator scales the whole history, which a shadow spliced at ``t`` does not
+        follow)."""
+        return bool(
+            self.control_variate and self.control_delta and self.delta_estimator == "hybrid_crn"
+        )
+
+    def delta_control(
+        self, obj_index: int, t: float, name: str, s_up: float, s_dn: float
+    ) -> tuple[FloatArray, FloatArray] | None:
+        """The per-path control of a delta target (the hybrid-CRN ``"delta"``, or the spot-kind
+        bump ``name``) of one object at ``t`` and its analytic conditional expectation, scaled
+        exactly like the target: the legs' shadow payoffs spliced at ``t`` from ``S_t e^{±h}`` —
+        ``h`` the bump's own re-anchoring shift ``ln(s_up/S₀)`` / ``ln(s_dn/S₀)`` — at the up /
+        down proxy vols, differenced over ``s_up − s_dn`` and converted to the dollar delta in
+        ``ln S_t`` (``× S₀``, the target's ``/ (S_t/S₀) × S_t``).  The conditional expectation is
+        the Black finite difference ``[V_BS(S_t e^{h_up}) − V_BS(S_t e^{h_dn})] × S₀/(s_up −
+        s_dn)`` — exact for the shadow (the Black delta ``DF(T) N(d₁) F(T)/F(t)`` up to
+        ``O(h²)``), so the regression stays unbiased whatever ``β``.  Under a Black–Scholes
+        pricing model the shadow is the model and the controlled target is that finite
+        difference to round-off.  ``None`` when no control applies (no proxy, a forward-start
+        leg past its ``T1``: noted)."""
+        legs = self.proxies.get(obj_index)
+        vols = self.delta_vols.get((obj_index, name))
+        if legs is None or vols is None or self.brownian is None:
+            return None
+        if not all(leg.active(float(t)) for leg in legs):
+            note = proxy_note(self.objects[obj_index], float(t))
+            if note not in self.notes:
+                self.notes.append(note)
+            return None
+        col = self.idx[float(t)]
+        fc = self.model.forward_curve
+        ln_s_t = self.paths.log_spot_at(col)
+        s0 = self.model.spot
+        n = self.sim.n_paths
+
+        def side(v: FloatArray, shift: float) -> tuple[FloatArray, FloatArray]:
+            c = np.zeros(n)
+            e = np.zeros(n)
+            assert self.brownian is not None and legs is not None
+            for leg, vol in zip(legs, v, strict=True):
+                c += self.brownian.leg_payoff(leg, self.paths, self.idx, col, float(vol), fc, shift)
+                e += leg.weight * leg.conditional_value(ln_s_t + shift, float(t), float(vol), fc)
+            return c, e
+
+        c_up, e_up = side(vols[0], float(np.log(s_up / s0)))
+        c_dn, e_dn = side(vols[1], float(np.log(s_dn / s0)))
+        k = s0 / (s_up - s_dn)
+        return (c_up - c_dn) * k, (e_up - e_dn) * k
+
+    def value_control(self, obj_index: int, t: float) -> tuple[FloatArray, FloatArray] | None:
+        """The per-path control of the **value** target of one object at ``t`` — the legs'
+        shadow payoffs spliced at ``t`` at the base proxy vols — and its analytic conditional
+        expectation (the Black value given ``S_t``), or ``None`` (no proxy, a forward start past
+        its ``T1``).  Its expectation depends on ``S_t`` only, so the controlled value target
+        keeps its factor dependence while shedding the spot-driven payoff noise: the regression
+        gradient in the factors (:data:`VALUE_CV`, the minimum-variance delta's ``∂V/∂X_i``) is
+        read from it."""
+        legs = self.proxies.get(obj_index)
+        base = self.base_vols.get(obj_index)
+        if legs is None or base is None or self.brownian is None:
+            return None
+        if not all(leg.active(float(t)) for leg in legs):
+            return None
+        col = self.idx[float(t)]
+        fc = self.model.forward_curve
+        ln_s_t = self.paths.log_spot_at(col)
+        c = np.zeros(self.sim.n_paths)
+        e = np.zeros(self.sim.n_paths)
+        for leg, vol in zip(legs, base, strict=True):
+            c += self.brownian.leg_payoff(leg, self.paths, self.idx, col, float(vol), fc)
+            e += leg.weight * leg.conditional_value(ln_s_t, float(t), float(vol), fc)
+        return c, e
 
     def control(self, obj_index: int, t: float, b: Bump) -> tuple[FloatArray, FloatArray] | None:
         """The per-path control ``c`` of bump ``b`` for one object at ``t`` and its analytic
@@ -757,13 +919,22 @@ class ConditionalPricer:
     def controlled_target(
         y: FloatArray, c: FloatArray, e: FloatArray, alive: BoolArray
     ) -> tuple[FloatArray, float, float, float]:
-        """``y − β (c − e)`` with ``β = Cov(y, c)/Var(c)`` on the alive paths, the variance
-        reduction ``Var(y)/Var(y − β (c − e))`` there (``inf`` when the controlled target is
-        constant, 1.0 when ``y`` is), ``β``, and the bootstrap standard error of the reduction
-        (:data:`CV_BOOTSTRAP_DRAWS` path resamples; 0 when there is nothing to estimate)."""
-        ya, ca = y[alive], c[alive]
-        var_c = float(ca.var(ddof=1)) if ca.size > 1 else 0.0
-        beta = float(np.cov(ya, ca, ddof=1)[0, 1] / var_c) if var_c > 0.0 else 0.0
+        """``y − β (c − e)`` with ``β = Cov(y, c − e)/Var(c − e)`` on the alive paths, the
+        variance reduction ``Var(y)/Var(y − β (c − e))`` there (``inf`` when the controlled target
+        is constant, 1.0 when ``y`` is), ``β``, and the bootstrap standard error of the reduction
+        (:data:`CV_BOOTSTRAP_DRAWS` path resamples; 0 when there is nothing to estimate).
+
+        The coefficient is the one of the **centred** control ``c − e`` (``e = E[c | state]``
+        varies with the state): with it ``Var(y − β (c − e)) = Var(y) − Cov(y, c − e)²/Var(c − e)
+        ≤ Var(y)`` on the alive paths by construction (the sample identity, same ``ddof``), so the
+        reduction is ``≥ 1`` up to rounding.  The coefficient ``Cov(y, c)/Var(c)`` used before
+        2026-09-16 minimises ``Var(y − β c)``, not the variance of the target actually returned,
+        and can make it larger (``tests/test_hedging.py::
+        test_controlled_target_coefficient_never_increases_the_variance``)."""
+        ya = y[alive]
+        za = np.asarray(c[alive] - e[alive], dtype=np.float64)
+        var_z = float(za.var(ddof=1)) if za.size > 1 else 0.0
+        beta = float(np.cov(ya, za, ddof=1)[0, 1] / var_z) if var_z > 0.0 else 0.0
         out = np.asarray(y - beta * (c - e), dtype=np.float64)
         var_y = float(ya.var(ddof=1)) if ya.size > 1 else 0.0
         ra = out[alive]
@@ -851,7 +1022,41 @@ class ConditionalPricer:
         betas: dict[str, float] = {}
         controlled: list[str] = []
         n_alive = int(alive.sum())
+        # the delta target: the hybrid-CRN one, or the spot-kind bump that replaces it (a §7.2
+        # regime: the same shadow from the regime's own spot ratio at its moved proxy vols)
+        regime = next((b for b in self.bumps if b.kind == "spot" and b.name == "delta"), None)
+        if self.delta_controlled and n_alive > 1:
+            if regime is None:
+                ce = self.delta_control(obj_index, float(t), "delta", self._s_up, self._s_dn)
+            else:
+                assert regime.dn is not None
+                ce = self.delta_control(
+                    obj_index, float(t), regime.name, regime.up.spot, regime.dn.spot
+                )
+            if ce is not None:
+                (
+                    targets["delta"],
+                    variance_reduction["delta"],
+                    betas["delta"],
+                    variance_reduction_se["delta"],
+                ) = self.controlled_target(targets["delta"], ce[0], ce[1], alive)
+                controlled.append("delta")
+        if self.control_variate and self.control_value and n_alive > 1:
+            cv = self.value_control(obj_index, float(t))
+            if cv is not None:
+                (
+                    targets[VALUE_CV],
+                    variance_reduction[VALUE_CV],
+                    betas[VALUE_CV],
+                    variance_reduction_se[VALUE_CV],
+                ) = self.controlled_target(pay.base, cv[0], cv[1], alive)
+                controlled.append(VALUE_CV)
         for b in self.bumps:
+            if b.kind == "spot" and b.name == "delta":
+                variance_reduction.setdefault(b.name, 1.0)
+                variance_reduction_se.setdefault(b.name, 0.0)
+                betas.setdefault(b.name, 0.0)
+                continue
             ce = self.control(obj_index, float(t), b) if n_alive > 1 else None
             if ce is None:
                 variance_reduction[b.name], betas[b.name] = 1.0, 0.0
@@ -956,14 +1161,25 @@ class ConditionalPricer:
         self.fits[key] = fit
         return fit
 
-    def cv_reductions(self) -> list[float]:
+    def cv_reductions(self, delta: bool = False) -> list[float]:
         """Every controlled bump's variance reduction over the fits computed so far (dates ×
-        objects), for the run's ``cv_reduction_median``."""
-        return [f.variance_reduction[k] for f in self.fits.values() for k in f.controlled]
+        objects), for the run's ``cv_reduction_median``; ``delta=True``: the delta control's
+        instead (``cv_delta_reduction_median``)."""
+        return [
+            f.variance_reduction[k]
+            for f in self.fits.values()
+            for k in f.controlled
+            if k != VALUE_CV and (k == "delta") == delta
+        ]
 
-    def cv_reduction_ses(self) -> list[float]:
+    def cv_reduction_ses(self, delta: bool = False) -> list[float]:
         """The bootstrap standard errors matching :meth:`cv_reductions`."""
-        return [f.variance_reduction_se[k] for f in self.fits.values() for k in f.controlled]
+        return [
+            f.variance_reduction_se[k]
+            for f in self.fits.values()
+            for k in f.controlled
+            if k != VALUE_CV and (k == "delta") == delta
+        ]
 
     # -- evaluation --------------------------------------------------------------------------
 

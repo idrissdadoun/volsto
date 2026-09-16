@@ -44,6 +44,7 @@ import dataclasses
 import importlib
 import logging
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -89,7 +90,7 @@ SPX = ROOT / "configs" / "surfaces" / "snapshots" / "hdn_2022H2_ssvi" / "spx_202
 SSR_SIM = SimConfig(n_paths=40_000, dt_max=1.0 / 100.0, chunk_size=20_000, seed=7)
 
 
-def _cached(spec):  # type: ignore[no-untyped-def]
+def _cached(spec: Any) -> Any:
     """The cached LSV of ``spec`` (never calibrated here) or a skip."""
     from volsto.calibration.cache import CacheMissError, LeverageCache
 
@@ -107,7 +108,7 @@ def _reference_spec(kind: str):  # type: ignore[no-untyped-def]
     )
 
 
-def _spx_surface():  # type: ignore[no-untyped-def]
+def _spx_surface() -> Any:
     from volsto.market.loaders import load_ssvi_surface
 
     return load_ssvi_surface(SPX)
@@ -186,7 +187,7 @@ def test_config_validation(ssvi) -> None:  # type: ignore[no-untyped-def]
         {"rho12_flag": 1.5},
     ):
         with pytest.raises(ValueError):
-            BreakEvenFitConfig(**bad)  # type: ignore[arg-type]
+            BreakEvenFitConfig(**bad)
     # the YAML round trip of a config (the study specs carry it)
     from volsto.config import to_mapping
 
@@ -246,7 +247,7 @@ def test_exact_qp_and_least_violation(rng) -> None:  # type: ignore[no-untyped-d
         n_active += bool(active)
         assert feas and np.all(G @ x <= h + 1e-8)
 
-        def quad(z, H=H, g=g):  # type: ignore[no-untyped-def]
+        def quad(z: Any, H: Any = H, g: Any = g) -> Any:
             return 0.5 * z @ H @ z - g @ z
 
         res = minimize(
@@ -954,3 +955,55 @@ def test_real_data_end_to_end() -> None:
         print(m.summary())
         assert all(np.isfinite(v) for v in dataclasses.asdict(m.params).values())
         assert (m.targets.policy_check()["reading"] == "absolute").all()
+
+
+def test_marking_targets_stencil_consistent_argument(spx) -> None:  # type: ignore[no-untyped-def]
+    """The stencil-consistency argument ``skew_h`` of :func:`marking_targets_for` /
+    :func:`fit_2f_marking` (M8b fix of 2026-09-16, for the recalibration rule's base fit): without
+    it the M7 reading is unchanged (the SPX SSVI's analytic ATM skew, the ``h = 1e-3``
+    curvature, no stencil flag); with ``skew_h = 0.05, h = 0.10`` step 0 reads the skew as the
+    ``±0.05`` central difference and the curvature as the ``±0.10`` second difference of the
+    surface's own implied vols (to round-off), the skew constraint's ``skew_fn`` reads the same
+    stencil, the pillar records it and a flag says so."""
+    from volsto.calibration.fit_2f import marking_targets_for
+    from volsto.calibration.targets import SABR_CURVATURE_H
+
+    surf = _spx_surface()
+    cfg = BreakEvenFitConfig(pillars=(0.25, 1.0, 3.0), mat_min=0.0, skew_pillars=(1.0, 3.0))
+    m7 = marking_targets_for(surf, cfg, ssr_target=1.0)
+    for s in m7.sabr:
+        assert s.skew == float(np.asarray(surf.atm_skew(s.T)))
+        assert s.h == SABR_CURVATURE_H and s.skew_h is None
+        assert not any("stencil-consistent" in f for f in s.flags)
+    same = marking_targets_for(surf, cfg, ssr_target=1.0, h=SABR_CURVATURE_H, skew_h=None)
+    assert np.array_equal(same.correl_target, m7.correl_target)
+    assert np.array_equal(same.spot_vol_covar, m7.spot_vol_covar)
+    st = marking_targets_for(surf, cfg, ssr_target=1.0, h=0.10, skew_h=0.05)
+    rows = []
+    for s, s7 in zip(st.sabr, m7.sabr, strict=True):
+        T = float(s.T)
+        v = np.asarray(surf.implied_vol_k(np.array([-0.10, 0.0, 0.10]), np.full(3, T)))
+        w = np.asarray(surf.implied_vol_k(np.array([-0.05, 0.05]), np.full(2, T)))
+        # to round-off: step 0 passes the reads through the 365-day quote conversion
+        assert s.skew == pytest.approx(float((w[1] - w[0]) / (2 * 0.05)), rel=1e-13)
+        assert s.curv == pytest.approx(float((v[2] - 2 * v[1] + v[0]) / (0.10 * 0.10)), rel=1e-13)
+        assert s.atf == pytest.approx(float(v[1]), rel=1e-13) and s.atf == s7.atf
+        assert s.h == 0.10 and s.skew_h == 0.05
+        assert any("stencil-consistent" in f for f in s.flags)
+        rows.append((T, s7.skew, s.skew, s7.curv, s.curv, s7.rho_sabr, s.rho_sabr))
+    for r in rows:
+        print(
+            f"T {r[0]:g}: skew {r[1]:+.5f} -> {r[2]:+.5f}, curv {r[3]:+.4f} -> {r[4]:+.4f}, "
+            f"Corr_SABR {r[5]:+.4f} -> {r[6]:+.4f}"
+        )
+    t = np.array([0.5, 2.0])
+    assert st.skew_fn is not None and m7.skew_fn is not None
+    fd = [
+        float(np.diff(np.asarray(surf.implied_vol_k(np.array([-0.05, 0.05]), np.full(2, x))))[0])
+        / (2 * 0.05)
+        for x in t
+    ]
+    assert np.array_equal(st.skew_fn(t), np.array(fd))
+    assert np.array_equal(m7.skew_fn(t), np.asarray(surf.atm_skew(t), dtype=np.float64))
+    with pytest.raises(ValueError):
+        marking_targets_for(surf, cfg, ssr_target=1.0, skew_h=0.0)

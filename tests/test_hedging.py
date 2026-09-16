@@ -21,6 +21,10 @@ wall-clock assertion.  Every P&L figure carries its standard error.
   surfaces); the guarded correlation fallback on a synthetic degenerate target set; the
   ``|Corr_BE|`` cap; the named study-C pinning case reproduced bit for bit at 2·10⁴ strip paths
   (pinned, step-0 flags recorded) and cleared by the rebuilt rule (slow, cached leverages);
+* the strip at forward moneyness (fix of 2026-09-16): its ATMF vol and skew at ``t = 0`` equal
+  the surface's within stated Monte Carlo se's (a local-vol world, fast; the study-C pricing
+  twin, slow), the ``curvature_h`` stencil (five strikes) and the base fit read on the strip's
+  stencil; the §7.11 coefficient of the centred control never increases the target's variance;
 * the §7.2 delta regimes as hedging deltas: the sticky-strike regime delta at ``t = 0`` equals the
   M5 ``delta_gamma`` estimator (the spot-kind bump re-anchored at the bumped spot);
 * ``stream_bumps``: streamed and in-memory bumped sets give identical P&L, the scratch directory
@@ -43,7 +47,14 @@ from numpy.typing import NDArray
 from scipy.stats import norm
 
 from volsto.calibration.cache import CacheMissError, LeverageCache
-from volsto.config import CalibrationSpec, CurveConfig, MarketConfig, SimConfig, load_yaml
+from volsto.config import (
+    BergomiParams,
+    CalibrationSpec,
+    CurveConfig,
+    MarketConfig,
+    SimConfig,
+    load_yaml,
+)
 from volsto.engine.mc import MonteCarlo
 from volsto.hedging import (
     Costs,
@@ -938,13 +949,12 @@ def test_refit_targets_guarded_fallback_on_a_synthetic_set(fc: ForwardCurve) -> 
     surface nothing falls back and no base fit is needed; a degenerate date without a base fit,
     or with mismatched pillars, raises.  Under ``sticky_breakeven`` the fallback is recorded and
     the value is the one the policy holds anyway."""
-    from volsto.calibration.fit_2f import marking_targets_for
     from volsto.hedging.hedger import refit_targets, step0_degenerate_pillars
 
     rule = _rule_for()
     bad, good = _state(fc, _CURV_GUARDED), _state(fc, _CURV_REGULAR)
-    base = marking_targets_for(good, rule.config(), ssr_target=1.0)
-    plain = marking_targets_for(bad, rule.config(), ssr_target=1.0)
+    base = rule.marking_targets(good)
+    plain = rule.marking_targets(bad)
     assert step0_degenerate_pillars(plain) == _RULE_PILLARS
     assert all(s.radicand_guarded for s in plain.sabr)
     assert np.array_equal(plain.correl_target, -np.ones(3))
@@ -983,14 +993,13 @@ def test_refit_correlation_cap(fc: ForwardCurve) -> None:
     0.97): a regular (unguarded) 3M pillar reading ``Corr_SABR = −0.983`` is capped to −0.97
     with ``corr_capped`` recorded and only ``correl_target`` touched; a cap of 1 leaves it; the
     cap applies after the guarded fallback (a cap of 0.5 clips the held base values too)."""
-    from volsto.calibration.fit_2f import marking_targets_for
     from volsto.hedging.hedger import REFIT_CORRELATION_CAP, refit_targets
 
     curv = _CURV_REGULAR.copy()
     curv[0] = _CURV_STEEP_3M
     steep = _state(fc, curv)
     rule = _rule_for()
-    plain = marking_targets_for(steep, rule.config(), ssr_target=1.0)
+    plain = rule.marking_targets(steep)
     assert not any(s.radicand_guarded for s in plain.sabr)
     assert -0.995 < plain.correl_target[0] < -REFIT_CORRELATION_CAP
     assert np.all(np.abs(plain.correl_target[1:]) < REFIT_CORRELATION_CAP)
@@ -1006,7 +1015,7 @@ def test_refit_correlation_cap(fc: ForwardCurve) -> None:
     uncapped = refit_targets(steep, _rule_for(correlation_cap=1.0), None)
     assert not uncapped.corr_capped
     assert np.array_equal(uncapped.targets.correl_target, plain.correl_target)
-    base = marking_targets_for(_state(fc, _CURV_REGULAR), rule.config(), ssr_target=1.0)
+    base = rule.marking_targets(_state(fc, _CURV_REGULAR))
     both = refit_targets(_state(fc, _CURV_GUARDED), _rule_for(correlation_cap=0.5), base)
     assert both.fallback_applied and both.corr_capped
     assert np.array_equal(both.targets.correl_target, np.clip(base.correl_target, -0.5, 0.5))
@@ -1155,22 +1164,27 @@ class _NoCalibrationBuilder:
 def test_named_pinning_case_and_the_rebuilt_refit() -> None:
     """The named M8b study-C pinning case (autocall 3y, +1 rota, ``sabr_linked``, the refit at
     ``t = 0.9615`` — rebalancing date 50 — on the production task's hedger, 2·10⁴ pricing and
-    world paths, seed 2024), reproduced bit for bit from the diagnosis of 2026-09-16:
+    world paths, seed 2024), on the strip at FORWARD moneyness (fix of 2026-09-16; the base fit
+    on the strip's stencil, ``RecalibrationRule.marking_targets``):
 
-    * at **2·10⁴ strip paths** the world's state surface reads curvature −1.2194 / −0.5288 /
-      −0.3430, step 0's radicand guard fires at every pillar and clips ``Corr_SABR`` to −1, and
-      the pre-rebuild refit (the plain marking targets) lands on the collapsed set
-      ``ρ12 = +1, ρ_SX1 = ρ_SX2 = −1`` with ν = 2.397492534477822 — the stored run's refit;
-      the rebuilt refit on the same surface records the step-0 flags and ``fallback_applied``
-      (the base fit's −0.904 / −0.901 / −0.903 held) and is not pinned (ρ_SX1 −0.9627, ρ_SX2
-      −0.8253, ρ12 +0.7385; ``k1`` unchanged: step 2 untouched);
-    * at **8·10⁴ strip paths** (study C's rule) the curvature reads −0.5852 / +0.1876 / +0.7086,
-      no pillar is guarded, nothing falls back or caps (3M ``Corr_BE`` −0.963) and the fit is
-      regular (ρ_SX1 −0.7027, ρ_SX2 −0.4242, ρ12 −0.3397).
+    * at **2·10⁴ strip paths** the world's state surface reads curvature −1.2211 / −0.4806 /
+      −0.2518, step 0's radicand guard fires at every pillar and clips ``Corr_SABR`` to −1, and
+      the plain marking targets land on the collapsed set ``ρ12 = +1, ρ_SX1 = ρ_SX2 = −1``
+      (ν = 2.404628218584923); the rebuilt refit on the same surface records the step-0 flags
+      and ``fallback_applied`` (the base fit's −0.8953 / −0.8967 / −0.9010 held) and is not
+      pinned (ρ_SX1 −0.9567, ρ_SX2 −0.8268, ρ12 +0.7310; ``k1`` unchanged: step 2 untouched);
+    * at **8·10⁴ strip paths** (study C's rule) the curvature reads −0.6090 / +0.2019 / +0.7154,
+      no pillar is guarded, nothing falls back or caps (3M ``Corr_BE`` −0.9655) and the fit is
+      regular (ρ_SX1 −0.7026, ρ_SX2 −0.4160, ρ12 −0.3483).
+
+    Before the fix (spot-relative strikes ``e^{k}``, base fit on the M7 stencil) the same case
+    read −1.2194 / −0.5288 / −0.3430 (ν of the pinned set 2.397492534477822; rebuilt ρ_SX1
+    −0.9627, ρ_SX2 −0.8253, ρ12 +0.7385) and −0.5852 / +0.1876 / +0.7086 (ρ_SX1 −0.7027, ρ_SX2
+    −0.4242, ρ12 −0.3397): the diagnosis's qualitative picture is unchanged.
 
     Leverages from the cache (skipped when absent); nothing calibrated — the refit's model
     rebuild is stubbed.  No wall-clock assertion (measured about 15 s + 20 s)."""
-    from volsto.calibration.fit_2f import fit_2f, fit_2f_marking, marking_targets_for
+    from volsto.calibration.fit_2f import fit_2f, fit_2f_marking
     from volsto.hedging.hedger import degenerate_correlations, step0_degenerate_pillars
     from volsto.market.varswap import xi0_curve
     from volsto.studies import m8b
@@ -1198,7 +1212,15 @@ def test_named_pinning_case_and_the_rebuilt_refit() -> None:
     kdx = 50
     t = float(dates[kdx])
     assert t == pytest.approx(0.9615384615384616, abs=1e-12)
-    base = fit_2f_marking(ctx.surface, rule.config(), ssr_target=rule.ssr_target)
+    assert rule.curvature_h is None and rule.curvature_stencil == rule.h == 0.05
+    base = fit_2f_marking(
+        ctx.surface,
+        rule.config(),
+        ssr_target=rule.ssr_target,
+        h=rule.curvature_stencil,
+        skew_h=rule.h,
+    )
+    assert base.targets.correl_target == pytest.approx([-0.8953, -0.8967, -0.9010], abs=5e-5)
     xi0 = xi0_curve(ctx.surface, float(min(ctx.surface.max_maturity, 3.0 + t)))
     rho = ("rho12", "rho_SX1", "rho_SX2")
 
@@ -1210,7 +1232,7 @@ def test_named_pinning_case_and_the_rebuilt_refit() -> None:
         r = dataclasses.replace(rule, strip_paths=n_strip, log_rows=[], base_fit=base)
         ss = h.strip_surfaces(dates, r, only=[kdx], twin=False)
         surf = ss.world[kdx]
-        plain = marking_targets_for(surf, r.config(), ssr_target=r.ssr_target)
+        plain = r.marking_targets(surf)
         old = params_of(fit_2f(plain, xi0, r.config()).params)
         h._recalibrate(t, ss, kdx, r, None)  # type: ignore[arg-type]
         row = r.log_rows[-1]
@@ -1221,33 +1243,84 @@ def test_named_pinning_case_and_the_rebuilt_refit() -> None:
         )
         seen[n_strip] = new
         if n_strip == 20_000:
-            assert surf.curv == pytest.approx(
-                [-1.2194074887483242, -0.5288025125503116, -0.3430201166014236], rel=1e-9
-            )
+            assert surf.curv == pytest.approx([-1.221058, -0.480572, -0.251784], abs=5e-7)
             assert step0_degenerate_pillars(plain) == (0.25, 1.0, 3.0)
             assert set(degenerate_correlations(old)) == set(rho)
-            assert old["nu"] == pytest.approx(2.397492534477822, rel=1e-9)
+            assert old["nu"] == pytest.approx(2.404628218584923, rel=1e-9)
             assert old["rho12"] > 0.9999999 and old["rho_SX1"] < -0.9999999
             assert row["fallback_applied"] is True and row["corr_capped"] is False
             assert row["step0_flags"].count("radicand guard fired") == 3
             assert row["step0_flags"].count("clipped") == 3
             assert row["at_bound"] == ""
             assert not degenerate_correlations(new)
-            assert new["rho_SX1"] == pytest.approx(-0.9627077471675081, rel=1e-6)
-            assert new["rho_SX2"] == pytest.approx(-0.8252817617585934, rel=1e-6)
-            assert new["rho12"] == pytest.approx(0.7384591347868525, rel=1e-6)
+            assert new["rho_SX1"] == pytest.approx(-0.956740052562423, rel=1e-6)
+            assert new["rho_SX2"] == pytest.approx(-0.826772238468473, rel=1e-6)
+            assert new["rho12"] == pytest.approx(0.7310232729932535, rel=1e-6)
             assert new["k1"] == pytest.approx(old["k1"], rel=1e-9)
         else:
-            assert surf.curv == pytest.approx(
-                [-0.5852113321785415, 0.1875746367112767, 0.7085993844002169], rel=1e-9
-            )
+            assert surf.curv == pytest.approx([-0.609042, 0.201888, 0.715385], abs=5e-7)
             assert step0_degenerate_pillars(plain) == ()
             assert row["fallback_applied"] is False and row["corr_capped"] is False
             assert row["step0_flags"].count("radicand guard") == 0 and row["at_bound"] == ""
             assert {k: new[k] for k in old} == pytest.approx(old, rel=1e-12)
-            assert new["rho_SX1"] == pytest.approx(-0.7027186096481359, rel=1e-6)
-            assert new["rho_SX2"] == pytest.approx(-0.424203795732525, rel=1e-6)
-            assert new["rho12"] == pytest.approx(-0.3397429452709632, rel=1e-6)
+            assert new["rho_SX1"] == pytest.approx(-0.7026253089227829, rel=1e-6)
+            assert new["rho_SX2"] == pytest.approx(-0.4160203466178672, rel=1e-6)
+            assert new["rho12"] == pytest.approx(-0.3482838541931257, rel=1e-6)
+
+
+@pytest.mark.slow
+def test_twin_strip_reads_the_snapshot_smile_at_t0() -> None:
+    """Fix of 2026-09-16 on the production case: at ``t = 0`` the study-C pricing-model twin
+    strip (SPX 2022-12-30 marking LSV from the cache, 8·10⁴ strip paths, ``h = 0.05``, the VKO
+    put's hedger) reads the snapshot's ATMF vol and its ``±h`` skew at 3M / 1Y / 3Y within 4
+    Monte Carlo se's (per-strike vols linearised by their Black vega, antithetic pairs); the
+    snapshot reference is its ``total_variance`` at forward log-moneyness.  The pre-fix read sat
+    at the vol of the SPOT strike (measured then 0.2225 / 0.2364 / 0.2373 against the ATMF
+    0.2200 / 0.2275 / 0.2218), which lies outside that band at 1Y and 3Y (at 3M the forward drift
+    is too small to tell them apart at 4 se).  Measured after the fix: 0.2198 / 0.2266 / 0.2215,
+    z −0.35 / −1.37 / −0.39; skew z +1.12 / −0.01 / −0.73.  Nothing calibrated (about 50 s)."""
+    from volsto.engine.mc import summarize
+    from volsto.studies import m8b
+
+    cfg = m8b.StudyConfig(allow_calibrate=False, verbose=False)
+    try:
+        env = m8b.StudyEnvironment(cfg)
+        task = next(
+            t
+            for t in m8b.enumerate_tasks("C", cfg).tasks
+            if t.product == "vko put 12m" and t.rota == 3.0 and t.policy == "sabr_linked"
+        )
+        h, product, _ = m8b.make_hedger(task, env)
+    except CacheMissError as exc:
+        pytest.skip(f"cached leverage absent (tests never calibrate): {exc}")
+    rule = h.recalibration
+    assert rule is not None and rule.strip_paths == 80_000 and rule.h == 0.05
+    dates = h.schedule.build(product)
+    tw = h._twin_skew_pricer(h._world_skew_pricer(dates, rule, [0]))
+    ss = h._state_surface(tw, 0, 0.0, rule)
+    snap = h.context.surface
+    fc = snap.forward_curve
+    ks = rule.strip_log_moneyness()
+    assert len(env.calibration_keys) == 0
+    for pi, tau in enumerate(rule.pillars):
+        L = _strip_linear_se(tw, snap, pi * len(ks), tau, ks)
+
+        def vol(k: float, tau: float = tau) -> float:
+            return float(np.sqrt(snap.total_variance(k, tau) / tau))
+
+        se_atf = summarize(L[1], tw.sim.antithetic).stderr
+        se_skew = summarize((L[2] - L[0]) / 0.10, tw.sim.antithetic).stderr
+        ref_atf, ref_skew = vol(0.0), (vol(0.05) - vol(-0.05)) / 0.10
+        spot_strike = vol(-float(np.log(fc.forward(tau) / fc.spot)))
+        print(
+            f"T {tau:g}: atf {ss.atf[pi]:.5f} vs snapshot ATMF {ref_atf:.5f} +/- {se_atf:.5f} "
+            f"(spot-strike vol {spot_strike:.5f}); skew {ss.skew[pi]:+.5f} vs {ref_skew:+.5f} "
+            f"+/- {se_skew:.5f}"
+        )
+        assert abs(ss.atf[pi] - ref_atf) < 4 * se_atf
+        assert abs(ss.skew[pi] - ref_skew) < 4 * se_skew
+        if tau >= 1.0:
+            assert abs(spot_strike - ref_atf) > 4 * se_atf
 
 
 def test_regime_delta_bump_reanchors_at_the_bumped_spot(fc: ForwardCurve) -> None:
@@ -1680,3 +1753,360 @@ def test_no_control_for_autocall(bs: BlackScholes, fc: ForwardCurve) -> None:
     assert fit.controlled == ()
     assert fit.variance_reduction["vega"] == 1.0 and fit.beta["vega"] == 0.0
     assert pr.cv_reductions() == []
+
+
+# --------------------------------------------------------------------------------------------
+# the minimum-variance delta and the delta control (owner's decision of 2026-09-16, M8b study D)
+# --------------------------------------------------------------------------------------------
+
+
+def test_min_variance_delta_reduces_to_model_delta_under_bs(
+    bs: BlackScholes, fc: ForwardCurve
+) -> None:
+    """Under Black–Scholes (no stochastic-vol factor, a complete market in the spot) the
+    ``min_variance`` regime IS the model delta: identical per-date deltas and per-path P&L, and
+    the run says why (the note), never silently."""
+    from volsto.hedging.hedger import (
+        COMPLETE_MARKET_NOTE,
+        min_variance_delta,
+        spot_factor_projection,
+    )
+
+    ls = np.log(np.array([90.0, 100.0, 110.0]))
+    proj, note = spot_factor_projection(bs, 0.5, ls, np.zeros((3, 0)))
+    assert proj.shape == (3, 0) and note == COMPLETE_MARKET_NOTE.format(name="BlackScholes")
+    d = np.array([0.3, 0.5, 0.7])
+    assert min_variance_delta(d, np.zeros((3, 0)), proj) is not None
+    assert np.array_equal(min_variance_delta(d, np.zeros((3, 0)), proj), d)
+    opt = EuropeanOption(100.0, 1.0, 1, fc.rate_curve)
+    sim = dataclasses.replace(SIM_SMALL, n_paths=2_000, chunk_size=2_000)
+    runs = {}
+    for regime in ("model", "min_variance"):
+        h = Hedger(
+            PricingContext.from_model(bs),
+            bs,
+            Schedule("weekly"),
+            Costs(),
+            sim=sim,
+            world_paths=2_000,
+            verbose=False,
+        )
+        runs[regime] = h.run(
+            opt, GreekTargetStrategy((Target("delta"),), [Spot()], delta_regime=regime)
+        )
+    m, v = runs["model"], runs["min_variance"]
+    print(f"model {m.summary()}\nmin_variance {v.summary()}")
+    assert np.array_equal(m.pnl_total, v.pnl_total)
+    assert np.array_equal(m.greeks_by_date["delta"], v.greeks_by_date["delta"])
+    assert COMPLETE_MARKET_NOTE.format(name="BlackScholes") in v.pricing_notes
+    assert v.settings["delta_regime"] == "min_variance"
+
+
+def test_spot_factor_projection_from_the_model_sde(fc: ForwardCurve) -> None:
+    """``d⟨X_i, S⟩/d⟨S, S⟩ = ρ_Si / (S σ)`` with ``σ² = L² ξ_t^t`` (the model's instantaneous
+    variance): the pure 2F Bergomi (book Table 8.2) and an LSV on it with a constant leverage
+    1.5; a model with factors but no readable spot-factor correlation raises."""
+    from volsto.hedging.hedger import min_variance_delta, spot_factor_projection
+    from volsto.market.varswap import ForwardVarianceCurve
+    from volsto.models.bergomi import BergomiSV
+    from volsto.models.leverage import LeverageFunction
+    from volsto.models.lsv import LSV
+
+    params = load_yaml(ROOT / "configs" / "models" / "bergomi_table_8_2.yaml", BergomiParams)
+    kernel = BergomiSV(params, ForwardVarianceCurve.flat(0.04), fc)
+    rng = np.random.default_rng(0)
+    n = 50
+    ls = np.log(100.0) + 0.2 * rng.standard_normal(n)
+    fac = 0.5 * rng.standard_normal((n, 2))
+    t = 0.5
+    proj, note = spot_factor_projection(kernel, t, ls, fac)
+    sigma = np.sqrt(kernel.variance_from_factors(t, fac))
+    expect = kernel.rho_s[None, :] / (np.exp(ls) * sigma)[:, None]
+    assert note is None and np.allclose(proj, expect, rtol=1e-13, atol=0.0)
+    lev = LeverageFunction([0.0, 2.0], np.linspace(-2, 2, 5), np.full((2, 5), 1.5), fc)
+    lsv = LSV(kernel, lev)
+    proj_l, _ = spot_factor_projection(lsv, t, ls, fac)
+    assert np.allclose(proj_l, expect / 1.5, rtol=1e-12, atol=0.0)
+    grads = rng.standard_normal((n, 2))
+    d = rng.standard_normal(n)
+    assert np.allclose(min_variance_delta(d, grads, proj), d + (grads * expect).sum(axis=1))
+    # negative spot-vol correlations and a long-vega (positive dV/dX) value: the MV delta is lower
+    assert np.all(min_variance_delta(d, np.abs(grads), proj) < d)
+
+    class _Factored(BlackScholes):
+        n_factors = 1
+
+    with pytest.raises(ValueError, match="no spot-factor correlation"):
+        spot_factor_projection(_Factored(0.2, fc), t, ls, fac[:, :1])
+
+
+def test_delta_control_exact_under_bs(bs: BlackScholes, fc: ForwardCurve) -> None:
+    """The §7.11 control on the hybrid-CRN delta target: under Black–Scholes the shadow is the
+    pricing model, so the control reproduces the raw target to round-off and the controlled target
+    is the Black finite-difference delta up to the in-sample coefficient's sampling error — its
+    fit sits closer to the analytic delta than the raw fit; the reduction is reported under ``"delta"`` apart from the bump
+    controls'.  The default (``control_delta=False``: measured to hurt under the 2F model) leaves
+    the raw target."""
+    opt = EuropeanOption(100.0, 1.0, 1, fc.rate_curve)
+    t = 0.5
+    sim = dataclasses.replace(SIM, n_paths=8_000, chunk_size=8_000)
+    grid = union_grid([bs], [opt], np.array([t]), sim)
+    on = ConditionalPricer(bs, [opt], grid, sim, control_delta=True)
+    off = ConditionalPricer(bs, [opt], grid, sim)
+    assert not off.control_delta  # off by default: measured to hurt under the 2F model
+    assert on.delta_controlled and not off.delta_controlled
+    f_on, f_off = on.fit(0, t), off.fit(0, t)
+    assert "delta" in f_on.controlled and "delta" not in f_off.controlled
+    ce = on.delta_control(0, t, "delta", on._s_up, on._s_dn)
+    assert ce is not None
+    c, e = ce
+    hyb = on.hybrid_payoffs(t)
+    s_t = np.exp(on.paths.log_spot_at(on.idx[t]))
+    y = (hyb["up"][:, 0] - hyb["dn"][:, 0]) / (on._s_up - on._s_dn) / (s_t / bs.spot) * s_t
+    assert np.max(np.abs(y - c)) < 1e-9 * np.max(np.abs(y)), np.max(np.abs(y - c))
+    # the centred-control coefficient (2026-09-16) is the SAMPLE variance minimiser
+    # Cov(y, c − e)/Var(c − e): its population value is 1 here (y = c, Cov(e, c − e) = 0), its
+    # sample value is 1 + Cov(e, c − e)/Var(c − e) — measured 0.99837 at 8·10³ paths (the
+    # pre-fix Cov(y, c)/Var(c) was exactly 1 when y = c); the controlled target is then
+    # e + (1 − β)(c − e) to round-off
+    z = c - e
+    beta = f_on.beta["delta"]
+    assert beta == pytest.approx(float(np.cov(y, z, ddof=1)[0, 1] / z.var(ddof=1)), rel=1e-9)
+    assert abs(beta - 1.0) < 0.005, beta
+    vr, vr_se = f_on.variance_reduction["delta"], f_on.variance_reduction_se["delta"]
+    assert vr > 1.0 and np.isfinite(vr_se) and vr_se > 0.0
+    assert on.cv_reductions() == [] and on.cv_reductions(delta=True) == [vr]
+    # the controlled target is the finite-difference Black delta in ln S (× S0 / (S_up − S_dn))
+    fd = e / s_t
+    F = s_t * float(fc.forward(1.0) / fc.forward(t))
+    d1 = (np.log(F / 100.0) + 0.5 * 0.04 * 0.5) / (0.2 * np.sqrt(0.5))
+    analytic = float(fc.rate_curve.df(1.0)) * norm.cdf(d1) * float(fc.forward(1.0) / fc.forward(t))
+    # the finite difference over S_t e^{±h} is the Black delta to O(h²) (h = 0.01: measured
+    # max |difference| 2.6e-4 over the paths)
+    assert np.max(np.abs(fd - analytic)) < 5.0 * on.spot_size**2
+    d_on = on.evaluate(0, t, on.paths, ["delta"])[0]["delta"]
+    d_off = off.evaluate(0, t, off.paths, ["delta"])[0]["delta"]
+    inside = (s_t > 80) & (s_t < 125)
+    rmse_on = float(np.sqrt(np.mean((d_on - analytic)[inside] ** 2)))
+    rmse_off = float(np.sqrt(np.mean((d_off - analytic)[inside] ** 2)))
+    print(
+        f"delta VR {vr:.2f} +/- {vr_se:.2f}; fitted delta RMSE on {rmse_on:.5f} off {rmse_off:.5f}"
+    )
+    assert rmse_on < rmse_off
+
+
+def test_controlled_target_coefficient_never_increases_the_variance() -> None:
+    """§7.11 coefficient (2026-09-16 fix): the control is centred, ``c − e`` with ``e = E[c |
+    state]`` varying with the state, so the variance-minimising coefficient is ``Cov(y, c − e)/
+    Var(c − e)``, for which ``Var(y − β (c − e)) = Var(y) − Cov(y, c − e)²/Var(c − e)`` exactly
+    on the sample.  Constructed data where the old ``Cov(y, c)/Var(c)`` made the reduction < 1:
+    ``y = e`` (all of the target is state-driven), ``c = e + z`` with a small independent noise
+    ``z``; the old ``β ≈ 1`` subtracts ``z`` and adds its variance.  The new coefficient gives a
+    reduction ``≥ 1`` there and on a set of random draws (with and without a dead path mask), and
+    the sample identity to round-off; the bootstrap se is kept."""
+    rng = np.random.default_rng(20260916)
+    n = 4_000
+    e = rng.standard_normal(n)
+    z = 0.3 * rng.standard_normal(n)
+    y, c = e.copy(), e + z
+    alive = np.ones(n, dtype=bool)
+    # the pre-fix coefficient on these data: its reduction is below 1
+    beta_old = float(np.cov(y, c, ddof=1)[0, 1] / c.var(ddof=1))
+    red_old = float(y.var(ddof=1) / (y - beta_old * (c - e)).var(ddof=1))
+    out, red, beta, se = ConditionalPricer.controlled_target(y, c, e, alive)
+    print(
+        f"constructed: old beta {beta_old:.4f} reduction {red_old:.4f}; "
+        f"new beta {beta:+.5f} reduction {red:.6f} +/- {se:.6f} (bootstrap)"
+    )
+    assert beta_old > 0.8 and red_old < 0.95
+    assert red >= 1.0 and abs(beta) < 0.1 and np.isfinite(se)
+    zc = c - e
+    ident = y.var(ddof=1) - np.cov(y, zc, ddof=1)[0, 1] ** 2 / zc.var(ddof=1)
+    assert out.var(ddof=1) == pytest.approx(ident, rel=1e-10)
+    for draw in range(20):
+        a = rng.standard_normal((3, n))
+        mask = rng.random(n) > (0.2 if draw % 2 else 0.0)
+        yy = a[0] + rng.uniform(-2, 2) * a[1]
+        ee = rng.uniform(-2, 2) * a[0] + a[2]
+        cc = ee + rng.uniform(0, 2) * a[1] + rng.uniform(0, 1) * rng.standard_normal(n)
+        _, rr, _, _ = ConditionalPricer.controlled_target(yy, cc, ee, mask)
+        assert rr >= 1.0 - 1e-12, (draw, rr)
+
+
+# --------------------------------------------------------------------------------------------
+# the recalibration strip at forward moneyness and its curvature stencil (2026-09-16 fixes)
+# --------------------------------------------------------------------------------------------
+
+
+def _lv_context_drift(rate: float, dividend: float) -> PricingContext:
+    """The local-vol context of the reference surface on a market with a larger forward drift
+    (no leverage: nothing calibrated), so a spot-relative strike sits far from the forward."""
+    st = _reference_state()
+    mkt = dataclasses.replace(
+        st.spec.market,
+        rate_curve=CurveConfig((1.0,), (rate,)),
+        dividend_curve=CurveConfig((1.0,), (dividend,)),
+    )
+    spec = dataclasses.replace(st.spec, market=mkt)
+    return PricingContext.from_state(type(st)(spec), None, "lv", label="LV drift")
+
+
+def _strip_linear_se(pr: ConditionalPricer, surface: Any, first: int, tau: float, ks: Any) -> Any:
+    """Per strike of one pillar's strip at ``t = 0``: the per-path payoff divided by its Black
+    vega at the surface's vol (the first-order vol contribution of each path), so the Monte Carlo
+    se of any linear combination of the strip's vols is the antithetic-pair se of the same
+    combination of these arrays."""
+    fc = surface.forward_curve
+    f = float(fc.forward(tau) / fc.spot)
+    df = float(fc.rate_curve.df(tau))
+    out = []
+    for si, k in enumerate(ks):
+        obj = pr.objects[first + si]
+        assert isinstance(obj, ForwardStartOption)
+        sig = float(np.sqrt(surface.total_variance(k, tau) / tau))
+        d1 = (np.log(f / obj.strike) + 0.5 * sig * sig * tau) / (sig * np.sqrt(tau))
+        out.append(pr.payoffs[first + si].base / (df * f * np.sqrt(tau) * norm.pdf(d1)))
+    return out
+
+
+def test_strip_reads_the_smile_at_forward_moneyness() -> None:
+    """Fix of 2026-09-16: the trigger strip's forward-start options pay ``(S_T2/S_T1 − m)⁺``, a
+    SPOT-relative strike; they are now struck at ``m = F(T2)/F(T1) e^{k}`` and inverted at that
+    strike, so the three reads sit at forward log-moneyness ``{−h, 0, +h}``.  On a local-vol world
+    = pricing model of the reference SSVI with ``r − q = 6%`` (no calibration), at ``t = 0``
+    (where the conditional smile is the surface's own), 8·10⁴ strip paths, daily steps:
+
+    * the objects carry the forward strikes (three per pillar; five with ``curvature_h``);
+    * the ATMF vol and the ``±h`` skew equal the surface's ATMF vol and same-stencil skew within
+      4 Monte Carlo se's (per-strike vols linearised by their Black vega, antithetic pairs), and
+      the pre-fix reading — the vol at the spot strike — lies outside that band;
+    * with ``curvature_h = 0.15`` the curvature equals the surface's ``±0.15`` second difference
+      within 4 se's, and the level and skew are bit-identical to the three-strike strip's on the
+      same paths (the extra pair touches only the curvature);
+    * a strip read with a rule whose strikes it does not carry raises."""
+    from volsto.engine.mc import summarize
+
+    ctx = _lv_context_drift(0.06, 0.0)
+    surf = ctx.surface
+    fc = surf.forward_curve
+    n = 80_000
+    sim = SimConfig(n_paths=n, chunk_size=20_000, seed=5, dt_max=1.0 / 252.0)
+    dates = np.array([0.0, 0.5])
+    reads = {}
+    for ch in (None, 0.05, 0.15):
+        rule = RecalibrationRule(pillars=(0.25, 1.0), h=0.05, strip_paths=n, curvature_h=ch)
+        h = Hedger(ctx, ctx.model, Schedule("monthly"), Costs(), sim=sim, verbose=False)
+        ks = rule.strip_log_moneyness()
+        assert len(ks) == (5 if ch == 0.15 else 3) and rule.curvature_stencil == (ch or 0.05)
+        objs = h._strip_objects(dates, rule)
+        assert len(objs) == dates.size * 2 * len(ks)
+        for j, o in enumerate(objs):
+            t, tau, k = dates[j // (2 * len(ks))], (0.25, 1.0)[(j // len(ks)) % 2], ks[j % len(ks)]
+            assert isinstance(o, ForwardStartOption) and o.cp == (1 if k >= 0 else -1)
+            ratio = float(fc.forward(t + tau) / fc.forward(t))
+            assert o.strike == pytest.approx(ratio * np.exp(k), rel=1e-15)
+        pr = h._world_skew_pricer(dates, rule, [0])
+        ss = h._state_surface(pr, 0, 0.0, rule)
+        reads[ch] = ss
+        if ch is None:
+            wrong = dataclasses.replace(rule, h=0.06, log_rows=[])
+            with pytest.raises(ValueError, match="forward log-moneyness"):
+                h._state_surface(pr, 0, 0.0, wrong)
+        for pi, tau in enumerate(rule.pillars):
+            L = _strip_linear_se(pr, surf, pi * len(ks), tau, ks)
+
+            def vol(k: float, tau: float = tau) -> float:
+                return float(np.sqrt(surf.total_variance(k, tau) / tau))
+
+            se_atf = summarize(L[1], True).stderr
+            se_skew = summarize((L[2] - L[0]) / 0.10, True).stderr
+            c = rule.curvature_stencil
+            c_lo, c_hi = (L[0], L[2]) if len(ks) == 3 else (L[3], L[4])
+            se_curv = summarize((c_hi - 2 * L[1] + c_lo) / (c * c), True).stderr
+            ref = (
+                vol(0.0),
+                (vol(0.05) - vol(-0.05)) / 0.10,
+                (vol(c) - 2 * vol(0) + vol(-c)) / c**2,
+            )
+            spot_strike = vol(-float(np.log(fc.forward(tau) / fc.spot)))
+            print(
+                f"curvature_h {ch}, T {tau:g}: atf {ss.atf[pi]:.5f} vs {ref[0]:.5f} +/- "
+                f"{se_atf:.5f} (spot-strike vol {spot_strike:.5f}); skew {ss.skew[pi]:+.5f} vs "
+                f"{ref[1]:+.5f} +/- {se_skew:.5f}; curv {ss.curv[pi]:+.4f} vs {ref[2]:+.4f} "
+                f"+/- {se_curv:.4f}"
+            )
+            assert abs(ss.atf[pi] - ref[0]) < 4 * se_atf
+            assert abs(spot_strike - ref[0]) > 8 * se_atf
+            assert abs(ss.skew[pi] - ref[1]) < 4 * se_skew
+            if ch == 0.15:
+                assert abs(ss.curv[pi] - ref[2]) < 4 * se_curv
+    assert np.array_equal(reads[0.15].atf, reads[None].atf)
+    assert np.array_equal(reads[0.15].skew, reads[None].skew)
+    for f in ("atf", "skew", "curv"):
+        assert np.array_equal(getattr(reads[0.05], f), getattr(reads[None], f))
+    assert not np.array_equal(reads[0.15].curv, reads[None].curv)
+
+
+def test_curvature_stencil_wiring_and_base_fit_consistency(
+    fc: ForwardCurve, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``RecalibrationRule.curvature_h`` (2026-09-16): validated; ``None`` means ``h``; the
+    rule's targets read any surface on the strip's stencil (skew ``±h``, curvature
+    ``±curvature_h``) — exactly the default read on a state surface (a quadratic) —, the refit
+    reads through it, and the hedger's base marking fit on the pricing surface is computed on the
+    same stencil (``fit_2f_marking(h=curvature_h, skew_h=h)``; captured, not run)."""
+    import importlib
+
+    from volsto.hedging.hedger import refit_targets
+
+    fit_mod = importlib.import_module("volsto.calibration.fit_2f")
+
+    with pytest.raises(ValueError):
+        RecalibrationRule(curvature_h=0.0)
+    with pytest.raises(ValueError):
+        RecalibrationRule(h=-0.05)
+    r = _rule_for(curvature_h=0.10)
+    assert r.curvature_stencil == 0.10 and r.strip_log_moneyness() == (-0.05, 0.0, 0.05, -0.1, 0.1)
+    assert _rule_for().curvature_stencil == 0.05 and _rule_for().strip_log_moneyness() == (
+        -0.05,
+        0.0,
+        0.05,
+    )
+    state = _state(fc, _CURV_REGULAR)
+    got = r.marking_targets(state)
+    ref = fit_mod.marking_targets_for(state, r.config(), ssr_target=1.0)
+    for s in got.sabr:
+        assert s.h == 0.10 and s.skew_h == 0.05
+    for name in ("atf", "skew_target", "spot_vol_covar", "vol_var", "correl_target"):
+        assert np.allclose(getattr(got, name), getattr(ref, name), rtol=1e-9, atol=0), name
+    rt = refit_targets(state, r, None)
+    assert np.array_equal(rt.targets.correl_target, got.correl_target)
+    # the base fit, captured on a short LV run (stub refit, 2e3 strip paths)
+    lv = _lv_context()
+    captured: dict[str, Any] = {}
+
+    class _StopError(Exception):
+        pass
+
+    def spy(surface: Any, cfg: Any, **kw: Any) -> Any:
+        captured.update(kw, surface=surface)
+        raise _StopError
+
+    monkeypatch.setattr(fit_mod, "fit_2f_marking", spy)
+    rule = RecalibrationRule(
+        pillars=(0.25, 0.5),
+        h=0.05,
+        curvature_h=0.10,
+        policy="sticky_breakeven",
+        refit=lambda surf, params: params,
+        strip_paths=2_000,
+    )
+    sim = SimConfig(n_paths=2_000, chunk_size=2_000, seed=5, dt_max=1.0 / 52.0)
+    hr = Hedger(
+        lv, lv.model, Schedule("monthly"), Costs(), recalibration=rule, sim=sim, verbose=False
+    )
+    opt = EuropeanOption(float(fc.spot), 0.5, 1, lv.surface.forward_curve.rate_curve)
+    with pytest.raises(_StopError):
+        hr.run(opt, GreekTargetStrategy((Target("delta"),), [Spot()], name="delta"))
+    assert captured["surface"] is lv.surface
+    assert captured["h"] == 0.10 and captured["skew_h"] == 0.05 and captured["ssr_target"] == 1.0

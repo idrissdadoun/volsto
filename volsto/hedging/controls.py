@@ -8,11 +8,14 @@ such object and each surface-driven model bump (vega / volga, forward-variance b
 ``skew_T`` / ``curvature_T`` tents) :class:`~volsto.hedging.pricing.ConditionalPricer` prices a
 Black–Scholes **shadow** on the pricing draws' spot normals — one per proxy vol, with the pricing
 model's forward curve — and forms the per-path control ``c_i`` as the leg payoffs on the shadow
-futures spliced onto the pricing path's history at ``t`` (the hybrid construction of the
-targets), scaled exactly like the target.  Its conditional expectation given the state is the
-analytic value difference of :meth:`ProxyLeg.conditional_value`; the controlled target ``y_i − β
-(c_i − E[c_i | state_i])`` keeps the regression unbiased whatever ``β`` (``β = Cov(y, c)/Var(c)``
-on the alive paths at the date).
+futures spliced onto the pricing path's history at ``t`` (the hybrid construction of the targets),
+scaled exactly like the target.  Its conditional expectation given the state is the analytic value
+difference of :meth:`ProxyLeg.conditional_value`; the controlled target ``y_i − β (c_i − E[c_i |
+state_i])`` keeps the regression unbiased whatever ``β`` (``β = Cov(y, c)/Var(c)`` on the alive
+paths at the date).  The **hybrid-CRN delta target** (and a §7.2 regime's delta) is controlled the
+same way (``ConditionalPricer(control_delta=True)``): the shadow payoff difference under ``S_t
+e^{±h}`` (the spot bump's own re-anchoring shift), whose conditional expectation is the Black
+finite-difference delta at the leg's proxy vol — exact for the shadow.
 
 **The shadow is exact by construction.**  :class:`ShadowBrownian` accumulates the spot Brownian
 motion ``W`` of the pricing draws (``GaussianDraws`` with the pricing seed, Brownian column 0 —
@@ -229,13 +232,23 @@ class ShadowBrownian:
         return ShadowBrownian(w, np.asarray(grid.record_times, dtype=np.float64))
 
     def shadow_paths(
-        self, base: PathSet, idx: Any, col: int, vol: float, fc: Any, fixings: FloatArray
+        self,
+        base: PathSet,
+        idx: Any,
+        col: int,
+        vol: float,
+        fc: Any,
+        fixings: FloatArray,
+        shift: float = 0.0,
     ) -> PathSet:
         """The base paths with the columns of ``fixings`` after ``col`` (the splice at ``t``)
-        replaced by the Black–Scholes shadow at ``vol`` from ``S_t^base``: ``ln S_T = ln S_t +
-        ln F(T)/F(t) − ½ vol² (T − t) + vol (W_T − W_t)``; a fixing at or before ``t`` keeps the
-        base value (the history held).  Only ``log_spot`` is rewritten — the proxies read
-        nothing else."""
+        replaced by the Black–Scholes shadow at ``vol`` from ``S_t^base e^shift``: ``ln S_T =
+        ln S_t + shift + ln F(T)/F(t) − ½ vol² (T − t) + vol (W_T − W_t)``; a fixing at or before
+        ``t`` keeps the base value (the history held).  ``shift`` is the re-anchoring log-shift of
+        a spot bump (``±h`` for the hybrid-CRN delta, the regime's own spot ratio for a §7.2
+        regime bump: the delta control of
+        :meth:`~volsto.hedging.pricing.ConditionalPricer.delta_control`), 0 for the model bumps.
+        Only ``log_spot`` is rewritten — the proxies read nothing else."""
         ls = base.log_spot.copy()
         t = float(self.times[col])
         ln_f_t = float(np.log(fc.forward(t)))
@@ -245,14 +258,22 @@ class ShadowBrownian:
                 continue
             tau = float(T) - t
             drift = float(np.log(fc.forward(float(T)))) - ln_f_t - 0.5 * vol * vol * tau
-            ls[:, c] = base.log_spot[:, col] + drift + vol * (self.w[:, c] - self.w[:, col])
+            ls[:, c] = base.log_spot[:, col] + shift + drift + vol * (self.w[:, c] - self.w[:, col])
         return PathSet(base.times, ls, base.variance, base.factors, base.int_var, base.sum_sq)
 
     def leg_payoff(
-        self, leg: ProxyLeg, base: PathSet, idx: Any, col: int, vol: float, fc: Any
+        self,
+        leg: ProxyLeg,
+        base: PathSet,
+        idx: Any,
+        col: int,
+        vol: float,
+        fc: Any,
+        shift: float = 0.0,
     ) -> FloatArray:
-        """``weight × leg payoff`` on the shadow paths of ``vol`` spliced at ``col``."""
-        paths = self.shadow_paths(base, idx, col, vol, fc, leg.columns)
+        """``weight × leg payoff`` on the shadow paths of ``vol`` spliced at ``col`` (started
+        from ``S_t e^shift``)."""
+        paths = self.shadow_paths(base, idx, col, vol, fc, leg.columns, shift)
         return np.asarray(leg.weight * leg.product.payoff(paths, idx), dtype=np.float64)
 
 
