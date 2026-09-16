@@ -925,22 +925,20 @@ Measured before the study re-run (2F LSV at 8·10⁵ particles, 2·10⁴ paths, 
 
 Estimator diagnostics (`scripts/m8b_delta_estimator.py` → `outputs/m8b/delta_estimator.{csv,md}`; Black–Scholes flat 20%, 1y ATM call, daily, 2·10⁴ world paths): the regimes and `min_variance` are bit-identical under Black–Scholes; the hedged std over the analytic-delta hedge is 1.133 ± 0.006 at 2·10⁴ pricing paths (1.260 ± 0.009 at 5·10³), 1.074 ± 0.005 with the delta control; pooled delta bias −0.0022, RMSE 0.0116 (0.0086 controlled), with a last-week basis floor of 0.038 that the control does not touch.
 
-The table below is the 2026-09-15 run (four regimes, the old reference); it is replaced when study D is re-run.
+Study D — (from `outputs/m8b/m8b_table_D.csv`, re-run 2026-09-16: 10 tasks, 298 s, recalibrated: no; value ± se). Distance rank 1 = closest to the common minimum-variance delta, 0 = the min_variance benchmark row itself. autocall 3y: common MV delta 0.2993 ± 0.0022 (spread across the four regimes 0.0094); vanilla 1y atm: common MV delta 0.5362 ± 0.0009 (spread across the four regimes 0.0035). The autocall's min_variance row is not a valid benchmark (z 7.0, raw regression gradients: no Black-Scholes proxy for the controlled value target).
 
-Study D — (from `outputs/m8b/m8b_table_D.csv`, run 2026-09-15; value ± se; every column of the CSV carries its `_se` twin)
-
-| product | regime | status | unit | P&L std | mean (desk) | winner | closest to model | wall s |
-|---|---|---|---|---|---|---|---|---|
-| autocall 3y | model | ok | % of notional | 7.704 ± 0.083 | +0.150 ± 0.054 | no | no | 12 |
-| autocall 3y | sticky_strike | ok | % of notional | 6.764 ± 0.076 | +0.147 ± 0.048 | no | no | 19 |
-| autocall 3y | sticky_skew | ok | % of notional | 6.562 ± 0.073 | +0.148 ± 0.046 | yes | no | 20 |
-| autocall 3y | sticky_moneyness | ok | % of notional | 8.125 ± 0.087 | +0.136 ± 0.057 | no | yes | 20 |
-| vanilla 1y atm | model | ok | % of spot | 3.144 ± 0.011 | +0.014 ± 0.022 | no | no | 25 |
-| vanilla 1y atm | sticky_strike | ok | % of spot | 1.925 ± 0.008 | +0.018 ± 0.014 | yes | no | 50 |
-| vanilla 1y atm | sticky_skew | ok | % of spot | 1.971 ± 0.008 | +0.017 ± 0.014 | no | no | 43 |
-| vanilla 1y atm | sticky_moneyness | ok | % of spot | 3.060 ± 0.010 | +0.011 ± 0.022 | no | yes | 32 |
-
-
+| product | regime | unit | P&L std | std rank | mean delta | λ* (in-sample) | implied MV delta | distance to common MV | distance rank | MV row valid | wall s |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| vanilla 1y atm | model | % of spot | 3.144 ± 0.011 | 5 | 0.6493 ± 0.0008 | 0.824 ± 0.001 | 0.5347 ± 0.0010 | +0.1131 ± 0.0012 | 4 | — | 22 |
+| vanilla 1y atm | sticky_strike | % of spot | 1.925 ± 0.008 | 2 | 0.5979 ± 0.0008 | 0.899 ± 0.001 | 0.5376 ± 0.0008 | +0.0617 ± 0.0012 | 1 | — | 35 |
+| vanilla 1y atm | sticky_skew | % of spot | 1.971 ± 0.008 | 3 | 0.5991 ± 0.0008 | 0.897 ± 0.001 | 0.5372 ± 0.0008 | +0.0629 ± 0.0012 | 2 | — | 36 |
+| vanilla 1y atm | sticky_moneyness | % of spot | 3.060 ± 0.010 | 4 | 0.6439 ± 0.0009 | 0.830 ± 0.001 | 0.5341 ± 0.0009 | +0.1077 ± 0.0012 | 3 | — | 32 |
+| vanilla 1y atm | min_variance | % of spot | 1.701 ± 0.013 | 1 | 0.5358 ± 0.0007 | 0.981 ± 0.001 | 0.5254 ± 0.0009 | -0.0004 ± 0.0011 | 0 | yes | 35 |
+| autocall 3y | model | % of notional | 7.704 ± 0.083 | 3 | 0.2430 ± 0.0016 | 1.210 ± 0.005 | 0.2941 ± 0.0023 | -0.0563 ± 0.0027 | 3 | — | 13 |
+| autocall 3y | sticky_strike | % of notional | 6.764 ± 0.076 | 2 | 0.2686 ± 0.0016 | 1.130 ± 0.005 | 0.3034 ± 0.0022 | -0.0307 ± 0.0027 | 2 | — | 21 |
+| autocall 3y | sticky_skew | % of notional | 6.562 ± 0.073 | 1 | 0.2723 ± 0.0016 | 1.113 ± 0.005 | 0.3031 ± 0.0021 | -0.0270 ± 0.0027 | 1 | — | 21 |
+| autocall 3y | sticky_moneyness | % of notional | 8.125 ± 0.087 | 5 | 0.2380 ± 0.0016 | 1.240 ± 0.006 | 0.2952 ± 0.0024 | -0.0613 ± 0.0027 | 4 | — | 21 |
+| autocall 3y | min_variance | % of notional | 8.028 ± 0.079 | 4 | 0.3184 ± 0.0016 | 0.970 ± 0.005 | 0.3089 ± 0.0021 | +0.0191 ± 0.0027 | 0 | no | 25 |
 
 ---
 
