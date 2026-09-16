@@ -251,6 +251,37 @@ def _synthetic(study: str, product: str, **kw: object) -> TaskResult:
     return TaskResult(**base)  # type: ignore[arg-type]
 
 
+def test_refits_at_bound_counts_pinned_refits() -> None:
+    """``refits_at_bound`` reads the hedger's own ``at_bound`` column when the run recorded it
+    and otherwise parses the correlations out of the stored ``params`` repr (the study-C runs of
+    2026-09-15 predate the flag; their JSONs were backfilled from the pickles).  Measured over
+    the 45 stored runs: 41 of the 113 ``sabr_linked`` refits are pinned, 0 of the 113
+    ``sticky_breakeven`` ones."""
+    import pandas as pd
+
+    from volsto.studies.m8b import refits_at_bound
+
+    assert refits_at_bound(pd.DataFrame()) == 0
+    recorded = pd.DataFrame(
+        {
+            "t": [0.5, 1.0, 1.5],
+            "recalibrated": [True, False, True],
+            "at_bound": ["rho12=+1.0000; rho_SX1=-1.0000", "", ""],
+        }
+    )
+    assert refits_at_bound(recorded) == 1
+    collapsed = "LSV(BergomiSV(2F, BergomiParams(nu=2.4, rho12=0.9999999955, rho_SX1=-0.99999, "
+    sane = "LSV(BergomiSV(2F, BergomiParams(nu=2.4, rho12=0.41, rho_SX1=-0.92, rho_SX2=-0.73)))"
+    parsed = pd.DataFrame(
+        {
+            "t": [0.5, 1.0, 1.5],
+            "recalibrated": [True, True, False],
+            "params": [collapsed + "rho_SX2=-0.99999)))", sane, None],
+        }
+    )
+    assert refits_at_bound(parsed) == 1  # only the fired, collapsed refit counts
+
+
 def test_table_builders_on_synthetic_results(tmp_path: Path) -> None:
     res: list[TaskResult] = []
     # A: three strategies, two pricing models; the std sets the rank
@@ -336,6 +367,8 @@ def test_table_builders_on_synthetic_results(tmp_path: Path) -> None:
                 recal_total=(tot, 0.005),
                 recal_by_date=[{"t": 1.5, "mean": tot, "stderr": 0.005, "alive_fraction": 0.7}],
                 n_refits=1,
+                # the +2 row's refit pinned a correlation: the row is reported and marked
+                n_refits_at_bound=1 if rota == 2.0 else 0,
                 mean=(0.2, 0.01),
             )
         )
@@ -351,7 +384,11 @@ def test_table_builders_on_synthetic_results(tmp_path: Path) -> None:
         }
     }
     tc = table_C(rc, static)
-    assert {"ratio_se", "nonlinearity_se"} <= set(tc.columns)
+    assert {"ratio_se", "nonlinearity_se", "refits_at_bound", "contaminated"} <= set(tc.columns)
+    pinned = tc[(tc["rota"] == 2.0) & (tc["recalibration"] == "sabr_linked")].iloc[0]
+    clean1 = tc[(tc["rota"] == 1.0) & (tc["recalibration"] == "sabr_linked")].iloc[0]
+    assert pinned["refits_at_bound"] == 1 and bool(pinned["contaminated"])
+    assert clean1["refits_at_bound"] == 0 and not bool(clean1["contaminated"])
     ok_rows = tc[tc["ratio"].notna()]
     assert (ok_rows["ratio_se"] > 0).all(), ok_rows[["ratio", "ratio_se"]]
     two = tc[(tc["rota"] != 1.0) & tc["nonlinearity"].notna()]

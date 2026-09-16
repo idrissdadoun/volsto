@@ -137,6 +137,7 @@ from volsto.engine.grid import TimeGrid
 from volsto.engine.mc import MonteCarlo
 from volsto.engine.paths import PathSet
 from volsto.hedging.hedger import (
+    CORRELATION_BOUND,
     FREQUENCIES,
     MAX_HALVINGS,
     SPOT_BUMP,
@@ -717,6 +718,29 @@ class RecordingHedger(Hedger):
         return p
 
 
+_RHO_IN_REPR = re.compile(r"rho(?:12|_SX1|_SX2)=(-?[0-9.eE+]+)")
+
+
+def refits_at_bound(recalibrations: pd.DataFrame) -> int:
+    """How many of a run's refits landed with a fitted correlation at its bound
+    (``|rho| >=`` :data:`~volsto.hedging.hedger.CORRELATION_BOUND`): the hedger's own
+    ``at_bound`` column when the run recorded it, else the correlations read back out of the
+    stored ``params`` repr (the runs of 2026-09-15, before the flag existed).  A refit that
+    lands there prices the product under perfectly correlated factors, so the recalibration
+    P&L of that row measures the fitter railing as much as the cost of re-marking: study C
+    carries the count per row and marks such rows contaminated (§8.2)."""
+    if recalibrations.empty or "recalibrated" not in recalibrations:
+        return 0
+    fired = recalibrations.loc[recalibrations["recalibrated"].astype(bool)]
+    if "at_bound" in fired:
+        return int(sum(bool(str(v).strip()) for v in fired["at_bound"]))
+    n = 0
+    for text in fired.get("params", []):
+        rhos = [abs(float(x)) for x in _RHO_IN_REPR.findall(str(text))]
+        n += int(bool(rhos) and max(rhos) >= CORRELATION_BOUND)
+    return n
+
+
 def recalibration_by_date(
     hedger: RecordingHedger, result: HedgeResult
 ) -> tuple[list[dict[str, float]], str | None]:
@@ -803,6 +827,9 @@ class TaskResult:
     recal_total: tuple[float, float] = (0.0, 0.0)
     recal_by_date: list[dict[str, float]] = field(default_factory=list)
     n_refits: int = 0
+    #: refits whose fitted set has a correlation at its bound (-1: not recorded, a run from
+    #: before the flag existed whose JSON was not backfilled)
+    n_refits_at_bound: int = -1
     world_value_0: tuple[float, float] | None = None
     static_spread: tuple[float, float] | None = None
     settings: dict[str, Any] = field(default_factory=dict)
@@ -1343,6 +1370,7 @@ def summarize(
         recal_total=_mean_se(result.pnl_recalibration * scale),
         recal_by_date=recal_rows,
         n_refits=n_refits,
+        n_refits_at_bound=refits_at_bound(result.recalibrations),
         world_value_0=world_v0,
         static_spread=spread,
         settings=_jsonable(result.settings),
@@ -1866,7 +1894,11 @@ def table_C(
     ± se and the number of refits), the static prediction ``desk_pnl_shadow × rota`` (the M7
     greek under the same policy; ``desk_pnl_usual × rota`` for the ``none`` rows, against the
     total hedged desk P&L), the ratio (± its delta-method se, :func:`ratio_stderr`), the 30%
-    flag and z at every rota, and the nonlinearity at +2 / +3 against the +1 row (± se)."""
+    flag and z at every rota, the nonlinearity at +2 / +3 against the +1 row (± se), and
+    ``refits_at_bound`` / ``contaminated`` (:func:`refits_at_bound`): a row whose refits pinned
+    a correlation prices under perfectly correlated factors and is **excluded from the study's
+    conclusion** — the simulated shadow there measures the fitter railing as much as the cost of
+    re-marking (§8.2, owner's decision of 2026-09-16)."""
     static = static or {}
     res = [r for r in results if r.study == "C"]
     by_key = {(r.product, r.policy, r.rota): r for r in res}
@@ -1914,6 +1946,8 @@ def table_C(
                 "recal_pnl_desk": recal,
                 "recal_se": recal_se,
                 "n_refits": r.n_refits,
+                "refits_at_bound": r.n_refits_at_bound,
+                "contaminated": r.n_refits_at_bound > 0,
                 "refit_dates": ";".join(f"{d['t']:.4g}" for d in r.recal_by_date),
                 "recal_by_date_desk": ";".join(
                     f"{-d['mean']:+.4f}+/-{d['stderr']:.4f}" for d in r.recal_by_date
@@ -2030,7 +2064,11 @@ TABLE_HEADERS: dict[str, str] = {
         "total hedged desk P&L on the `none` rows, a reference only); `ratio` = simulated / "
         "static (`ratio_se`: delta method, independent errors), `within_30pct` the first-order "
         "test at +1 rota, `nonlinearity` = P&L(rota)/(rota x P&L(+1)) - 1 (`nonlinearity_se`: "
-        "delta method; the rota runs share the world seed, so it is conservative)."
+        "delta method; the rota runs share the world seed, so it is conservative). "
+        "`refits_at_bound` counts the refits of the row that landed with a fitted correlation "
+        "at its bound and `contaminated` marks the row: such rows are reported but EXCLUDED "
+        "from the study's conclusion, the marking fit being infeasible for the 2F "
+        "parameterisation at that mid-life state (owner's decision, 2026-09-16)."
     ),
     "D": (
         "Study D — delta-regime P&L: world = pricing (2F), delta only under each §7.2 regime; "

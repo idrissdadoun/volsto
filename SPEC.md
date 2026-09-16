@@ -734,45 +734,50 @@ three pillars × the dates), so a recalibration run holds two strip pricers of a
 beside the product's — 9 to 13 GB at 2·10⁴ paths — and each refit is a fresh calibration at the
 refit particle count. The studies therefore run one process at a time.
 
-**Study C — the first-order test fails, and why (the owner's "assert 30% agreement at +1 rota").**
-The simulated recalibration P&L is 2 of 10 product × policy pairs within 30% of the
-static greek's `desk_pnl_shadow × rota`; the ratios run from 1.19 to 6.03 and the z-scores
-from -88 to +16, so the disagreement is not Monte Carlo noise. Three measurements say what it is:
+**Study C — what the study concludes, and what it does not (owner's decision, 2026-09-16).**
+The simulated recalibration P&L agrees with the static greek's `desk_pnl_shadow × rota` within
+30% on 2 of 10 product × policy pairs at +1 rota. The conclusion below is drawn on the
+**`sticky_breakeven` column only**; the `sabr_linked` column is reported but **excluded**.
 
-1. **The static greek is the right comparator.** `shadow = recalibrated − usual` is exactly the
-   extra price move caused by re-marking (the world's own move is in `usual`), which is what the
-   simulated difference `V(new set) − V(old set)` at a refit date measures, and the greek's base
-   fit is checked equal to the pricing model (`base_fit_equals_marking_fit`). The two static
-   values reproduce §15 Part 3 on an independent run (3y autocall −0.0539 ± 0.0066 and
+**Why the `sabr_linked` column is excluded.** 41 of its 113 refits land with a fitted correlation
+at its bound (|ρ| ≥ `CORRELATION_BOUND` = 0.99; the first autocall refit at t = 0.96 returns
+ρ12 = 1.000 and ρ_SX1 = ρ_SX2 = −1.000), against **0 of 113** under `sticky_breakeven`: every one
+of its fifteen rows is marked `contaminated` in the table above, with its own `refits_at_bound`
+count. Mid-life, the rotated state surface's skew at the rule's pillars is not attainable for the
+two-factor parameterisation with the targets that policy holds, and the fit rails. What those
+rows measure is the fitter hitting a wall as much as the cost of re-marking, so they support no
+conclusion. The hedger warns and records it per date (`degenerate_correlations`,
+`recalibrations["at_bound"]`, `TaskResult.n_refits_at_bound`), and every study-C row carries the
+count from now on.
+
+**The conclusion, on the clean column.** Ratios 1.19 (Phoenix), 1.20 (KO var), 2.39 (cliquet),
+2.56 (autocall), 3.38 (VKO put): two within 30%, the rest a genuine gap in one direction — the
+simulated cost is **larger** than the greek's, never smaller. **The M7 shadow-rotation greek is a
+lower bound on the realised recalibration cost, not an estimate of it.** Three measurements say
+why, and none of them is noise (z from −88 to +16):
+
+1. **The comparator is right.** `shadow = recalibrated − usual` is exactly the extra price move
+   caused by re-marking (the world's own move is in `usual`), which is what `V(new) − V(old)` at
+   a refit date measures, and the greek's base fit is checked equal to the pricing model. The two
+   static values reproduce §15 Part 3 on an independent run (3y autocall −0.0539 ± 0.0066 and
    −0.0737 ± 0.0072 % of notional per rota against the recorded −0.054 / −0.074).
-2. **The rule fires more than once, and more often the larger the shock.** A +1 rota run refits
-   twice (the 3y notes) or four times (the 1y products), a +2 run seven times, a +3 run twelve to
-   thirteen: the trigger compares the world's excess skew with the reference it resets at each
-   refit, and a bigger shock crosses the threshold repeatedly. The static prediction books one
-   re-marking. This also makes the **nonlinearity** column (`P&L(rota) / (rota × P&L(+1)) − 1`,
-   measured between -1.44 and +0.03) a statement about the firing count, not about curvature of the fee: with a
-   threshold-triggered rule the recalibration P&L is not a smooth function of the shock size, and
-   for the 3y notes under `sabr_linked` it is not even monotone (the +1 total is −0.27 % of
-   notional and the +2 total +0.16).
-3. **A third of the `sabr_linked` refits are degenerate.** 41 of the 113 refits under
-   `sabr_linked` land with a fitted correlation at its bound (|ρ| ≥ `CORRELATION_BOUND` = 0.99 —
-   the first autocall refit at t = 0.96 returns ρ12 = 1.000, ρ_SX1 = ρ_SX2 = −1.000), against 0 of
-   the 113 under `sticky_breakeven`: mid-life, the state surface's skew at the rule's pillars is
-   not attainable with the targets that policy holds, and the fit runs to the bound. The
-   repricing such a refit books is a bound artefact, and it is concentrated in exactly the rows
-   that miss the 30% test worst (`sabr_linked` ratios 4.98, 5.85, 1.42, 6.03 and one sign flip, -7.83 on the VKO put against `sticky_breakeven`
-   2.56, 1.19, 2.39, 3.38, 1.20). The hedger now warns and records it per date
-   (`recalibrations["at_bound"]`, `degenerate_correlations`) so a run says so while it runs.
+2. **The rule fires more than once, and more often the larger the shock** — twice for the 3y
+   notes at +1 rota, four times for the 1y products, seven at +2, twelve to thirteen at +3: the
+   trigger resets its reference at each refit and a bigger shock crosses the threshold again.
+   The static prediction books one re-marking. This also makes the **nonlinearity** column
+   (measured between −1.44 and +0.03) a statement about the firing count rather than curvature
+   of the fee: with a threshold rule the recalibration P&L is not a smooth function of the shock,
+   and for the 3y notes it is not even monotone.
+3. **Where the refit happens matters.** The 3y notes refit just before their first observation
+   date, where an autocall's model sensitivity is largest, and the fit targets the world's
+   *conditional* state surface rather than a rotated spot surface; the greek is a t = 0,
+   spot-surface, one-step object.
 
-**Reading.** The M7 shadow-rotation greek predicts the *cost of one re-marking of the spot
-surface at t = 0*. The desk's realised recalibration P&L over the life of a hedged note is a sum
-over the dates a threshold rule fires, each at a different point of the product's life (the 3y
-notes refit just before their first observation date, where an autocall's model sensitivity is at
-its largest), each fitted to the world's *conditional* state surface rather than to a rotated spot
-surface, and — under the aggressive policy — a third of them fitted to a target the two-factor
-parameterisation cannot reach. The greek is a lower bound on the realised cost, not an estimate of
-it: measured here it understates by 1.19 to 6.03 times. Under the conservative policy
-(`sticky_breakeven`, no degenerate fits) the two agree to within 30% on two of the five products and within a factor 3.4 on the rest.
+**Open and unexplained.** On the clean column the policy ordering **reverses** against the static
+greek: the greek makes `sticky_breakeven` the larger shadow on every product (|−0.074| > |−0.054|
+for the autocall, the deck's 1.4× ordering), while the simulated `sticky_breakeven` P&L is
+*smaller* than the contaminated `sabr_linked` one on four of five products. Pending a clean
+`sabr_linked` column — the refit-feasibility work below — this is recorded, not explained.
 
 **Measured tables (pasted by the orchestrator from `outputs/m8b/m8b.md` after the production run).**
 
@@ -827,56 +832,57 @@ Study B — (from `outputs/m8b/m8b_table_B.csv`, run 2026-09-15; value ± se; ev
 | nu x1.5 | ko var 1y | ok | vol points of vega notional | +0.227 ± 0.025 | 3.52 ± 0.42 | -4.07 / +4.17 | +0.234 ± 0.066 | -0.008 ± 0.071 | +0.021 ± 0.037 | 113 |
 
 
-Study C — (from `outputs/m8b/m8b_table_C.csv`, run 2026-09-15; value ± se; every column of the CSV carries its `_se` twin)
+Study C — (from `outputs/m8b/m8b_table_C.csv`, run 2026-09-15/16; value ± se; every column of the CSV carries its `_se` twin).  **Every `sabr_linked` row is contaminated** (its refits pinned a correlation at its bound) and is excluded from the conclusion below.
 
-| product | rota | recalibration | status | unit | recal P&L (desk) | refits | total P&L (desk) | static × rota | ratio | 30% | z | nonlinearity | wall s | cal |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| autocall 3y | +1 | none | ok | % of notional | -0.000 ± 0.000 | 0 | +0.313 ± 0.063 | +0.005 ± 0.007 | 57.22 ± 69.94 | no | +4.9 | +0.00 ± 0.00 | 1120 | 0 |
-| autocall 3y | +1 | sabr_linked | ok | % of notional | -0.269 ± 0.008 | 2 | +0.283 ± 0.060 | -0.054 ± 0.007 | 4.98 ± 0.63 | no | -20.7 | +0.00 ± 0.00 | 477 | 0 |
-| autocall 3y | +1 | sticky_breakeven | ok | % of notional | -0.188 ± 0.004 | 2 | +0.295 ± 0.071 | -0.074 ± 0.007 | 2.56 ± 0.26 | no | -13.9 | +0.00 ± 0.00 | 734 | 2 |
-| autocall 3y | +2 | none | ok | % of notional | -0.000 ± 0.000 | 0 | +0.310 ± 0.063 | +0.011 ± 0.013 | 28.38 ± 34.70 | no | +4.6 | -0.50 ± 0.14 | 175 | 0 |
-| autocall 3y | +2 | sabr_linked | ok | % of notional | +0.163 ± 0.014 | 7 | +0.095 ± 0.066 | -0.108 ± 0.013 | -1.51 ± 0.22 | no | +14.3 | -1.30 ± 0.03 | 1558 | 7 |
-| autocall 3y | +2 | sticky_breakeven | ok | % of notional | -0.056 ± 0.007 | 7 | +0.386 ± 0.068 | -0.147 ± 0.014 | 0.38 ± 0.06 | no | +5.7 | -0.85 ± 0.02 | 1533 | 7 |
-| autocall 3y | +3 | none | ok | % of notional | -0.000 ± 0.000 | 0 | +0.323 ± 0.064 | +0.016 ± 0.020 | 19.74 ± 24.11 | no | +4.6 | -0.66 ± 0.10 | 175 | 0 |
-| autocall 3y | +3 | sabr_linked | ok | % of notional | +0.020 ± 0.019 | 13 | +0.703 ± 0.074 | -0.162 ± 0.020 | -0.12 ± 0.12 | no | +6.7 | -1.03 ± 0.02 | 2495 | 13 |
-| autocall 3y | +3 | sticky_breakeven | ok | % of notional | -0.061 ± 0.010 | 13 | +0.316 ± 0.071 | -0.221 ± 0.022 | 0.28 ± 0.05 | no | +6.7 | -0.89 ± 0.02 | 2496 | 13 |
-| phoenix 3y | +1 | none | ok | % of notional | -0.000 ± 0.000 | 0 | +0.348 ± 0.047 | +0.003 ± 0.005 | 138.21 ± 273.51 | no | +7.3 | +0.00 ± 0.00 | 286 | 0 |
-| phoenix 3y | +1 | sabr_linked | ok | % of notional | -0.303 ± 0.011 | 2 | -0.141 ± 0.062 | -0.052 ± 0.005 | 5.85 ± 0.61 | no | -20.3 | +0.00 ± 0.00 | 555 | 0 |
-| phoenix 3y | +1 | sticky_breakeven | ok | % of notional | -0.069 ± 0.023 | 2 | +0.374 ± 0.099 | -0.058 ± 0.006 | 1.19 ± 0.42 | yes | -0.5 | +0.00 ± 0.00 | 553 | 0 |
-| phoenix 3y | +2 | none | ok | % of notional | -0.000 ± 0.000 | 0 | +0.317 ± 0.047 | +0.005 ± 0.010 | 63.03 ± 124.79 | no | +6.5 | -0.54 ± 0.09 | 285 | 0 |
-| phoenix 3y | +2 | sabr_linked | ok | % of notional | +0.265 ± 0.020 | 7 | +0.010 ± 0.060 | -0.103 ± 0.010 | -2.56 ± 0.31 | no | +16.5 | -1.44 ± 0.04 | 672 | 0 |
-| phoenix 3y | +2 | sticky_breakeven | ok | % of notional | -0.050 ± 0.028 | 7 | +0.428 ± 0.106 | -0.116 ± 0.011 | 0.43 ± 0.25 | no | +2.2 | -0.64 ± 0.24 | 673 | 0 |
-| phoenix 3y | +3 | none | ok | % of notional | -0.000 ± 0.000 | 0 | +0.298 ± 0.047 | +0.008 ± 0.015 | 39.46 ± 78.15 | no | +5.8 | -0.71 ± 0.06 | 285 | 0 |
-| phoenix 3y | +3 | sabr_linked | ok | % of notional | +0.023 ± 0.049 | 13 | +0.156 ± 0.062 | -0.155 ± 0.015 | -0.15 ± 0.32 | no | +3.5 | -1.03 ± 0.05 | 824 | 0 |
-| phoenix 3y | +3 | sticky_breakeven | ok | % of notional | -0.028 ± 0.042 | 13 | +0.323 ± 0.088 | -0.174 ± 0.017 | 0.16 ± 0.24 | no | +3.2 | -0.87 ± 0.21 | 820 | 0 |
-| cliquet 1y | +1 | none | ok | % of notional | -0.000 ± 0.000 | 0 | +0.577 ± 0.015 | -0.005 ± 0.000 | -121.94 ± 7.34 | no | +39.0 | +0.00 ± 0.00 | 84 | 0 |
-| cliquet 1y | +1 | sabr_linked | ok | % of notional | -0.112 ± 0.007 | 4 | +1.411 ± 0.045 | -0.079 ± 0.000 | 1.42 ± 0.08 | no | -5.0 | +0.00 ± 0.00 | 1258 | 4 |
-| cliquet 1y | +1 | sticky_breakeven | ok | % of notional | -0.243 ± 0.002 | 4 | +0.435 ± 0.009 | -0.102 ± 0.000 | 2.39 ± 0.02 | no | -88.1 | +0.00 ± 0.00 | 1274 | 4 |
-| cliquet 1y | +2 | none | ok | % of notional | -0.000 ± 0.000 | 0 | +0.574 ± 0.013 | -0.009 ± 0.001 | -60.72 ± 3.58 | no | +44.4 | -0.50 ± 0.02 | 83 | 0 |
-| cliquet 1y | +2 | sabr_linked | ok | % of notional | -0.166 ± 0.006 | 7 | +0.179 ± 0.027 | -0.159 ± 0.001 | 1.05 ± 0.04 | yes | -1.3 | -0.26 ± 0.05 | 1777 | 7 |
-| cliquet 1y | +2 | sticky_breakeven | ok | % of notional | -0.306 ± 0.002 | 7 | +0.321 ± 0.009 | -0.203 ± 0.001 | 1.50 ± 0.01 | no | -53.0 | -0.37 ± 0.01 | 1821 | 7 |
-| cliquet 1y | +3 | none | ok | % of notional | -0.000 ± 0.000 | 0 | +0.569 ± 0.013 | -0.014 ± 0.001 | -40.12 ± 2.36 | no | +45.6 | -0.67 ± 0.01 | 83 | 0 |
-| cliquet 1y | +3 | sabr_linked | ok | % of notional | -0.347 ± 0.006 | 12 | +0.562 ± 0.025 | -0.238 ± 0.001 | 1.46 ± 0.03 | no | -17.4 | +0.03 ± 0.06 | 2636 | 12 |
-| cliquet 1y | +3 | sticky_breakeven | ok | % of notional | -0.348 ± 0.002 | 12 | +0.265 ± 0.011 | -0.305 ± 0.001 | 1.14 ± 0.01 | yes | -17.9 | -0.52 ± 0.00 | 2648 | 12 |
-| vko put 12m | +1 | none | ok | % of notional | -0.000 ± 0.000 | 0 | -0.627 ± 0.039 | +0.057 ± 0.005 | -11.01 ± 1.12 | no | -17.6 | +0.00 ± 0.00 | 163 | 0 |
-| vko put 12m | +1 | sabr_linked | ok | % of notional | +0.153 ± 0.019 | 4 | -1.056 ± 0.048 | -0.020 ± 0.003 | -7.83 ± 1.62 | no | +8.9 | +0.00 ± 0.00 | 939 | 0 |
-| vko put 12m | +1 | sticky_breakeven | ok | % of notional | +0.096 ± 0.003 | 4 | -0.687 ± 0.040 | +0.028 ± 0.003 | 3.38 ± 0.39 | no | +15.7 | +0.00 ± 0.00 | 833 | 0 |
-| vko put 12m | +2 | none | ok | % of notional | -0.000 ± 0.000 | 0 | -0.615 ± 0.038 | +0.114 ± 0.009 | -5.40 ± 0.55 | no | -18.6 | -0.51 ± 0.04 | 163 | 0 |
-| vko put 12m | +2 | sabr_linked | ok | % of notional | -0.062 ± 0.016 | 7 | -0.235 ± 0.046 | -0.039 ± 0.006 | 1.58 ± 0.48 | no | -1.3 | -1.20 ± 0.06 | 841 | 0 |
-| vko put 12m | +2 | sticky_breakeven | ok | % of notional | +0.118 ± 0.003 | 7 | -0.592 ± 0.039 | +0.057 ± 0.006 | 2.09 ± 0.24 | no | +8.7 | -0.38 ± 0.03 | 912 | 0 |
-| vko put 12m | +3 | none | ok | % of notional | -0.000 ± 0.000 | 0 | -0.601 ± 0.038 | +0.171 ± 0.014 | -3.52 ± 0.36 | no | -19.3 | -0.68 ± 0.03 | 163 | 0 |
-| vko put 12m | +3 | sabr_linked | ok | % of notional | -0.136 ± 0.017 | 12 | -0.468 ± 0.045 | -0.059 ± 0.010 | 2.33 ± 0.48 | no | -4.0 | -1.30 ± 0.05 | 944 | 0 |
-| vko put 12m | +3 | sticky_breakeven | ok | % of notional | +0.089 ± 0.005 | 12 | -0.599 ± 0.040 | +0.085 ± 0.009 | 1.04 ± 0.13 | yes | +0.3 | -0.69 ± 0.02 | 1000 | 0 |
-| ko var 1y | +1 | none | ok | vol points of vega notional | -0.000 ± 0.000 | 0 | +0.204 ± 0.028 | +0.036 ± 0.002 | 5.61 ± 0.84 | no | +5.9 | +0.00 ± 0.00 | 90 | 0 |
-| ko var 1y | +1 | sabr_linked | ok | vol points of vega notional | +0.444 ± 0.024 | 4 | +0.052 ± 0.041 | +0.074 ± 0.002 | 6.03 ± 0.38 | no | +15.3 | +0.00 ± 0.00 | 914 | 0 |
-| ko var 1y | +1 | sticky_breakeven | ok | vol points of vega notional | +0.114 ± 0.003 | 4 | +0.404 ± 0.029 | +0.095 ± 0.002 | 1.20 ± 0.04 | yes | +5.0 | +0.00 ± 0.00 | 906 | 0 |
-| ko var 1y | +2 | none | ok | vol points of vega notional | -0.000 ± 0.000 | 0 | +0.198 ± 0.028 | +0.073 ± 0.004 | 2.72 ± 0.42 | no | +4.4 | -0.52 ± 0.10 | 90 | 0 |
-| ko var 1y | +2 | sabr_linked | ok | vol points of vega notional | +0.584 ± 0.023 | 7 | +0.006 ± 0.041 | +0.147 ± 0.005 | 3.97 ± 0.20 | no | +18.9 | -0.34 ± 0.04 | 875 | 0 |
-| ko var 1y | +2 | sticky_breakeven | ok | vol points of vega notional | +0.123 ± 0.003 | 7 | +0.382 ± 0.030 | +0.189 ± 0.004 | 0.65 ± 0.02 | no | -11.9 | -0.46 ± 0.02 | 1010 | 0 |
-| ko var 1y | +3 | none | ok | vol points of vega notional | -0.000 ± 0.000 | 0 | +0.194 ± 0.029 | +0.109 ± 0.006 | 1.78 ± 0.28 | no | +2.9 | -0.68 ± 0.06 | 101 | 0 |
-| ko var 1y | +3 | sabr_linked | ok | vol points of vega notional | +0.461 ± 0.022 | 12 | +0.001 ± 0.038 | +0.221 ± 0.007 | 2.09 ± 0.12 | no | +10.4 | -0.65 ± 0.02 | 983 | 0 |
-| ko var 1y | +3 | sticky_breakeven | ok | vol points of vega notional | +0.193 ± 0.005 | 12 | +0.480 ± 0.030 | +0.284 ± 0.007 | 0.68 ± 0.02 | no | -11.4 | -0.44 ± 0.02 | 914 | 0 |
+| product | rota | recalibration | unit | recal P&L (desk) | refits | at bound | contaminated | total P&L (desk) | static × rota | ratio | 30% | z | nonlinearity | wall s | cal |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| autocall 3y | +1 | none | % of notional | -0.000 ± 0.000 | 0 | 0 | no | +0.313 ± 0.063 | +0.005 ± 0.007 | 57.22 ± 69.94 | no | +4.9 | +0.00 ± 0.00 | 1120 | 0 |
+| autocall 3y | +1 | sabr_linked | % of notional | -0.269 ± 0.008 | 2 | 1 | yes | +0.283 ± 0.060 | -0.054 ± 0.007 | 4.98 ± 0.63 | no | -20.7 | +0.00 ± 0.00 | 477 | 0 |
+| autocall 3y | +1 | sticky_breakeven | % of notional | -0.188 ± 0.004 | 2 | 0 | no | +0.295 ± 0.071 | -0.074 ± 0.007 | 2.56 ± 0.26 | no | -13.9 | +0.00 ± 0.00 | 734 | 2 |
+| autocall 3y | +2 | none | % of notional | -0.000 ± 0.000 | 0 | 0 | no | +0.310 ± 0.063 | +0.011 ± 0.013 | 28.38 ± 34.70 | no | +4.6 | -0.50 ± 0.14 | 175 | 0 |
+| autocall 3y | +2 | sabr_linked | % of notional | +0.163 ± 0.014 | 7 | 3 | yes | +0.095 ± 0.066 | -0.108 ± 0.013 | -1.51 ± 0.22 | no | +14.3 | -1.30 ± 0.03 | 1558 | 7 |
+| autocall 3y | +2 | sticky_breakeven | % of notional | -0.056 ± 0.007 | 7 | 0 | no | +0.386 ± 0.068 | -0.147 ± 0.014 | 0.38 ± 0.06 | no | +5.7 | -0.85 ± 0.02 | 1533 | 7 |
+| autocall 3y | +3 | none | % of notional | -0.000 ± 0.000 | 0 | 0 | no | +0.323 ± 0.064 | +0.016 ± 0.020 | 19.74 ± 24.11 | no | +4.6 | -0.66 ± 0.10 | 175 | 0 |
+| autocall 3y | +3 | sabr_linked | % of notional | +0.020 ± 0.019 | 13 | 3 | yes | +0.703 ± 0.074 | -0.162 ± 0.020 | -0.12 ± 0.12 | no | +6.7 | -1.03 ± 0.02 | 2495 | 13 |
+| autocall 3y | +3 | sticky_breakeven | % of notional | -0.061 ± 0.010 | 13 | 0 | no | +0.316 ± 0.071 | -0.221 ± 0.022 | 0.28 ± 0.05 | no | +6.7 | -0.89 ± 0.02 | 2496 | 13 |
+| phoenix 3y | +1 | none | % of notional | -0.000 ± 0.000 | 0 | 0 | no | +0.348 ± 0.047 | +0.003 ± 0.005 | 138.21 ± 273.51 | no | +7.3 | +0.00 ± 0.00 | 286 | 0 |
+| phoenix 3y | +1 | sabr_linked | % of notional | -0.303 ± 0.011 | 2 | 1 | yes | -0.141 ± 0.062 | -0.052 ± 0.005 | 5.85 ± 0.61 | no | -20.3 | +0.00 ± 0.00 | 555 | 0 |
+| phoenix 3y | +1 | sticky_breakeven | % of notional | -0.069 ± 0.023 | 2 | 0 | no | +0.374 ± 0.099 | -0.058 ± 0.006 | 1.19 ± 0.42 | yes | -0.5 | +0.00 ± 0.00 | 553 | 0 |
+| phoenix 3y | +2 | none | % of notional | -0.000 ± 0.000 | 0 | 0 | no | +0.317 ± 0.047 | +0.005 ± 0.010 | 63.03 ± 124.79 | no | +6.5 | -0.54 ± 0.09 | 285 | 0 |
+| phoenix 3y | +2 | sabr_linked | % of notional | +0.265 ± 0.020 | 7 | 3 | yes | +0.010 ± 0.060 | -0.103 ± 0.010 | -2.56 ± 0.31 | no | +16.5 | -1.44 ± 0.04 | 672 | 0 |
+| phoenix 3y | +2 | sticky_breakeven | % of notional | -0.050 ± 0.028 | 7 | 0 | no | +0.428 ± 0.106 | -0.116 ± 0.011 | 0.43 ± 0.25 | no | +2.2 | -0.64 ± 0.24 | 673 | 0 |
+| phoenix 3y | +3 | none | % of notional | -0.000 ± 0.000 | 0 | 0 | no | +0.298 ± 0.047 | +0.008 ± 0.015 | 39.46 ± 78.15 | no | +5.8 | -0.71 ± 0.06 | 285 | 0 |
+| phoenix 3y | +3 | sabr_linked | % of notional | +0.023 ± 0.049 | 13 | 3 | yes | +0.156 ± 0.062 | -0.155 ± 0.015 | -0.15 ± 0.32 | no | +3.5 | -1.03 ± 0.05 | 824 | 0 |
+| phoenix 3y | +3 | sticky_breakeven | % of notional | -0.028 ± 0.042 | 13 | 0 | no | +0.323 ± 0.088 | -0.174 ± 0.017 | 0.16 ± 0.24 | no | +3.2 | -0.87 ± 0.21 | 820 | 0 |
+| cliquet 1y | +1 | none | % of notional | -0.000 ± 0.000 | 0 | 0 | no | +0.577 ± 0.015 | -0.005 ± 0.000 | -121.94 ± 7.34 | no | +39.0 | +0.00 ± 0.00 | 84 | 0 |
+| cliquet 1y | +1 | sabr_linked | % of notional | -0.112 ± 0.007 | 4 | 2 | yes | +1.411 ± 0.045 | -0.079 ± 0.000 | 1.42 ± 0.08 | no | -5.0 | +0.00 ± 0.00 | 1258 | 4 |
+| cliquet 1y | +1 | sticky_breakeven | % of notional | -0.243 ± 0.002 | 4 | 0 | no | +0.435 ± 0.009 | -0.102 ± 0.000 | 2.39 ± 0.02 | no | -88.1 | +0.00 ± 0.00 | 1274 | 4 |
+| cliquet 1y | +2 | none | % of notional | -0.000 ± 0.000 | 0 | 0 | no | +0.574 ± 0.013 | -0.009 ± 0.001 | -60.72 ± 3.58 | no | +44.4 | -0.50 ± 0.02 | 83 | 0 |
+| cliquet 1y | +2 | sabr_linked | % of notional | -0.166 ± 0.006 | 7 | 3 | yes | +0.179 ± 0.027 | -0.159 ± 0.001 | 1.05 ± 0.04 | yes | -1.3 | -0.26 ± 0.05 | 1777 | 7 |
+| cliquet 1y | +2 | sticky_breakeven | % of notional | -0.306 ± 0.002 | 7 | 0 | no | +0.321 ± 0.009 | -0.203 ± 0.001 | 1.50 ± 0.01 | no | -53.0 | -0.37 ± 0.01 | 1821 | 7 |
+| cliquet 1y | +3 | none | % of notional | -0.000 ± 0.000 | 0 | 0 | no | +0.569 ± 0.013 | -0.014 ± 0.001 | -40.12 ± 2.36 | no | +45.6 | -0.67 ± 0.01 | 83 | 0 |
+| cliquet 1y | +3 | sabr_linked | % of notional | -0.347 ± 0.006 | 12 | 4 | yes | +0.562 ± 0.025 | -0.238 ± 0.001 | 1.46 ± 0.03 | no | -17.4 | +0.03 ± 0.06 | 2636 | 12 |
+| cliquet 1y | +3 | sticky_breakeven | % of notional | -0.348 ± 0.002 | 12 | 0 | no | +0.265 ± 0.011 | -0.305 ± 0.001 | 1.14 ± 0.01 | yes | -17.9 | -0.52 ± 0.00 | 2648 | 12 |
+| vko put 12m | +1 | none | % of notional | -0.000 ± 0.000 | 0 | 0 | no | -0.627 ± 0.039 | +0.057 ± 0.005 | -11.01 ± 1.12 | no | -17.6 | +0.00 ± 0.00 | 163 | 0 |
+| vko put 12m | +1 | sabr_linked | % of notional | +0.153 ± 0.019 | 4 | 2 | yes | -1.056 ± 0.048 | -0.020 ± 0.003 | -7.83 ± 1.62 | no | +8.9 | +0.00 ± 0.00 | 939 | 0 |
+| vko put 12m | +1 | sticky_breakeven | % of notional | +0.096 ± 0.003 | 4 | 0 | no | -0.687 ± 0.040 | +0.028 ± 0.003 | 3.38 ± 0.39 | no | +15.7 | +0.00 ± 0.00 | 833 | 0 |
+| vko put 12m | +2 | none | % of notional | -0.000 ± 0.000 | 0 | 0 | no | -0.615 ± 0.038 | +0.114 ± 0.009 | -5.40 ± 0.55 | no | -18.6 | -0.51 ± 0.04 | 163 | 0 |
+| vko put 12m | +2 | sabr_linked | % of notional | -0.062 ± 0.016 | 7 | 3 | yes | -0.235 ± 0.046 | -0.039 ± 0.006 | 1.58 ± 0.48 | no | -1.3 | -1.20 ± 0.06 | 841 | 0 |
+| vko put 12m | +2 | sticky_breakeven | % of notional | +0.118 ± 0.003 | 7 | 0 | no | -0.592 ± 0.039 | +0.057 ± 0.006 | 2.09 ± 0.24 | no | +8.7 | -0.38 ± 0.03 | 912 | 0 |
+| vko put 12m | +3 | none | % of notional | -0.000 ± 0.000 | 0 | 0 | no | -0.601 ± 0.038 | +0.171 ± 0.014 | -3.52 ± 0.36 | no | -19.3 | -0.68 ± 0.03 | 163 | 0 |
+| vko put 12m | +3 | sabr_linked | % of notional | -0.136 ± 0.017 | 12 | 4 | yes | -0.468 ± 0.045 | -0.059 ± 0.010 | 2.33 ± 0.48 | no | -4.0 | -1.30 ± 0.05 | 944 | 0 |
+| vko put 12m | +3 | sticky_breakeven | % of notional | +0.089 ± 0.005 | 12 | 0 | no | -0.599 ± 0.040 | +0.085 ± 0.009 | 1.04 ± 0.13 | yes | +0.3 | -0.69 ± 0.02 | 1000 | 0 |
+| ko var 1y | +1 | none | vol points of vega notional | -0.000 ± 0.000 | 0 | 0 | no | +0.204 ± 0.028 | +0.036 ± 0.002 | 5.61 ± 0.84 | no | +5.9 | +0.00 ± 0.00 | 90 | 0 |
+| ko var 1y | +1 | sabr_linked | vol points of vega notional | +0.444 ± 0.024 | 4 | 2 | yes | +0.052 ± 0.041 | +0.074 ± 0.002 | 6.03 ± 0.38 | no | +15.3 | +0.00 ± 0.00 | 914 | 0 |
+| ko var 1y | +1 | sticky_breakeven | vol points of vega notional | +0.114 ± 0.003 | 4 | 0 | no | +0.404 ± 0.029 | +0.095 ± 0.002 | 1.20 ± 0.04 | yes | +5.0 | +0.00 ± 0.00 | 906 | 0 |
+| ko var 1y | +2 | none | vol points of vega notional | -0.000 ± 0.000 | 0 | 0 | no | +0.198 ± 0.028 | +0.073 ± 0.004 | 2.72 ± 0.42 | no | +4.4 | -0.52 ± 0.10 | 90 | 0 |
+| ko var 1y | +2 | sabr_linked | vol points of vega notional | +0.584 ± 0.023 | 7 | 3 | yes | +0.006 ± 0.041 | +0.147 ± 0.005 | 3.97 ± 0.20 | no | +18.9 | -0.34 ± 0.04 | 875 | 0 |
+| ko var 1y | +2 | sticky_breakeven | vol points of vega notional | +0.123 ± 0.003 | 7 | 0 | no | +0.382 ± 0.030 | +0.189 ± 0.004 | 0.65 ± 0.02 | no | -11.9 | -0.46 ± 0.02 | 1010 | 0 |
+| ko var 1y | +3 | none | vol points of vega notional | -0.000 ± 0.000 | 0 | 0 | no | +0.194 ± 0.029 | +0.109 ± 0.006 | 1.78 ± 0.28 | no | +2.9 | -0.68 ± 0.06 | 101 | 0 |
+| ko var 1y | +3 | sabr_linked | vol points of vega notional | +0.461 ± 0.022 | 12 | 4 | yes | +0.001 ± 0.038 | +0.221 ± 0.007 | 2.09 ± 0.12 | no | +10.4 | -0.65 ± 0.02 | 983 | 0 |
+| ko var 1y | +3 | sticky_breakeven | vol points of vega notional | +0.193 ± 0.005 | 12 | 0 | no | +0.480 ± 0.030 | +0.284 ± 0.007 | 0.68 ± 0.02 | no | -11.4 | -0.44 ± 0.02 | 914 | 0 |
 
+**Study D — the ranking is WITHDRAWN pending the estimator check (owner's decision, 2026-09-16).** With world = pricing the model delta is the minimum-variance delta by construction, so the measured ordering below — model worst on both products, by 1.6× on the vanilla — indicts the conditional-Greeks estimator (the hybrid-CRN bump and its regression), not the regimes. The numbers stand as a measurement of *this estimator's* hedge, and no regime conclusion is drawn from them until the Black-Scholes check (estimator against the analytic delta on the same paths: bias, RMSE, and the hedged P&L std against the analytic-delta hedge) shows the model-delta estimator within tolerance, the variance reduction below is in place, and the study is re-run.
 
 Study D — (from `outputs/m8b/m8b_table_D.csv`, run 2026-09-15; value ± se; every column of the CSV carries its `_se` twin)
 
