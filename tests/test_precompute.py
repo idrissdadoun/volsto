@@ -19,7 +19,11 @@ read and unchanged), the risk plan and the cost model of the configured ladder, 
 its errors, the tier-aware ``--resume`` rule (:func:`~volsto.viewers.precompute.pending_steps`),
 the per-point failure handling (a monkeypatched ``process_point``), the provenance strings
 (relative grid path, path-free ``argv``) and the store's stderr invariant on a synthetic marking
-row.  Wall clock is reported, never asserted.
+row.  The measured-cost report (``volsto-precompute report``) and ``--cost-from`` are checked on
+a synthetic run-record set (a current record and an old-format one whose missing fields must be
+reported absent, never filled in) and on the toy fixture's store, which they only read (output
+to a temporary directory; the fixture stays byte-identical).  Wall clock is reported, never
+asserted.
 """
 
 from __future__ import annotations
@@ -54,6 +58,7 @@ from volsto.viewers.grid import (
 )
 from volsto.viewers.store import (
     TABLES,
+    PointResult,
     ResultsStore,
     StoreReader,
     mc_columns_without_stderr,
@@ -124,8 +129,8 @@ def test_dry_run_projects_without_computing(
     """``--dry-run`` on the default grid against the repository cache: prints the resolved store
     and cache roots, the counts (105 one-factor combinations), the per-point cost lines
     (overhead, calibration from the cache manifest's measured wall times, diagnostics repricing)
-    and one row per tier — the light tier twice, at the configured 20-bucket fwd-var ladder and
-    at the 3-bucket alternative, so the owner can choose.  It writes nothing into the store and
+    and one row per tier — the light tier twice, at the configured 3-bucket fwd-var ladder (the
+    owner's grid decision) and at the 20-bucket alternative, so the owner can choose.  It writes nothing into the store and
     **calibrates nothing**: the repository cache manifest is byte-identical afterwards."""
     store = tmp_path / "store"
     keys_before = _cache_keys(REPO_CACHE)
@@ -734,3 +739,589 @@ def test_mc_columns_without_stderr_on_a_marking_row() -> None:
     assert mc_columns_without_stderr(df) == ["ssr_lsv"]
     df["ssr_lsv_stderr"] = 0.019
     assert mc_columns_without_stderr(df) == []
+
+
+# --------------------------------------------------------------------------------------------
+# measured cost: the run-record report and --cost-from (read-only, nothing calibrates)
+# --------------------------------------------------------------------------------------------
+
+_NEW_RUN = "2026-09-16T100000Z_1of2_1.json"
+_OLD_RUN = "2026-09-15T160350Z_1of1_2.json"
+
+
+def _entry(pid: str, mode: str, walls: dict[str, float], total: float, **kw: Any) -> dict[str, Any]:
+    base = dict.fromkeys(precompute.WALL_STEPS, 0.0)
+    base.update(walls)
+    return {"point_id": pid, "label": pid[:8], "mode": mode, **base, "total": total, **kw}
+
+
+def _entry_row(points: pd.DataFrame, run: str, point_id: str) -> pd.Series:
+    """The one flattened entry of ``point_id`` in ``run``."""
+    sub = points[(points["run"] == run) & (points["point_id"] == point_id)]
+    assert len(sub) == 1, (run, point_id, len(sub))
+    return sub.iloc[0]
+
+
+def _synthetic_cost_store(root: Path) -> None:
+    """Two run records — a current one (2 workers x 3 threads, a calibrated 1F point, a cache
+    hit, the LV point and a risk-only refresh) and an old-format one (the M9 S1 layout of
+    ``outputs/store``: no mode, steps, calibrated, cache_hit, threads or peak RSS) — plus the
+    store rows the report reads the particle pass and the modes from."""
+    store = ResultsStore(root)
+    rows = {
+        "a" * 64: ("one_factor", 100.0),
+        "b" * 64: ("one_factor", 90.0),
+        "c" * 64: ("two_factor", 120.0),
+    }
+    for pid, (mode, cal) in rows.items():
+        store.write_point(PointResult(pid, {"mode": mode, "calibration_seconds": cal}, {}, {}))
+    new = {
+        "host": "vm-1",
+        "shard": "1/2",
+        "workers": 2,
+        "threads_per_worker": 3,
+        "cpu_count": 6,
+        "wall_seconds": 7200.0,
+        "points_selected": 6,
+        "points_skipped": 1,
+        "n_calibrated": 1,
+        "n_cache_hits": 3,
+        "failed": [{"point_id": "x", "label": "x", "error": "E", "traceback": ""}],
+        "n_particles": 800_000,
+        "pricing": {"n_paths": 400_000, "seed": 2024},
+        "peak_rss_bytes": 2**30,
+        "resume": True,
+        "points_computed": [
+            _entry(
+                "a" * 64,
+                "one_factor",
+                {"calibration": 110.0, "diagnostics": 20.0, "pricing": 150.0, "analytics": 100.0},
+                383.0,
+                steps=["all"],
+                calibrated=True,
+                cache_hit=False,
+                threads=3,
+                peak_rss_bytes=3 * 2**30,
+            ),
+            _entry(
+                "b" * 64,
+                "one_factor",
+                {"calibration": 4.0, "pricing": 170.0, "analytics": 110.0},
+                285.0,
+                steps=["all"],
+                calibrated=False,
+                cache_hit=True,
+                threads=3,
+                peak_rss_bytes=2 * 2**30,
+            ),
+            _entry(
+                "lv:" + "d" * 64,
+                "lv",
+                {"calibration": 2.0, "pricing": 90.0, "analytics": 30.0},
+                122.5,
+                steps=["all"],
+                calibrated=False,
+                cache_hit=False,
+                threads=3,
+                peak_rss_bytes=2**30,
+            ),
+            _entry(
+                "c" * 64,
+                "two_factor",
+                {"calibration": 3.0, "risk": 600.0},
+                603.0,
+                steps=["risk"],
+                calibrated=False,
+                cache_hit=True,
+                threads=3,
+                peak_rss_bytes=2**30,
+            ),
+        ],
+    }
+    old = {  # the S1 record layout: walls and totals only
+        "host": "laptop",
+        "shard": "1/1",
+        "workers": 1,
+        "wall_seconds": 1447.0,
+        "n_particles": 800_000,
+        "pricing": {"n_paths": 400_000, "seed": 2024},
+        "points_in_shard": 2,
+        "points_computed": [
+            {"point_id": "b" * 64, "label": "hit", "calibration": 5.8, "diagnostics": 0.0,
+             "pricing": 175.8, "analytics": 123.0, "risk": 0.0, "total": 304.7},
+            {"point_id": "lv:" + "e" * 64, "label": "lv", "calibration": 3.3,
+             "pricing": 118.6, "analytics": 43.2, "risk": 0.0, "total": 165.2},
+        ],
+    }  # fmt: skip
+    store.runs_dir.mkdir(parents=True, exist_ok=True)
+    (store.runs_dir / _NEW_RUN).write_text(json.dumps(new))
+    (store.runs_dir / _OLD_RUN).write_text(json.dumps(old))
+
+
+def test_cost_report_on_synthetic_records(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``volsto-precompute report`` on a synthetic record set: per run the wall clock, host,
+    workers, threads, points computed / skipped / failed, calibrated vs cache hits and the hit
+    rate, core-hours = wall x workers x threads and the peak RSS; per entry the particle pass
+    split from the overhead (the store row's ``calibration_seconds``), core-seconds = seconds x
+    threads; per (kind, mode, how) and step the median and p90.  The old-format record's missing
+    fields are **listed and left absent** — no hit rate, no core-seconds, the calibration step
+    unsplit, the mode taken from the store row or the id prefix — and ``--assume-threads``
+    labels a stated thread count as assumed.  Nothing is computed."""
+    root = tmp_path / "store"
+    _synthetic_cost_store(root)
+    rec = precompute.load_cost_records(root)
+    runs = rec.runs.set_index("run")
+    new, old = runs.loc[_NEW_RUN], runs.loc[_OLD_RUN]
+    assert (new["host"], new["workers"], new["threads_per_worker"]) == ("vm-1", 2, 3.0)
+    assert new["core_hours"] == pytest.approx(7200.0 * 2 * 3 / 3600.0)
+    assert (new["points_computed"], new["points_skipped"], new["points_failed"]) == (4, 1, 1)
+    assert (new["n_calibrated"], new["n_cache_hits"]) == (1, 3)
+    assert new["cache_hit_rate"] == pytest.approx(3 / 4)
+    assert new["peak_rss_gib"] == pytest.approx(3.0)
+    assert old[["n_calibrated", "n_cache_hits"]].isna().all()  # absent, not zero
+    assert np.isnan(old["cache_hit_rate"]) and np.isnan(old["core_hours"])
+    assert np.isnan(old["threads_per_worker"]) and old["threads_source"] == "absent"
+    assert old[["points_skipped", "points_failed"]].isna().all()
+    assert np.isnan(old["peak_rss_gib"])
+    absent = rec.absent[_OLD_RUN]
+    for field in ("threads_per_worker", "n_calibrated", "n_cache_hits", "peak_rss_bytes"):
+        assert field in absent
+    for field in ("calibrated", "cache_hit", "mode", "steps", "threads"):
+        assert f"points_computed[].{field}" in absent
+    assert rec.absent[_NEW_RUN] == []
+
+    pts = rec.points
+    cal = _entry_row(pts, _NEW_RUN, "a" * 64)
+    assert (cal["how"], cal["kind"], bool(cal["calibration_split"])) == ("calibrated", "full", True)
+    assert cal["calibration"] == pytest.approx(100.0)  # the particle pass of the store row
+    # the rest of the step (10 s) + the untimed remainder 383 - 380 = 3 s
+    assert cal["overhead"] == pytest.approx(13.0)
+    assert cal["core_total"] == pytest.approx(383.0 * 3)
+    hit = _entry_row(pts, _NEW_RUN, "b" * 64)
+    assert (hit["how"], hit["calibration"], hit["overhead"]) == ("cache hit", 0.0, 5.0)
+    lv = _entry_row(pts, _NEW_RUN, "lv:" + "d" * 64)
+    assert (lv["how"], lv["overhead"]) == ("no leverage", 2.5)
+    refresh = _entry_row(pts, _NEW_RUN, "c" * 64)
+    assert (refresh["kind"], refresh["mode"], refresh["risk"]) == (
+        "refresh risk",
+        "two_factor",
+        600.0,
+    )
+    old_hit = _entry_row(pts, _OLD_RUN, "b" * 64)
+    assert (old_hit["how"], old_hit["kind"], old_hit["mode"]) == (
+        "unknown",
+        "unknown",
+        "one_factor",
+    )
+    assert old_hit["mode_source"] == "store" and not bool(old_hit["calibration_split"])
+    assert old_hit["calibration"] == pytest.approx(5.8)  # kept whole: no flag to split on
+    assert np.isnan(old_hit["core_total"]) and old_hit["threads_source"] == "absent"
+    old_lv = _entry_row(pts, _OLD_RUN, "lv:" + "e" * 64)
+    assert (old_lv["mode"], old_lv["mode_source"]) == ("lv", "id")
+    # its diagnostics wall is absent: reported absent (NaN), never 0 — and so is the untimed
+    # remainder the overhead would absorb it into
+    assert np.isnan(old_lv["diagnostics"]) and np.isnan(old_lv["overhead"])
+    assert old_lv["pricing"] == pytest.approx(118.6)
+    assert "points_computed[].diagnostics" in absent
+
+    summary = precompute.cost_summary(rec.points)
+    one = summary[(summary["kind"] == "full") & (summary["mode"] == "one_factor")]
+    pricing = one[(one["how"] == "calibrated") & (one["step"] == "pricing")].iloc[0]
+    assert (pricing["n"], pricing["median_s"], pricing["median_core_s"]) == (1, 150.0, 450.0)
+    unknown = summary[(summary["kind"] == "unknown") & (summary["step"] == "total")]
+    assert set(unknown["mode"]) == {"one_factor", "lv"}
+    old_lv_diag = summary[
+        (summary["kind"] == "unknown")
+        & (summary["mode"] == "lv")
+        & (summary["step"] == "diagnostics")
+    ].iloc[0]
+    assert old_lv_diag["n"] == 0 and np.isnan(old_lv_diag["median_s"])
+    assert unknown["median_core_s"].isna().all() and unknown["core_hours"].isna().all()
+    # median and p90 over several entries: the linear-interpolation percentile
+    many = pd.concat([rec.points] * 3, ignore_index=True)
+    many.loc[many.index[: len(rec.points)], "pricing"] += 10.0
+    s3 = precompute.cost_summary(many)
+    row = s3[(s3["kind"] == "full") & (s3["how"] == "cache hit") & (s3["step"] == "pricing")]
+    assert row["median_s"].iloc[0] == pytest.approx(170.0)
+    assert row["p90_s"].iloc[0] == pytest.approx(np.percentile([180.0, 170.0, 170.0], 90))
+
+    out_dir = tmp_path / "report"
+    assert precompute.main(["report", "--store", str(root), "--out", str(out_dir)]) == 0
+    text = capsys.readouterr().out
+    assert "| vm-1 | 1/2 | 2 | 3 |" in text and "0.750" in text
+    assert "## Fields absent from the records" in text and "points_computed[].calibrated" in text
+    assert "over the 1 runs that record both (1 do not)" in text
+    assert (
+        "| unknown | lv | unknown | diagnostics | 0 | absent | absent | absent | absent |" in text
+    )
+    assert "Report wall clock" in text and "nothing recalibrated" in text
+    for name in ("cost_report.md", "runs.csv", "points.csv", "summary.csv"):
+        assert (out_dir / name).exists()
+    assert len(pd.read_csv(out_dir / "points.csv")) == 6
+    assert (
+        precompute.main(["report", "--store", str(root), "--no-write", "--assume-threads", "12"])
+        == 0
+    )
+    text = capsys.readouterr().out
+    assert "12 (assumed)" in text and "written:" not in text
+    assert not (root / precompute.COST_REPORT_DIRNAME).exists()
+    assert precompute.main(["report", "--store", str(tmp_path / "missing")]) == 2
+    assert "no results store" in capsys.readouterr().err
+    assert not (tmp_path / "missing").exists()
+
+
+def test_thread_factor_reads_the_measured_ratios() -> None:
+    """The thread rescaling of ``--cost-from``: identity at equal counts, the measured ratio at
+    a measured count, inverse pairs, interpolation in ``1/n`` between measured counts, the
+    fitted Amdahl tail beyond them, serial steps unchanged."""
+    table = precompute.MEASURED_THREAD_RATIO
+    assert set(table) == set(precompute.THREAD_PARALLEL_FRACTION)
+    for step, ratios in table.items():
+        assert ratios[1] == 1.0
+        assert precompute.thread_factor(step, 4, 4) == 1.0
+        assert precompute.thread_factor(step, 1, 2) == pytest.approx(ratios[2])
+        assert precompute.thread_factor(step, 12, 1) == pytest.approx(1.0 / ratios[12])
+        for n_from, n_to in ((1, 12), (2, 3), (5, 48)):
+            assert precompute.thread_factor(step, n_from, n_to) * precompute.thread_factor(
+                step, n_to, n_from
+            ) == pytest.approx(1.0)
+        # 3 threads: between the 2- and 4-thread ratios, linear in 1/n
+        w = (1 / 3 - 1 / 4) / (1 / 2 - 1 / 4)
+        assert precompute.thread_factor(step, 1, 3) == pytest.approx(
+            w * ratios[2] + (1 - w) * ratios[4]
+        )
+        # beyond 12: the fitted Amdahl tail, continuous at 12 and bounded by the serial part
+        p = precompute.THREAD_PARALLEL_FRACTION[step]
+        assert precompute.thread_factor(step, 1, 24) == pytest.approx(
+            ratios[12] - p * (1 / 12 - 1 / 24)
+        )
+        assert precompute.thread_factor(step, 1, 10**6) <= ratios[12] + 1e-12
+    # the second thread gains 8 % on the particle pass (measured), not Amdahl's 16 %
+    assert precompute.thread_factor("calibration", 1, 2) == pytest.approx(0.9182)
+    assert precompute.thread_factor("overhead", 1, 48) == 1.0
+    with pytest.raises(ValueError):
+        precompute.thread_factor("pricing", 0, 1)
+    with pytest.raises(KeyError):
+        precompute.thread_factor("bogus", 1, 2)
+    with pytest.raises(KeyError):
+        precompute.thread_factor("bogus", 2, 2)
+
+
+def test_risk_cost_charges_states_misses_and_mode() -> None:
+    """``CostModel.risk_s``: each bumped state pays its mode's budget-independent cost (the work
+    outside the engine + the state's model build), an LSV point pays ``states − 1`` particle
+    passes (its base state is its own leverage), and each pricing its mode's risk pricing — with
+    the measured constants this reproduces the production light-tier risk steps measured on the
+    laptop (1F 4283.0 s, LV 943.5 s; 17 states, 38 pricings, 1 thread)."""
+    outside = precompute.RISK_STATE_OVERHEAD_S
+    build, ratio = precompute.RISK_STATE_BUILD_S, precompute.RISK_PRICING_RATIO
+    cost = precompute.CostModel(
+        overhead_s=6.0,
+        calibration_s=3045.5 / 16,  # the 16 risk calibrations of that run (cache manifest)
+        calibration_source="test",
+        diagnostics_s=36.7,
+        pricing_s=265.403,
+        analytics_s=196.6,
+        risk_pricing_s=ratio["lsv"] * 265.403,
+        pricing_source="test",
+        risk_calibrations={"none": 0, "light": 17},
+        risk_pricings={"none": 0, "light": 38},
+        risk_state_s=outside + build["lsv"],
+        risk_source="test",
+        by_mode={
+            "lv": {"risk_pricing": ratio["lv"] * 187.491, "risk_state": outside + build["lv"]}
+        },
+    )
+    assert cost.risk_s("none", True) == 0.0
+    assert cost.risk_s("light", True, "one_factor") == pytest.approx(
+        17 * (outside + build["lsv"]) + 3045.5 + 38 * ratio["lsv"] * 265.403
+    )
+    assert cost.risk_s("light", True, "one_factor") == pytest.approx(4283.0, rel=2e-3)
+    assert cost.risk_s("light", False, "lv") == pytest.approx(943.5, rel=2e-3)
+    # an LSV point that does not calibrate (none does; the guard of the formula) pays no pass
+    assert cost.risk_s("light", False, "one_factor") == pytest.approx(
+        cost.risk_s("light", True, "one_factor") - 3045.5
+    )
+    # the default model charges the measured constants
+    grid = load_grid(DEFAULT_GRID)
+    default = precompute.default_cost_model(LeverageCache(Path("/nonexistent/cache")), grid)
+    assert default.risk_state_s == pytest.approx(outside + build["lsv"])
+    assert default.by_mode["lv"]["risk_state"] == pytest.approx(outside + build["lv"])
+    assert default.risk_pricing_s == pytest.approx(ratio["lsv"] * default.pricing_s)
+    # the LV ratio is to the LV pricing step; the fallback pricing is an LSV one
+    assert default.by_mode["lv"]["risk_pricing"] == pytest.approx(
+        ratio["lv"] * precompute.LV_TO_LSV_PRICING_RATIO * default.pricing_s
+    )
+    assert pytest.approx(187.5 / 265.4) == precompute.LV_TO_LSV_PRICING_RATIO
+    assert not Path("/nonexistent/cache").exists()
+
+
+def _synthetic_risk_store(root: Path) -> None:
+    """Probe C as a synthetic store (the laptop measurement, 1 thread, 10⁵ particles, 5·10⁴
+    paths, light tier on the 3-bucket ladder): a calibrated 1F point and the LV point with their
+    run-record walls and their engine budgets."""
+    store = ResultsStore(root)
+    lsv_id, lv_id = "f" * 64, "lv:" + "g" * 64
+    store.write_point(
+        PointResult(
+            lsv_id,
+            {"mode": "one_factor", "calibration_seconds": 26.0},
+            {},
+            {"risk_budget": {"cache_misses": 16.0, "pricings": 38.0, "recalibrations": 17.0,
+                             "wall_clock_s": 642.78}},
+        )
+    )  # fmt: skip
+    store.write_point(
+        PointResult(
+            lv_id,
+            {"mode": "lv", "calibration_seconds": float("nan")},
+            {},
+            {"risk_budget": {"cache_misses": 17.0, "pricings": 38.0, "recalibrations": 17.0,
+                             "wall_clock_s": 123.07}},
+        )
+    )  # fmt: skip
+    rec = {
+        "host": "laptop",
+        "shard": "1/1",
+        "workers": 1,
+        "threads_per_worker": 1,
+        "wall_seconds": 1068.0,
+        "n_particles": 100_000,
+        "pricing": {"n_paths": 50_000, "seed": 2024},
+        "points_computed": [
+            _entry(
+                lsv_id,
+                "one_factor",
+                {"calibration": 32.08, "diagnostics": 4.79, "pricing": 34.30,
+                 "analytics": 25.09, "risk": 726.30},
+                822.59,
+                steps=["all"], calibrated=True, cache_hit=False, threads=1,
+                peak_rss_bytes=2_299_854_848,
+            ),
+            _entry(
+                lv_id,
+                "lv",
+                {"calibration": 2.83, "pricing": 23.20, "analytics": 10.97, "risk": 206.69},
+                243.74,
+                steps=["all"], calibrated=False, cache_hit=False, threads=1,
+                peak_rss_bytes=2_299_854_848,
+            ),
+        ],
+    }  # fmt: skip
+    store.runs_dir.mkdir(parents=True, exist_ok=True)
+    (store.runs_dir / _NEW_RUN).write_text(json.dumps(rec))
+
+
+def test_cost_from_risk_budgets_by_mode(tmp_path: Path) -> None:
+    """``--cost-from`` on a store with an LSV and an LV risk budget: the LSV risk pricing
+    subtracts its cache misses x the particle pass, the LV one does **not** (its "misses" are
+    Dupire rebuilds; subtracting them clipped the LV budget to 0 and halved the median), the
+    per-state overhead is the step wall outside the engine, and both pricings rescale with the
+    paths and the threads."""
+    root = tmp_path / "risk_store"
+    _synthetic_risk_store(root)
+    rec = precompute.load_cost_records(root)
+    budgets = precompute.risk_budget_costs(ResultsStore(root), rec.points, 26.0)
+    build = precompute.RISK_STATE_BUILD_S
+    lsv_pp = (642.78 - 16 * 26.0 - 17 * build["lsv"]) / 38
+    lv_pp = (123.07 - 17 * build["lv"]) / 38
+    assert budgets.lsv_per_pricing == [pytest.approx(lsv_pp)]
+    assert budgets.lv_per_pricing == [pytest.approx(lv_pp)]
+    assert sorted(budgets.state_s) == [
+        pytest.approx((726.30 - 642.78) / 17),
+        pytest.approx((206.69 - 123.07) / 17),
+    ]
+    assert budgets.notes == []
+
+    grid = load_grid(DEFAULT_GRID)  # light tier, 3-bucket ladder: 17 states, 38 pricings
+    assert precompute.risk_plan("light", grid.risk) == (17, 38)
+    probe = dataclasses.replace(
+        grid,
+        particle=dataclasses.replace(grid.particle, n_particles=100_000),
+        pricing=dataclasses.replace(grid.pricing, n_paths=50_000),
+    )
+    fallback = precompute.default_cost_model(LeverageCache(tmp_path / "cache"), probe)
+    same, lines = precompute.cost_model_from_store(root, probe, fallback, target_threads=1)
+    state = float(np.median(budgets.state_s))
+    assert same.risk_state_s == pytest.approx(state + build["lsv"])
+    assert same.by_mode["lv"]["risk_state"] == pytest.approx(state + build["lv"])
+    assert same.risk_pricing_s == pytest.approx(lsv_pp)
+    assert same.by_mode["lv"]["risk_pricing"] == pytest.approx(lv_pp)
+    # the measured risk steps come back at the source budget and thread count
+    assert same.risk_s("light", True, "one_factor") == pytest.approx(726.30, rel=1e-3)
+    assert same.risk_s("light", False, "lv") == pytest.approx(206.69, rel=1e-3)
+    assert any("risk pricing (LV)" in line and "stored LV risk budgets" in line for line in lines)
+    assert any("risk state" in line and "RISK_STATE_BUILD_S" in line for line in lines)
+
+    # production budget (x8 paths), 2 threads per worker: pricings rescale, state overhead not
+    two, _ = precompute.cost_model_from_store(root, grid, fallback, target_threads=2)
+    tf = precompute.thread_factor("risk", 1, 2)
+    assert two.risk_pricing_s == pytest.approx(lsv_pp * 8 * tf)
+    assert two.by_mode["lv"]["risk_pricing"] == pytest.approx(lv_pp * 8 * tf)
+    assert two.risk_state_s == pytest.approx(state + build["lsv"])  # not rescaled
+
+    # an LV-only source: the LSV risk pricing falls back to the measured ratio, named
+    ResultsStore(root).point_dir("f" * 64).rename(tmp_path / "moved")
+    lv_only, lines = precompute.cost_model_from_store(root, probe, fallback, target_threads=1)
+    assert lv_only.by_mode["lv"]["risk_pricing"] == pytest.approx(lv_pp)
+    assert lv_only.risk_pricing_s == pytest.approx(
+        precompute.RISK_PRICING_RATIO["lsv"] * lv_only.pricing_s
+    )
+    assert any("no LSV risk budget in the source" in line for line in lines)
+
+    # an LSV-only source (probe D's ``--only`` store): the LV risk pricing falls back to the LV
+    # ratio applied to the LV pricing step, itself the LSV pricing x LV_TO_LSV_PRICING_RATIO
+    lsv_root = tmp_path / "lsv_only"
+    _synthetic_risk_store(lsv_root)
+    lsv_store = ResultsStore(lsv_root)
+    lsv_store.point_dir("lv:" + "g" * 64).rename(tmp_path / "moved_lv")
+    run_file = lsv_store.runs_dir / _NEW_RUN
+    run = json.loads(run_file.read_text())
+    run["points_computed"] = [e for e in run["points_computed"] if e["mode"] != "lv"]
+    run_file.write_text(json.dumps(run))
+    lsv_only, lines = precompute.cost_model_from_store(lsv_root, probe, fallback, target_threads=1)
+    assert "pricing" not in lsv_only.by_mode.get("lv", {})
+    assert lsv_only.risk_pricing_s == pytest.approx(lsv_pp)
+    assert lsv_only.by_mode["lv"]["risk_pricing"] == pytest.approx(
+        precompute.RISK_PRICING_RATIO["lv"]
+        * precompute.LV_TO_LSV_PRICING_RATIO
+        * lsv_only.pricing_s
+    )
+    assert any("no LV risk budget in the source" in line for line in lines)
+
+
+def test_cost_report_on_the_toy_store(toy_build: ToyBuild, tmp_path: Path) -> None:
+    """The report on the fixture's store (read only; the output goes to a temporary directory):
+    the two shard runs, 3 calibrated points and no cache hit (hit rate 0), the LV point without a
+    leverage, the thread count and peak RSS recorded by the precompute itself, the particle pass
+    equal to the store rows' ``calibration_seconds`` — and the fixture directory unchanged."""
+    toy = toy_build.require()
+    before = _file_snapshot(toy.base)
+    rec = precompute.load_cost_records(toy.store_root)
+    assert len(rec.runs) == len(TOY_SHARDS)
+    assert int(rec.runs["points_computed"].sum()) == 4
+    assert int(rec.runs["n_calibrated"].sum()) == 3 and int(rec.runs["n_cache_hits"].sum()) == 0
+    assert (rec.runs["threads_source"] == "record").all()
+    assert (rec.runs["peak_rss_gib"] > 0).all()
+    assert all(fields == [] for fields in rec.absent.values()), rec.absent
+    pts = rec.points
+    assert sorted(pts["how"]) == ["calibrated"] * 3 + ["no leverage"]
+    assert set(pts["mode"]) == {"lv", "one_factor", "two_factor"}
+    assert (pts["mode_source"] == "record").all() and (pts["kind"] == "full").all()
+    rows = StoreReader(toy.store_root).points().set_index("point_id")
+    for _, e in pts[pts["how"] == "calibrated"].iterrows():
+        assert e["calibration"] == pytest.approx(rows.loc[e["point_id"], "calibration_seconds"])
+        assert e["overhead"] >= 0 and e["total"] == pytest.approx(
+            sum(e[s] for s in precompute.COST_STEPS[:-1]), rel=1e-9
+        )
+    assert np.isfinite(pts["core_total"]).all()
+    out = tmp_path / "toy_report"
+    assert precompute.report_main(["--store", str(toy.store_root), "--out", str(out)]) == 0
+    assert (out / "cost_report.md").read_text().count("| full | one_factor | calibrated |") >= 5
+    assert _file_snapshot(toy.base) == before
+    print("\n" + (out / "cost_report.md").read_text())
+
+
+def test_cost_from_builds_the_cost_model_from_the_toy_store(
+    toy_build: ToyBuild, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--dry-run --cost-from`` on the toy store: the calibration cost is the median particle
+    pass of its calibrated points (rescaled linearly in particles), pricing / analytics the
+    median of its LSV points (linearly in paths) with per-mode values, the risk pricing the
+    documented ratio (the toy ran no risk), the thread rescaling the Amdahl factor, and the
+    source of every number is printed.  A source without a thread count is not rescaled and says
+    so.  Nothing is computed or written."""
+    toy = toy_build.require()
+    before = _file_snapshot(toy.base)
+    grid = load_grid(TOY_GRID)
+    fallback = precompute.default_cost_model(LeverageCache(tmp_path / "cache"), grid)
+    rec = precompute.load_cost_records(toy.store_root)
+    threads = int(rec.points["threads"].iloc[0])
+    cal = rec.points[rec.points["how"] == "calibrated"]
+    lsv = rec.points[rec.points["mode"] != "lv"]
+    cost, lines = precompute.cost_model_from_store(
+        toy.store_root, grid, fallback, target_threads=threads
+    )
+    assert cost.calibration_s == pytest.approx(float(np.median(cal["calibration"])))
+    assert cost.diagnostics_s == pytest.approx(float(np.median(cal["diagnostics"])))
+    assert cost.pricing_s == pytest.approx(float(np.median(lsv["pricing"])))
+    assert cost.analytics_s == pytest.approx(float(np.median(lsv["analytics"])))
+    assert cost.overhead_s == pytest.approx(float(np.median(rec.points["overhead"])))
+    assert cost.risk_pricing_s == pytest.approx(
+        precompute.RISK_PRICING_RATIO["lsv"] * cost.pricing_s
+    )
+    assert cost.risk_state_s == pytest.approx(
+        precompute.RISK_STATE_OVERHEAD_S + precompute.RISK_STATE_BUILD_S["lsv"]
+    )
+    lv = rec.points[rec.points["mode"] == "lv"].iloc[0]
+    assert cost.by_mode["lv"]["pricing"] == pytest.approx(lv["pricing"])
+    assert set(cost.by_mode) == {"lv", "one_factor", "two_factor"}
+    assert any("no LSV risk budget in the source" in line for line in lines)
+    assert cost.by_mode["lv"]["risk_pricing"] == pytest.approx(
+        precompute.RISK_PRICING_RATIO["lv"] * cost.by_mode["lv"]["pricing"]
+    )
+    # the LV point is charged its own measured pricing, an LSV point the LSV median
+    assert cost.point_s("none", calibrates=False, miss=False, mode="lv") == pytest.approx(
+        cost.by_mode["lv"]["overhead"] + lv["pricing"] + lv["analytics"]
+    )
+
+    # rescaled: twice the particles and paths, a different thread count
+    bigger = dataclasses.replace(
+        grid,
+        particle=dataclasses.replace(grid.particle, n_particles=2 * grid.particle.n_particles),
+        pricing=dataclasses.replace(grid.pricing, n_paths=2 * grid.pricing.n_paths),
+    )
+    target = threads + 3
+    big, _ = precompute.cost_model_from_store(
+        toy.store_root, bigger, fallback, target_threads=target
+    )
+    assert big.calibration_s == pytest.approx(
+        2 * cost.calibration_s * precompute.thread_factor("calibration", threads, target)
+    )
+    assert big.pricing_s == pytest.approx(
+        2 * cost.pricing_s * precompute.thread_factor("pricing", threads, target)
+    )
+    assert big.overhead_s == pytest.approx(cost.overhead_s)  # serial, budget-independent
+
+    base = [
+        "--grid",
+        str(TOY_GRID),
+        "--store",
+        str(tmp_path / "store"),
+        "--cache",
+        str(tmp_path / "cache"),
+        "--dry-run",
+    ]
+    assert precompute.main([*base, "--cost-from", str(toy.store_root), "--workers", "2"]) == 0
+    out = capsys.readouterr().out
+    assert "cost model from the measured store" in out
+    assert "--cost-from: median particle pass" in out
+    assert "memory: measured peak RSS" in out and "x 2 workers" in out
+    assert "parallel (shard 1/1, 4 points to compute): 2 worker(s)" in out
+    assert "dry run: nothing computed" in out
+    # on a shard, the parallel line is the shard's, not the whole grid's
+    assert precompute.main([*base, "--cost-from", str(toy.store_root), "--shard", "2/2"]) == 0
+    out = capsys.readouterr().out
+    line = next(ln for ln in out.splitlines() if ln.startswith("parallel ("))
+    shard_line = next(ln for ln in out.splitlines() if ln.startswith("this shard (2/2)"))
+    assert "shard 2/2, 2 points to compute" in line
+    shard_h = float(shard_line.split("projected ")[1].split(" process-hours")[0])
+    assert f"({shard_h:.2f} process-hours" in line
+    assert precompute.main([*base, "--cost-from", str(tmp_path / "nowhere")]) == 2
+    assert "no run records" in capsys.readouterr().err
+
+    # a source whose records carry no thread count: no rescaling, said so
+    old = tmp_path / "old_store"
+    _synthetic_cost_store(old)
+    (old / "results" / "runs" / _NEW_RUN).unlink()
+    _, lines = precompute.cost_model_from_store(old, grid, fallback, target_threads=4)
+    assert any("thread count ABSENT" in line for line in lines)
+    assert any("calibration" in line and "kept" in line for line in lines)  # nothing to split
+    _, lines = precompute.cost_model_from_store(
+        old, grid, fallback, target_threads=4, source_threads=12
+    )
+    assert any("assumed by --cost-from-threads" in line for line in lines)
+    assert not (tmp_path / "store").exists()
+    assert _file_snapshot(toy.base) == before

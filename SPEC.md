@@ -1035,6 +1035,7 @@ each with the test the finding asked for. What the reviews changed, beyond the c
   study-B bar whose stderr was NaN. A column without its twin is now not plotted at all — the page
   names the column and the script that produces it — and rows with a NaN value or stderr are
   counted in a caption instead of being drawn.
+- **A guessed stderr twin broke on a new column** (2026-09-16): the M8b tables wrote the desk mean's stderr under a stem (`desk_mean` beside `mean_se`, `recal_pnl_desk` beside `recal_se`) and the read API re-attached it by prefix. When study D gained `mean_delta`, the prefix matched two columns and the walker test failed on the real table. The writers now emit exact twins (`<value>_se`, pinned by a walk over every table the builders emit), and the API's re-attachment of older tables skips any candidate that already has its own twin.
 - **A read path that wrote**: `ResultsStore` created `results/points` and `results/runs` in its
   constructor, so `volsto-viewer --check` on an empty store left directories behind. The
   directories are created by the writers now, and the test pins that a check creates nothing.
@@ -1071,6 +1072,83 @@ fixture in `tests/conftest.py` (3 calibrations at 2·10⁴ particles, ~31 s, sha
 workers). `volsto-viewer --check` on the repository roots renders all eight pages in 6.9 s
 (page 1 5.8 s for the surface build, the rest 0.10-0.25 s) against the 5-point placeholder store,
 and on an empty store-cache-outputs triple it renders all eight, exits 0 and creates nothing.
+
+**VM runbook and measured-cost sizing** (2026-09-16; `docs/vm_grid_run.md`, `volsto-precompute report`, `--cost-from`). The owner provisions the VM; the runbook gives the command lines, the expected per-shard wall clock, the rsync back of the store AND the cache, and the arrival check. `volsto-precompute report --store ROOT` reads the run records (wall clock, host, workers, threads, calibrated vs cache hits, per-point cost by mode and step, core-seconds); `--dry-run --cost-from ROOT` sizes a grid from a previous store's measured costs. **The owner's ~3 h target is not reachable on one 48-vCPU instance:** a grid point's work is mostly serial (12 threads buy 1.70× over one; the particle pass 1.41×), so the 126.5-hour projection is twelve-thread laptop time and the grid needs many single-thread workers, capped by physical cores and memory.
+
+**VM sizing, corrected** (2026-09-16; `volsto/viewers/precompute.py`, `volsto/calibration/cache.py`, `docs/vm_grid_run.md`).
+
+*Risk-step cost.* Measured on the laptop at 1 thread on one placeholder 1F point and the LV point, light tier on the 3-bucket ladder (17 bumped states, 38 pricings), at two budgets: probe C (10⁵ particles / 5·10⁴ paths) and production (8·10⁵ / 4·10⁵; 1F risk step 4283.0 s of 4984.8 s, LV 943.5 s of 1223.9 s, peak RSS 2.36 GiB). The step decomposes as
+
+`states × (RISK_STATE_OVERHEAD_S + RISK_STATE_BUILD_S[mode]) + (states − 1) × particle pass (LSV) + pricings × RISK_PRICING_RATIO[mode] × pricing step`
+
+with:
+- RISK_STATE_OVERHEAD_S = 4.86 s: work outside the engine (arbitrage checks, bucket ε sizing, base build); budget- and mode-independent to 2%;
+- RISK_STATE_BUILD_S = 6.05 s (LSV) / 1.04 s (LV, the Dupire rebuild);
+- RISK_PRICING_RATIO = 0.1044 (LSV) / 0.1183 (LV); budget-independent to 3.5%.
+
+The 17th state is the point's own leverage, so an LSV point pays 16 particle passes.
+
+`--cost-from` derives the same quantities from a store's risk budgets by mode (`risk_budget_costs`):
+- per-state outside work = (step wall − engine wall) / states;
+- LSV pricing = (engine − misses × particle pass − states × build) / pricings;
+- LV pricing = (engine − states × build) / pricings, since an LV point's "misses" are Dupire rebuilds.
+Pricings scale with paths and threads; per-state costs are serial and are never rescaled.
+
+*Threads.* `thread_factor` reads MEASURED_THREAD_RATIO: t(n)/t(1) at 1/2/4/8/12 threads on the probe, interpolated in 1/n.
+- Particle pass: 0.918 / 0.801 / 0.717 / 0.644.
+- Pricing: 0.752 / 0.616 / 0.554 / 0.545.
+- Diagnostics: 0.733 / 0.586 / 0.519 / 0.503.
+- Analytics: 0.754 / 0.621 / 0.557 / 0.552.
+
+Least-squares Amdahl fractions over all counts (0.316 / 0.549 / 0.504 / 0.498) are used only beyond 12 threads. They fit diagnostics, pricing and analytics to within 0.008, but misfit the particle pass by +0.076 at 2 threads and −0.066 at 12. The 2-thread figures are for real cores; an SMT sibling gains less.
+
+*Grid cost.* The default grid (light tier, 3 buckets) costs 177.0 process-hours at 1 thread at laptop per-core speed (cross-checks: 180.6 and 185.7). The wall-clock floor at laptop speed (a lower bound) is 7.37 h on 24 × 1, 3.69 h on 48 × 1, and 3.67 / 3.70 h for `--shard 1/2`, `2/2` at 24 × 1. With a VM per-core factor f (1.0–1.5) and a concurrency efficiency e (0.75–1.0), the expected wall clock is:
+
+| layout | expected | range |
+|---|---|---|
+| one 48-vCPU instance | about 10 h | 7–16 h |
+| one 96-vCPU instance | about 5 h | 3.5–8 h |
+| two 48-vCPU instances | about 5 h | 3.5–8 h |
+
+Memory is 2.36 GiB per process with the risk step on, so a 48-vCPU instance needs 57 GiB and a 96-vCPU instance 113 GiB. The runbook's probes A–D measure f, e(K), the risk costs and the production RSS on the VM.
+
+*Dry run.* The `parallel (shard i/n, M points to compute)` line is the wall clock of the points that invocation computes, floored at its longest point.
+
+*Report.* A wall a record does not carry is NaN and shown as absent, never 0. Peak RSS is reported in GiB.
+
+*Cache manifest.* `LeverageCache._append_manifest` holds an exclusive `flock` on `manifest.parquet.lock` and publishes by temp file + `os.replace`; the format is unchanged. `tests/test_cache_concurrency.py` runs 12 writer processes × 30 rows with 3 readers: 0 failures, no rows lost. The pre-fix code on the same test failed 571–1188 operations and lost 306 of 360 rows.
+
+**Atomic leverage cache** (2026-09-16; `volsto/calibration/cache.py`).
+
+Every file the cache writes goes through `atomic_write(dest, write)`. This covers `leverage.npz`, `spec.json`, `diagnostics.json` and `manifest.parquet`.
+- **How a write works.** The writer fills a temporary file beside the destination. The file is named `.<name>.<16 hex>.tmp<suffix>` (`TEMP_GLOB = '.*.tmp*'`) and is created with `O_EXCL` and mode `0666 & ~umask`. The file is fsync'd, then `os.replace`d over the destination, and the directory is fsync'd. On an exception the temporary is removed.
+- **What a kill leaves.** The previous file or the new one, never a torn file. At most one leftover temporary remains, and no reader looks at it.
+
+Order within an entry:
+1. `spec.json`;
+2. removal of a stale `diagnostics.json`;
+3. `leverage.npz`, the commit point;
+4. `diagnostics.json`;
+5. the manifest row, under the `flock`.
+
+Reading an entry:
+- **`has()` / `has_key()`:** a hit is a `leverage.npz` that is a complete zip archive. A torn file from before this change is a logged miss, so `--resume` recalibrates it.
+- **`unlisted_keys()`:** lists committed entries that have no manifest row (a kill between steps 3 and 5). Such an entry is still a valid hit.
+- **`temporaries()`:** lists leftovers. Delete them when no writer is running.
+- **`merge_manifest(rows)`:** adds another copy's rows for keys this cache lacks, under the lock and atomically. It is the runbook's merge of a VM's manifest.
+
+The precompute's hit test, its `--resume` test and its diagnostics refresh go through `has_key` and `write_report`.
+
+Tests (`tests/test_cache_concurrency.py`):
+- a walking test that every file is published by `atomic_write` with the umask mode;
+- a SIGKILL halfway through a leverage save, for a new key and an existing key;
+- a save that raises half-way;
+- a torn legacy file;
+- an unlisted entry.
+
+On the old code, the kill scenario gives has() = True followed by `BadZipFile` on load.
+
+**LV risk-pricing fallback** (`volsto/viewers/precompute.py`). `RISK_PRICING_RATIO["lv"]` is measured against the LV pricing step. When no LV pricing is measured (the default model, or a `--cost-from` store without an LV point), that step is taken as `LV_TO_LSV_PRICING_RATIO` (187.5 / 265.4 = 0.7065, production, 1 thread) × the LSV pricing. The default dry run of `configs/grids/default.yaml` gives 126.52 h for light on the 3-bucket ladder and 238.54 h on the 20-bucket ladder. It is a single-process projection from the cache manifest and the 12-thread fallbacks. The measured 1-thread light-tier cost is 177 process-hours (`--cost-from`).
 
 ---
 
@@ -1135,6 +1213,85 @@ Measured on 2022-09-15: implied forwards within 0.7 bp (≤ 6m) / 3.5 bp (2y) of
 Implementation notes (M3b, measured on the 2022 H2 SPX sample): contracts are grouped by (root, expiration) as the vendor does — SPX (AM) and SPXW (PM) share expiration dates but differ by one day in `T`; the implied forward is the regression `C − P = a + b K` on two-sided pairs within ±10% of spot (`F = −a/b`, discount `−b`, delta-method standard error), which agrees with the vendor's closest-strike parity forward within 0.7 bp to 6m and 3.5 bp at 2y (the vendor discounts at the Treasury rate, the market-implied rate was 0.4–0.6% higher); our Black-76 inversion reproduces the vendor's `iv` on `iv_flag = 0` rows to a median 0.1 vp near the money. Butterfly pruning is iterative convexity of OTM prices in strike; the calendar check runs on the common quoted `k` range of consecutive slices (a global fixed point dropping the worst violating quote), which is also what `GridSurface` enforces. `θ_T` is fitted at the SPEC pillar tenors (1m, 3m, 6m, 1y, 18m, 2y, 3y) by isotonic least squares through the slices' ATM total variances; the global `(ρ, η, γ)` least squares (vega-weighted, |k| ≤ 0.25, expiries ≥ 3 weeks) enforces both SSVI butterfly conditions through a bounded reparametrisation of `η`; imported surfaces default to eSSVI — `ρ` fitted at the pillars (piecewise-linear `ρ_T`, `ESSVISurface`) — with `--ssvi` as the single-`ρ` opt-out; synthetic surfaces (`configs/surfaces/reference_ssvi.yaml`, the study parameters) stay plain SSVI. Expiries under 3m are reported in the residual tables but sit outside the acceptance region. Fit quality on four sample days, inside ±20% moneyness: RMS 0.12–0.22 vp and max 0.4–1.0 vp from 3m to 2y (eSSVI RMS 0.08–0.16 from 6m); the 1–2 month weeklies of these high-volatility days are 1–7 vp off — a single power-law φ cannot follow them, so the §13 target of 0.3 vp holds in RMS from 3m but not as a maximum below 3m. The snapshot YAML has `market` + `ssvi` sections (loadable by `load_ssvi_surface`) and a `provenance` section (vendor, file and manifest SHA-256, filters, forwards, rate curve, fit residuals, code version). `scripts/capture_yfinance.py` writes the same 34-column layout (blank calculated columns, `iv_flag = 7`) plus a manifest with a user-supplied Treasury curve.
 
 Data sourcing decisions: build against the free sample; buy the HistoricalData.net full archive ($799 one-time, daily updates $79/month) for a multi-year backtest; ThetaData's free tier (1y EOD) as a second-source check; rates from FRED/SOFR or the desk's OIS curve; forwards and dividends always implied per expiry from put-call parity on the chain.
+
+### 13.1 M10 Part 0 — eSSVI calendar repair: the invariant, enforced by construction (2026-09-16)
+
+**Invariant.** For every eSSVI surface the importer returns WITHOUT a fallback (`calendar_fallback is None` — every one of the 127 sample days), the exact derivative `∂_T w(k, T) ≥ margin = 1e-4` per year holds for every `|k| ≤ 3` and every `T ∈ [1/365, max_maturity]`, both one-sided limits at every knot included — proven, not sampled. The escalation steps return weaker invariants, recorded on the result: `margin0` proves `∂_T w ≥ 0` only, `k_abs_1` proves it on `|k| ≤ 1` only, and `ssvi` returns a plain SSVI (single ρ, calendar-free for non-decreasing `θ_T`) that the certificate does not examine. Synthetic searches reach the fallback; the real sample never does.
+
+**Why a third pass.** Twice the constraint was checked at points that missed where the violation lives:
+- first, the pillars were missing from the grid;
+- second, the secant over an edge step `h = 1e-3·segment` does not bound the one-sided limit (`secant = w'(b−) − (h/2) w_TT`, and `w` is concave in `T` near the short pillars).
+
+Per the owner's rule, this pass enforces the invariant itself instead of densifying the grid again.
+
+**Exact derivative** (`volsto.market.surface.essvi_dw_dt`). On each knot segment (knots `{1/365} ∪ pillars ∪ {max_maturity}`), `θ_T` and `ρ_T` are affine. With `x = kφ(θ)`, `S = √((x+ρ)² + 1 − ρ²)`, `g = 1 + ρx + S` and `χ = γ + (1−γ)θ/(1+θ)`:
+
+`∂_T w = (θ'/2)·g·(1 − χ + χ/S) + (θρ'/2)·x·(1 + 1/S)`
+
+At a knot, each one-sided limit uses the slopes of the segment on that side. The constructor check, the repair, the certificate and the dense check all use this formula.
+
+**Certificate** (`certify_calendar`). Branch and bound on the exact derivative:
+- The exact value is computed on 121 `k` × 48 `T` per segment.
+- Each cell between those points gets a lower bound (`dw_dt_lower_bound`). Every factor's range on the cell is exact, from monotonicity:
+  - `θ` and `ρ` are affine;
+  - `φ` decreases in `θ`, and `χ` increases;
+  - `S²` is linear in `ρ` and convex in `x`;
+  - `g` is monotone in `ρ` and convex in `x`.
+
+  The factors are then combined with interval arithmetic.
+- Cells whose bound reaches the floor are proven. The others are bisected, and their centres evaluated.
+- The outcome is `certified`, `violated` (with the points) or `inconclusive` (budget exhausted; never a pass).
+- Soundness was checked on 2·10⁵ random cells.
+
+**Repair** (`repair_calendar`), an exchange method:
+- It imposes `∂_T w ≥ margin + headroom` (1.1e-4) on the initial point set, knot limits included.
+- After each feasible solve, the certificate either proves `≥ margin` on the continuous range, or returns the points below `margin + headroom/2`. Those points join the constraint set.
+- An input that is already proven is returned bit-identical.
+- Unchanged: θ frozen; ρ_T and γ free inside their boxes; only η capped; the escalation order margin 0 → ±1 → plain SSVI.
+
+**Constructor.** It refuses when the exact `∂_T w` on its ±1 grid (pillars included, both limits) is below −1e-10. The unrepaired importer now passes 108/127 days, against 109 under the second pass's step check and 112 under M3b's; 2022-10-31 is newly refused. Both committed eSSVI snapshots load.
+
+**Proof in tests.**
+- 500 seeded violating draws. If 5% of draws failed, all 500 would pass with probability 7·10⁻¹².
+- Each is checked three ways: the repair's proof, an independent certificate of the constructed surface, and the exact derivative on 1201 × 3000 plus both limits at every knot.
+- Plus the 29 draws the second-pass verifier found failing, and a case that only the certificate's cuts can repair.
+
+**Gate** (`scripts/essvi_calendar_gate.py`; 141 s, single core; recalibrated: no; no Monte Carlo).
+- Repaired eSSVI on 127/127 days: 25 repaired (7–9 solves, 0 cuts) and 102 bit-equal; no fallback.
+- All 127 are proven `∂_T w ≥ 1e-4` (smallest certificate bound 1.000e-4).
+- Dense exact minimum +1.099e-4 per year, against +2.843e-5 in the second pass. Unrepaired: 25 negative days, worst −2.113.
+- Fit error medians, |k| ≤ 0.2, 3m–3y (fit's points / surface returned):
+
+  | variant | RMS | max |
+  |---|---|---|
+  | eSSVI, repaired | 0.1957 / 0.1384 | 1.3455 / 0.6108 |
+  | SSVI | 0.2375 / 0.1939 | 1.4506 / 0.7520 |
+
+- On the 25 repaired days: worst RMS 0.3644 (2022-12-28), worst max 2.0324 (2022-12-29).
+- Against the second pass the cost is nil: the largest max increase is +0.0003.
+- ATMF skew, medians, 1y / 2y / 3y:
+
+  | variant | 1y | 2y | 3y |
+  |---|---|---|---|
+  | eSSVI, repaired | −0.2897 | −0.1966 | −0.1626 |
+  | SSVI | −0.2875 | −0.2240 | −0.1910 |
+
+- Anchor 2022-12-30:
+  - 2y skew −0.1940 against −0.2181 with SSVI; 3y skew −0.1660 against −0.1910;
+  - RMS 0.2605 → 0.2684;
+  - proven floor 1e-4 (lower bound 1.003e-4).
+- History rerun: 127/127 imported (142 s). The 127 snapshots, reloaded: all proven, 0 negative.
+- Discriminator (115 s): fitted 60-day SSR 0.874 ± 0.117 / 0.800 ± 0.080 / 0.799 ± 0.069 / 0.834 ± 0.068 at 1m / 3m / 6m / 1y. Verdict unchanged: surface artefact.
+
+**Where the owner's Part 0 specification and the measurements disagree** (implemented as measured; reported 2026-09-16):
+1. *Constraint range.* A repair on the trusted strike range repairs nothing — inside `|k| ≤ 0.25` there is no violation on any of the 127 days. The violations live in the wings. Under the exact certificate, 25 of the 127 unrepaired fits violate on the Dupire range `|k| ≤ 3` against 19 on the constructor's `|k| ≤ 1`: six days pass a `±1` check while Dupire would silently floor a negative `∂_T w` (the pre-M10 point check raised on 15 days, hence the 112-date history). The objective stays on the trusted range; the constraint is on `±3`.
+2. *What moves.* Only `ρ_T` (with `γ` inside its box and `η` capped); `θ_T` is frozen, not projected. The violation comes from `θ_T(1 + ρ_T)` and `θ_T` is already made non-decreasing twice; a `ρ`-only refit is feasible on 127/127 days.
+3. *"The 2y–3y skew is no longer extrapolated" cannot be met by any repair.* The pillar counts are P = 5 / 6 / 7 on 1 / 117 / 9 days: on 118 of the 127 days the last pillar is at or below 2y, so the 3y skew is flat-forward-variance extrapolation whatever the repair (only one day quotes at or beyond 3y; the median longest quoted maturity is 2.25y). What the repair delivers is that on every passing day the 2y/3y skew comes from the eSSVI `ρ_T` instead of the single-`ρ` fallback (medians −0.1966 / −0.1626 against −0.2240 / −0.1910).
+4. *The discriminator cannot give a verdict on ~10 days.* Its estimator needs at least 21 dates (windows of 60 and 100 business days; `MIN_INCREMENTS = 20`), so it was re-run on all 127 repaired days, plus a 21-day smoke run with 20-day windows. **The verdict is unchanged: "surface artefact".** At 1m the raw SSR is 0.942 ± 0.153 (60-day window), and 0.942 + 2 × 0.153 = 1.249 is not below 1; on the fitted pillars (3m–1y) the raw and fitted SSR agree (0.80 / 0.79 / 0.77 raw against 0.80 / 0.80 / 0.83 fitted) and read significantly below 1. So the owner's gate keeps study B's historical world skipped: the 0.85 SSR is supported at 3m–1y and not established at 1m, where the raw estimator's error is too large to decide.
+
+**Deferred for the owner: the fit's θ clamp.** `fit_ssvi`'s residuals clamp `θ_T` beyond the last pillar while the surface it returns extrapolates it, so the fit reports errors for a slightly different surface than the one it returns: median RMS, `|k| ≤ 0.2`, 3m–3y, 0.1957 vp reported against 0.1384 vp on the surface returned (max 1.2994 against 0.6108). Fixing it changes every fitted snapshot and every cache key built on one.
+
+**Provenance of the histories.** Before M10, `outputs/m7/hdn_history.csv` was an eSSVI history on 112 dates (the days whose eSSVI passed the check); only the committed snapshots under `configs/surfaces/snapshots/hdn_2022H2_ssvi/` and the M8b discriminator's fitted column were plain SSVI. The committed snapshots are not regenerated by this change; the gate and the repaired history are written under `outputs/` only.
 
 ---
 

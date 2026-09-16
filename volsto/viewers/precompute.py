@@ -62,11 +62,14 @@ measured repricing of the pillar surface (:data:`DIAGNOSTICS_S_FALLBACK`), charg
 and, under ``--diagnostics``, to every hit without a report; pricing and analytics = the
 ``--probe`` measurement on the first point of the shard (else the measured fallbacks
 :data:`PRICING_S_FALLBACK` / :data:`ANALYTICS_S_FALLBACK` at 400k paths, rescaled by the grid's
-paths); risk = calibrations per tier × calibration cost (LSV points) + pricings per tier × the
-single-pricing cost.  The light tier is projected twice — at the configured bucket count and at
-the alternative one (20 ↔ ``len(light_pillars)``) — so the owner can choose.  A running ETA
-follows every finished point.  ``--dry-run`` enumerates, prints the counts per surface and mode
-and the projection and computes nothing (the cache manifest is read, never written).
+paths); risk = bumped states per tier × the budget-independent per-state cost of the point's
+mode (:data:`RISK_STATE_OVERHEAD_S` + :data:`RISK_STATE_BUILD_S`) + (states − 1) × calibration
+cost (LSV points; the base state is the point's own leverage) + pricings per tier × the risk
+pricing of the point's mode (:data:`RISK_PRICING_RATIO` × its pricing step).  The light tier
+is projected twice — at the configured bucket count and at the alternative one (20 ↔
+``len(light_pillars)``) — so the owner can choose.  A running ETA follows every finished point.
+``--dry-run`` enumerates, prints the counts per surface and mode and the projection and
+computes nothing (the cache manifest is read, never written).
 
 **Sharding, workers, selection, resume.**  ``--shard i/n`` takes the interleaved shard
 :func:`~volsto.viewers.grid.shard`; ``--only ID [ID ...]`` keeps only the named points of the
@@ -84,6 +87,32 @@ the new tier, ``updated_utc`` / ``updated_steps``); with ``--diagnostics`` a sto
 whose cache entry has no ``diagnostics.json`` is refreshed for the diagnostics step the same
 way.  Nothing else is recomputed on a resume, so the per-point manifest entries of the skipped
 points are unchanged.
+
+**Workers and threads.**  ``--workers k`` runs ``k`` spawn processes with ``NUMBA_NUM_THREADS =
+--threads-per-worker`` (default ``max(1, cpu_count // k)``); with one process
+``--threads-per-worker`` lowers the pool numba started with (``numba.set_num_threads``).  The
+per-point work is mostly serial at the production budget (SPEC §9.2 "VM sizing": the measured
+thread ratios of :data:`MEASURED_THREAD_RATIO`), so throughput comes from many 1–2-thread
+workers, bounded by the physical cores and by memory (the peak RSS each run records).
+
+**Measured cost** (the VM runbook, ``docs/vm_grid_run.md``).  Every run record carries, per
+computed point, its mode, the steps run, ``calibrated`` / ``cache_hit``, the wall split, the
+numba thread count and the process's peak RSS, and at the top the workers, threads per worker,
+CPU count, skipped / failed counts and the peak RSS.  ``volsto-precompute report --store ROOT``
+(:func:`report_main`) reads ``results/runs/*.json`` — never computes — and prints per run the
+wall clock, host, workers × threads, shard, points computed / skipped / failed, calibrated vs
+cache hits (the hit rate), core-hours and peak RSS, and per (kind, mode, how) and step
+(:data:`COST_STEPS`) the median, p90 and core-seconds (seconds × threads per worker); it writes
+``cost_report.md`` and ``runs.csv`` / ``points.csv`` / ``summary.csv`` under
+``<store>/cost_report`` (or ``--out``).  Fields an older record lacks are listed and left absent
+(``--assume-threads`` states a thread count, labelled as assumed).  ``--cost-from ROOT``
+(:func:`cost_model_from_store`) replaces the manifest / fallback cost model by the medians a
+previous store measured, rescaled linearly in particles (calibration) and paths (diagnostics,
+pricing, analytics, risk pricing) and by the measured thread ratio :func:`thread_factor` from
+the source's thread count to ``--threads-per-worker``, printing the source of every number;
+``--cost-from-threads`` states the source's count when its records predate the field.  A dry run
+with ``--workers k`` also prints the parallel wall clock of the points it would compute
+(their process-hours / k, or the longest point; a lower bound) — the shard's, not the grid's.
 
 **Contract with the read API** (:func:`volsto.viewers.api.precompute_command`): a missing point
 is produced by ``volsto-precompute --grid <grid> --store <store> --cache <cache> --only <id>
@@ -103,7 +132,12 @@ header prints the absolute store and cache roots (the defaults are repository-ro
 ``outputs/store`` and ``cache``, like the viewer's).
 
 Checked by ``tests/test_precompute.py`` on the one sanctioned calibrating fixture of the layer
-(``tests/conftest.py::toy_build``: a 3-point toy grid at 2·10⁴ particles into a temporary cache).
+(``tests/conftest.py::toy_build``: a 3-point toy grid at 2·10⁴ particles into a temporary cache);
+the cost report and ``--cost-from`` by ``test_cost_report_on_synthetic_records`` (an old-format
+record included), ``test_cost_report_on_the_toy_store``,
+``test_cost_from_builds_the_cost_model_from_the_toy_store``,
+``test_cost_from_risk_budgets_by_mode`` and ``test_thread_factor_reads_the_measured_ratios``;
+the cache manifest's concurrent writers by ``tests/test_cache_concurrency.py``.
 """
 
 from __future__ import annotations
@@ -111,6 +145,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import difflib
+import json
 import logging
 import math
 import multiprocessing
@@ -223,7 +258,9 @@ PRICING_S_FALLBACK = 176.4
 ANALYTICS_S_FALLBACK = 124.6
 #: Fallback cost of one risk pricing at 400k paths (s), same measurement: the 3y autocall on one
 #: path set 21.7 s, the 1y cliquet CLIQUET_1Y_PRICING_S; the two risk products alternate, so
-#: the mean is charged per pricing.
+#: the mean is one pure pricing.  Not used by the projection any more: a risk pricing also
+#: carries the bumped state's model build (:data:`RISK_STATE_BUILD_S`), and the pure risk
+#: pricing is measured as :data:`RISK_PRICING_RATIO` × the point's pricing step.
 AUTOCALL_PRICING_S = 21.7
 CLIQUET_1Y_PRICING_S = 10.5
 RISK_PRICING_S_FALLBACK = 0.5 * (AUTOCALL_PRICING_S + CLIQUET_1Y_PRICING_S)
@@ -326,21 +363,55 @@ class CostModel:
     pricing_source: str
     risk_calibrations: dict[str, int]
     risk_pricings: dict[str, int]
+    #: Serial, budget-independent cost of the risk step per bumped state of an LSV point: the work
+    #: outside the engine's timer (:data:`RISK_STATE_OVERHEAD_S`) + the state's model build
+    #: inside it (:data:`RISK_STATE_BUILD_S`); an LV point's is ``by_mode["lv"]["risk_state"]``.
+    risk_state_s: float
+    risk_source: str
+    #: Per-mode overrides ``{mode: {"overhead" | "pricing" | "analytics" | "risk_pricing" |
+    #: "risk_state": s}}`` — set by ``--cost-from`` (:func:`cost_model_from_store`) and by
+    #: :func:`default_cost_model` (the LV risk costs); a mode absent here is charged the scalar
+    #: costs above.
+    by_mode: dict[str, dict[str, float]] = dataclasses.field(default_factory=dict)
 
-    def risk_s(self, tier: str, calibrates: bool) -> float:
-        cal = self.risk_calibrations[tier] * self.calibration_s if calibrates else 0.0
-        return cal + self.risk_pricings[tier] * self.risk_pricing_s
+    def _mode_s(self, mode: str | None, step: str, default: float) -> float:
+        return float(self.by_mode.get(mode or "", {}).get(step, default))
 
-    def point_s(self, tier: str, *, calibrates: bool, miss: bool, backfill: bool = False) -> float:
-        """A full computation: overhead + (calibration + diagnostics on a miss) + (diagnostics
-        on a hit backfilled under ``--diagnostics``) + pricing + analytics + risk."""
+    def risk_s(self, tier: str, calibrates: bool, mode: str | None = None) -> float:
+        """The risk step of one point: ``states × risk state + (states − 1) × calibration``
+        (LSV points: the base state is the point's own leverage, a cache hit) ``+ pricings ×
+        risk pricing``, the risk state and pricing of ``mode`` (an LV point's state cost is its
+        Dupire rebuild)."""
+        states = self.risk_calibrations[tier]
+        pricings = self.risk_pricings[tier]
+        if states == 0 and pricings == 0:
+            return 0.0
+        cal = max(states - 1, 0) * self.calibration_s if calibrates else 0.0
         return (
-            self.overhead_s
+            states * self._mode_s(mode, "risk_state", self.risk_state_s)
+            + cal
+            + pricings * self._mode_s(mode, "risk_pricing", self.risk_pricing_s)
+        )
+
+    def point_s(
+        self,
+        tier: str,
+        *,
+        calibrates: bool,
+        miss: bool,
+        backfill: bool = False,
+        mode: str | None = None,
+    ) -> float:
+        """A full computation: overhead + (calibration + diagnostics on a miss) + (diagnostics
+        on a hit backfilled under ``--diagnostics``) + pricing + analytics + risk (the overhead,
+        pricing and analytics of ``mode`` when :attr:`by_mode` has them)."""
+        return (
+            self._mode_s(mode, "overhead", self.overhead_s)
             + (self.calibration_s + self.diagnostics_s if miss else 0.0)
             + (self.diagnostics_s if backfill and not miss else 0.0)
-            + self.pricing_s
-            + self.analytics_s
-            + self.risk_s(tier, calibrates)
+            + self._mode_s(mode, "pricing", self.pricing_s)
+            + self._mode_s(mode, "analytics", self.analytics_s)
+            + self.risk_s(tier, calibrates, mode)
         )
 
     def steps_s(
@@ -351,16 +422,19 @@ class CostModel:
         calibrates: bool,
         miss: bool,
         backfill: bool = False,
+        mode: str | None = None,
     ) -> float:
         """Cost of ``steps`` (:func:`pending_steps`): nothing when done, :meth:`point_s` for a
         full computation, the overhead plus the named refresh steps otherwise."""
         if not steps:
             return 0.0
         if "all" in steps:
-            return self.point_s(tier, calibrates=calibrates, miss=miss, backfill=backfill)
-        s = self.overhead_s
+            return self.point_s(
+                tier, calibrates=calibrates, miss=miss, backfill=backfill, mode=mode
+            )
+        s = self._mode_s(mode, "overhead", self.overhead_s)
         if "risk" in steps:
-            s += self.risk_s(tier, calibrates)
+            s += self.risk_s(tier, calibrates, mode)
         if "diagnostics" in steps:
             s += self.diagnostics_s
         return s
@@ -413,20 +487,34 @@ def risk_plan_by_tier(risk: RiskSettings) -> tuple[dict[str, int], dict[str, int
 
 
 def default_cost_model(cache: LeverageCache, grid: GridSpec) -> CostModel:
+    """The cost model from the cache manifest and the measured fallbacks (no ``--cost-from``):
+    the risk pricing of an LSV point is :data:`RISK_PRICING_RATIO` × the fallback pricing, of an
+    LV point :data:`RISK_PRICING_RATIO` × :data:`LV_TO_LSV_PRICING_RATIO` × the fallback pricing
+    (the LV ratio is to the LV pricing step, the fallback is an LSV one); each risk state is
+    charged :data:`RISK_STATE_OVERHEAD_S` + :data:`RISK_STATE_BUILD_S`."""
     cal, src = calibration_cost(cache, grid.particle.n_particles, grid.particle.horizon)
     scale = grid.pricing.n_paths / FALLBACK_N_PATHS
     cals, prs = risk_plan_by_tier(grid.risk)
+    pricing = PRICING_S_FALLBACK * scale
     return CostModel(
         OVERHEAD_S_FALLBACK,
         cal,
         src,
         DIAGNOSTICS_S_FALLBACK * scale,
-        PRICING_S_FALLBACK * scale,
+        pricing,
         ANALYTICS_S_FALLBACK * scale,
-        RISK_PRICING_S_FALLBACK * scale,
+        RISK_PRICING_RATIO["lsv"] * pricing,
         f"measured fallbacks at {FALLBACK_N_PATHS} paths rescaled to {grid.pricing.n_paths}",
         cals,
         prs,
+        RISK_STATE_OVERHEAD_S + RISK_STATE_BUILD_S["lsv"],
+        _RISK_RATIO_SOURCE,
+        by_mode={
+            "lv": {
+                "risk_pricing": RISK_PRICING_RATIO["lv"] * LV_TO_LSV_PRICING_RATIO * pricing,
+                "risk_state": RISK_STATE_OVERHEAD_S + RISK_STATE_BUILD_S["lv"],
+            }
+        },
     )
 
 
@@ -436,7 +524,7 @@ def _hit(cache: LeverageCache, point: GridPoint) -> bool:
         return True
     if point.cache_key is None:
         return False
-    return (cache.root / point.cache_key / "leverage.npz").exists()
+    return cache.has_key(point.cache_key)
 
 
 def _has_report(cache: LeverageCache, key: str | None) -> bool:
@@ -483,6 +571,7 @@ def projection_table(
                 calibrates=p.calibrates,
                 miss=p.calibrates and not _hit(cache, p),
                 backfill=_backfill(p),
+                mode=p.mode,
             )
             for p in points
         )
@@ -502,6 +591,7 @@ def projection_table(
                 "risk_calibrations": cost.risk_calibrations[plan_key],
                 "risk_pricings": cost.risk_pricings[plan_key],
                 "risk_s_lsv_point": round(plan.risk_s(tier, True), 1),
+                "risk_s_lv_point": round(plan.risk_s(tier, False, "lv"), 1),
                 "mean_s_per_point": round(total / n, 1),
                 "total_h": round(total / 3600.0, 2),
                 "calibrating_points": n_cal,
@@ -519,8 +609,13 @@ def format_projection(table: pd.DataFrame, cost: CostModel, tier: str, risk: Ris
         f"{cost.calibration_source}",
         f"  diagnostics cost: {cost.diagnostics_s:.1f} s per calibration (pillar repricing; also "
         "per hit without a report under --diagnostics)",
-        f"  pricing / analytics cost: {cost.pricing_s:.1f} / {cost.analytics_s:.1f} s per point, "
-        f"risk pricing {cost.risk_pricing_s:.1f} s each — {cost.pricing_source}",
+        f"  pricing / analytics cost: {cost.pricing_s:.1f} / {cost.analytics_s:.1f} s per point"
+        f" — {cost.pricing_source}",
+        f"  risk step: states x {cost.risk_state_s:.1f} s (LSV) / "
+        f"{cost._mode_s('lv', 'risk_state', cost.risk_state_s):.1f} s (LV) + (states - 1) x "
+        f"calibration (LSV) + pricings x {cost.risk_pricing_s:.1f} s (LSV) / "
+        f"{cost._mode_s('lv', 'risk_pricing', cost.risk_pricing_s):.1f} s (LV) — "
+        f"{cost.risk_source}",
     ]
     for _, r in table.iterrows():
         configured = r["tier"] != "light" or int(r["fwd_var_buckets"]) == risk.fwd_var_buckets
@@ -535,7 +630,8 @@ def format_projection(table: pd.DataFrame, cost: CostModel, tier: str, risk: Ris
             f"{backfills}) x "
             f"({r['overhead_s']} overhead + {r['calibration_s_per_miss']} cal + "
             f"{r['diagnostics_s']} diag + {r['pricing_s']} pricing + {r['analytics_s']} "
-            f"analytics + {r['risk_s_lsv_point']} risk [{int(r['risk_calibrations'])} cal, "
+            f"analytics + {r['risk_s_lsv_point']} risk (LV {r['risk_s_lv_point']}) "
+            f"[{int(r['risk_calibrations'])} states, "
             f"{int(r['risk_pricings'])} pricings{ladder}] s; mean {r['mean_s_per_point']} "
             f"s/point) = {r['total_h']} h"
         )
@@ -685,10 +781,9 @@ def store_report(
     would re-save the leverage and stamp a new ``created_utc`` / ``git_commit`` on an entry that
     was not recalibrated (the manifest row is rebuilt from the leverage's own metadata, so the
     original stamps survive)."""
-    path = cache.entry_dir(spec) / "diagnostics.json"
     if not cache.has(spec):
         raise FileNotFoundError(f"no cache entry to attach diagnostics to: {cache.key(spec)}")
-    report.save(path)
+    path = cache.write_report(spec, report)  # atomic, like every cache write
     cache._append_manifest(cache.key(spec), spec, leverage, report)
     return path
 
@@ -1075,11 +1170,7 @@ def pending_steps(
     status = str(row.get("status", "") or "")
     has_model = point.mode == "lv" or status != "infeasible"
     key = str(row.get("cache_key", "") or "")
-    if (
-        point.mode != "lv"
-        and has_model
-        and not (key and (cache.root / key / "leverage.npz").exists())
-    ):
+    if point.mode != "lv" and has_model and not (key and cache.has_key(key)):
         return ("all",)
     steps: list[str] = []
     stored_tier = str(row.get("risk_tier", "none") or "none")
@@ -1252,18 +1343,933 @@ def process_point(
     return {
         "point_id": point.id,
         "label": point.label,
+        "mode": point.mode,
         "steps": list(steps),
         "calibrated": calibrated,
         "cache_hit": hit,
         "diagnostics_backfilled": backfilled,
         **walls,
         "total": time.perf_counter() - t0,
+        "threads": numba_threads(),
+        "pid": os.getpid(),
+        "peak_rss_bytes": peak_rss_bytes(),
     }
+
+
+# --------------------------------------------------------------------------------------------
+# measured cost: the run-record report and the cost model built from a previous store
+# --------------------------------------------------------------------------------------------
+
+#: Modes of the cost report, in grid order (:data:`volsto.viewers.grid.MODES`).
+COST_MODES: tuple[str, ...] = ("lv", "one_factor", "two_factor", "marking")
+#: Steps of the cost report.  ``calibration`` is the leverage's particle pass alone (the
+#: ``calibration_seconds`` of the store row, for a point calibrated in the run); ``overhead`` is
+#: everything else of the timed calibration step (market build, leverage load or Dupire build,
+#: mean |L − 1|, the marking fit) plus the untimed remainder ``total − Σ steps`` (the store
+#: write); the other steps are the run record's own splits.
+COST_STEPS: tuple[str, ...] = (
+    "overhead",
+    "calibration",
+    "diagnostics",
+    "pricing",
+    "analytics",
+    "risk",
+    "total",
+)
+#: Directory the report writes under ``--store`` by default (outside ``results/``, which the
+#: store reader walks).
+COST_REPORT_DIRNAME = "cost_report"
+#: Top-level fields of a current run record the report reads; an older record's missing ones
+#: are listed, never filled in.
+RUN_RECORD_FIELDS: tuple[str, ...] = (
+    "host",
+    "shard",
+    "workers",
+    "threads_per_worker",
+    "cpu_count",
+    "wall_seconds",
+    "points_selected",
+    "points_skipped",
+    "n_calibrated",
+    "n_cache_hits",
+    "failed",
+    "n_particles",
+    "pricing",
+    "peak_rss_bytes",
+)
+#: Fields of a current ``points_computed`` entry the report reads.
+POINT_ENTRY_FIELDS: tuple[str, ...] = (
+    "mode",
+    "steps",
+    "calibrated",
+    "cache_hit",
+    "threads",
+    "peak_rss_bytes",
+    *WALL_STEPS,
+    "total",
+)
+#: Measured wall-clock ratio ``t(n)/t(1)`` per step at ``n`` numba threads — the thread
+#: rescaling of ``--cost-from`` (:func:`thread_factor`).  Owner's laptop (Apple M-series, 12
+#: logical cores = 8 performance + 4 efficiency, 24 GiB, shared with other agents: load average
+#: 2.5–4.3), one placeholder 1F point (ν 0.5, ρ −0.7, κ 1.5, risk none) at the probe budget
+#: (10⁵ particles, 3y, 5·10⁴ paths), a fresh scratch cache per thread count
+#: (``scratchpad/scaling/store_{1,2,4,8,12}``): particle pass 25.22 / 23.16 / 20.20 / 18.09 /
+#: 16.25 s, diagnostics 4.63 / 3.40 / 2.72 / 2.40 / 2.33 s, pricing 33.19 / 24.94 / 20.44 /
+#: 18.39 / 18.08 s, analytics 24.16 / 18.23 / 15.01 / 13.45 / 13.33 s.  A risk pricing is
+#: charged the pricing ratio; the overhead (market build, store write) is serial.  The table is
+#: used rather than an Amdahl law because Amdahl does not fit the particle pass
+#: (:data:`THREAD_PARALLEL_FRACTION`); between the measured counts the ratio is interpolated
+#: linearly in ``1/n``.  Production-budget check (8·10⁵ particles, 4·10⁵ paths, 12 vs 1 thread,
+#: ``scratchpad/prod/store_{1,12}``): measured 0.709 / 0.488 / 0.540 / 0.546 against the table's
+#: 0.644 / 0.503 / 0.545 / 0.552 — the particle pass is less parallel at production size (the
+#: projections at 1 thread per worker therefore read a 1-thread source and do not rescale).
+#: These are two *real* laptop cores at ``n = 2``: a second thread on an SMT sibling of a server
+#: core gains less (unmeasured; the runbook's VM probe A measures it).
+MEASURED_THREAD_RATIO: dict[str, dict[int, float]] = {
+    "overhead": {1: 1.0, 2: 1.0, 4: 1.0, 8: 1.0, 12: 1.0},
+    "calibration": {1: 1.0, 2: 0.9182, 4: 0.8009, 8: 0.7172, 12: 0.6442},
+    "diagnostics": {1: 1.0, 2: 0.7328, 4: 0.5861, 8: 0.5185, 12: 0.5029},
+    "pricing": {1: 1.0, 2: 0.7516, 4: 0.6159, 8: 0.5541, 12: 0.5447},
+    "analytics": {1: 1.0, 2: 0.7544, 4: 0.6213, 8: 0.5566, 12: 0.5516},
+    "risk": {1: 1.0, 2: 0.7516, 4: 0.6159, 8: 0.5541, 12: 0.5447},
+}
+#: Amdahl parallel fraction ``p`` per step (``t(n)/t(1) = 1 − p + p/n``), least-squares fitted
+#: to every measured ratio (the probe at 2, 4, 8, 12 threads and the production budget at 12),
+#: used only beyond the largest measured count (:func:`thread_factor`).  Fit residuals
+#: (measured − fitted ratio at 2 / 4 / 8 / 12 / production-12 threads): particle pass p 0.316,
+#: +0.076 / +0.038 / −0.006 / −0.066 / −0.002 — Amdahl misfits it (the second thread gains
+#: 8 %, not the 16 % a single fraction implies), hence the table; diagnostics p 0.549, +0.007 /
+#: −0.002 / −0.001 / +0.007 / −0.008; pricing p 0.504, +0.004 / −0.006 / −0.005 / +0.007 /
+#: +0.002; analytics p 0.498, +0.003 / −0.005 / −0.008 / +0.008 / +0.002.  (The previous
+#: 1-vs-12-only fit gave 0.32 / 0.56 / 0.50 / 0.50 and over-predicted the 2-thread particle-pass
+#: gain: 0.84 against the measured 0.918.)
+THREAD_PARALLEL_FRACTION: dict[str, float] = {
+    "overhead": 0.0,
+    "calibration": 0.316,
+    "diagnostics": 0.549,
+    "pricing": 0.504,
+    "analytics": 0.498,
+    "risk": 0.504,
+}
+#: Risk-step constants, measured on the laptop at NUMBA_NUM_THREADS = 1 on one placeholder 1F
+#: point (ν 0.5, ρ −0.7, κ 1.5) and the surface's LV point, ``--risk light`` on the 3-bucket
+#: ladder (17 bumped states and 38 pricings per point), at two budgets: probe C (10⁵ particles,
+#: 5·10⁴ paths; ``scratchpad/vmverify/P/C``) and production (8·10⁵ / 4·10⁵;
+#: ``scratchpad/vmfix/prodrisk``, run wall 6211 s, peak RSS 2.36 GiB).  Risk step wall /
+#: engine timer (state builds + pricings): 1F 726.3 / 642.8 s and 4283.0 / 4200.9 s; LV
+#: 206.7 / 123.1 s and 943.5 / 860.8 s.  The 16 risk calibrations took 408.4 s and 3045.5 s
+#: (cache manifests).  The engine remainder (LSV: minus those calibrations) is ``38 a + 17 b``
+#: with ``a`` a pure pricing (∝ paths) and ``b`` a per-state build (budget-independent); the two
+#: budgets give
+#:
+#: * :data:`RISK_STATE_OVERHEAD_S` — work outside the engine per state (surface arbitrage
+#:   checks, the ε sizing of the bucket bumps on the variance-swap strip, the base-model build):
+#:   4.913 / 4.830 s (1F, probe / production) and 4.919 / 4.866 s (LV) — mode- and
+#:   budget-independent to 2 %, so their mean; serial, never rescaled.
+#: * :data:`RISK_STATE_BUILD_S` — ``b``: 6.05 s per LSV state (market build, leverage load or
+#:   store), 1.04 s per LV state (the Dupire rebuild).
+#: * :data:`RISK_PRICING_RATIO` — ``a`` over the point's pricing step: LSV 0.1009 (probe) /
+#:   0.1044 (production), LV 0.1195 / 0.1183; the production value is used.  This is *not* an
+#:   independent check of the decomposition: the split imposes ``a_prod = 8 a_probe`` and solves
+#:   ``b`` from the same two points, so the two ratios agreeing to 3.5 % only says the pricing
+#:   step itself scaled by about 8 between the budgets.
+#:
+#: The model then reproduces both measurements by construction.  Its one independent check is
+#: the outside-engine work, measured directly at both budgets and agreeing to 1.7 %; the grid
+#: projections from different stores (177.0 / 180.6 / 185.7 process-hours) all use
+#: :data:`RISK_STATE_BUILD_S` and are not independent of it either.  Earlier rules on the
+#: production 1F risk step (4283.0 s): the pre-fix rule (17 × calibration + 38 × 0.0913 ×
+#: pricing) −0.3 % by cancellation (17 passes charged for 16 run, 921 s charged for 1237.5 s of
+#: pricings and per-state work; −31 % on the LV step); probe C × 8 +36 %; probe C with the state
+#: build folded into the pricing +17 %.
+RISK_STATE_OVERHEAD_S = (4.913 + 4.830 + 4.919 + 4.866) / 4
+RISK_STATE_BUILD_S: dict[str, float] = {"lsv": 6.050, "lv": 1.040}
+RISK_PRICING_RATIO: dict[str, float] = {"lsv": 0.1044, "lv": 0.1183}
+#: LV pricing step / LSV (1F) pricing step of the same production run (1 thread,
+#: ``scratchpad/vmfix/prodrisk``): 187.5 / 265.4 s.  Converts an LSV pricing (the fallback, or a
+#: ``--cost-from`` source without an LV point, e.g. probe D's ``--only`` store) into the LV
+#: pricing step that :data:`RISK_PRICING_RATIO` ``["lv"]`` is measured against.  (At 12 threads,
+#: ``outputs/store``: 118.6 / 180.3 = 0.658.)  The default model still charges an LV point's own
+#: pricing and analytics steps at the LSV fallbacks: it has no per-mode fallbacks, and the four
+#: LV points are under 0.3 % of the grid; ``--cost-from`` charges them their measured costs.
+LV_TO_LSV_PRICING_RATIO = 187.5 / 265.4
+_RISK_RATIO_SOURCE = (
+    f"measured risk-step constants (laptop, 1 thread, probe C + production): "
+    f"{RISK_STATE_OVERHEAD_S:.2f} s per state outside the engine + a state build of "
+    f"{RISK_STATE_BUILD_S['lsv']:.2f} s (LSV) / {RISK_STATE_BUILD_S['lv']:.2f} s (LV); risk "
+    f"pricing = {RISK_PRICING_RATIO['lsv']:.4f} (LSV) x the pricing step, "
+    f"{RISK_PRICING_RATIO['lv']:.4f} (LV) x the LV pricing step, which the default model takes as "
+    f"{LV_TO_LSV_PRICING_RATIO:.4f} x the LSV pricing step (measured at 1 thread; the 12-thread "
+    "ratio is lower — a small mixing of thread counts on 4 LV points)"
+)
+#: The mode groups of the risk costs: every leverage mode shares the LSV builder.
+LSV_MODES: tuple[str, ...] = ("one_factor", "two_factor", "marking")
+
+
+def _thread_ratio(step: str, n: int) -> float:
+    """``t(n)/t(1)`` of ``step`` (:data:`MEASURED_THREAD_RATIO`, linear in ``1/n`` between the
+    measured counts, the fitted Amdahl tail beyond the largest)."""
+    table = MEASURED_THREAD_RATIO[step]
+    if n in table:
+        return table[n]
+    counts = sorted(table)
+    if n > counts[-1]:
+        top = counts[-1]
+        return table[top] + THREAD_PARALLEL_FRACTION[step] * (1.0 / n - 1.0 / top)
+    hi = next(c for c in counts if c > n)
+    lo = max(c for c in counts if c < n)
+    w = (1.0 / n - 1.0 / hi) / (1.0 / lo - 1.0 / hi)
+    return w * table[lo] + (1.0 - w) * table[hi]
+
+
+def thread_factor(step: str, n_from: int, n_to: int) -> float:
+    """Rescaling factor ``t(n_to)/t(n_from)`` of ``step`` (:data:`MEASURED_THREAD_RATIO`); 1
+    when the counts are equal."""
+    if n_from < 1 or n_to < 1:
+        raise ValueError("thread counts must be >= 1")
+    if n_from == n_to:
+        _thread_ratio(step, n_from)  # an unknown step is still an error
+        return 1.0
+    return _thread_ratio(step, n_to) / _thread_ratio(step, n_from)
+
+
+@dataclass(frozen=True)
+class CostRecords:
+    """The run records of a store, flattened: ``runs`` (one row per ``results/runs/*.json``),
+    ``points`` (one row per ``points_computed`` entry, the :data:`COST_STEPS` in seconds and
+    ``core_<step>`` = seconds × threads) and ``absent`` (run file → the fields of
+    :data:`RUN_RECORD_FIELDS` / :data:`POINT_ENTRY_FIELDS` that record lacks)."""
+
+    root: Path
+    runs: pd.DataFrame
+    points: pd.DataFrame
+    absent: dict[str, list[str]]
+
+
+def _store_points(store: ResultsStore) -> dict[str, dict[str, Any]]:
+    """``point_id → {mode, calibration_seconds}`` from the store's points rows (read by file)."""
+    out: dict[str, dict[str, Any]] = {}
+    for pid in store.point_ids():
+        try:
+            row = _stored_row(store, pid)
+        except (OSError, ValueError, IndexError):  # pragma: no cover - a half-written point
+            continue
+        out[pid] = {
+            "mode": str(row.get("mode", "")),
+            "calibration_seconds": float(row.get("calibration_seconds", math.nan)),
+        }
+    return out
+
+
+def _mode_from_id(point_id: str) -> str | None:
+    if point_id.startswith("lv:"):
+        return "lv"
+    if point_id.startswith("marking:"):
+        return "marking"
+    return None
+
+
+def load_cost_records(store_root: str | Path, *, assume_threads: int | None = None) -> CostRecords:
+    """Flatten the run records of ``store_root`` (module section "measured cost").
+
+    Per entry: ``mode`` from the entry (``mode_source = record``), else the store's points row
+    (``store``), else the id prefix ``lv:`` / ``marking:`` (``id``), else ``unknown``;
+    ``threads`` from the entry, else the run's ``threads_per_worker``, else ``assume_threads``
+    (``assumed``, the caller's statement), else absent (core-seconds NaN); ``calibrated`` /
+    ``cache_hit`` from the entry, else absent (``None``).  The calibration step is split into the
+    particle pass (``calibration_seconds`` of the store row) and the overhead only for an entry
+    that says it calibrated; for one without the flag the step is kept whole
+    (``calibration_split = False``).  Nothing is filled in from elsewhere."""
+    store = ResultsStore(store_root)
+    stored = _store_points(store)
+    files = sorted(store.runs_dir.glob("*.json")) if store.runs_dir.exists() else []
+    run_rows: list[dict[str, Any]] = []
+    point_rows: list[dict[str, Any]] = []
+    absent: dict[str, list[str]] = {}
+    for path in files:
+        rec = json.loads(path.read_text())
+        entries = list(rec.get("points_computed") or [])
+        missing = [f for f in RUN_RECORD_FIELDS if f not in rec]
+        missing_e = sorted({f for e in entries for f in POINT_ENTRY_FIELDS if f not in e})
+        absent[path.name] = missing + [f"points_computed[].{f}" for f in missing_e]
+        run_threads = rec.get("threads_per_worker")
+        pricing = rec.get("pricing") or {}
+        n_paths = pricing.get("n_paths") if isinstance(pricing, dict) else None
+        peaks: list[float] = []
+        for e in entries:
+            pid = str(e.get("point_id", ""))
+            if "mode" in e:
+                mode, mode_src = str(e["mode"]), "record"
+            elif pid in stored and stored[pid]["mode"]:
+                mode, mode_src = stored[pid]["mode"], "store"
+            elif _mode_from_id(pid) is not None:
+                mode, mode_src = str(_mode_from_id(pid)), "id"
+            else:
+                mode, mode_src = "unknown", "absent"
+            if "threads" in e:
+                threads, th_src = float(e["threads"]), "record"
+            elif run_threads is not None:
+                threads, th_src = float(run_threads), "record"
+            elif assume_threads is not None:
+                threads, th_src = float(assume_threads), "assumed"
+            else:
+                threads, th_src = math.nan, "absent"
+            calibrated = e.get("calibrated")
+            cache_hit = e.get("cache_hit")
+            steps = e.get("steps")
+            # a wall the entry does not carry is absent (NaN), never 0; the untimed remainder
+            # (and so the overhead) is then unknown too
+            walls = {k: float(e[k]) if e.get(k) is not None else math.nan for k in WALL_STEPS}
+            total = float(e.get("total", math.nan))
+            timed = sum(walls.values())
+            remainder = max(0.0, total - timed) if math.isfinite(total + timed) else math.nan
+            cal_step = walls["calibration"]
+            cal_s = stored.get(pid, {}).get("calibration_seconds", math.nan)
+            split = calibrated is not None and math.isfinite(cal_step)
+            if not math.isfinite(cal_step):
+                particle = math.nan
+            elif calibrated and math.isfinite(cal_s):
+                particle = min(cal_s, cal_step)
+            elif calibrated:  # the flag says it calibrated but the store row is gone
+                particle, split = cal_step, False
+            elif calibrated is None:
+                particle = cal_step
+            else:
+                particle = 0.0
+            if calibrated is None:
+                how = "unknown"
+            elif calibrated:
+                how = "calibrated"
+            elif cache_hit:
+                how = "cache hit"
+            else:
+                how = "no leverage"
+            if steps is None:
+                kind = "unknown"
+            else:
+                kind = "full" if "all" in steps else "refresh " + "+".join(steps)
+            row: dict[str, Any] = {
+                "run": path.name,
+                "point_id": pid,
+                "label": str(e.get("label", "")),
+                "mode": mode,
+                "mode_source": mode_src,
+                "kind": kind,
+                "how": how,
+                "calibrated": calibrated,
+                "cache_hit": cache_hit,
+                "calibration_split": split,
+                "threads": threads,
+                "threads_source": th_src,
+                "n_particles": rec.get("n_particles", math.nan),
+                "n_paths": n_paths if n_paths is not None else math.nan,
+                "peak_rss_bytes": float(e.get("peak_rss_bytes", math.nan)),
+                "overhead": cal_step - particle + remainder,
+                "calibration": particle,
+                "diagnostics": walls["diagnostics"],
+                "pricing": walls["pricing"],
+                "analytics": walls["analytics"],
+                "risk": walls["risk"],
+                "total": total,
+            }
+            for step in COST_STEPS:
+                row[f"core_{step}"] = row[step] * threads
+            point_rows.append(row)
+            peaks.append(row["peak_rss_bytes"])
+        peaks.append(float(rec.get("peak_rss_bytes", math.nan)))
+        finite = [p for p in peaks if math.isfinite(p)]
+        n_computed = len(entries)
+        n_failed = len(rec.get("failed") or []) if "failed" in rec else None
+        if "points_skipped" in rec:
+            skipped: Any = int(rec["points_skipped"])
+        elif "points_selected" in rec and n_failed is not None:
+            skipped = f"{int(rec['points_selected']) - n_computed - n_failed} (derived)"
+        else:
+            skipped = None
+        n_cal = rec.get("n_calibrated")
+        n_hit = rec.get("n_cache_hits")
+        hit_rate = (
+            n_hit / (n_cal + n_hit)
+            if n_cal is not None and n_hit is not None and (n_cal + n_hit) > 0
+            else math.nan
+        )
+        workers = rec.get("workers")
+        if run_threads is not None:
+            r_threads, r_src = float(run_threads), "record"
+        elif assume_threads is not None:
+            r_threads, r_src = float(assume_threads), "assumed"
+        else:
+            r_threads, r_src = math.nan, "absent"
+        wall = float(rec.get("wall_seconds", math.nan))
+        run_rows.append(
+            {
+                "run": path.name,
+                "created_utc": rec.get("created_utc"),
+                "host": rec.get("host"),
+                "platform": rec.get("platform"),
+                "cpu_count": rec.get("cpu_count"),
+                "shard": rec.get("shard"),
+                "workers": workers,
+                "threads_per_worker": r_threads,
+                "threads_source": r_src,
+                "risk_tier": rec.get("risk_tier"),
+                "n_particles": rec.get("n_particles"),
+                "n_paths": n_paths,
+                "resume": rec.get("resume"),
+                "wall_seconds": wall,
+                "core_hours": (
+                    wall * float(workers) * r_threads / 3600.0 if workers is not None else math.nan
+                ),
+                "points_computed": n_computed,
+                "points_skipped": skipped,
+                "points_failed": n_failed,
+                "n_calibrated": n_cal,
+                "n_cache_hits": n_hit,
+                "cache_hit_rate": hit_rate,
+                "peak_rss_gib": max(finite) / 2**30 if finite else math.nan,
+            }
+        )
+    return CostRecords(Path(store_root), pd.DataFrame(run_rows), pd.DataFrame(point_rows), absent)
+
+
+def cost_summary(points: pd.DataFrame) -> pd.DataFrame:
+    """Per ``(kind, mode, how)`` and step: ``n``, ``median_s``, ``p90_s`` (linear
+    interpolation), ``median_core_s`` (seconds × threads; NaN when the threads are absent) and
+    ``core_hours`` (the sum)."""
+    cols = ["kind", "mode", "how", "step", "n", "median_s", "p90_s", "median_core_s", "core_hours"]
+    if points.empty:
+        return pd.DataFrame(columns=cols)
+    rows: list[dict[str, Any]] = []
+    order = {m: i for i, m in enumerate(COST_MODES)}
+    keys = sorted(
+        {
+            (str(k), str(m), str(h))
+            for k, m, h in zip(points["kind"], points["mode"], points["how"])
+        },
+        key=lambda t: (t[0] != "full", order.get(t[1], len(order)), t[1], t[2]),
+    )
+    for kind, mode, how in keys:
+        sub = points[(points["kind"] == kind) & (points["mode"] == mode) & (points["how"] == how)]
+        for step in COST_STEPS:
+            v = sub[step].to_numpy(dtype=float)
+            v = v[np.isfinite(v)]
+            c = sub[f"core_{step}"].to_numpy(dtype=float)
+            c = c[np.isfinite(c)]
+            rows.append(
+                {
+                    "kind": kind,
+                    "mode": mode,
+                    "how": how,
+                    "step": step,
+                    "n": int(v.size),
+                    "median_s": float(np.median(v)) if v.size else math.nan,
+                    "p90_s": float(np.percentile(v, 90)) if v.size else math.nan,
+                    "median_core_s": float(np.median(c)) if c.size else math.nan,
+                    "core_hours": float(c.sum()) / 3600.0 if c.size else math.nan,
+                }
+            )
+    return pd.DataFrame(rows, columns=cols)
+
+
+def _fmt(v: Any, digits: int = 1) -> str:
+    if v is None:
+        return "absent"
+    if isinstance(v, bool | np.bool_):
+        return str(bool(v))
+    if isinstance(v, int | np.integer):
+        return str(int(v))
+    if isinstance(v, float | np.floating):
+        return "absent" if not math.isfinite(float(v)) else f"{float(v):.{digits}f}"
+    return str(v)
+
+
+def _md_table(header: Sequence[str], rows: Sequence[Sequence[str]]) -> list[str]:
+    out = ["| " + " | ".join(header) + " |", "|" + "---|" * len(header)]
+    out += ["| " + " | ".join(r) + " |" for r in rows]
+    return out
+
+
+def format_cost_report(records: CostRecords, summary: pd.DataFrame, wall_s: float) -> str:
+    """The markdown report: runs, totals, per-point cost by kind / mode / how and step, the
+    fields absent from older records, and the definitions."""
+    runs, pts = records.runs, records.points
+    lines = [f"# Measured per-point cost — store `{records.root}`", ""]
+    if runs.empty:
+        lines += ["No run records under `results/runs/` — nothing to report.", ""]
+        lines.append(f"Report wall clock {wall_s:.2f} s; nothing recalibrated (reads JSON only).")
+        return "\n".join(lines)
+    lines += ["## Runs", ""]
+    header = [
+        "run",
+        "host",
+        "shard",
+        "workers",
+        "threads/worker",
+        "tier",
+        "particles",
+        "paths",
+        "wall h",
+        "core-h",
+        "computed",
+        "skipped",
+        "failed",
+        "calibrated",
+        "cache hits",
+        "hit rate",
+        "peak RSS GiB",
+    ]
+    rows = []
+    for _, r in runs.iterrows():
+        th = _fmt(r["threads_per_worker"], 0)
+        if r["threads_source"] == "assumed":
+            th += " (assumed)"
+        rows.append(
+            [
+                str(r["run"]),
+                _fmt(r["host"]),
+                _fmt(r["shard"]),
+                _fmt(r["workers"]),
+                th,
+                _fmt(r["risk_tier"]),
+                _fmt(r["n_particles"]),
+                _fmt(r["n_paths"]),
+                _fmt(r["wall_seconds"] / 3600.0, 3),
+                _fmt(r["core_hours"], 3),
+                _fmt(r["points_computed"]),
+                _fmt(r["points_skipped"]),
+                _fmt(r["points_failed"]),
+                _fmt(r["n_calibrated"]),
+                _fmt(r["n_cache_hits"]),
+                _fmt(r["cache_hit_rate"], 3),
+                _fmt(r["peak_rss_gib"], 2),
+            ]
+        )
+    lines += _md_table(header, rows)
+    known = runs.dropna(subset=["n_calibrated", "n_cache_hits"])
+    if known.empty:
+        hits = "calibrated / cache hits absent from every record"
+    else:
+        n_cal = int(known["n_calibrated"].astype(int).sum())
+        n_hit = int(known["n_cache_hits"].astype(int).sum())
+        rate = _fmt(n_hit / (n_cal + n_hit), 3) if n_cal + n_hit else "n/a (no leverage point)"
+        hits = (
+            f"calibrated {n_cal} / cache hits {n_hit} (hit rate {rate}) over the {len(known)} "
+            f"runs that record both ({len(runs) - len(known)} do not)"
+        )
+    core = runs["core_hours"].to_numpy(dtype=float)
+    n_core = int(np.isfinite(core).sum())
+    cores = (
+        f"core-hours {float(np.nansum(core)):.3f} over the {n_core} runs with a thread count"
+        if n_core
+        else "core-hours absent (no run records its thread count; see --assume-threads)"
+    )
+    lines += [
+        "",
+        f"**Total**: {len(runs)} runs, wall {runs['wall_seconds'].sum() / 3600.0:.3f} h summed "
+        f"over runs (concurrent shards overlap in time), "
+        f"{int(runs['points_computed'].sum())} points computed; {hits}; {cores}.",
+        "",
+        "## Per-point cost by mode and step (seconds; core-s = seconds x threads per worker)",
+        "",
+    ]
+    rows = []
+    for _, r in summary.iterrows():
+        # a step no entry of the group carries (n = 0) is shown as absent, never as 0
+        rows.append(
+            [
+                str(r["kind"]),
+                str(r["mode"]),
+                str(r["how"]),
+                str(r["step"]),
+                str(int(r["n"])),
+                _fmt(r["median_s"]),
+                _fmt(r["p90_s"]),
+                _fmt(r["median_core_s"]),
+                _fmt(r["core_hours"], 3),
+            ]
+        )
+    lines += _md_table(
+        ["kind", "mode", "how", "step", "n", "median s", "p90 s", "median core-s", "core-h"],
+        rows,
+    )
+    unsplit = int((~pts["calibration_split"].astype(bool)).sum()) if not pts.empty else 0
+    lines += ["", "## Fields absent from the records (reported, never filled in)", ""]
+    any_absent = False
+    for run, fields in records.absent.items():
+        if fields:
+            any_absent = True
+            lines.append(f"- `{run}`: {', '.join(fields)}")
+    if not any_absent:
+        lines.append("- none")
+    if not pts.empty:
+        derived = pts[pts["mode_source"] != "record"]
+        if not derived.empty:
+            srcs = derived["mode_source"].value_counts().to_dict()
+            lines.append(f"- mode not in the record for {len(derived)} entries: taken from {srcs}")
+    lines += [
+        "",
+        "## Definitions",
+        "",
+        "- *calibration* = the leverage's particle pass (`calibration_seconds` of the store row) "
+        "for a point calibrated in the run, 0 for a cache hit or the LV point; *overhead* = the "
+        "rest of the timed calibration step (market build, leverage load / Dupire, mean |L-1|, "
+        "marking fit) + the untimed remainder (store write).",
+        f"- {unsplit} entries have the calibration step unsplit (no `calibrated` flag in the "
+        "record, or no store row): their *calibration* includes the overhead.",
+        "- *hit rate* = cache hits / (calibrated + cache hits), points with a leverage only.",
+        "- *core-h* of a run = wall x workers x threads per worker (cores held, not cores busy).",
+        "- *peak RSS* = the largest `ru_maxrss` of the run's processes (per worker process).",
+        "",
+        f"Report wall clock {wall_s:.2f} s; nothing recalibrated (reads the store's JSON and "
+        "points rows only).",
+    ]
+    return "\n".join(lines)
+
+
+def build_report_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="volsto-precompute report",
+        description="Measured per-point cost and cache hit rate from a store's run records "
+        "(results/runs/*.json); reads only, calibrates and simulates nothing.",
+    )
+    p.add_argument("--store", default=str(DEFAULT_STORE), help="results store root")
+    p.add_argument(
+        "--out",
+        default=None,
+        help=f"directory for cost_report.md, runs.csv, points.csv, summary.csv (default "
+        f"<store>/{COST_REPORT_DIRNAME}, outside results/)",
+    )
+    p.add_argument("--no-write", action="store_true", help="print the markdown, write no file")
+    p.add_argument(
+        "--assume-threads",
+        type=int,
+        default=None,
+        help="thread count per worker for records that predate the 'threads' fields (labelled "
+        "'assumed' in the report); without it their core-seconds are reported absent",
+    )
+    return p
+
+
+def report_main(argv: Sequence[str]) -> int:
+    """``volsto-precompute report``: print the markdown report and write it with the three CSVs."""
+    args = build_report_parser().parse_args(list(argv))
+    t0 = time.perf_counter()
+    root = Path(args.store)
+    if not (root / "results").exists():
+        print(f"error: no results store under {root.resolve()}", file=sys.stderr)
+        return 2
+    records = load_cost_records(root, assume_threads=args.assume_threads)
+    summary = cost_summary(records.points)
+    text = format_cost_report(records, summary, time.perf_counter() - t0)
+    print(text)
+    if not args.no_write:
+        out = Path(args.out) if args.out else root / COST_REPORT_DIRNAME
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "cost_report.md").write_text(text + "\n")
+        records.runs.to_csv(out / "runs.csv", index=False)
+        records.points.to_csv(out / "points.csv", index=False)
+        summary.to_csv(out / "summary.csv", index=False)
+        print(f"\nwritten: {out.resolve()}/{{cost_report.md, runs.csv, points.csv, summary.csv}}")
+    return 0
+
+
+@dataclass(frozen=True)
+class RiskBudgetCosts:
+    """What the stored risk steps of a store measure (:func:`risk_budget_costs`), unscaled:
+    per-state work outside the engine and pure per-pricing costs by mode group."""
+
+    state_s: list[float]
+    lsv_per_pricing: list[float]
+    lv_per_pricing: list[float]
+    notes: list[str]
+
+
+def risk_budget_costs(
+    store: ResultsStore, points: pd.DataFrame, particle_pass_s: float
+) -> RiskBudgetCosts:
+    """Per stored risk step: the engine budget of the point's manifest (``risk_budget``: states
+    = ``recalibrations``, ``cache_misses``, ``pricings``, the engine's ``wall_clock_s``) and the
+    step's wall clock in the run records (``points``, the last entry of the point with a risk
+    wall).  Per point, by mode:
+
+    * state overhead = ``(step wall − engine wall) / states`` (any mode);
+    * LSV (``one_factor`` / ``two_factor`` / ``marking``): ``(engine wall − cache misses ×
+      particle_pass_s − states × RISK_STATE_BUILD_S["lsv"]) / pricings`` — a miss is a particle
+      pass at the source's budget; a budget with misses is skipped when ``particle_pass_s`` is
+      not finite;
+    * LV: ``(engine wall − states × RISK_STATE_BUILD_S["lv"]) / pricings`` — its "misses" are
+      the Dupire rebuilds, not particle passes.
+
+    A point whose mode is not known, or whose budget has no pricing, is skipped and said so."""
+    state_s: list[float] = []
+    lsv: list[float] = []
+    lv: list[float] = []
+    notes: list[str] = []
+    step_wall: dict[str, float] = {}
+    modes: dict[str, str] = {}
+    if not points.empty:
+        for _, e in points.iterrows():
+            modes[str(e["point_id"])] = str(e["mode"])
+            if math.isfinite(float(e["risk"])) and float(e["risk"]) > 0:
+                step_wall[str(e["point_id"])] = float(e["risk"])
+    for pid, entry in store.point_manifests().items():
+        b = entry.get("risk_budget")
+        if not b or not float(b.get("pricings", 0.0)):
+            continue
+        mode = modes.get(pid) or _stored_mode(store, pid)
+        engine = float(b.get("wall_clock_s", math.nan))
+        n_pr = float(b["pricings"])
+        states = float(b.get("recalibrations", math.nan))
+        misses = float(b.get("cache_misses", math.nan))
+        if pid in step_wall and math.isfinite(engine) and states > 0:
+            state_s.append(max(step_wall[pid] - engine, 0.0) / states)
+        if mode == "lv":
+            lv.append(max(engine - states * RISK_STATE_BUILD_S["lv"], 0.0) / n_pr)
+        elif mode in LSV_MODES:
+            if not math.isfinite(misses) or (misses and not math.isfinite(particle_pass_s)):
+                notes.append(f"risk budget of {pid[:16]} skipped: no particle pass to subtract")
+                continue
+            builds = states * RISK_STATE_BUILD_S["lsv"]
+            lsv.append(max(engine - misses * particle_pass_s - builds, 0.0) / n_pr)
+        else:
+            notes.append(f"risk budget of {pid[:16]} skipped: mode {mode!r} unknown")
+    return RiskBudgetCosts(state_s, lsv, lv, notes)
+
+
+def _stored_mode(store: ResultsStore, point_id: str) -> str:
+    if _mode_from_id(point_id) is not None:
+        return str(_mode_from_id(point_id))
+    try:
+        return str(_stored_row(store, point_id).get("mode", ""))
+    except (OSError, ValueError, IndexError, KeyError):  # pragma: no cover - a half-written point
+        return ""
+
+
+def cost_model_from_store(
+    source: str | Path,
+    grid: GridSpec,
+    fallback: CostModel,
+    *,
+    target_threads: int,
+    source_threads: int | None = None,
+) -> tuple[CostModel, list[str]]:
+    """The :class:`CostModel` of ``grid`` built from the measured full computations of a previous
+    store (``--cost-from``), and one line per number saying where it comes from.
+
+    From the source's full-computation entries (:func:`load_cost_records`): calibration = the
+    median particle pass of the calibrated entries × ``grid particles / source particles``;
+    diagnostics = their median × ``grid paths / source paths``; overhead = the median overhead
+    (not rescaled: market build and store write do not depend on the budget); pricing and
+    analytics = the median over the calibrating modes × the path ratio, with per-mode values
+    (:attr:`CostModel.by_mode`) for every mode measured; the risk step from the stored risk
+    budgets by mode (:func:`risk_budget_costs`: the per-state overhead, not rescaled, and the
+    LSV and LV risk pricings × the path ratio), else the measured probe-C constants
+    :data:`RISK_STATE_OVERHEAD_S` and :data:`RISK_PRICING_RATIO` × that mode's pricing.  The
+    linear rules are the existing ones of :func:`default_cost_model`.  Every number is then
+    rescaled from the source thread count to ``target_threads`` with :func:`thread_factor`; a
+    source without a thread count (and no ``source_threads``) is not rescaled, and the lines say
+    so.  A quantity the source did not measure keeps ``fallback``'s value, named as such."""
+    rec = load_cost_records(source, assume_threads=source_threads)
+    pts = rec.points
+    lines = [f"cost model from the measured store {Path(source).resolve()}"]
+    if pts.empty:
+        lines.append("  no point entries in its run records: the default cost model is kept")
+        return fallback, lines
+    full = pts[pts["kind"].isin(["full", "unknown"])]
+    if full.empty:
+        lines.append("  no full computation in its run records: the default cost model is kept")
+        return fallback, lines
+    th = full["threads"].to_numpy(dtype=float)
+    th = th[np.isfinite(th)]
+    src_threads: int | None = int(np.median(th)) if th.size else None
+    if src_threads is not None and len(set(th.tolist())) > 1:
+        lines.append(f"  source thread counts differ {sorted(set(th.tolist()))}: median used")
+    if src_threads is None:
+        lines.append(
+            "  source thread count ABSENT from the records (pass --cost-from-threads N): no "
+            f"thread rescaling to the target {target_threads} — the projection below is at the "
+            "source's unknown thread count"
+        )
+    else:
+        how = "assumed by --cost-from-threads" if source_threads is not None else "recorded"
+        lines.append(
+            f"  threads: source {src_threads} ({how}) -> target {target_threads}; rescaled by "
+            "the measured laptop thread ratios (MEASURED_THREAD_RATIO; a second thread on an "
+            "SMT sibling gains less than the measured real core)"
+        )
+
+    def tf(step: str) -> float:
+        return 1.0 if src_threads is None else thread_factor(step, src_threads, target_threads)
+
+    def med(frame: pd.DataFrame, col: str) -> float:
+        v = frame[col].to_numpy(dtype=float)
+        v = v[np.isfinite(v)]
+        return float(np.median(v)) if v.size else math.nan
+
+    def ratio(frame: pd.DataFrame, col: str, target: float) -> float:
+        src = med(frame, col)
+        return target / src if math.isfinite(src) and src > 0 else math.nan
+
+    path_r = ratio(full, "n_paths", float(grid.pricing.n_paths))
+    lines.append(
+        f"  budget: source {med(full, 'n_particles'):.0f} particles / {med(full, 'n_paths'):.0f} "
+        f"paths -> grid {grid.particle.n_particles} / {grid.pricing.n_paths} (linear rules)"
+    )
+    cal = full[(full["how"] == "calibrated") & full["calibration_split"].astype(bool)]
+    calibration_s, cal_src = fallback.calibration_s, f"kept: {fallback.calibration_source}"
+    diagnostics_s, diag_src = fallback.diagnostics_s, "kept: measured fallback"
+    if not cal.empty:
+        part_r = ratio(cal, "n_particles", float(grid.particle.n_particles))
+        if math.isfinite(part_r):
+            calibration_s = med(cal, "calibration") * part_r * tf("calibration")
+            cal_src = (
+                f"median particle pass {med(cal, 'calibration'):.1f} s of {len(cal)} calibrated "
+                f"entries x {part_r:g} (particles) x {tf('calibration'):.3f} (threads)"
+            )
+        if math.isfinite(path_r):
+            diagnostics_s = med(cal, "diagnostics") * path_r * tf("diagnostics")
+            diag_src = (
+                f"median {med(cal, 'diagnostics'):.1f} s of {len(cal)} calibrated entries x "
+                f"{path_r:g} (paths) x {tf('diagnostics'):.3f} (threads)"
+            )
+    overhead_s = med(full, "overhead") * tf("overhead")
+    lines.append(f"  calibration {calibration_s:.1f} s per miss — {cal_src}")
+    lines.append(f"  diagnostics {diagnostics_s:.1f} s per miss — {diag_src}")
+    lines.append(
+        f"  overhead {overhead_s:.1f} s per point — median of {len(full)} entries (not rescaled)"
+    )
+    lsv = full[full["mode"].isin(["one_factor", "two_factor", "marking"])]
+    base = lsv if not lsv.empty else full
+    pricing_s, analytics_s = fallback.pricing_s, fallback.analytics_s
+    pr_src = f"kept: {fallback.pricing_source}"
+    if math.isfinite(path_r):
+        pricing_s = med(base, "pricing") * path_r * tf("pricing")
+        analytics_s = med(base, "analytics") * path_r * tf("analytics")
+        pr_src = (
+            f"median of {len(base)} {'LSV' if not lsv.empty else ''} entries "
+            f"({med(base, 'pricing'):.1f} / {med(base, 'analytics'):.1f} s) x {path_r:g} (paths) "
+            f"x {tf('pricing'):.3f} / {tf('analytics'):.3f} (threads)"
+        )
+    lines.append(f"  pricing / analytics {pricing_s:.1f} / {analytics_s:.1f} s — {pr_src}")
+    by_mode: dict[str, dict[str, float]] = {}
+    if math.isfinite(path_r):
+        for mode in COST_MODES:
+            sub = full[full["mode"] == mode]
+            if sub.empty:
+                continue
+            by_mode[mode] = {
+                "overhead": med(sub, "overhead") * tf("overhead"),
+                "pricing": med(sub, "pricing") * path_r * tf("pricing"),
+                "analytics": med(sub, "analytics") * path_r * tf("analytics"),
+            }
+            lines.append(
+                f"  mode {mode}: overhead / pricing / analytics "
+                f"{by_mode[mode]['overhead']:.1f} / {by_mode[mode]['pricing']:.1f} / "
+                f"{by_mode[mode]['analytics']:.1f} s ({len(sub)} entries)"
+            )
+    cal_src_s = med(cal, "calibration") if not cal.empty else math.nan
+    budgets = risk_budget_costs(ResultsStore(source), pts, cal_src_s)
+    lines.extend(f"  {note}" for note in budgets.notes)
+    outside_s = RISK_STATE_OVERHEAD_S
+    state_src = f"{RISK_STATE_OVERHEAD_S:.2f} s outside the engine (RISK_STATE_OVERHEAD_S)"
+    if budgets.state_s:
+        outside_s = float(np.median(budgets.state_s))
+        state_src = (
+            f"{outside_s:.2f} s outside the engine, median of {len(budgets.state_s)} stored risk "
+            "steps (step wall - engine wall) / states"
+        )
+    state_src += (
+        f" + a state build of {RISK_STATE_BUILD_S['lsv']:.2f} s (LSV) / "
+        f"{RISK_STATE_BUILD_S['lv']:.2f} s (LV) (RISK_STATE_BUILD_S); budget-independent and "
+        "serial, not rescaled"
+    )
+    risk_state_s = outside_s + RISK_STATE_BUILD_S["lsv"]
+    lv_measured = "pricing" in by_mode.get("lv", {})
+    lv_pricing_s = by_mode["lv"]["pricing"] if lv_measured else LV_TO_LSV_PRICING_RATIO * pricing_s
+    ref_names = {
+        "lsv": "LSV pricing",
+        "lv": (
+            "measured LV pricing"
+            if lv_measured
+            else f"LV pricing (LSV x {LV_TO_LSV_PRICING_RATIO:.4f}, LV_TO_LSV_PRICING_RATIO)"
+        ),
+    }
+    risk_by_mode: dict[str, tuple[float, str]] = {}
+    for group, measured, ref_s in (
+        ("lsv", budgets.lsv_per_pricing, pricing_s),
+        ("lv", budgets.lv_per_pricing, lv_pricing_s),
+    ):
+        if measured and math.isfinite(path_r):
+            v = float(np.median(measured))
+            risk_by_mode[group] = (
+                v * path_r * tf("risk"),
+                f"median of {len(measured)} stored {group.upper()} risk budgets ({v:.3f} "
+                f"s/pricing net of state builds) x {path_r:g} (paths) x {tf('risk'):.3f} "
+                "(threads)",
+            )
+        else:
+            risk_by_mode[group] = (
+                RISK_PRICING_RATIO[group] * ref_s,
+                f"no {group.upper()} risk budget in the source: {RISK_PRICING_RATIO[group]:.4f} "
+                f"(RISK_PRICING_RATIO) x the {ref_names[group]} {ref_s:.1f} s",
+            )
+    risk_pricing_s = risk_by_mode["lsv"][0]
+    by_mode.setdefault("lv", {})["risk_pricing"] = risk_by_mode["lv"][0]
+    by_mode["lv"]["risk_state"] = outside_s + RISK_STATE_BUILD_S["lv"]
+    lines.append(
+        f"  risk state {risk_state_s:.2f} s (LSV) / {by_mode['lv']['risk_state']:.2f} s (LV) per "
+        f"bumped state — {state_src}"
+    )
+    for group, (v, src) in risk_by_mode.items():
+        lines.append(f"  risk pricing ({group.upper()}) {v:.2f} s each — {src}")
+    lines.append(
+        "  risk calibrations: (states - 1) x the calibration cost above on an LSV point (the "
+        "base state is the point's own leverage); an LV point's Dupire rebuilds are in its risk "
+        "pricing"
+    )
+    risk_src = (
+        f"--cost-from {Path(source).name}: states {state_src}; LSV {risk_by_mode['lsv'][1]}; "
+        f"LV {risk_by_mode['lv'][1]}"
+    )
+    cost = dataclasses.replace(
+        fallback,
+        overhead_s=overhead_s,
+        calibration_s=calibration_s,
+        calibration_source=f"--cost-from: {cal_src}",
+        diagnostics_s=diagnostics_s,
+        pricing_s=pricing_s,
+        analytics_s=analytics_s,
+        risk_pricing_s=risk_pricing_s,
+        pricing_source=f"--cost-from {Path(source).name}: {pr_src}",
+        risk_state_s=risk_state_s,
+        risk_source=risk_src,
+        by_mode=by_mode,
+    )
+    return cost, lines
 
 
 # --------------------------------------------------------------------------------------------
 # workers, provenance, CLI
 # --------------------------------------------------------------------------------------------
+
+
+def numba_threads() -> int:
+    """The numba thread count of this process's parallel regions (``numba.get_num_threads()``:
+    ``NUMBA_NUM_THREADS`` at import — else the logical CPU count — unless lowered by
+    ``--threads-per-worker``) — recorded per point and per run so the cost report can charge
+    core-seconds."""
+    import numba
+
+    return int(numba.get_num_threads())  # type: ignore[no-untyped-call]
+
+
+def peak_rss_bytes() -> int:
+    """Peak resident set size of this process so far, in bytes (``getrusage`` ``ru_maxrss``: bytes
+    on macOS, kilobytes on Linux) — the number that caps the worker count on a VM."""
+    import resource
+
+    rss = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    return rss if sys.platform == "darwin" else rss * 1024
 
 
 @dataclass(frozen=True)
@@ -1380,6 +2386,53 @@ def select_points(
     return [p for p in points if p.id in wanted]
 
 
+def _set_numba_threads(n: int) -> str:
+    """Lower this process's numba thread count to ``n`` (``numba.set_num_threads``); the error
+    message when ``n`` exceeds the pool numba started with (``NUMBA_NUM_THREADS`` at import),
+    else ``""``."""
+    import numba
+
+    ceiling = int(numba.config.NUMBA_NUM_THREADS)  # type: ignore[attr-defined]
+    if n > ceiling:
+        return (
+            f"--threads-per-worker {n} exceeds NUMBA_NUM_THREADS {ceiling} of this process "
+            f"(export NUMBA_NUM_THREADS={n} instead)"
+        )
+    numba.set_num_threads(n)  # type: ignore[no-untyped-call]
+    return ""
+
+
+def _physical_memory_gb() -> float:
+    """Physical memory of this machine in GiB (``sysconf``; NaN where unavailable)."""
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 2**30
+    except (ValueError, OSError, AttributeError):  # pragma: no cover - platform dependent
+        return math.nan
+
+
+def _parallel_line(
+    process_s: float,
+    longest_s: float,
+    n_points: int,
+    tier: str,
+    shard_label: str,
+    workers: int,
+    threads: int,
+) -> str:
+    """The projected wall clock of **the points this invocation computes** (the shard, after
+    ``--only`` / ``--resume`` / ``--limit``) on ``workers`` processes: their process-hours
+    divided by the workers, or the longest single point when that is longer — a lower bound
+    (even packing at laptop per-core speed; contention and slower cores lengthen it)."""
+    total_h = process_s / 3600.0
+    wall_h = max(total_h / max(workers, 1), longest_s / 3600.0)
+    return (
+        f"parallel (shard {shard_label}, {n_points} points to compute): {workers} worker(s) x "
+        f"{threads} thread(s) -> {wall_h:.2f} h wall for the {tier} tier "
+        f"({total_h:.2f} process-hours at {threads} thread(s) / {workers}; a lower bound — even "
+        "packing, the slowest point sets the tail; the projection table above is the whole grid)"
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="volsto-precompute", description=__doc__.split("\n\n")[0] if __doc__ else None
@@ -1417,11 +2470,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="measure the per-point cost on the first point of the shard, then project",
     )
     p.add_argument("--limit", type=int, default=None, help="process at most N points")
+    p.add_argument(
+        "--threads-per-worker",
+        type=int,
+        default=None,
+        help="numba threads per process (default: cpu_count // workers with --workers > 1, "
+        "else NUMBA_NUM_THREADS); also the thread count --cost-from rescales to",
+    )
+    p.add_argument(
+        "--cost-from",
+        default=None,
+        metavar="ROOT",
+        help="build the cost model from the measured run records of a previous store (by mode "
+        "and step, rescaled by particles, paths and threads) instead of the cache manifest and "
+        "the measured fallbacks",
+    )
+    p.add_argument(
+        "--cost-from-threads",
+        type=int,
+        default=None,
+        help="thread count the --cost-from store ran at, for records that predate the "
+        "'threads' fields (stated, not inferred)",
+    )
     return p
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    """The CLI; ``volsto-precompute report ...`` dispatches to :func:`report_main`."""
+    raw = list(argv) if argv is not None else sys.argv[1:]
+    if raw and raw[0] == "report":
+        return report_main(raw[1:])
+    args = build_parser().parse_args(raw)
     if not logging.getLogger().handlers:
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     t_run = time.perf_counter()
@@ -1461,7 +2540,42 @@ def main(argv: Sequence[str] | None = None) -> int:
             "(pure Dupire, no calibration); the degenerate ω=1,2,3 points are included"
         )
 
+    workers = max(1, int(args.workers))
+    if args.threads_per_worker is not None and args.threads_per_worker < 1:
+        print("error: --threads-per-worker must be >= 1", file=sys.stderr)
+        return 2
+    if workers > 1:
+        threads_per_worker = args.threads_per_worker or max(1, (os.cpu_count() or 1) // workers)
+    else:
+        threads_per_worker = args.threads_per_worker or numba_threads()
+        if not args.dry_run and threads_per_worker != numba_threads():
+            error = _set_numba_threads(threads_per_worker)
+            if error:
+                print(f"error: {error}", file=sys.stderr)
+                return 2
     cost = default_cost_model(cache, grid)
+    if args.cost_from:
+        if not (Path(args.cost_from) / "results" / "runs").exists():
+            print(f"error: --cost-from: no run records under {args.cost_from}", file=sys.stderr)
+            return 2
+        cost, cost_lines = cost_model_from_store(
+            args.cost_from,
+            grid,
+            cost,
+            target_threads=threads_per_worker,
+            source_threads=args.cost_from_threads,
+        )
+        print("\n".join(cost_lines))
+        peak = load_cost_records(args.cost_from).points["peak_rss_bytes"].to_numpy(dtype=float)
+        peak = peak[np.isfinite(peak)]
+        if peak.size:
+            print(
+                f"  memory: measured peak RSS {peak.max() / 2**30:.2f} GiB per process x {workers} "
+                f"workers = {peak.max() * workers / 2**30:.1f} GiB (this machine: "
+                f"{_physical_memory_gb():.1f} GiB)"
+            )
+        else:
+            print("  memory: peak RSS absent from the source records")
     selected = mine
     if args.only:
         try:
@@ -1471,6 +2585,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 2
         print(f"only: {len(selected)} of the shard's {len(mine)} points selected")
     plan: dict[str, tuple[str, ...]] = {}
+    n_skipped = 0
     if args.resume:
         n_skip = n_refresh = 0
         for p in selected:
@@ -1488,6 +2603,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             plan[p.id] = steps
         todo = [p for p in selected if plan[p.id]]
+        n_skipped = n_skip
         print(
             f"resume: {n_skip} points already done, {len(todo)} to compute "
             f"({n_refresh} of them refreshed for {list(REFRESH_STEPS)} steps only)"
@@ -1499,10 +2615,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         todo = todo[: max(0, args.limit)]
 
     projection = projection_table(points, cache, cost, grid.risk, diagnostics=diagnostics)
-    if args.dry_run:
-        print(format_projection(projection, cost, tier, grid.risk))
-        print("dry run: nothing computed")
-        return 0
 
     def point_cost(p: GridPoint) -> float:
         return cost.steps_s(
@@ -1516,7 +2628,26 @@ def main(argv: Sequence[str] | None = None) -> int:
                 and _hit(cache, p)
                 and not _has_report(cache, p.cache_key)
             ),
+            mode=p.mode,
         )
+
+    if args.dry_run:
+        print(format_projection(projection, cost, tier, grid.risk))
+        shard_s = sum(point_cost(p) for p in todo)
+        longest = max((point_cost(p) for p in todo), default=0.0)
+        print(
+            _parallel_line(
+                shard_s, longest, len(todo), tier, f"{i}/{n}", workers, threads_per_worker
+            )
+        )
+        print(
+            f"this shard ({i}/{n}): {len(todo)} points to compute, projected "
+            f"{shard_s / 3600.0:.2f} process-hours at {threads_per_worker} thread(s) "
+            f"({shard_s / 3600.0 / workers:.2f} h wall on {workers} worker(s), lower bound; "
+            f"longest single point {longest / 3600.0:.2f} h)"
+        )
+        print("dry run: nothing computed")
+        return 0
 
     done_walls: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
@@ -1535,11 +2666,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             done_walls.append(w)
             if "all" in plan[first.id]:
                 entry = store.read_point(first.id)
-                budget = entry.manifest.get("risk_budget", {})
-                n_pr = float(budget.get("pricings", 0.0)) or 1.0
-                risk_pricing = (
-                    float(budget.get("wall_clock_s", 0.0)) / n_pr if budget else cost.risk_pricing_s
+                probe_pts = pd.DataFrame(
+                    [{"point_id": first.id, "mode": first.mode, "risk": float(w["risk"])}]
                 )
+                particle = float(entry.row.get("calibration_seconds", math.nan))
+                if not w["calibrated"]:
+                    particle = cost.calibration_s
+                measured = risk_budget_costs(store, probe_pts, particle)
+                by_mode = {m: dict(v) for m, v in cost.by_mode.items()}
+                risk_pricing = cost.risk_pricing_s
+                risk_state = cost.risk_state_s
+                if measured.state_s:
+                    risk_state = measured.state_s[0] + RISK_STATE_BUILD_S["lsv"]
+                    by_mode.setdefault("lv", {})["risk_state"] = (
+                        measured.state_s[0] + RISK_STATE_BUILD_S["lv"]
+                    )
+                if first.mode == "lv" and measured.lv_per_pricing:
+                    by_mode.setdefault("lv", {})["risk_pricing"] = measured.lv_per_pricing[0]
+                elif measured.lsv_per_pricing:
+                    risk_pricing = measured.lsv_per_pricing[0]
                 cost = dataclasses.replace(
                     cost,
                     calibration_s=(
@@ -1556,6 +2701,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                     pricing_s=float(w["pricing"]),
                     analytics_s=float(w["analytics"]),
                     risk_pricing_s=risk_pricing,
+                    risk_state_s=risk_state,
+                    risk_source=(
+                        f"probe on {first.label!r} (tier {tier})"
+                        if measured.state_s
+                        else cost.risk_source
+                    ),
+                    by_mode=by_mode,
                     pricing_source=f"probe on {first.label!r} (tier {tier})",
                 )
                 projection = projection_table(
@@ -1599,7 +2751,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             flush=True,
         )
 
-    workers = max(1, int(args.workers))
     if workers == 1 or len(todo) <= 1:
         for p in todo:
             try:
@@ -1609,7 +2760,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             except Exception as exc:
                 report(_failure(p, exc))
     else:
-        threads = max(1, (os.cpu_count() or 1) // workers)
+        threads = threads_per_worker
         previous = os.environ.get("NUMBA_NUM_THREADS")
         os.environ["NUMBA_NUM_THREADS"] = str(threads)
         print(f"workers: {workers} processes, NUMBA_NUM_THREADS={threads} each")
@@ -1649,6 +2800,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "shard": f"{i}/{n}",
         "only": list(args.only) if args.only else None,
         "workers": workers,
+        "threads_per_worker": threads_per_worker,
+        "cpu_count": os.cpu_count(),
+        "platform": f"{platform.system()} {platform.machine()} {platform.processor()}".strip(),
+        "peak_rss_bytes": peak_rss_bytes(),
         "risk_tier": tier,
         "diagnostics": diagnostics,
         "n_particles": grid.particle.n_particles,
@@ -1664,6 +2819,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "points_total": len(points),
         "points_in_shard": len(mine),
         "points_selected": len(selected),
+        "points_skipped": n_skipped,
+        "limit": args.limit,
+        "cost_from": Path(args.cost_from).name if args.cost_from else None,
         "points_computed": done_walls,
         "n_calibrated": n_calibrated,
         "n_cache_hits": n_hits,

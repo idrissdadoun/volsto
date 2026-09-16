@@ -518,6 +518,20 @@ def test_reattach_stderr_names_on_the_three_desk_conventions() -> None:
     )
     assert list(c.columns) == ["recal_pnl_desk", "recal_pnl_desk_stderr", "recal_by_date_desk"]
     assert api.columns_without_stderr(c) == []
+    # a legacy table D: ``mean_delta`` is a prefix match for ``mean_se`` but owns its own twin
+    d = api.reattach_stderr_names(
+        api.normalise_stderr_names(
+            pd.DataFrame(
+                {"desk_mean": [1.0], "mean_se": [0.1], "mean_delta": [0.5], "mean_delta_se": [0.01]}
+            )
+        )
+    )
+    assert list(d.columns) == [
+        "desk_mean",
+        "desk_mean_stderr",
+        "mean_delta",
+        "mean_delta_stderr",
+    ]
     ambiguous = api.reattach_stderr_names(
         api.normalise_stderr_names(pd.DataFrame({"x_one": [1.0], "x_two": [2.0], "x_se": [0.1]}))
     )
@@ -577,7 +591,11 @@ def test_real_hedging_runs_schema() -> None:
         if not (ROOT / "outputs" / "m8b" / f"m8b_table_{name}.csv").exists():
             continue
         table = api.get_hedging_table(cfg, name)
-        assert api.columns_without_stderr(table) == [], (name, list(table.columns))
+        declared = api.UNPAIRED_UPSTREAM.get(f"hedging_table_{name}", frozenset())
+        assert api.columns_without_stderr(table, unpaired=declared) == [], (
+            name,
+            list(table.columns),
+        )
         print(f"m8b table {name}: {len(table)} rows, {len(table.columns)} columns")
     if (ROOT / "outputs" / "m8b" / "discriminator.csv").exists():
         disc = api.get_hedging_table(cfg, "discriminator")

@@ -56,6 +56,7 @@ from volsto.engine.grid import TimeGrid
 from volsto.engine.rng import GaussianDraws
 from volsto.market.bs import black_vega, implied_vol
 from volsto.market.curves import ForwardCurve
+from volsto.market.import_hdn import DEFAULT_CALENDAR_REPAIR, CalendarRepairConfig
 from volsto.market.surface import ImpliedSurface, atm_skew_numeric
 from volsto.market.varswap import ForwardVarianceCurve, varswap_strike
 from volsto.models.bergomi import BergomiSV, factor_step_covariance, sqrt_covariance
@@ -1657,12 +1658,14 @@ def build_hdn_history(
     pillars: Sequence[float] = DEFAULT_PILLARS,
     essvi: bool = True,
     skip_failures: bool = True,
+    calendar_repair: CalendarRepairConfig | None = DEFAULT_CALENDAR_REPAIR,
 ) -> tuple[SurfaceHistory, dict[str, str]]:
     """Run the importer (:func:`volsto.market.import_hdn.import_day`) for each date, write the
     snapshot YAML into ``out_dir`` and build the history from the snapshots.  Returns the
     history and the failures ``{date: error}``; with ``skip_failures=False`` the first importer
     error propagates.  About 1 s per day plus 0.1 s per day for the pillar strip (measured on
-    the 2022 H2 sample) — a test should run a handful of days only."""
+    the 2022 H2 sample) — a test should run a handful of days only.  ``calendar_repair`` is
+    passed to the importer (eSSVI calendar repair, M10 Part 0; ``None`` = pre-M10 behaviour)."""
     from volsto.market.import_hdn import import_day, write_snapshot
 
     out = Path(out_dir)
@@ -1671,7 +1674,9 @@ def build_hdn_history(
     failures: dict[str, str] = {}
     for date in dates:
         try:
-            cfg, _, _, _ = import_day(root, date, underlying, essvi=essvi)
+            cfg, _, _, _ = import_day(
+                root, date, underlying, essvi=essvi, calendar_repair=calendar_repair
+            )
             written.append(write_snapshot(cfg, out / f"{underlying.lower()}_{date}.yaml"))
         except Exception as exc:
             if not skip_failures:

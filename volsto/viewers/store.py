@@ -66,13 +66,14 @@ import datetime as _dt
 import json
 import os
 import re
-import tempfile
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
+
+from volsto.calibration.cache import atomic_write
 
 TABLES: tuple[str, ...] = (
     "points",
@@ -146,21 +147,17 @@ def utc_now() -> str:
 
 
 def _write_atomic(df: pd.DataFrame, path: Path) -> None:
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name, suffix=".tmp")
-    os.close(fd)
-    try:
-        df.to_parquet(tmp, index=False)
-        os.replace(tmp, path)
-    finally:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
+    """Write ``df`` as parquet through the cache's atomic writer (temporary beside the target,
+    fsync, rename, directory fsync) — the one write rule of the project's on-disk stores."""
+    atomic_write(path, lambda p: df.to_parquet(p, index=False))
 
 
 def _write_json_atomic(data: Mapping[str, Any], path: Path) -> None:
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name, suffix=".tmp")
-    with os.fdopen(fd, "w") as fh:
-        json.dump(data, fh, indent=1, sort_keys=True, default=str)
-    os.replace(tmp, path)
+    """Write ``data`` to ``path`` through the cache's atomic writer (a temporary beside the target
+    created with the umask's mode, fsync, rename, directory fsync): a reader never sees a torn
+    file and the file keeps the usual 0644 mode, which ``mkstemp``'s 0600 did not."""
+    text = json.dumps(data, indent=1, sort_keys=True, default=str)
+    atomic_write(path, lambda p: p.write_text(text, encoding="utf-8"))
 
 
 @dataclass

@@ -70,5 +70,10 @@ risk:
                           # 20 here would skip a point stored at light) — or directly from
                           # volsto.risk.report.risk_report, whose default is the 20-bucket
                           # ladder.  Every bucket is one leverage
-                          # recalibration: 17 instead of 34 per LSV point, 121.7 h instead of
-                          # 224.3 h single-process on this grid (volsto-precompute --dry-run).
+                          # recalibration: 17 instead of 34 per LSV point, 126.52 h instead of
+                          # 238.54 h on this grid — the plain `volsto-precompute --dry-run`
+                          # (2026-09-16): a single-process laptop projection from the cache
+                          # manifest's calibration cost and the measured fallbacks (pricing /
+                          # analytics timed at 12 threads).  At 1 thread per process, measured
+                          # with the risk step on, the light tier is 177 process-hours
+                          # (--cost-from; docs/vm_grid_run.md §0).

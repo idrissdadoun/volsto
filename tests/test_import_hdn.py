@@ -8,17 +8,26 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
 import pytest
 
 from volsto.config import MarketConfig, SSVIConfig, load_yaml
-from volsto.market import ESSVISurface, SSVISurface, implied_vol
+from volsto.market import ESSVISurface, SSVISurface, implied_vol, import_hdn
 from volsto.market.import_hdn import (
+    DEFAULT_CALENDAR_REPAIR,
     HDN_COLUMNS,
     HdnFilters,
+    SSVIFit,
+    SurfacePoints,
+    _eta_max,
+    _eta_theta_range,
+    _surface_theta,
+    calendar_constraint_grid,
     implied_forwards,
     import_day,
     load_day,
@@ -31,6 +40,9 @@ from volsto.market.loaders import load_ssvi_surface
 ROOT = Path(__file__).resolve().parents[1]
 SAMPLE = ROOT / "data" / "hdn_sample" / "options_sample_2022H2"
 DAY = "2022-09-15"
+FAILING_DAY = "2022-12-21"
+"""One of the 15 days whose unrepaired eSSVI fails the calendar check (M10 Part 0)."""
+Pipeline = tuple[dict[str, Any], SSVIFit, SurfacePoints, pd.DataFrame]
 pytestmark = pytest.mark.skipif(not SAMPLE.exists(), reason="HDN sample not present")
 
 
@@ -42,7 +54,7 @@ def chain() -> pd.DataFrame:
 
 
 @pytest.fixture(scope="module")
-def pipeline():
+def pipeline() -> Pipeline:
     return import_day(SAMPLE, DAY, "SPX")
 
 
@@ -112,7 +124,7 @@ def test_mid_implied_vols_reproduce_vendor_iv_on_flag0_rows(chain: pd.DataFrame)
     assert np.median(d) < 0.001 and np.quantile(d, 0.9) < 0.005, (np.median(d), np.quantile(d, 0.9))
 
 
-def test_grid_surface_and_ssvi_fit(pipeline) -> None:
+def test_grid_surface_and_ssvi_fit(pipeline: Pipeline) -> None:
     _cfg, fit, points, _chain = pipeline
     assert points.table["expiry"].nunique() >= 25 and len(points.table) > 3000
     assert set(points.dropped) >= {"butterfly", "calendar", "spread", "min_bid"}
@@ -127,7 +139,7 @@ def test_grid_surface_and_ssvi_fit(pipeline) -> None:
     assert all(0.15 < v < 0.40 for v in fit.params["atm_vols"])
 
 
-def test_essvi_fit_improves_near_money(pipeline) -> None:
+def test_essvi_fit_improves_near_money(pipeline: Pipeline) -> None:
     _cfg, fit_e, _points, _chain = pipeline
     _, fit, _, _ = import_day(SAMPLE, DAY, "SPX", essvi=False)  # plain SSVI, single rho
     assert isinstance(fit.surface, SSVISurface) and isinstance(fit_e.surface, ESSVISurface)
@@ -138,7 +150,7 @@ def test_essvi_fit_improves_near_money(pipeline) -> None:
     assert len(fit_e.params["rho"]) == len(fit_e.params["atm_maturities"])
 
 
-def test_snapshot_config_round_trip(pipeline, tmp_path: Path) -> None:
+def test_snapshot_config_round_trip(pipeline: Pipeline, tmp_path: Path) -> None:
     cfg, fit, points, chain = pipeline
     p = write_snapshot(cfg, tmp_path / "spx.yaml")
     surface = load_ssvi_surface(p)
@@ -225,3 +237,158 @@ def test_yfinance_capture_layout(tmp_path: Path) -> None:
     assert man["rates"]["2022-12-30"][0] == 4.1 and man["files"][0]["rows"] == 2
     day = load_day(path, "SPX", manifest=man)
     assert len(day) == 2 and set(day["root"]) == {"SPX", "SPXW"} and (day["T"] > 0).all()
+
+
+# --------------------------------------------------------------------------------------------
+# eSSVI calendar repair (M10 Part 0)
+# --------------------------------------------------------------------------------------------
+
+
+class _UncheckedESSVI(ESSVISurface):
+    def _check_calendar_numeric(self) -> None:
+        return None
+
+
+@pytest.fixture(scope="module")
+def failing_day() -> Pipeline:
+    return import_day(SAMPLE, FAILING_DAY, "SPX")
+
+
+def test_feasible_day_is_bit_identical(pipeline: Pipeline) -> None:
+    """2022-09-15: the certificate proves ``∂_T w ≥ margin`` on ±3 for the unrepaired fit, so
+    the repair is skipped and the fit equals the pre-M10 fit (``calendar_repair=None``) bit for
+    bit."""
+    _cfg, fit, _points, _chain = pipeline
+    cfg = DEFAULT_CALENDAR_REPAIR
+    assert fit.params["calendar_repaired"] is False and fit.params["calendar_stages"] == 0
+    assert fit.params["calendar_fallback"] is None and fit.params["calendar_cost_delta"] == 0.0
+    assert fit.params["calendar_min_dw_dt"] >= cfg.margin
+    assert fit.params["calendar_floor"] == cfg.margin and fit.params["calendar_k_abs"] == 3.0
+    assert fit.params["calendar_lower_bound"] >= cfg.margin
+    _, old, _, _ = import_day(SAMPLE, DAY, "SPX", calendar_repair=None)
+    assert "calendar_repaired" not in old.params
+    for key in ("rho", "eta", "gamma", "atm_vols", "atm_maturities", "cost"):
+        assert fit.params[key] == old.params[key], key
+    assert isinstance(old.surface, ESSVISurface)
+    assert repr(fit.surface) == repr(old.surface)
+    pd.testing.assert_frame_equal(fit.points, old.points)
+
+
+def test_essvi_repair_on_failing_day(
+    failing_day: Pipeline, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """2022-12-21: the unrepaired eSSVI is refused by the calendar check; the repaired one
+    imports with the invariant PROVEN (exact ``∂_T w ≥ margin`` on ±3, every ``T``, both knot
+    limits — re-proven here on the returned surface and seen on the dense check).
+
+    Its fit cost is checked against a bracket that is well motivated but NOT guaranteed, because
+    both ends assume optimality and ``least_squares`` only returns a local minimiser:
+
+    * above the unrepaired cost — the unrepaired fit minimises the same residual without the
+      constraint (``calendar_cost_delta > 0``);
+    * at most the plain-SSVI cost — the SSVI fit is a point of the repair's feasible set (same
+      ``θ_T``; one ``ρ`` at every pillar; its ``η`` below the repair's cap, its exact ``∂_T w``
+      above ``margin + headroom`` on the constraint grid and its invariant proven, all three
+      checked here), and the constrained optimum costs no more than any feasible point; a
+      penalty iterate that globally minimised its penalised objective would cost no more than
+      that optimum.
+
+    (Measured: cost 85.87 -> 90.18 against SSVI 121.36; RMS inside ±20%, 3m-3y 0.2797 ->
+    0.2989 against SSVI 0.3256 — the RMS is not the fitted objective, so it is not bounded.)"""
+    with pytest.raises(ValueError, match="calendar"):
+        import_day(SAMPLE, FAILING_DAY, "SPX", calendar_repair=None)
+    _cfg, fit, _points, _chain = failing_day
+    cfg = DEFAULT_CALENDAR_REPAIR
+    assert isinstance(fit.surface, ESSVISurface)
+    assert fit.params["calendar_repaired"] is True and fit.params["calendar_fallback"] is None
+    assert fit.params["calendar_min_dw_dt_before"] < 0.0
+    assert fit.params["calendar_min_dw_dt"] >= cfg.margin + cfg.headroom - cfg.tol
+    assert fit.params["calendar_lower_bound"] >= cfg.margin
+    assert fit.params["calendar_floor"] == cfg.margin and fit.params["calendar_k_abs"] == 3.0
+    assert fit.surface.calendar_certificate(3.0, cfg.margin).certified
+    assert fit.surface.calendar_min_dw_dt(3.0, 121) >= cfg.margin
+    assert fit.surface.calendar_min_dw_dt() == pytest.approx(
+        fit.params["calendar_min_dw_dt_1"], rel=1e-9
+    )
+    dense = fit.surface.calendar_dense_check()
+    assert dense.ok and dense.min_dw_dt >= cfg.margin, dense
+    assert fit.params["calendar_cost_delta"] > 0.0
+
+    _, plain, _, _ = import_day(SAMPLE, FAILING_DAY, "SPX", essvi=False)
+    pil = np.asarray(plain.params["atm_maturities"])
+    th = np.asarray(plain.params["atm_vols"]) ** 2 * pil
+    np.testing.assert_array_equal(th, np.asarray(fit.params["atm_vols"]) ** 2 * pil)
+    lo, hi = _eta_theta_range(th)
+    ends = _surface_theta(pil, th, np.array([1.0 / 365.0, fit.surface.max_maturity]))
+    cap = 0.999 * _eta_max(
+        abs(plain.params["rho"]), plain.params["gamma"], min(lo, ends[0]), max(hi, ends[1])
+    )
+    assert plain.params["eta"] <= cap
+    as_essvi = ESSVISurface(
+        pil,
+        th,
+        [plain.params["rho"]] * pil.size,
+        plain.params["eta"],
+        plain.params["gamma"],
+        plain.surface.forward_curve,
+        plain.surface.discount,
+        max_maturity=fit.surface.max_maturity,
+    )
+    ks, seg, ts = calendar_constraint_grid(pil, fit.surface.max_maturity, cfg)
+    D = as_essvi.calendar_segments().dw_dt(
+        ks[None, :], seg[:, None], ts[:, None], as_essvi.eta, as_essvi.gamma
+    )
+    assert np.min(D) >= cfg.margin + cfg.headroom
+    assert as_essvi.calendar_certificate(3.0, cfg.margin).certified
+    assert fit.params["cost"] <= plain.params["cost"], (fit.params["cost"], plain.params["cost"])
+
+    monkeypatch.setattr(import_hdn, "ESSVISurface", _UncheckedESSVI)
+    _, base, _, _ = import_day(SAMPLE, FAILING_DAY, "SPX", calendar_repair=None)
+    assert isinstance(base.surface, ESSVISurface)
+    assert base.surface.calendar_min_dw_dt() < -ESSVISurface.CALENDAR_TOL
+    assert not base.surface.calendar_dense_check().ok
+    assert base.params["cost"] < fit.params["cost"]
+
+
+def test_repaired_snapshot_round_trip(failing_day: Pipeline, tmp_path: Path) -> None:
+    cfg, fit, _points, _chain = failing_day
+    p = write_snapshot(cfg, tmp_path / "spx_repaired.yaml")
+    surface = load_ssvi_surface(p)
+    assert isinstance(surface, ESSVISurface)
+    assert cfg["essvi"]["rhos"] == fit.params["rho"]
+    np.testing.assert_allclose(
+        surface.implied_vol_k([-0.3, 0.0, 0.3], [0.5, 2.0, 3.0]),
+        fit.surface.implied_vol_k([-0.3, 0.0, 0.3], [0.5, 2.0, 3.0]),
+        rtol=1e-12,
+    )
+    prov = cfg["provenance"]["fit"]
+    for key in (
+        "calendar_repaired",
+        "calendar_stages",
+        "calendar_min_dw_dt",
+        "calendar_lower_bound",
+        "calendar_fallback",
+    ):
+        assert prov[key] == fit.params[key], key
+
+
+def test_repair_failure_falls_back_to_ssvi() -> None:
+    """No penalty stage allowed: the escalation ends in plain SSVI for the day, recorded."""
+    cfg = replace(DEFAULT_CALENDAR_REPAIR, max_stages=0)
+    _, fit, _, _ = import_day(SAMPLE, FAILING_DAY, "SPX", calendar_repair=cfg)
+    assert type(fit.surface) is SSVISurface
+    assert fit.params["calendar_fallback"] == "ssvi" and fit.params["essvi"] is False
+    assert fit.params["calendar_min_dw_dt_before"] < 0.0
+    assert fit.params["calendar_min_dw_dt"] is None
+    assert fit.params["calendar_floor"] is None and fit.params["calendar_lower_bound"] is None
+    _, plain, _, _ = import_day(SAMPLE, FAILING_DAY, "SPX", essvi=False)
+    assert fit.params["rho"] == plain.params["rho"] and fit.params["eta"] == plain.params["eta"]
+
+
+def test_cli_no_calendar_repair(tmp_path: Path) -> None:
+    rc = main(
+        ["--date", DAY, "--root", str(SAMPLE), "--out", str(tmp_path), "--no-calendar-repair"]
+    )
+    assert rc == 0
+    doc = load_ssvi_surface(tmp_path / f"spx_{DAY}.yaml")
+    assert isinstance(doc, ESSVISurface)

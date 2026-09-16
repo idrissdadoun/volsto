@@ -80,7 +80,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from volsto.calibration.cache import build_market
+from volsto.calibration.cache import build_market, has_complete_leverage
 from volsto.calibration.diagnostics import CalibrationReport
 from volsto.config import CalibrationSpec, from_mapping
 from volsto.market.curves import ForwardCurve
@@ -136,6 +136,8 @@ EXACT_COLUMNS: frozenset[str] = frozenset(
         "n_paths_world",
         "n_refits",
         "refits_at_bound",
+        "refits_fallback",  # refits that took the guarded fallback (counts, study C)
+        "refits_capped",  # refits whose target correlation hit REFIT_CORRELATION_CAP
         "calibrations",
         "cache_keys_touched",
         "cache_hits",
@@ -143,6 +145,9 @@ EXACT_COLUMNS: frozenset[str] = frozenset(
         "n_paths",
         "wall_s",
         "rank",
+        "std_rank",  # study D: rank of the hedged std among the ok regime rows
+        "distance_rank",  # study D: rank of |distance to the common MV delta|
+        "mv_common_rows",  # study D: how many regime rows entered the common MV delta
         "date",
         "t",
         "k",
@@ -244,6 +249,10 @@ UNPAIRED_UPSTREAM: dict[str, frozenset[str]] = {
         }
     ),
     "hedging_regimes": frozenset({"std", "realised_vol_mean"}),
+    #: ``m8b_table_D.csv``: the spread (largest minus smallest) of the four regimes' implied
+    #: minimum-variance deltas behind ``mv_common`` — a dispersion diagnostic of Monte Carlo
+    #: values, reported beside ``mv_common`` ± its se, without an se of its own.
+    "hedging_table_D": frozenset({"mv_common_spread"}),
     #: ``discriminator.csv`` (the M8b raw-slice gate): the regression diagnostics of the SSR
     #: fit per window — the runner reports the fitted SSR with its se but not these.
     "hedging_discriminator": frozenset(
@@ -463,7 +472,8 @@ def list_grid(cfg: ViewerConfig) -> pd.DataFrame:
         row["n_particles"] = int(r.get("n_particles", 0) or 0)
         row["horizon"] = float(r.get("horizon", math.nan))
         row["cache_key"] = key
-        row["has_leverage"] = bool(key) and (cfg.cache_root / key / "leverage.npz").exists()
+        # the cache's own completeness test: a torn leverage.npz is not a leverage
+        row["has_leverage"] = bool(key) and has_complete_leverage(cfg.cache_root, key)
         for t in POINT_TABLES:
             row[f"has_{t}"] = pid in present[t]
         for c in ("risk_tier", "code_tag", "git_commit", "created_utc"):
@@ -787,7 +797,7 @@ def get_leverage(cfg: ViewerConfig, key: str) -> LeverageRecord:
         )
     entry = cfg.cache_root / cache_key
     npz = entry / "leverage.npz"
-    if not npz.exists():
+    if not has_complete_leverage(cfg.cache_root, cache_key):
         raise MissingPoint(
             key,
             precompute_command(cfg, only=key),
@@ -1188,6 +1198,8 @@ def get_hedging_run(cfg: ViewerConfig, run_id: str) -> HedgingRunRecord:
             "n_dates",
             "n_refits",
             "n_refits_at_bound",
+            "n_refits_fallback",
+            "n_refits_capped",
             "calibrations",
             "cache_hits",
             "wall_seconds",
@@ -1241,18 +1253,24 @@ def get_hedging_pnl(cfg: ViewerConfig, run_id: str) -> pd.DataFrame:
 
 def reattach_stderr_names(df: pd.DataFrame) -> pd.DataFrame:
     """Give every orphan ``<stem>_stderr`` of an M8b table the name of the value column it
-    belongs to, whichever desk-naming convention that table uses:
+    belongs to.
 
-    * table A / D write ``desk_mean`` + ``mean_se`` (the desk sign as a *prefix*) → the twin
+    Since 2026-09-16 the M8b writers emit exact twins (``<value>_se``, see
+    :func:`volsto.studies.m8b.table_A` … ``table_D``), so a table written today has no orphan.
+    This re-attaches the tables written before, whichever desk-naming convention they used:
+
+    * table A / D wrote ``desk_mean`` + ``mean_se`` (the desk sign as a *prefix*) → the twin
       becomes ``desk_mean_stderr``;
     * table B writes ``leakage_desk`` + ``leakage_desk_se`` (the desk sign as a *suffix*), which
       :func:`normalise_stderr_names` already pairs — nothing to do;
-    * table C writes ``recal_pnl_desk`` + ``recal_se`` (and ``total_pnl_desk`` + ``total_se``,
+    * table C wrote ``recal_pnl_desk`` + ``recal_se`` (and ``total_pnl_desk`` + ``total_se``,
       ``static_prediction`` + ``static_se``): the stem is a *prefix of the value column*.
 
-    An orphan is re-attached only when exactly one numeric, non-stderr column matches, so an
-    ambiguous stem is left alone and the stderr walk reports the unpaired value column instead
-    of pairing it with the wrong twin (review:S2 F1)."""
+    A candidate value column that already has its own twin cannot own the orphan (table D's
+    ``mean_delta`` next to ``mean_delta_se`` is a prefix match for ``mean_se`` but is not its
+    value).  An orphan is re-attached only when exactly one numeric, non-stderr, twinless column
+    matches, so an ambiguous stem is left alone and the stderr walk reports the unpaired value
+    column instead of pairing it with the wrong twin (review:S2 F1)."""
     numeric = [
         str(c)
         for c in df.columns
@@ -1268,8 +1286,12 @@ def reattach_stderr_names(df: pd.DataFrame) -> pd.DataFrame:
         stem = name[: -len("_stderr")]
         if stem in df.columns:
             continue
-        hits = [v for v in numeric if v == f"desk_{stem}" or v.startswith(f"{stem}_")]
-        if len(hits) == 1 and f"{hits[0]}_stderr" not in df.columns:
+        hits = [
+            v
+            for v in numeric
+            if (v == f"desk_{stem}" or v.startswith(f"{stem}_")) and f"{v}_stderr" not in df.columns
+        ]
+        if len(hits) == 1:
             ren[name] = f"{hits[0]}_stderr"
     return df.rename(columns=ren)
 

@@ -202,9 +202,9 @@ def test_desk_sign_conversion() -> None:
     }
     df = table_C([dataclasses.replace(r, rota=1.0, policy="sabr_linked")], static)
     row = df.iloc[0]
-    assert row["recal_pnl_desk"] == pytest.approx(-0.0539) and row["recal_se"] == pytest.approx(
-        0.0066
-    )
+    assert row["recal_pnl_desk"] == pytest.approx(-0.0539) and row[
+        "recal_pnl_desk_se"
+    ] == pytest.approx(0.0066)
     assert row["static_prediction"] == pytest.approx(-0.0539) and row["ratio"] == pytest.approx(1.0)
     assert bool(row["within_30pct"]) and row["nonlinearity"] == 0.0
 
@@ -527,6 +527,14 @@ def test_table_builders_on_synthetic_results(tmp_path: Path) -> None:
     assert td.loc[td["distance_rank"] == 1, "regime"].tolist() == ["sticky_strike"]
     # the writers: CSVs, the markdown with the placeholders, the results round trip from disk
     tables = build_tables([*res, rb, rb_same, *rc, *rd], skipped, static)
+    # every stderr column a writer emits is the exact twin of a value column it also emits
+    # (``<value>_se``): an orphan stem made the read API guess, and the guess broke when table D
+    # gained ``mean_delta`` beside the old ``mean_se``
+    for st, frame in tables.items():
+        orphans = [
+            c for c in frame.columns if str(c).endswith("_se") and str(c)[:-3] not in frame.columns
+        ]
+        assert not orphans, f"table {st}: stderr columns without their value column {orphans}"
     md = write_tables(
         tmp_path, tables, header_lines=["wall clock 1 s", "recalibrated: no"], static=static
     )

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import json
 import time
 from pathlib import Path
 from typing import Any
@@ -65,6 +66,72 @@ HISTORICAL_SKEW_WEIGHT = 10.0
 """Owner decision: soft skew with weight 10 is the historical-mode default (FINAL fitter)."""
 WORLD_N_PARTICLES = 800_000
 """Study B particle count (the owner's M8b spec)."""
+DEFAULT_FITTED_HISTORY = "outputs/m7/hdn_history_ssvi.csv"
+"""The committed M8b comparison history: plain SSVI (``scripts/m7_hdn_history.py --no-essvi``)."""
+DEFAULT_FITTED_LABEL = "SSVI"
+"""Label of :data:`DEFAULT_FITTED_HISTORY`.  Any other ``--ssvi-history`` needs an explicit
+``--fitted-label``: the history CSV does not record which parametrisation produced it."""
+REPORT_HEADING = "## SSR: raw slices vs SSVI snapshots (same estimator, common dates)"
+"""Heading written by :func:`write_discriminator_report`, relabelled for another history."""
+
+
+def fitted_label(history: str, label: str | None) -> str:
+    """The fitted history's label: explicit, or the default history's; never guessed."""
+    if label:
+        return label
+    if Path(history) == Path(DEFAULT_FITTED_HISTORY):
+        return DEFAULT_FITTED_LABEL
+    raise SystemExit(
+        f"--ssvi-history {history} is not the default SSVI history: pass --fitted-label "
+        "(e.g. 'eSSVI repaired') so the report names what the fitted columns hold"
+    )
+
+
+def dedup_windows(table: pd.DataFrame) -> pd.DataFrame:
+    """With ``--window-ssr`` equal to ``--window-long`` the discriminator tabulates the same
+    rows twice (and the verdict repeats every failing pillar): keep one copy."""
+    out = table.drop_duplicates(subset=["T", "window"], ignore_index=True)
+    out.attrs.update(table.attrs)
+    return out
+
+
+REASON_PHRASES: tuple[str, ...] = (" vs SSVI ", "raw and SSVI SSR")
+"""The phrases in which ``verdict_from_table`` names the fitted side 'SSVI'."""
+
+
+def relabel(text: str, label: str) -> str:
+    """Rename the fitted side in a verdict reason (only the phrases that name it)."""
+    if label == DEFAULT_FITTED_LABEL:
+        return text
+    for phrase in REASON_PHRASES:
+        text = text.replace(phrase, phrase.replace("SSVI", label))
+    return text
+
+
+def relabel_report(paths: dict[str, Path], label: str, history: str) -> None:
+    """Name the fitted history in ``discriminator.md`` and ``discriminator_verdict.json``.  The
+    CSV keeps its ``*_ssvi`` column names (the viewers' read API parses them)."""
+    if label == DEFAULT_FITTED_LABEL:
+        return
+    md = paths["md"].read_text(encoding="utf-8")
+    if REPORT_HEADING not in md:
+        raise RuntimeError(f"report heading changed: {REPORT_HEADING!r} not in {paths['md']}")
+    md = relabel(
+        md.replace(
+            REPORT_HEADING,
+            f"## SSR: raw slices vs {label} snapshots (same estimator, common dates)\n\n"
+            f"Fitted history: `{history}` ({label}); the `*_ssvi` columns below hold that "
+            "history.",
+            1,
+        ),
+        label,
+    )
+    paths["md"].write_text(md, encoding="utf-8")
+    js = json.loads(paths["json"].read_text(encoding="utf-8"))
+    js["reason"] = relabel(str(js["reason"]), label)
+    js["fitted_history"] = history
+    js["fitted_label"] = label
+    paths["json"].write_text(json.dumps(js, indent=2), encoding="utf-8")
 
 
 def spx_base_spec(n_particles: int) -> CalibrationSpec:
@@ -185,7 +252,12 @@ def world_spec_document(
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--root", default="data/hdn_sample/options_sample_2022H2")
-    ap.add_argument("--ssvi-history", default="outputs/m7/hdn_history_ssvi.csv")
+    ap.add_argument("--ssvi-history", default=DEFAULT_FITTED_HISTORY)
+    ap.add_argument(
+        "--fitted-label",
+        default=None,
+        help="what --ssvi-history holds (required unless it is the default SSVI history)",
+    )
     ap.add_argument("--out", default="outputs/m8b")
     ap.add_argument("--limit", type=int, default=None, help="first N sample days only")
     ap.add_argument("--fit-band", type=float, default=FIT_BAND)
@@ -197,6 +269,7 @@ def main() -> None:
     ap.add_argument("--n-particles", type=int, default=WORLD_N_PARTICLES)
     ap.add_argument("--skew-weight", type=float, default=HISTORICAL_SKEW_WEIGHT)
     args = ap.parse_args()
+    label = fitted_label(args.ssvi_history, args.fitted_label)
     pd.set_option("display.width", 220)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -220,6 +293,9 @@ def main() -> None:
     table, verdict = discriminator(
         raw_frame, ssvi_frame, window_ssr=args.window_ssr, window_long=args.window_long
     )
+    if args.window_ssr == args.window_long:
+        table = dedup_windows(table)
+        verdict = verdict_from_table(table, args.window_ssr)
     wall = time.perf_counter() - t0
     # sensitivity, not the gate: the rule on the historical fit's pillars only (MatMin 3M)
     fitted = verdict_from_table(table[table["T"] >= HISTORICAL_PILLARS[0] - 1e-9], args.window_ssr)
@@ -239,9 +315,11 @@ def main() -> None:
             f"reads **{fitted.verdict}** - {fitted.reason}",
         ),
     )
-    print(f"sensitivity on the fitted pillars: {fitted.verdict} -- {fitted.reason}")
+    relabel_report(paths, label, str(args.ssvi_history))
+    print(f"fitted history: {args.ssvi_history} ({label})")
+    print(f"sensitivity on the fitted pillars: {fitted.verdict} -- {relabel(fitted.reason, label)}")
     print(table.round(4).to_string(index=False))
-    print(f"VERDICT: {verdict.verdict} -- {verdict.reason}")
+    print(f"VERDICT: {verdict.verdict} -- {relabel(verdict.reason, label)}")
     print(f"written {', '.join(str(p) for p in paths.values())}; wall clock {wall:.0f} s")
 
     if args.no_world_spec:

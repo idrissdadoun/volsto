@@ -82,9 +82,10 @@ PNL_COMPONENTS: tuple[str, ...] = (
 HIST_BINS = 80
 #: Study-C table columns (``table_C`` of :mod:`volsto.studies.m8b`): the simulated
 #: recalibration P&L, the static prediction and the total, each with the stderr twin the read
-#: API emits.  ``table_C`` writes the stderr under the *stem* of its value column (``recal_se``
-#: beside ``recal_pnl_desk``); :func:`volsto.viewers.api.reattach_stderr_names` gives it the
-#: value column's own name, so what a page reads is ``<value>_stderr`` — the names below are
+#: API emits.  ``table_C`` writes exact twins since 2026-09-16 (``recal_pnl_desk_se``); a table
+#: written before carries the stem (``recal_se``) and
+#: :func:`volsto.viewers.api.reattach_stderr_names` gives it the value column's own name, so
+#: what a page reads is ``<value>_stderr`` either way — the names below are
 #: walked against :func:`volsto.viewers.api.get_hedging_table` by
 #: ``tests/test_viewers_pages_c.py::test_page_twin_names_match_api``, so the next rename of the
 #: read API fails a test instead of this page.

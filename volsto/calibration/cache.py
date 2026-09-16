@@ -3,18 +3,37 @@
 Key = SHA-256 of the canonical JSON of :meth:`~volsto.config.CalibrationSpec.key_payload` plus
 the calibration code tag (:data:`~volsto.calibration.particle.CALIBRATION_CODE_TAG`, bumped when
 the calibration numerics change).  Each entry directory holds ``leverage.npz`` (with provenance
-metadata: git commit, config hash, seeds) and optionally ``diagnostics.json``; ``manifest.parquet``
-at the cache root has one row per entry.  ``get_or_calibrate`` is the only entry point studies and
-viewers use; a viewer passes ``allow_calibrate=False`` and reports what is missing.
+metadata: git commit, config hash, seeds), ``spec.json`` and optionally ``diagnostics.json``;
+``manifest.parquet`` at the cache root has one row per entry.  ``get_or_calibrate`` is the only
+entry point studies and viewers use; a viewer passes ``allow_calibrate=False`` and reports what is
+missing.
+
+**Every file this module writes goes through** :func:`atomic_write`: a temporary file in the
+destination's directory (named ``.<name>.<random>.tmp<suffix>``, :data:`TEMP_MARKER`), created
+with the ordinary ``0666 & ~umask`` mode, fsync'd, then ``os.replace``-d over the destination and
+the directory fsync'd.  A process killed at any instant therefore leaves the previous file or the
+new one, never a torn one, plus at most a leftover temporary, which no reader looks at
+(:meth:`LeverageCache.temporaries` lists them).  ``leverage.npz`` is the entry's commit point: it
+is written after ``spec.json`` and before ``diagnostics.json`` and the manifest row, and
+:meth:`LeverageCache.has` also rejects a ``leverage.npz`` that is not a complete zip archive (a
+torn file written before writes were atomic).  A kill between the leverage and the manifest row
+leaves a complete entry whose row is missing (:meth:`LeverageCache.unlisted_keys`); a kill before
+``diagnostics.json`` leaves an entry without a report, which ``volsto-precompute --resume
+--diagnostics`` refreshes.  Checked by ``tests/test_cache_concurrency.py``.
 """
 
 from __future__ import annotations
 
 import datetime as _dt
+import fcntl
 import hashlib
 import json
 import logging
+import os
+import secrets
 import subprocess
+import zipfile
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +51,98 @@ from volsto.models.leverage import LeverageFunction
 from volsto.models.lsv import LSV
 
 log = logging.getLogger(__name__)
+
+
+#: The cache manifest: one row per entry, rewritten atomically under :data:`MANIFEST_LOCK_NAME`.
+MANIFEST_NAME = "manifest.parquet"
+#: Advisory-lock file (POSIX ``flock``) serialising manifest writers; empty, never removed.
+MANIFEST_LOCK_NAME = "manifest.parquet.lock"
+#: The entry's commit point (written last of the entry's own files, before the manifest row).
+LEVERAGE_NAME = "leverage.npz"
+#: The entry's full spec (:func:`~volsto.config.to_mapping`), for humans; nothing reads it back.
+SPEC_NAME = "spec.json"
+#: The entry's calibration report (:class:`CalibrationReport`), optional.
+DIAGNOSTICS_NAME = "diagnostics.json"
+#: Every temporary file :func:`atomic_write` creates is named ``.<name>.<16 hex>.tmp<suffix>``:
+#: a leading dot and this marker, so ``find -name '.*.tmp*'`` / ``rsync --exclude '.*.tmp*'``
+#: match all of them and none of the cache's real files.  The destination's suffix is kept at the
+#: end because ``numpy.savez_compressed`` appends ``.npz`` to a path without it.
+TEMP_MARKER = ".tmp"
+#: Glob matching every leftover temporary (see :data:`TEMP_MARKER`).
+TEMP_GLOB = ".*" + TEMP_MARKER + "*"
+#: Mode passed to ``os.open`` for a temporary: the process umask applies, exactly as for a plain
+#: ``open(path, "w")`` (``tempfile.mkstemp`` would force 0600).
+TEMP_FILE_MODE = 0o666
+
+
+def _temp_path(dest: Path) -> tuple[int, Path]:
+    """Create (``O_EXCL``) and open a fresh temporary beside ``dest``; return ``(fd, path)``."""
+    while True:
+        tmp = dest.with_name(f".{dest.name}.{secrets.token_hex(8)}{TEMP_MARKER}{dest.suffix}")
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, TEMP_FILE_MODE)
+        except FileExistsError:  # 64 random bits: practically never
+            continue
+        return fd, tmp
+
+
+def _fsync_dir(directory: Path) -> None:
+    fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def atomic_write(dest: str | Path, write: Callable[[Path], object]) -> Path:
+    """Publish ``dest`` atomically: ``write(tmp)`` fills a temporary beside it (by path), which is
+    then fsync'd and renamed over ``dest``.  On any exception (``KeyboardInterrupt`` included)
+    the temporary is removed and ``dest`` is untouched; a SIGKILL leaves ``dest`` untouched plus
+    the temporary.  The one implementation of the cache's write rule (module docstring)."""
+    path = Path(dest)
+    fd, tmp = _temp_path(path)
+    try:
+        os.close(fd)
+        write(tmp)
+        with open(tmp, "rb+") as fh:
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    _fsync_dir(path.parent)
+    return path
+
+
+def _is_complete_npz(path: Path) -> bool:
+    """``path`` exists and is a complete zip archive: the central directory opens and every
+    member's CRC checks (``ZipFile.testzip``).  ``zipfile.is_zipfile`` alone only searches the
+    file's last ~65 KB for the end-of-central-directory signature, so a file cut short by a kill
+    whose remaining bytes happen to contain that signature would pass it (reproduced by the M10
+    verification with an incompressible leverage array).  The CRC pass reads the whole file —
+    about 10-20 ms for an 18 MB leverage entry."""
+    try:
+        if not path.is_file():
+            return False
+        with zipfile.ZipFile(path) as zf:
+            return zf.testzip() is None
+    except (OSError, zipfile.BadZipFile, EOFError, ValueError):
+        return False
+
+
+def has_complete_leverage(root: str | Path, key: str) -> bool:
+    """Whether the cache under ``root`` holds a complete ``leverage.npz`` for ``key`` — the one
+    completeness test, shared by :meth:`LeverageCache.has_key` and the viewers' read API.  A read,
+    with no side effect on a missing root.  Leftover temporaries never count; a torn
+    ``leverage.npz`` (a pre-atomic write cut by a kill) is a miss, logged, so a ``--resume``
+    recalibrates it instead of loading it."""
+    path = Path(root) / key / LEVERAGE_NAME
+    if not path.exists():
+        return False
+    if _is_complete_npz(path):
+        return True
+    log.warning("leverage cache entry %s: %s is not a complete archive; a miss", key[:12], path)
+    return False
 
 
 class CacheMissError(KeyError):
@@ -92,19 +203,52 @@ class LeverageCache:
         return self.root / self.key(spec)
 
     def has(self, spec: CalibrationSpec) -> bool:
-        return (self.entry_dir(spec) / "leverage.npz").exists()
+        """A committed entry for ``spec`` (:meth:`has_key`)."""
+        return self.has_key(self.key(spec))
+
+    def has_key(self, key: str) -> bool:
+        """The entry ``key`` holds a complete ``leverage.npz`` (:func:`has_complete_leverage`)."""
+        return has_complete_leverage(self.root, key)
+
+    def temporaries(self) -> list[Path]:
+        """Leftover temporaries of interrupted writes (root and entry directories), sorted.
+        Harmless; delete them when no writer is running."""
+        if not self.root.is_dir():
+            return []
+        return sorted([*self.root.glob(TEMP_GLOB), *self.root.glob(f"*/{TEMP_GLOB}")])
+
+    def unlisted_keys(self) -> list[str]:
+        """Keys with a committed leverage and no manifest row (a kill between the two writes)."""
+        if not self.root.is_dir():
+            return []
+        m = self.manifest()
+        listed = set() if m.empty else {str(k) for k in m["key"]}
+        return sorted(
+            d.name
+            for d in self.root.iterdir()
+            if d.is_dir() and d.name not in listed and self.has_key(d.name)
+        )
 
     # -- read / write --------------------------------------------------------------------------
 
     def load(self, spec: CalibrationSpec) -> LeverageFunction:
-        p = self.entry_dir(spec) / "leverage.npz"
+        p = self.entry_dir(spec) / LEVERAGE_NAME
         if not p.exists():
             raise CacheMissError(self.key(spec))
         return LeverageFunction.load(p)
 
     def load_report(self, spec: CalibrationSpec) -> CalibrationReport | None:
-        p = self.entry_dir(spec) / "diagnostics.json"
+        p = self.entry_dir(spec) / DIAGNOSTICS_NAME
         return CalibrationReport.load(p) if p.exists() else None
+
+    def write_report(self, spec: CalibrationSpec, report: CalibrationReport) -> Path:
+        """Write ``diagnostics.json`` of an entry atomically (the entry must exist)."""
+        return self._write_report(self.entry_dir(spec), report)
+
+    @staticmethod
+    def _write_report(d: Path, report: CalibrationReport) -> Path:
+        text = json.dumps(report.to_dict(), indent=1, default=str)
+        return atomic_write(d / DIAGNOSTICS_NAME, lambda tmp: tmp.write_text(text))
 
     def store(
         self,
@@ -124,10 +268,13 @@ class LeverageCache:
                 "spec": spec.key_payload(),
             }
         )
-        leverage.save(d / "leverage.npz")
-        (d / "spec.json").write_text(json.dumps(to_mapping(spec), indent=1, default=str))
+        spec_text = json.dumps(to_mapping(spec), indent=1, default=str)
+        atomic_write(d / SPEC_NAME, lambda tmp: tmp.write_text(spec_text))
+        # a report left from an earlier leverage of this key does not describe the new one
+        (d / DIAGNOSTICS_NAME).unlink(missing_ok=True)
+        atomic_write(d / LEVERAGE_NAME, leverage.save)  # the commit point
         if report is not None:
-            report.save(d / "diagnostics.json")
+            self._write_report(d, report)
         self._append_manifest(key, spec, leverage, report)
         return d
 
@@ -160,17 +307,51 @@ class LeverageCache:
             "wall_time": float(leverage.metadata.get("wall_time", float("nan"))),
             "max_abs_error_vp": report.max_abs_error() if report is not None else None,
         }
+        # Concurrent writers (a ``--workers N`` pool, or N ``--shard i/n`` processes sharing one
+        # cache) serialise the read-modify-write on an advisory lock held on a sibling file, and
+        # publish the new manifest by an atomic rename, so a reader never sees a torn parquet
+        # and no writer's row is lost.  The on-disk format is unchanged.
+        row_df = pd.DataFrame([row])
+        self._update_manifest(
+            lambda old: (
+                row_df
+                if old.empty
+                else pd.concat([old[old["key"] != key], row_df], ignore_index=True)
+            )
+        )
+
+    def _update_manifest(self, update: Callable[[pd.DataFrame], pd.DataFrame]) -> pd.DataFrame:
+        """``update(current manifest)`` under the lock, published by :func:`atomic_write`."""
         self.root.mkdir(parents=True, exist_ok=True)
-        path = self.root / "manifest.parquet"
-        df = pd.DataFrame([row])
-        if path.exists():
-            old = pd.read_parquet(path)
-            old = old[old["key"] != key]
-            df = pd.concat([old, df], ignore_index=True)
-        df.to_parquet(path, index=False)
+        path = self.root / MANIFEST_NAME
+        with open(self.root / MANIFEST_LOCK_NAME, "a") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                old = pd.read_parquet(path) if path.exists() else pd.DataFrame({"key": []})
+                new = update(old)
+                atomic_write(path, lambda tmp: new.to_parquet(tmp, index=False))
+                return new
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+    def merge_manifest(self, rows: pd.DataFrame) -> tuple[int, int]:
+        """Add the rows of another copy of this cache's manifest whose key this one lacks (the
+        runbook's merge of a VM's manifest), under the lock and atomically.  Returns
+        ``(rows before, rows added)``."""
+        counts: list[int] = []
+
+        def _merge(old: pd.DataFrame) -> pd.DataFrame:
+            add = rows[~rows["key"].isin(old["key"])]
+            counts.extend([len(old), len(add)])
+            if old.empty:
+                return add.reset_index(drop=True)
+            return pd.concat([old, add], ignore_index=True)
+
+        self._update_manifest(_merge)
+        return counts[0], counts[1]
 
     def manifest(self) -> pd.DataFrame:
-        path = self.root / "manifest.parquet"
+        path = self.root / MANIFEST_NAME
         return pd.read_parquet(path) if path.exists() else pd.DataFrame()
 
     # -- entry point ---------------------------------------------------------------------------

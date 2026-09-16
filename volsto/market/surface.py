@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -394,14 +395,481 @@ class GridSurface(ImpliedSurface):
 # --------------------------------------------------------------------------------------------
 
 
+CALENDAR_GRID_N_T: int = 200
+"""Maturities from ``min_maturity`` to the last pillar in the eSSVI constructor's calendar grid
+(M3b)."""
+CALENDAR_SEGMENT_N: int = 48
+"""Maturities per knot segment, both ends included, of the repair's constraint grid and of the
+initial partition of :func:`certify_calendar` (M10 Part 0: 7 segments of 48 points match the
+200-point grid's density on the 1m-2y segments and are denser on the short ones)."""
+CERT_N_K: int = 121
+"""Log-moneyness points of the initial partition of :func:`certify_calendar` (step 0.05 on
+``±3``: the repair's ``k`` grid, so the cell corners are its constraint points)."""
+CERT_MAX_LEVELS: int = 60
+"""Bisection levels of :func:`certify_calendar` before it gives up (``inconclusive``); a cell
+edge halves per level, so 60 levels reach below ``1e-19`` of the initial cell."""
+CERT_MAX_CELLS: int = 4_000_000
+"""Cells :func:`certify_calendar` may examine in total before it gives up (``inconclusive``;
+bounds memory and time, never turned into a pass)."""
+CERT_MAX_POINTS: int = 64
+"""Largest number of violating points :func:`certify_calendar` returns (lowest first)."""
+DENSE_CHECK_K_ABS: float = 3.0
+"""Half-width in ``k`` of :meth:`ESSVISurface.calendar_dense_check`: the Dupire range."""
+DENSE_CHECK_N_K: int = 1201
+"""Log-moneyness points of the dense check (step 0.005; the M10 Part 0 verifier's grid)."""
+DENSE_CHECK_N_T: int = 3000
+"""Maturities of the dense check on ``[min_maturity, max_maturity]`` (the verifier's grid), plus
+every knot, evaluated with the slopes of both adjacent segments."""
+
+
+def calendar_t_grid(
+    min_maturity: float,
+    pillars: Sequence[float] | FloatArray,
+    max_maturity: float,
+    n_t: int = CALENDAR_GRID_N_T,
+) -> FloatArray:
+    """Maturity grid of the eSSVI constructor's calendar check:
+    ``unique(linspace(min_maturity, last_pillar, n_t) ∪ pillars ∪ {max_maturity})``.
+
+    The pillars are included (M10 Part 0 fix): ``θ_T`` and ``ρ_T`` kink there, and ``∂_T w`` is
+    evaluated there with both one-sided slopes.  The ``unique`` removes the zero-length step the
+    M3b grid had when the last pillar equals ``max_maturity`` (3y on seven-pillar days).  Checked
+    by ``test_essvi_calendar_grid_dedup`` and ``test_essvi_calendar_grid_sees_pillars``."""
+    pil = np.atleast_1d(np.asarray(pillars, dtype=np.float64))
+    return np.unique(
+        np.concatenate(
+            (np.linspace(min_maturity, float(pil[-1]), int(n_t)), pil, [float(max_maturity)])
+        )
+    ).astype(np.float64)
+
+
+def calendar_knots(
+    min_maturity: float, pillars: Sequence[float] | FloatArray, max_maturity: float
+) -> FloatArray:
+    """``{min_maturity} ∪ {pillars strictly inside} ∪ {max_maturity}``: the maturities between
+    which ``θ_T`` and ``ρ_T`` are affine, so ``w(k, T)`` is smooth on every knot segment and
+    ``∂_T w`` may jump only at a knot."""
+    pil = np.atleast_1d(np.asarray(pillars, dtype=np.float64))
+    inside = pil[(pil > min_maturity) & (pil < max_maturity)]
+    return np.unique(np.concatenate(([float(min_maturity)], inside, [float(max_maturity)])))
+
+
+def ssvi_theta(
+    pillars: Sequence[float] | FloatArray,
+    theta_p: Sequence[float] | FloatArray,
+    T: ArrayLike,
+) -> FloatArray:
+    """``θ_T`` exactly as :meth:`SSVISurface.theta` evaluates it: linear from ``θ_0 = 0``
+    through the pillars, the last forward variance extended beyond the last pillar."""
+    t = np.concatenate(([0.0], np.asarray(pillars, dtype=np.float64)))
+    th = np.concatenate(([0.0], np.asarray(theta_p, dtype=np.float64)))
+    T_ = np.asarray(T, dtype=np.float64)
+    slope = (th[-1] - th[-2]) / (t[-1] - t[-2])
+    beyond = th[-1] + slope * (T_ - t[-1])
+    return np.asarray(np.where(t[-1] < T_, beyond, np.interp(T_, t, th)), dtype=np.float64)
+
+
+def essvi_dw_dt(
+    k: ArrayLike,
+    theta: ArrayLike,
+    dtheta: ArrayLike,
+    rho: ArrayLike,
+    drho: ArrayLike,
+    eta: float,
+    gamma: float,
+) -> FloatArray:
+    r"""Exact ``∂_T w`` of eSSVI where ``θ_T`` and ``ρ_T`` are affine in ``T`` with slopes
+    ``dtheta`` and ``drho`` (inside a knot segment; at a knot, the one-sided limit on the side
+    whose slopes are passed).
+
+    With ``x = kφ(θ)``, ``S = sqrt((x+ρ)² + 1 − ρ²)``, ``g = 1 + ρx + S`` (so ``w = θg/2``) and
+    ``χ = θ|φ'/φ| = γ + (1−γ)θ/(1+θ)``, the chain rule ``∂_T w = θ' ∂_θ w + ρ' ∂_ρ w`` (``φ``
+    depends on ``T`` through ``θ``: ``∂_T x = −x θ' χ / θ``) collapses to
+
+    .. math::
+        \partial_T w = \tfrac{\theta'}{2}\, g \Big(1 - \chi + \frac{\chi}{S}\Big)
+                     + \tfrac{\theta\rho'}{2}\, x \Big(1 + \frac{1}{S}\Big),
+
+    using ``S² − x² − ρx = 1 + ρx``.  The first term is positive whenever ``θ' > 0`` (SSVI with
+    one ``ρ`` is calendar-free); only ``ρ' x < 0`` can make ``∂_T w`` negative.  Checked against
+    finite differences by ``tests/test_surface.py::test_essvi_dw_dt_is_the_derivative``."""
+    k_ = np.asarray(k, dtype=np.float64)
+    th = np.asarray(theta, dtype=np.float64)
+    r = np.asarray(rho, dtype=np.float64)
+    phi = eta / (th**gamma * (1.0 + th) ** (1.0 - gamma))
+    x = phi * k_
+    s = np.sqrt((x + r) ** 2 + 1.0 - r * r)
+    g = 1.0 + r * x + s
+    chi = gamma + (1.0 - gamma) * th / (1.0 + th)
+    out = 0.5 * np.asarray(dtheta) * g * (1.0 - chi + chi / s) + 0.5 * th * np.asarray(drho) * x * (
+        1.0 + 1.0 / s
+    )
+    return np.asarray(out, dtype=np.float64)
+
+
+@dataclass(frozen=True)
+class CalendarSegments:
+    """The knot segments ``[a_i, b_i]`` of an eSSVI surface with ``θ_T = θ_a + θ'(T − a)`` and
+    ``ρ_T = ρ_a + ρ'(T − a)`` on each (see :func:`calendar_knots`)."""
+
+    a: FloatArray
+    b: FloatArray
+    theta_a: FloatArray
+    dtheta: FloatArray
+    rho_a: FloatArray
+    drho: FloatArray
+
+    @classmethod
+    def from_knots(
+        cls, knots: FloatArray, theta_knots: FloatArray, rho_knots: FloatArray
+    ) -> CalendarSegments:
+        """Segments between consecutive knots from ``θ`` and ``ρ`` at the knots."""
+        kn = np.asarray(knots, dtype=np.float64)
+        th = np.asarray(theta_knots, dtype=np.float64)
+        r = np.asarray(rho_knots, dtype=np.float64)
+        dt = np.diff(kn)
+        return cls(kn[:-1], kn[1:], th[:-1], np.diff(th) / dt, r[:-1], np.diff(r) / dt)
+
+    @property
+    def n(self) -> int:
+        return int(self.a.size)
+
+    def theta(self, seg: NDArray[np.intp], T: FloatArray) -> FloatArray:
+        return np.asarray(self.theta_a[seg] + self.dtheta[seg] * (T - self.a[seg]))
+
+    def rho(self, seg: NDArray[np.intp], T: FloatArray) -> FloatArray:
+        return np.asarray(self.rho_a[seg] + self.drho[seg] * (T - self.a[seg]))
+
+    def points(self, Ts: FloatArray) -> tuple[NDArray[np.intp], FloatArray]:
+        """``(seg, T)`` for every maturity of ``Ts`` inside ``[a_i, b_i]``, per segment; a knot
+        appears once for each segment it bounds (both one-sided limits)."""
+        segs, ts = [], []
+        for i in range(self.n):
+            m = Ts[(Ts >= self.a[i]) & (Ts <= self.b[i])]
+            segs.append(np.full(m.size, i, dtype=np.intp))
+            ts.append(m)
+        return np.concatenate(segs), np.concatenate(ts).astype(np.float64)
+
+    def segment_grid(self, n_t: int) -> tuple[NDArray[np.intp], FloatArray]:
+        """``(seg, T)`` of ``linspace(a_i, b_i, n_t)`` on every segment (both ends, so both
+        one-sided limits at every knot)."""
+        segs = np.repeat(np.arange(self.n, dtype=np.intp), int(n_t))
+        u = np.linspace(0.0, 1.0, int(n_t))
+        ts = (self.a[:, None] + (self.b - self.a)[:, None] * u[None, :]).ravel()
+        ts[int(n_t) - 1 :: int(n_t)] = self.b  # the right end exactly on the knot
+        return segs, ts
+
+    def dw_dt(
+        self, k: ArrayLike, seg: NDArray[np.intp], T: FloatArray, eta: float, gamma: float
+    ) -> FloatArray:
+        """Exact ``∂_T w`` at ``(k, T)`` with the slopes of segment ``seg`` (broadcast)."""
+        return essvi_dw_dt(
+            k,
+            self.theta(seg, T),
+            self.dtheta[seg],
+            self.rho(seg, T),
+            self.drho[seg],
+            eta,
+            gamma,
+        )
+
+
+def essvi_segments(
+    pillars: Sequence[float] | FloatArray,
+    theta_p: Sequence[float] | FloatArray,
+    rhos: Sequence[float] | FloatArray,
+    min_maturity: float,
+    max_maturity: float,
+) -> CalendarSegments:
+    """:class:`CalendarSegments` of the eSSVI surface with these pillar parameters (``θ`` as
+    :func:`ssvi_theta`, ``ρ_T = interp(T, pillars, rhos)``, flat outside the pillars)."""
+    kn = calendar_knots(min_maturity, pillars, max_maturity)
+    pil = np.asarray(pillars, dtype=np.float64)
+    return CalendarSegments.from_knots(
+        kn, ssvi_theta(pil, theta_p, kn), np.interp(kn, pil, np.asarray(rhos, dtype=np.float64))
+    )
+
+
+def _imul(
+    al: FloatArray, ah: FloatArray, bl: FloatArray, bh: FloatArray
+) -> tuple[FloatArray, FloatArray]:
+    """Interval product ``[al, ah] × [bl, bh]``."""
+    p = np.stack([al * bl, al * bh, ah * bl, ah * bh])
+    return np.asarray(p.min(axis=0)), np.asarray(p.max(axis=0))
+
+
+def dw_dt_lower_bound(
+    segs: CalendarSegments,
+    seg: NDArray[np.intp],
+    T0: FloatArray,
+    T1: FloatArray,
+    k0: FloatArray,
+    k1: FloatArray,
+    eta: float,
+    gamma: float,
+) -> FloatArray:
+    r"""A lower bound of the exact ``∂_T w`` (:func:`essvi_dw_dt`) over each cell
+    ``[T0, T1] × [k0, k1]`` inside segment ``seg`` (closed: both knot limits included).
+
+    Every factor's range over the cell is exact, from monotonicity (``η ≥ 0``,
+    ``0 < γ ≤ 1``): ``θ`` and ``ρ`` are affine in ``T``; ``φ`` decreases in ``θ``, so
+    ``x = kφ`` spans the four products of the ends; ``χ`` increases in ``θ``; ``S² = x² + 2ρx + 1``
+    is linear in ``ρ`` and convex in ``x`` (minimum at ``x = −ρ``, clipped); ``g = 1 + ρx + S``
+    is monotone in ``ρ`` (``∂_ρ g = x(1 + 1/S)``) and convex in ``x`` (minimum at ``x = −2ρ``,
+    clipped).  The two terms are then combined by interval arithmetic, treating the factors as
+    independent, which can only widen the range: the result is a valid lower bound (up to
+    floating-point rounding, ~1e-16 relative), and it converges to the point value at rate
+    O(cell size) as the cell shrinks — which is what lets :func:`certify_calendar` terminate."""
+    dth = segs.dtheta[seg]
+    th0 = segs.theta_a[seg] + dth * (T0 - segs.a[seg])
+    th1 = segs.theta_a[seg] + dth * (T1 - segs.a[seg])
+    thl, thh = np.minimum(th0, th1), np.maximum(th0, th1)
+    drh = segs.drho[seg]
+    r0 = segs.rho_a[seg] + drh * (T0 - segs.a[seg])
+    r1 = segs.rho_a[seg] + drh * (T1 - segs.a[seg])
+    rl, rh = np.minimum(r0, r1), np.maximum(r0, r1)
+
+    def phi(t: FloatArray) -> FloatArray:
+        return np.asarray(eta / (t**gamma * (1.0 + t) ** (1.0 - gamma)))
+
+    def chi(t: FloatArray) -> FloatArray:
+        return np.asarray(gamma + (1.0 - gamma) * t / (1.0 + t))
+
+    xl, xh = _imul(k0, k1, phi(thh), phi(thl))
+
+    def q(x: FloatArray, r: FloatArray) -> FloatArray:
+        return np.asarray((x + r) ** 2 + 1.0 - r * r)
+
+    corners = [(xl, rl), (xl, rh), (xh, rl), (xh, rh)]
+    q_lo = np.minimum(q(np.clip(-rl, xl, xh), rl), q(np.clip(-rh, xl, xh), rh))
+    q_hi = np.max(np.stack([q(x, r) for x, r in corners]), axis=0)
+    s_lo, s_hi = np.sqrt(q_lo), np.sqrt(q_hi)
+
+    def gf(x: FloatArray, r: FloatArray) -> FloatArray:
+        return np.asarray(1.0 + r * x + np.sqrt(q(x, r)))
+
+    g_lo = np.minimum(gf(np.clip(-2.0 * rl, xl, xh), rl), gf(np.clip(-2.0 * rh, xl, xh), rh))
+    g_hi = np.max(np.stack([gf(x, r) for x, r in corners]), axis=0)
+    # h1 = 1 − χ (1 − 1/S)
+    cu_lo, cu_hi = _imul(chi(thl), chi(thh), 1.0 - 1.0 / s_lo, 1.0 - 1.0 / s_hi)
+    gh_lo, gh_hi = _imul(g_lo, g_hi, 1.0 - cu_hi, 1.0 - cu_lo)
+    t1_lo, _ = _imul(0.5 * dth, 0.5 * dth, gh_lo, gh_hi)
+    # x (1 + 1/S)
+    b_lo, b_hi = _imul(xl, xh, 1.0 + 1.0 / s_hi, 1.0 + 1.0 / s_lo)
+    tb_lo, tb_hi = _imul(thl, thh, b_lo, b_hi)
+    t2_lo, _ = _imul(0.5 * drh, 0.5 * drh, tb_lo, tb_hi)
+    return np.asarray(t1_lo + t2_lo, dtype=np.float64)
+
+
+@dataclass(frozen=True)
+class CalendarCertificate:
+    """Outcome of :func:`certify_calendar` (``∂_T w`` per year).
+
+    ``status`` is ``"certified"`` (``∂_T w ≥ floor`` proven on the whole range, knot limits
+    included; ``lower_bound`` is the smallest cell bound that proved it), ``"violated"`` (points
+    with ``∂_T w < stop_below`` were found: ``cut_*``, lowest first) or ``"inconclusive"`` (the
+    level or cell budget ran out: never a pass).  ``min_value`` / ``min_k`` / ``min_T`` /
+    ``min_seg`` locate the smallest exact ``∂_T w`` evaluated (grid points and cell centres) —
+    an upper bound of the true minimum."""
+
+    status: str
+    floor: float
+    stop_below: float
+    k_abs: float
+    lower_bound: float
+    min_value: float
+    min_k: float
+    min_T: float
+    min_seg: int
+    cut_k: FloatArray
+    cut_T: FloatArray
+    cut_seg: NDArray[np.intp]
+    levels: int
+    n_cells: int
+
+    @property
+    def certified(self) -> bool:
+        return self.status == "certified"
+
+
+def certify_calendar(
+    segs: CalendarSegments,
+    eta: float,
+    gamma: float,
+    *,
+    k_abs: float,
+    floor: float,
+    stop_below: float,
+    n_k: int = CERT_N_K,
+    n_t: int = CALENDAR_SEGMENT_N,
+    max_levels: int = CERT_MAX_LEVELS,
+    max_cells: int = CERT_MAX_CELLS,
+    max_points: int = CERT_MAX_POINTS,
+) -> CalendarCertificate:
+    """Prove ``∂_T w(k, T) ≥ floor`` for every ``|k| ≤ k_abs`` and every ``T`` of every knot
+    segment, both one-sided limits at every knot included — or find points below
+    ``stop_below`` (M10 Part 0, third pass: the invariant itself, not a grid).
+
+    Branch and bound on the exact derivative: the exact ``∂_T w`` is evaluated on
+    ``linspace(−k_abs, k_abs, n_k)`` × ``linspace(a_i, b_i, n_t)`` of every segment (with that
+    segment's slopes, so a knot is evaluated from both sides); the cells between these points
+    get the lower bound of :func:`dw_dt_lower_bound`; a cell whose bound is ``≥ floor`` is
+    proven, every other cell is bisected in ``T`` and ``k`` and its centre evaluated exactly.
+    It stops when every cell is proven (``certified``), when an evaluated point falls below
+    ``stop_below`` (``violated``), or when ``max_levels`` / ``max_cells`` run out
+    (``inconclusive``).  With ``stop_below ≥ floor`` the outcome is decided for every surface
+    except those whose minimum lies in ``[floor, stop_below)`` up to the budget: a true minimum
+    above ``floor`` is eventually proven (the bound converges to the point value), one below
+    ``stop_below`` eventually sampled.  Checked by ``tests/test_surface.py`` and
+    ``tests/test_calendar_repair.py``."""
+    ks = np.linspace(-float(k_abs), float(k_abs), int(n_k))
+    gseg, gT = segs.segment_grid(int(n_t))
+    D = segs.dw_dt(ks[None, :], gseg[:, None], gT[:, None], eta, gamma)
+    i, j = np.unravel_index(int(np.argmin(D)), D.shape)
+    best = (float(D[i, j]), float(ks[j]), float(gT[i]), int(gseg[i]))
+    n_cells = 0
+    lb_min = np.inf
+    empty_f = np.empty(0, dtype=np.float64)
+    empty_i = np.empty(0, dtype=np.intp)
+
+    def done(
+        status: str, level: int, cut: tuple[FloatArray, FloatArray, NDArray[np.intp]] | None
+    ) -> CalendarCertificate:
+        ck, cT, cs = cut if cut is not None else (empty_f, empty_f, empty_i)
+        return CalendarCertificate(
+            status=status,
+            floor=float(floor),
+            stop_below=float(stop_below),
+            k_abs=float(k_abs),
+            lower_bound=float(lb_min) if status == "certified" else float("nan"),
+            min_value=best[0],
+            min_k=best[1],
+            min_T=best[2],
+            min_seg=best[3],
+            cut_k=ck,
+            cut_T=cT,
+            cut_seg=cs,
+            levels=level,
+            n_cells=n_cells,
+        )
+
+    def lowest(
+        vals: FloatArray, kk: FloatArray, tt: FloatArray, ss: NDArray[np.intp]
+    ) -> tuple[FloatArray, FloatArray, NDArray[np.intp]]:
+        bad = np.flatnonzero(vals < stop_below)
+        order = bad[np.argsort(vals[bad], kind="stable")][:max_points]
+        return kk[order], tt[order], ss[order]
+
+    if best[0] < stop_below:
+        KK, TT = np.broadcast_to(ks[None, :], D.shape), np.broadcast_to(gT[:, None], D.shape)
+        SS = np.broadcast_to(gseg[:, None], D.shape)
+        return done("violated", 0, lowest(D.ravel(), KK.ravel(), TT.ravel(), SS.ravel()))
+    # level-0 cells: between consecutive grid points of each segment × consecutive ks
+    nt = int(n_t)
+    ti = np.arange(segs.n * nt).reshape(segs.n, nt)
+    lo_idx, hi_idx = ti[:, :-1].ravel(), ti[:, 1:].ravel()
+    nkc = ks.size - 1
+    c_seg = np.repeat(gseg[lo_idx], nkc)
+    c_T0 = np.repeat(gT[lo_idx], nkc)
+    c_T1 = np.repeat(gT[hi_idx], nkc)
+    c_k0 = np.tile(ks[:-1], lo_idx.size)
+    c_k1 = np.tile(ks[1:], lo_idx.size)
+    for level in range(int(max_levels)):
+        n_cells += c_seg.size
+        lb = dw_dt_lower_bound(segs, c_seg, c_T0, c_T1, c_k0, c_k1, eta, gamma)
+        proven = lb >= floor
+        if np.any(proven):
+            lb_min = min(lb_min, float(np.min(lb[proven])))
+        keep = ~proven
+        if not np.any(keep):
+            return done("certified", level, None)
+        c_seg, c_T0, c_T1 = c_seg[keep], c_T0[keep], c_T1[keep]
+        c_k0, c_k1 = c_k0[keep], c_k1[keep]
+        if n_cells + 4 * c_seg.size > max_cells:
+            return done("inconclusive", level, None)
+        Tm, km = 0.5 * (c_T0 + c_T1), 0.5 * (c_k0 + c_k1)
+        v = segs.dw_dt(km, c_seg, Tm, eta, gamma)
+        m = int(np.argmin(v))
+        if float(v[m]) < best[0]:
+            best = (float(v[m]), float(km[m]), float(Tm[m]), int(c_seg[m]))
+        if best[0] < stop_below:
+            return done("violated", level + 1, lowest(v, km, Tm, c_seg))
+        c_seg = np.tile(c_seg, 4)
+        c_T0, c_T1 = np.concatenate([c_T0, Tm, c_T0, Tm]), np.concatenate([Tm, c_T1, Tm, c_T1])
+        c_k0, c_k1 = np.concatenate([c_k0, c_k0, km, km]), np.concatenate([km, km, c_k1, c_k1])
+    return done("inconclusive", int(max_levels), None)
+
+
+@dataclass(frozen=True)
+class CalendarDenseCheck:
+    """Outcome of :meth:`ESSVISurface.calendar_dense_check` (``∂_T w`` per year).
+
+    All derivative fields use the exact ``∂_T w`` (:func:`essvi_dw_dt`): ``min_interior`` over
+    the dense maturities strictly inside a knot segment, ``min_left`` / ``min_right`` the
+    one-sided limits at every interior knot (a pillar), each over every ``k``; ``worst_*``
+    locate the smallest of the three.  ``min_slope`` (secant ``Δw/ΔT``) and ``min_dw`` (step
+    ``Δw``) are the verifier's finite-difference metrics on the same grid, kept as an
+    independent cross-check.  ``certificate`` is :func:`certify_calendar` with floor 0 on the
+    same ``k`` range: ``ok`` requires it to prove ``∂_T w ≥ 0`` everywhere."""
+
+    min_interior: float
+    min_left: float
+    min_right: float
+    min_slope: float
+    min_dw: float
+    worst_k: float
+    worst_T: float
+    k_abs: float
+    n_k: int
+    n_t: int
+    certificate: CalendarCertificate
+
+    @property
+    def min_dw_dt(self) -> float:
+        """The smallest exact ``∂_T w`` on the dense grid, knot limits included (per year)."""
+        return min(self.min_interior, self.min_left, self.min_right)
+
+    @property
+    def ok(self) -> bool:
+        """``∂_T w ≥ 0`` proven on the whole range (and seen on the dense grid)."""
+        return self.certificate.certified and self.min_dw_dt >= 0.0
+
+
+def calendar_grid_dw_dt(
+    segs: CalendarSegments, eta: float, gamma: float, ks: FloatArray, Ts: FloatArray
+) -> tuple[FloatArray, NDArray[np.intp], FloatArray]:
+    """Exact ``∂_T w`` on ``ks`` × every maturity of ``Ts``, per segment (knots from both
+    sides): returns ``(D, seg, T)`` with ``D`` of shape ``(n_points, ks.size)``."""
+    seg, T = segs.points(Ts)
+    return segs.dw_dt(ks[None, :], seg[:, None], T[:, None], eta, gamma), seg, T
+
+
 class ESSVISurface(SSVISurface):
     """SSVI with a maturity-dependent correlation ``ρ_T`` (Hendriks–Martini eSSVI family).
 
     ``ρ_T`` is piecewise-linear in ``T`` between the ATM pillars (flat outside).  Butterfly
     conditions are checked with ``max|ρ|`` (sufficient); calendar-spread absence is checked
-    numerically (``w`` non-decreasing in ``T`` on a ``k`` grid) since the analytic eSSVI
-    conditions couple ``ρ_T`` and ``θ_T``.  Intended for later single-stock use.
+    on the exact derivative ``∂_T w`` (:func:`essvi_dw_dt`), since the analytic eSSVI conditions
+    couple ``ρ_T`` and ``θ_T``.  Intended for later single-stock use.
+
+    The constructor's calendar check (:meth:`calendar_min_dw_dt` below ``−CALENDAR_TOL``) runs
+    on ``k ∈ [−CALENDAR_K_ABS, CALENDAR_K_ABS]`` at the maturities of :func:`calendar_t_grid`,
+    every knot from both sides; the importer's repair
+    (:func:`volsto.market.import_hdn.repair_calendar`) proves ``∂_T w ≥ margin`` on the Dupire
+    range ``±3`` with :func:`certify_calendar`, and :meth:`calendar_dense_check` reports it.
+    Checked by ``tests/test_surface.py`` and ``tests/test_calendar_repair.py``.
     """
+
+    CALENDAR_K_ABS: float = 1.0
+    """Half-width in ``k`` of the constructor's calendar check (unchanged since M3b; the Dupire
+    range ``±3`` is enforced by the importer's repair and reported by the M10 gate)."""
+    CALENDAR_N_K: int = 81
+    """Log-moneyness points of the constructor's calendar check."""
+    CALENDAR_N_T: int = CALENDAR_GRID_N_T
+    """Maturities from ``min_maturity`` to the last pillar in the calendar check (plus every
+    pillar and ``max_maturity``)."""
+    CALENDAR_TOL: float = 1e-10
+    """Most negative exact ``∂_T w`` (per year) the constructor tolerates as round-off."""
 
     def __init__(
         self,
@@ -459,11 +927,124 @@ class ESSVISurface(SSVISurface):
             0.5 * self.rho_T(T_) * self.phi(th) * np.sqrt(th) / np.sqrt(T_), dtype=np.float64
         )
 
-    def _check_calendar_numeric(self) -> None:
-        ks = np.linspace(-1.0, 1.0, 81)
-        Ts = np.concatenate((np.linspace(self.min_maturity, self._t[-1], 200), [self.max_maturity]))
+    @property
+    def pillars(self) -> FloatArray:
+        """The ATM pillar maturities (where ``θ_T`` and ``ρ_T`` kink)."""
+        return self._rho_t.copy()
+
+    def calendar_segments(self) -> CalendarSegments:
+        """The knot segments of this surface (``θ_T`` and ``ρ_T`` affine on each)."""
+        kn = calendar_knots(self.min_maturity, self._rho_t, self.max_maturity)
+        return CalendarSegments.from_knots(kn, self.theta(kn), self.rho_T(kn))
+
+    def dw_dT(self, k: ArrayLike, T: ArrayLike, side: str = "right") -> FloatArray:
+        """Exact ``∂_T w(k, T)``; at a knot, the ``"left"`` or ``"right"`` limit.  Checked by
+        ``test_essvi_dw_dt_is_the_derivative``."""
+        if side not in ("left", "right"):
+            raise ValueError("side must be 'left' or 'right'")
+        segs = self.calendar_segments()
+        T_ = np.asarray(T, dtype=np.float64)
+        if side == "left":
+            seg = np.searchsorted(segs.b, T_, side="left")
+        else:
+            seg = np.searchsorted(segs.a, T_, side="right") - 1
+        seg = np.clip(seg, 0, segs.n - 1).astype(np.intp)
+        return segs.dw_dt(k, seg, T_, self.eta, self.gamma)
+
+    def calendar_grid(
+        self, k_abs: float | None = None, n_k: int | None = None
+    ) -> tuple[FloatArray, FloatArray]:
+        """The calendar-check grid ``(ks, Ts)``: ``ks = linspace(−k_abs, k_abs, n_k)`` (defaults
+        ``CALENDAR_K_ABS``, ``CALENDAR_N_K``) and the maturities of :func:`calendar_t_grid`
+        (every pillar included, no zero-length step).  Checked by
+        ``test_essvi_calendar_grid_dedup`` and ``test_essvi_calendar_grid_sees_pillars``."""
+        ka = self.CALENDAR_K_ABS if k_abs is None else float(k_abs)
+        nk = self.CALENDAR_N_K if n_k is None else int(n_k)
+        ks = np.linspace(-ka, ka, nk)
+        Ts = calendar_t_grid(self.min_maturity, self._rho_t, self.max_maturity, self.CALENDAR_N_T)
+        return ks, Ts
+
+    def calendar_min_dw_dt(self, k_abs: float | None = None, n_k: int | None = None) -> float:
+        """The constructor's calendar quantity: the smallest exact ``∂_T w`` (per year) over
+        :meth:`calendar_grid`, every knot evaluated with the slopes of both adjacent segments
+        (negative = calendar arbitrage).  Returns instead of raising.  Checked by
+        ``test_essvi_calendar_min_dw_dt_matches_check``."""
+        ks, Ts = self.calendar_grid(k_abs, n_k)
+        D, _, _ = calendar_grid_dw_dt(self.calendar_segments(), self.eta, self.gamma, ks, Ts)
+        return float(np.min(D))
+
+    def calendar_min_dw(self, k_abs: float | None = None, n_k: int | None = None) -> float:
+        """The M3b-era slack, for the record only: the smallest step
+        ``w(k, T_{i+1}) − w(k, T_i)`` over :meth:`calendar_grid` (the constructor no longer
+        decides on it)."""
+        ks, Ts = self.calendar_grid(k_abs, n_k)
         w = self.total_variance(ks[None, :], Ts[:, None])
-        if np.any(np.diff(w, axis=0) < -1e-10):
+        return float(np.min(np.diff(w, axis=0)))
+
+    def calendar_certificate(
+        self, k_abs: float = DENSE_CHECK_K_ABS, floor: float = 0.0
+    ) -> CalendarCertificate:
+        """:func:`certify_calendar` of this surface: prove ``∂_T w ≥ floor`` on ``|k| ≤ k_abs``
+        and every ``T`` in ``[min_maturity, max_maturity]`` (stops at the first point below
+        ``floor``)."""
+        return certify_calendar(
+            self.calendar_segments(),
+            self.eta,
+            self.gamma,
+            k_abs=k_abs,
+            floor=floor,
+            stop_below=floor,
+        )
+
+    def calendar_dense_check(
+        self,
+        k_abs: float = DENSE_CHECK_K_ABS,
+        n_k: int = DENSE_CHECK_N_K,
+        n_t: int = DENSE_CHECK_N_T,
+    ) -> CalendarDenseCheck:
+        """Verification of ``∂_T w ≥ 0`` (M10 Part 0): the exact derivative on
+        ``linspace(−k_abs, k_abs, n_k)`` × ``linspace(min_maturity, max_maturity, n_t)`` plus
+        every knot from both sides, the verifier's secant and step metrics on the same grid, and
+        the certificate of :func:`certify_calendar` (floor 0) on the same ``k`` range.  Reports,
+        never raises.  Checked by ``tests/test_surface.py`` and
+        ``tests/test_calendar_repair.py``; run on every sample day by
+        ``scripts/essvi_calendar_gate.py``."""
+        ks = np.linspace(-float(k_abs), float(k_abs), int(n_k))
+        segs = self.calendar_segments()
+        knots = np.concatenate((segs.a, segs.b[-1:]))
+        Ts = np.union1d(np.linspace(self.min_maturity, self.max_maturity, int(n_t)), knots)
+        D, seg, tp = calendar_grid_dw_dt(segs, self.eta, self.gamma, ks, Ts)
+        at_left_end = tp == segs.a[seg]
+        at_right_end = tp == segs.b[seg]
+        interior = ~(at_left_end | at_right_end)
+        right = at_left_end & (seg > 0)  # right limit at an interior knot
+        left = at_right_end & (seg < segs.n - 1)  # left limit at an interior knot
+        ends = (at_left_end & (seg == 0)) | (at_right_end & (seg == segs.n - 1))
+
+        def rowmin(mask: NDArray[np.bool_]) -> float:
+            return float(np.min(D[mask])) if np.any(mask) else float("inf")
+
+        # the range ends (min_maturity, max_maturity) count with the interior
+        min_interior = rowmin(interior | ends)
+        i, j = np.unravel_index(int(np.argmin(D)), D.shape)
+        w = self.total_variance(ks[None, :], Ts[:, None])
+        dw = np.diff(w, axis=0)
+        return CalendarDenseCheck(
+            min_interior=min_interior,
+            min_left=rowmin(left),
+            min_right=rowmin(right),
+            min_slope=float(np.min(dw / np.diff(Ts)[:, None])),
+            min_dw=float(np.min(dw)),
+            worst_k=float(ks[j]),
+            worst_T=float(tp[i]),
+            k_abs=float(k_abs),
+            n_k=int(n_k),
+            n_t=int(n_t),
+            certificate=self.calendar_certificate(float(k_abs), 0.0),
+        )
+
+    def _check_calendar_numeric(self) -> None:
+        if self.calendar_min_dw_dt() < -self.CALENDAR_TOL:
             raise ValueError("eSSVI calendar arbitrage: total variance decreases in T for some k")
 
     def __repr__(self) -> str:

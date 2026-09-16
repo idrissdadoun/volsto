@@ -40,6 +40,7 @@ from pandas.testing import assert_frame_equal
 from volsto.models.leverage import LeverageFunction
 from volsto.viewers import api, app
 from volsto.viewers.config import ENV_CONFIG_FILE, ENV_VARS, ViewerConfig
+from volsto.viewers.grid import load_grid
 from volsto.viewers.pages import PAGES, page_paths
 from volsto.viewers.store import TABLES, StoreReader, mc_columns_without_stderr
 
@@ -544,11 +545,17 @@ def test_precompute_dry_run_cli(toy: StoreEnv, tmp_path: Path) -> None:
         for ln in full.stdout.splitlines()
         if ln.lstrip(" *").startswith(("none", "light", "full"))
     ]
-    # four rows since the light tier is projected at both fwd-var bucket counts (the configured
-    # 20-bucket M5 ladder and the coarse ladder over the light pillars), one of them starred
+    # four rows since the light tier is projected at both fwd-var bucket counts: first the
+    # configured one (the grid's coarse ladder over the light pillars, owner's decision
+    # 2026-09-16), starred as the requested tier, then the 20-bucket M5 ladder as the alternative
     assert len(tiers) == 4, full.stdout
-    assert sum(ln.startswith(" *") for ln in tiers) == 1, tiers
+    starred = [ln for ln in tiers if ln.startswith(" *")]
+    assert len(starred) == 1, tiers
     light = [ln for ln in tiers if ln.lstrip(" *").startswith("light")]
-    assert len(light) == 2 and "20-bucket" in light[0] and "3-bucket" in light[1], light
+    configured = load_grid(DEFAULT_GRID).risk.fwd_var_buckets
+    assert configured == 3  # the owner's grid decision; the rows below follow the YAML
+    assert len(light) == 2 and light[0] == starred[0], light
+    assert f" {configured}-bucket fwd-var ladder" in light[0], light
+    assert " 20-bucket fwd-var ladder" in light[1] and not light[1].startswith(" *"), light
     print(f"\ndefault-grid dry run from the CLI in {wall:.1f} s:\n" + "\n".join(tiers))
     print(f"toy build wall (session fixture): {t.wall_s:.1f} s")
