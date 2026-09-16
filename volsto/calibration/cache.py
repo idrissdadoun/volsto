@@ -77,8 +77,11 @@ class LeverageCache:
     """Directory-backed cache; see module docstring."""
 
     def __init__(self, root: str | Path) -> None:
+        #: the cache root is **not** created here: a reader (the viewers' read API, a
+        #: ``--dry-run`` projection, a test that asserts nothing was calibrated) must leave a
+        #: missing root missing.  The writers create it — :meth:`store` through the entry
+        #: directory's ``parents=True`` and :meth:`_record` before the manifest.
         self.root = Path(root)
-        self.root.mkdir(parents=True, exist_ok=True)
 
     # -- addressing ----------------------------------------------------------------------------
 
@@ -157,6 +160,7 @@ class LeverageCache:
             "wall_time": float(leverage.metadata.get("wall_time", float("nan"))),
             "max_abs_error_vp": report.max_abs_error() if report is not None else None,
         }
+        self.root.mkdir(parents=True, exist_ok=True)
         path = self.root / "manifest.parquet"
         df = pd.DataFrame([row])
         if path.exists():

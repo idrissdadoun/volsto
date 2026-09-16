@@ -22,9 +22,11 @@ dependencies = [
 
 [project.scripts]
 volsto-import = "volsto.market.import_hdn:main"
+volsto-precompute = "volsto.viewers.precompute:main"
+volsto-viewer = "volsto.viewers.app:main"
 
 [project.optional-dependencies]
-viewers = ["plotly>=5.18", "streamlit>=1.30", "openpyxl>=3.1"]
+viewers = ["plotly>=5.18", "streamlit>=1.30", "openpyxl>=3.1", "kaleido"]
 data = ["yfinance>=0.2"]
 dev = [
     "pytest>=7.4",

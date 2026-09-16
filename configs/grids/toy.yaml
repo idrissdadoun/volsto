@@ -1,0 +1,36 @@
+# Toy grid of the test suite — the toy calibration runs exactly once per pytest run, in the
+# tests/conftest.py session fixture (toy_build, the one sanctioned calibrating site; consumed by
+# tests/test_precompute.py and tests/test_viewers_app.py): the placeholder surface, 1F
+# ν ∈ {0.25, 0.5} × ρ −0.7 × κ 1.5 (2 points) + Table 8.2 (1 point) = 3 calibrations at 2·10⁴
+# particles over a 1y horizon, plus the surface's LV point; tiny pricing budget, no risk, M4
+# products only.  Loaded as volsto.viewers.grid.GridSpec.
+name: toy
+reference_spec: configs/studies/lsv_reference_2f.yaml
+surfaces:
+  - {name: placeholder, kind: placeholder, one_factor: true, two_factor: true, marking: false}
+particle:
+  n_particles: 20000
+  horizon: 1.0
+one_factor:
+  nu: [0.25, 0.5]
+  rho: [-0.7]
+  kappa: [1.5]
+two_factor_presets:
+  - name: "Table 8.2"
+    model: {nu: 1.74, theta: 0.245, k1: 5.35, k2: 0.28, rho12: 0.0, rho_SX1: -0.759, rho_SX2: -0.487}
+include_degenerate: false  # the toy keeps its 3 points
+products:
+  m4: true
+  m6: false
+  conditional: false
+  cliquet_maturities: [1.0]
+pricing:
+  n_paths: 4000
+  seed: 2024
+risk:
+  tier: none
+  products: ["autocall 3y", "cliquet 1y"]
+  light_pillars: [0.25, 1.0, 3.0]
+  fwd_var_buckets: 20     # unused at tier none; kept at the default (the M5 ladder) so the
+                          # grid loads with the production setting.  20 = the M5 ladder,
+                          # 3 = len(light_pillars), the coarse ladder; --dry-run projects both.

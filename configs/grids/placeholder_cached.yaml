@@ -1,0 +1,32 @@
+# The placeholder surface's CACHED headline models (viewer demo and the model-risk page's
+# baseline test): the 1F ω ∈ {1, 2, 3} points (ν 0.5 / 1 / 1.5, ρ −0.7, κ 1.5) and Table 8.2 at
+# 8·10⁵ particles — cache hits, nothing calibrates — plus the surface's LV point; the M4 / M6
+# headline set at the baseline budget (400k paths, seed 2024), no risk tier.
+# Loaded as volsto.viewers.grid.GridSpec.
+name: placeholder_cached
+reference_spec: configs/studies/lsv_reference_2f.yaml
+surfaces:
+  - {name: placeholder, kind: placeholder, one_factor: true, two_factor: true, marking: false}
+particle:
+  n_particles: 800000
+  horizon: 3.0
+one_factor:
+  nu: [0.5, 1.0, 1.5]
+  rho: [-0.7]
+  kappa: [1.5]
+two_factor_presets:
+  - name: "Table 8.2"
+    model: {nu: 1.74, theta: 0.245, k1: 5.35, k2: 0.28, rho12: 0.0, rho_SX1: -0.759, rho_SX2: -0.487}
+include_degenerate: true
+products:
+  m4: true
+  m6: true
+  conditional: true
+  cliquet_maturities: [1.0, 2.0]
+pricing:
+  n_paths: 400000
+  seed: 2024
+risk:
+  tier: none
+  products: ["autocall 3y", "cliquet 1y"]
+  light_pillars: [0.25, 1.0, 3.0]
