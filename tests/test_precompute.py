@@ -41,6 +41,7 @@ from volsto.risk.ladders import default_buckets
 from volsto.viewers import precompute
 from volsto.viewers.grid import (
     DEGENERATE_ONE_FACTOR,
+    M5_FWD_VAR_BUCKETS,
     MODES,
     GridPoint,
     RiskSettings,
@@ -450,22 +451,30 @@ def test_risk_plan_counts_follow_the_grid_settings() -> None:
     pillars + 1 pricings), measured against a counting pass of the RiskEngine plan on a
     non-simulating engine (reported in the stream's measurements, too slow for the suite).  The
     full tier is the measured engine constant, which no grid setting changes."""
-    risk = load_grid(DEFAULT_GRID).risk
-    assert (risk.tier, risk.fwd_var_buckets, risk.light_pillars) == ("light", 20, (0.25, 1.0, 3.0))
-    assert precompute.risk_plan("none", risk) == (0, 0)
-    assert precompute.risk_plan("light", risk) == (34, 72)
-    assert precompute.risk_plan("light", risk, 3) == (17, 38)
-    assert precompute.risk_plan("full", risk) == (
+    # the default grid runs the light tier on the coarse 3-bucket ladder (owner's decision of
+    # 2026-09-16: the grid is for cross-model comparison); 20 stays the library default
+    coarse = load_grid(DEFAULT_GRID).risk
+    assert (coarse.tier, coarse.fwd_var_buckets, coarse.light_pillars) == (
+        "light",
+        3,
+        (0.25, 1.0, 3.0),
+    )
+    assert M5_FWD_VAR_BUCKETS == len(default_buckets()) == 20
+    m5 = dataclasses.replace(coarse, fwd_var_buckets=M5_FWD_VAR_BUCKETS)
+    assert precompute.risk_plan("none", m5) == (0, 0)
+    assert precompute.risk_plan("light", m5) == (34, 72)
+    assert precompute.risk_plan("light", m5, 3) == (17, 38)
+    assert precompute.risk_plan("full", m5) == (
         precompute.RISK_FULL_CALIBRATIONS,
         precompute.RISK_FULL_PRICINGS,
     )
-    assert precompute.alternative_buckets(risk) == 3
+    assert precompute.alternative_buckets(m5) == 3
     # the coarse ladder is the tent over the light pillars; the M5 one is the library's
-    assert precompute.light_buckets(risk) == default_buckets()
-    coarse = dataclasses.replace(risk, fwd_var_buckets=3)
+    assert precompute.light_buckets(m5) == default_buckets()
     assert precompute.light_buckets(coarse) == ((0.0, 0.25), (0.25, 1.0), (1.0, 3.0))
     assert precompute.risk_plan("light", coarse) == (17, 38)
     assert precompute.alternative_buckets(coarse) == 20
+    risk = m5  # the pillar-count check below starts from the M5 ladder
     # one more pillar moves both counts by one calibration and one pricing per product
     four = dataclasses.replace(risk, light_pillars=(0.25, 1.0, 2.0, 3.0))
     assert precompute.risk_plan("light", four) == (35, 74)

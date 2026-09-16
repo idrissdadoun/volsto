@@ -58,10 +58,17 @@ risk:
   tier: light              # none | light | full (volsto-precompute --risk overrides)
   products: ["autocall 3y", "cliquet 1y"]
   light_pillars: [0.25, 1.0, 3.0]
-  fwd_var_buckets: 20     # light tier's fwd-var ladder: 20 = the M5 ladder (monthly to 1y,
-                          # quarterly to 3y), the default meaning of "fwd-var ladder" since M5;
-                          # 3 = len(light_pillars), the coarse ladder (0,0.25),(0.25,1),(1,3) —
-                          # 17 instead of 34 leverage recalibrations per LSV point.  Every
-                          # bucket is a recalibration, so this is the single largest lever on
-                          # the budget: --dry-run projects both (224.3 h vs 121.7 h on this
-                          # grid at the measured cache wall times).
+  fwd_var_buckets: 3      # OWNER DECISION 2026-09-16: 3 for the grid, 20 stays the library
+                          # default.  The grid exists for cross-model comparison, where a
+                          # short / belly / long ladder — (0,0.25), (0.25,1), (1,3), i.e.
+                          # len(light_pillars) — is ample; the 20-bucket M5 ladder (monthly to 1y,
+                          # quarterly to 3y) is a per-product RiskReport, generated on demand for
+                          # one point with the risk-only refresh at the full tier, which runs
+                          # every section at the library defaults (the 20-bucket ladder included):
+                          #   volsto-precompute --grid <this> --only <id> --resume --risk full
+                          # (--resume compares tiers, not bucket counts, so re-running light with
+                          # 20 here would skip a point stored at light) — or directly from
+                          # volsto.risk.report.risk_report, whose default is the 20-bucket
+                          # ladder.  Every bucket is one leverage
+                          # recalibration: 17 instead of 34 per LSV point, 121.7 h instead of
+                          # 224.3 h single-process on this grid (volsto-precompute --dry-run).

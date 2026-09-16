@@ -1407,10 +1407,14 @@ class Hedger:
 
         cfg = rule.config()
         held_flags: tuple[str, ...] = ()
+        # the step-0 provenance of the state surface read at this date (radicand guard, rho
+        # clip): recorded per refit, since it is what decides whether the refit is degenerate
+        targets_flags: tuple[str, ...] = ()
         if rule.refit is not None:
             params = rule.refit(surf, ctx.state.spec.model)
         else:
             targets = marking_targets_for(surf, cfg, ssr_target=rule.ssr_target)
+            targets_flags = tuple(targets.flags)
             if rule.sticky:
                 if rule.base_fit is None:
                     raise ValueError(
@@ -1430,10 +1434,14 @@ class Hedger:
             msg = (
                 f"recalibration at t={t:g} ({rule.policy}): the refit lands with "
                 + ", ".join(f"{k} = {v:+.4f}" for k, v in at_bound.items())
-                + f" (|rho| >= {CORRELATION_BOUND}): the state surface's skew at "
-                f"{tuple(rule.pillars)} is not attainable with the held targets and the fit runs "
-                "to the correlation bound — the repricing it books is a bound artefact, not a "
-                "measurement of the desk's re-marking"
+                + f" (|rho| >= {CORRELATION_BOUND}) — a degenerate two-factor set, so the "
+                "repricing it books is not a measurement of the desk's re-marking. "
+                "Step-0 flags of the state surface read at this date: "
+                + ("; ".join(targets_flags) if targets_flags else "none")
+                + ". (Measured cause on the M8b study-C runs: the strip's curvature read is "
+                "unconverged at the world path count, step 0's radicand guard fires and clips "
+                "Corr_SABR to -1, and the pinned set is then step 3's exact minimiser; the skew "
+                "target itself is attainable.)"
             )
             log.warning(msg)
             if msg not in ctx.notes:
@@ -1455,6 +1463,7 @@ class Hedger:
                 "cache_hit": hit,
                 "held": "; ".join(held_flags),
                 "at_bound": "; ".join(f"{k}={v:+.4f}" for k, v in at_bound.items()),
+                "step0_flags": "; ".join(targets_flags),
             }
         )
         return PricingContext(model, new_state, ctx.builder, ctx.surface, ctx.label), hit
@@ -1462,8 +1471,9 @@ class Hedger:
 
 #: a fitted correlation at least this large in absolute value is a degenerate two-factor set
 #: (perfectly correlated factors): the M7 marking work guards ``rho12`` for the same reason
-#: (§15 Part 3), and 32 of the 90 ``sabr_linked`` refits of the M8b study-C runs landed here
-#: while none of the 90 ``sticky_breakeven`` refits did
+#: (§15 Part 3), and 41 of the 113 ``sabr_linked`` refits of the M8b study-C runs landed here
+#: while none of the 113 ``sticky_breakeven`` refits did — measured cause: step 0's radicand
+#: guard firing on an unconverged state-surface curvature (§8.2)
 CORRELATION_BOUND = 0.99
 
 
