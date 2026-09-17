@@ -97,7 +97,7 @@ the dry-run cost against the real run).
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -164,8 +164,22 @@ class Explain:
     """Standard error of :attr:`residual`: the per-path residual (the total's paired difference
     minus every explained item's paired combination times its move) when every explained item
     comes from a paired combination (:attr:`residual_paired`), else the root sum of squares of
-    the total's and the explained items' standard errors."""
+    the total's, the explained items' and the recalibration's standard errors — which ignores
+    their covariance (they share one seed): an indicative number, flagged."""
     residual_paired: bool = False
+    bucket_stderrs: Mapping[str, float] = dataclasses.field(default_factory=dict)
+    """The standard error of each explained bucket of :meth:`buckets` (``"spot.delta"``,
+    ``"surface.vega_T"``, ...), from the per-path sum of its items (a ladder bucket's pillars
+    are correlated: they share the seed), no extra pricing; ``time.decay`` / ``time.carry``
+    carry theta's own paired errors (:func:`volsto.risk.greeks.theta`)."""
+    group_stderrs: Mapping[str, float] = dataclasses.field(default_factory=dict)
+    """Paired standard errors of bucket sums, per path: ``spot``, ``rates``, ``surface``,
+    ``params`` (the explained items of each step), ``time`` (decay + carry: theta's held-surface
+    difference), ``greeks`` (every explained item of steps 1-6) and ``explained`` (with the
+    recalibration bucket)."""
+    unpaired: tuple[str, ...] = ()
+    """The buckets and groups whose standard error above is a root sum of squares (an item
+    without a per-path combination: a derived Greek) — indicative only."""
 
     @property
     def explained(self) -> float:
@@ -210,6 +224,7 @@ class Explain:
                 "explained": self.explained,
                 "residual": self.residual,
                 "residual_stderr": self.residual_stderr,
+                "residual_paired": self.residual_paired,
             }
         )
         return pd.DataFrame(rows)
@@ -485,8 +500,8 @@ def explain(
         _PathRecorder(FrozenLeverageEngine(outer, state_0)) if mode == "sticky_leverage" else outer
     )
     steps: list[Step] = []
-    # (Greek, the move it multiplies) for every explained item of steps 1-6
-    explained_paths: list[tuple[Sensitivity, float]] = []
+    # (bucket, Greek, the move it multiplies) for every explained item of steps 1-6
+    explained_paths: list[tuple[str, Sensitivity, float]] = []
     time_stderrs: list[float] = []
     surf0, surf1 = surface_of(state_0), surface_of(state_1)
 
@@ -497,7 +512,7 @@ def explain(
         d, g = delta_gamma(eng, product, state_0, "sticky_moneyness", size)
         ds = state_1.spot - state_0.spot
         det = {"delta": d.value * ds, "gamma": 0.5 * g.value * ds * ds}
-        explained_paths += [(d, ds), (g, 0.5 * ds * ds)]
+        explained_paths += [("spot.delta", d, ds), ("spot.gamma", g, 0.5 * ds * ds)]
         steps.append(Step("spot", act.value, act.stderr, det["delta"] + det["gamma"], det))
 
     # 2. rates
@@ -516,7 +531,7 @@ def explain(
         act = _actual(eng, product, s_a, s_b, "explain.rates")
         rs = curve_move_sensitivities(eng, product, state_0, state_1)
         det = {"rho": rs["rho"].value, "repo": rs["repo"].value}
-        explained_paths += [(rs["rho"], 1.0), (rs["repo"], 1.0)]
+        explained_paths += [("rates.rho", rs["rho"], 1.0), ("rates.repo", rs["repo"], 1.0)]
         steps.append(Step("rates", act.value, act.stderr, det["rho"] + det["repo"], det))
 
     # 3. surface
@@ -535,7 +550,7 @@ def explain(
         if detail == "parallel":
             v = parallel_vega(eng, product, state_0, "recalibrated", size)
             det["parallel_vega"] = v.value * float(d_atm.mean()) / 0.01
-            explained_paths.append((v, float(d_atm.mean()) / 0.01))
+            explained_paths.append(("surface.parallel_vega", v, float(d_atm.mean()) / 0.01))
         else:
             vt = vega_T(eng, product, state_0, pillars, size, with_tents=True)
             det["vega_T"] = float(sum(t.value * dv / 0.01 for t, dv in zip(vt.tents, d_atm)))
@@ -545,9 +560,15 @@ def explain(
             cv = curvature_T(eng, product, state_0, pillars, size)
             det["skew_T"] = float(sum(e.value * x / 0.01 for e, x in zip(sk.entries, d_skew)))
             det["curvature_T"] = float(sum(e.value * x / 0.01 for e, x in zip(cv.entries, d_fly)))
-            explained_paths += [(t, float(dv) / 0.01) for t, dv in zip(vt.tents, d_atm)]
-            explained_paths += [(e, float(x) / 0.01) for e, x in zip(sk.entries, d_skew)]
-            explained_paths += [(e, float(x) / 0.01) for e, x in zip(cv.entries, d_fly)]
+            explained_paths += [
+                ("surface.vega_T", t, float(dv) / 0.01) for t, dv in zip(vt.tents, d_atm)
+            ]
+            explained_paths += [
+                ("surface.skew_T", e, float(x) / 0.01) for e, x in zip(sk.entries, d_skew)
+            ]
+            explained_paths += [
+                ("surface.curvature_T", e, float(x) / 0.01) for e, x in zip(cv.entries, d_fly)
+            ]
         steps.append(Step("surface", act.value, act.stderr, float(sum(det.values())), det))
 
     # 4. parameters
@@ -563,7 +584,7 @@ def explain(
             if param_moved(p0, p1):
                 ps_ = parameter_sensitivity(eng, product, state_0, name)
                 det[name] = ps_.value * (p1 - p0)
-                explained_paths.append((ps_, p1 - p0))
+                explained_paths.append((f"params.{name}", ps_, p1 - p0))
         steps.append(Step("params", act.value, act.stderr, float(sum(det.values())), det))
 
     # 5. factor state
@@ -587,13 +608,15 @@ def explain(
         aged = product.aged(dt) if product_1 is None else _theta_product(product, dt, product_theta)
         th = theta(eng, product, state_0, dt, aged=aged)
         det = {"decay": th.decay.value * dt, "carry": th.carry.value * dt}
-        # decay + carry is theta's held-surface difference (carry is derived): its paired terms
+        # decay and carry are paired combinations of theta; their sum is the held-surface
+        # difference, whose paired terms are:
         held_terms = [(aged, state_0, "recalibrate", 1.0), (product, state_0, "recalibrate", -1.0)]
         time_stderrs = [dt * th.decay.stderr, dt * th.carry.stderr]
         steps.append(Step("time", act.value, act.stderr, det["decay"] + det["carry"], det))
 
     # 7. recalibration (sticky leverage): the endpoint's leverage refit, a bucket of its own
     recal_path: FloatArray | None = None
+    recal_stderrs: list[float] = []
     if mode == "sticky_leverage":
         act = outer.paired(
             "explain.recalibration",
@@ -603,6 +626,7 @@ def explain(
             scheme="revaluation",
         )
         recal_path = outer.path_of(act)
+        recal_stderrs = [act.stderr]
         steps.append(
             Step(RECALIBRATION_STEP, act.value, act.stderr, act.value, {"recalibration": act.value})
         )
@@ -624,26 +648,84 @@ def explain(
         (state_0.label, state_1.label),
         engine.sim.n_paths,
     )
-    # the residual per path: the total minus every explained item's paired combination
-    residual_path = total_path.copy()
-    paired = True
-    for sens, move in explained_paths:
+    # per path: every bucket's sum of its items, and the residual (the total minus them all)
+    zero = np.zeros_like(total_path)
+    bucket_path: dict[str, FloatArray] = {}
+    rss: dict[str, float] = {}
+    unpaired: set[str] = set()
+    for bucket, sens, move in explained_paths:
+        rss[bucket] = rss.get(bucket, 0.0) + (move * sens.stderr) ** 2
         path = eng.path_of(sens)
         if path is None:
             if sens.value != 0.0 or sens.stderr != 0.0:  # a zero without pricing has no path
-                paired = False
+                unpaired.add(bucket)
             continue
-        residual_path = residual_path - move * path
+        bucket_path[bucket] = bucket_path.get(bucket, zero) + move * path
+    held_path = eng.path(held_terms) if held_terms else None
+    paired = not unpaired
+    bucket_se = {
+        b: (
+            (_stderr(bucket_path[b]) if b in bucket_path else 0.0)
+            if b not in unpaired
+            else float(np.sqrt(v))
+        )
+        for b, v in rss.items()
+    }
     if held_terms:
-        residual_path = residual_path - eng.path(held_terms)
+        bucket_se["time.decay"], bucket_se["time.carry"] = time_stderrs
+    members: dict[str, list[str]] = {}
+    for b in bucket_se:
+        if not b.startswith("time."):
+            members.setdefault(b.split(".", 1)[0], []).append(b)
+    group_se: dict[str, float] = {}
+    unpaired_groups: set[str] = set()
+
+    def group(name: str, names: Sequence[str], extra: Sequence[FloatArray | None]) -> None:
+        if any(b in unpaired for b in names):
+            unpaired_groups.add(name)
+            group_se[name] = float(np.sqrt(sum(rss[b] for b in names)))
+            return
+        path = zero
+        for b in names:
+            path = path + bucket_path.get(b, zero)
+        for x in extra:
+            if x is not None:
+                path = path + x
+        group_se[name] = _stderr(path)
+
+    for name, names in members.items():
+        group(name, names, ())
+    if held_path is not None:
+        group_se["time"] = _stderr(held_path)
+    greek_buckets = [b for names in members.values() for b in names]
+    group("greeks", greek_buckets, (held_path,))
+    group("explained", greek_buckets, (held_path, recal_path))
+    residual_path = total_path.copy()
+    for path in bucket_path.values():
+        residual_path = residual_path - path
+    if held_path is not None:
+        residual_path = residual_path - held_path
     if recal_path is not None:
         residual_path = residual_path - recal_path
     if paired:
         residual_se = _stderr(residual_path)
     else:
-        items = [abs(m) * s.stderr for s, m in explained_paths] + time_stderrs
+        items = [abs(m) * s.stderr for _, s, m in explained_paths]
+        items += time_stderrs + recal_stderrs
         residual_se = float(np.sqrt(total.stderr**2 + sum(x * x for x in items)))
-    return Explain(tuple(steps), total, p0, end_price, mode, s_e.key, residual_se, paired)
+    return Explain(
+        tuple(steps),
+        total,
+        p0,
+        end_price,
+        mode,
+        s_e.key,
+        residual_se,
+        paired,
+        bucket_se,
+        group_se,
+        tuple(sorted(unpaired | unpaired_groups)),
+    )
 
 
 # --------------------------------------------------------------------------------------------

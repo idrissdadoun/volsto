@@ -11,8 +11,8 @@ fixture** ``toy_build`` (the one sanctioned calibrating site: 3 leverage calibra
 particles over a 1y horizon, 4000 pricing paths, no risk, shards 1/2 and 2/2 through
 ``volsto.viewers.precompute.main`` into a temporary directory, never the repository cache);
 this file only **consumes** it, as does ``tests/test_precompute.py``.  Under ``pytest -n auto``
-the workers share that one build.  When the build exceeds its budget or fails, the toy half of
-every test skips with the reason and the wall clock; nothing here asserts on wall clock.  No
+the workers share that one build.  When the build fails, the toy half of every test fails with
+the reason; its wall clock is printed, never asserted and never used to skip.  No
 test here calibrates anything: the pages and the API read the toy cache by file, every LSV
 point's leverage is read through ``api.get_leverage`` after each render, and the toy cache's
 files are asserted unchanged (size and mtime) after every render.
@@ -70,7 +70,7 @@ class StoreEnv:
     cfg: ViewerConfig
     base: Path
     wall_s: float
-    skip_reason: str = ""
+    failure_reason: str = ""
 
 
 @pytest.fixture(scope="module")
@@ -91,29 +91,29 @@ def synthetic(tmp_path_factory: pytest.TempPathFactory) -> StoreEnv:
 @pytest.fixture(scope="session")
 def toy(toy_build: ToyBuild) -> StoreEnv:
     """The toy store of the conftest session fixture (module docstring) as a :class:`StoreEnv`;
-    ``skip_reason`` carries the fixture's (budget / failure) reason."""
+    ``failure_reason`` carries the fixture's build-failure reason."""
     cfg = ViewerConfig(
         cache_root=toy_build.cache_root,
         store_root=toy_build.store_root,
         outputs_root=toy_build.outputs_root,
         grid_path=toy_build.grid_path,
     )
-    return StoreEnv("toy", cfg, toy_build.base, toy_build.total_wall_s, toy_build.skip_reason)
+    return StoreEnv("toy", cfg, toy_build.base, toy_build.total_wall_s, toy_build.failure_reason)
 
 
 @pytest.fixture
 def env(request: pytest.FixtureRequest) -> StoreEnv:
-    """``synthetic`` or ``toy`` by parameter name; the toy half skips with its reason."""
+    """``synthetic`` or ``toy`` by parameter name; the toy half fails when its build failed."""
     store = request.getfixturevalue(str(request.param))
     assert isinstance(store, StoreEnv)
-    if store.skip_reason:
-        pytest.skip(store.skip_reason)
+    if store.failure_reason:
+        pytest.fail(store.failure_reason, pytrace=False)
     return store
 
 
 def _toy(toy: StoreEnv) -> StoreEnv:
-    if toy.skip_reason:
-        pytest.skip(toy.skip_reason)
+    if toy.failure_reason:
+        pytest.fail(toy.failure_reason, pytrace=False)
     return toy
 
 

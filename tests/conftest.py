@@ -10,15 +10,21 @@ every viewer and the read API only read a store and a cache.  ``tests/test_preco
 (the calibrating-pass assertions and the live, non-calibrating ``--resume`` / relocation steps
 on a private copy) and ``tests/test_viewers_app.py`` (every page rendered headless, the API's
 stderr schema, relocatability, the two CLIs) consume it; the fixture directory stays intact.
-Under ``pytest -n auto`` the workers share one build (controller base temp + ``os.mkdir`` lock
-+ ``done.json`` marker, stdlib only).  Wall clocks are recorded, never asserted.
+Under ``pytest -n auto`` the workers share one build (controller base temp + an atomically
+created lock directory naming the building process, ``tests/_locks.py`` — the one lock
+implementation of the session fixtures, shared with ``tests/_backtest_build.py`` — +
+``done.json`` marker, stdlib only).  Wall
+clocks are recorded and printed, never asserted and never used to skip.  **A build that raised,
+exited non-zero or died fails every test that requires it** (:meth:`ToyBuild.require`); the
+toy build needs nothing optional (the placeholder surface is in the repository), so nothing in
+it skips.
 
 **The toy marking build** (M10 Part 2, for the S5 marking study): :func:`toy_marking_build` runs
 ``volsto-precompute`` on ``configs/grids/toy_marking.yaml`` (the P1 marking fits at
 ``ssr_target {1.0, 1.5} × skew_eps {0.05, 0.10}`` on the placeholder surface, at most 4 leverage
 calibrations at 2·10⁴ particles over a 1y horizon — an infeasible fit is stored without one — the
 LV point, M4 products at 4000 paths, no risk) as the single shard ``1/1`` into its own temporary
-directory, once per pytest run, with the same sharing, recording and skip rules and the same
+directory, once per pytest run, with the same sharing, recording and failure rules and the same
 interface as :func:`toy_build` (``.require()``, ``.store_root``, ``.cache_root``,
 ``.outputs_root``, ``.grid_path``; the synthetic M7 / M8b outputs beside it).  It is the second
 sanctioned calibrating site of the suite, and like the first it calibrates only when a test asks
@@ -37,6 +43,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import _locks
 import numpy as np
 import pytest
 
@@ -88,11 +95,6 @@ TOY_SHARDS: tuple[str, ...] = ("1/2", "2/2")
 #: The toy marking grid (M10 Part 2) and its single shard.
 TOY_MARKING_GRID = ROOT / "configs" / "grids" / "toy_marking.yaml"
 TOY_MARKING_SHARDS: tuple[str, ...] = ("1/1",)
-#: Budget of the toy build (the owner's M9 brief: the toy half of a test skips with a reason
-#: when the build takes more than 3 min); reported, never asserted.
-TOY_BUDGET_S = 180.0
-#: How long an xdist worker waits for another worker's toy build before skipping.
-TOY_WAIT_S = 600.0
 
 
 @dataclass(frozen=True)
@@ -101,8 +103,9 @@ class ToyBuild:
     synthetic M7 / M8b outputs side by side under ``base``) and what the calibrating pass
     recorded per shard — return code, wall clock, captured stdout, captured ``volsto`` log
     messages (``"<logger>: <message>"``) and the leverage-cache manifest after the shard.
-    ``error`` is set when the build raised; tests call :meth:`require` to skip on any problem
-    with the reason."""
+    ``error`` is set when the build raised, was interrupted or its builder died; tests call
+    :meth:`require`, which **fails** them on any such problem or a non-zero exit (never a
+    skip: the build has no optional input)."""
 
     root: Path
     base: Path
@@ -134,19 +137,19 @@ class ToyBuild:
         return float(sum(self.wall_s.values())) if self.wall_s else float("nan")
 
     @property
-    def skip_reason(self) -> str:
+    def failure_reason(self) -> str:
+        """Why the build is unusable (``""`` when it is usable): an exception, an interrupted
+        or dead builder, or a non-zero exit of any shard."""
         if self.error:
             return f"toy build failed: {self.error}"
         if tuple(self.return_codes) != (0,) * len(self.shards):
             return f"toy precompute returned {list(self.return_codes)}"
-        if self.total_wall_s > TOY_BUDGET_S:
-            return f"toy build took {self.total_wall_s:.0f} s > {TOY_BUDGET_S:.0f} s budget"
         return ""
 
     def require(self) -> ToyBuild:
-        """Skip the calling test with the reason when the build is unusable."""
-        if self.skip_reason:
-            pytest.skip(self.skip_reason)
+        """**Fail** the calling test with the reason when the build is unusable."""
+        if self.failure_reason:
+            pytest.fail(self.failure_reason, pytrace=False)
         return self
 
     def calibrating_messages(
@@ -241,32 +244,7 @@ def _session_build(
     locking and recording of :func:`toy_build`)."""
     root = _shared_root(tmp_path_factory) / dirname
     root.mkdir(exist_ok=True)
-    done, lock = root / "done.json", root / "lock"
-    if not done.exists():
-        try:
-            os.mkdir(lock)  # atomic: exactly one process builds
-        except FileExistsError:
-            t0 = time.perf_counter()
-            while not done.exists() and time.perf_counter() - t0 < TOY_WAIT_S:
-                time.sleep(0.5)
-        else:
-            info: dict[str, Any] = {"error": "toy build interrupted"}
-            try:
-                info = _run_toy_precompute(root, grid, shards)
-            except Exception as exc:  # the toy half skips with the reason, the rest runs
-                info = {"error": f"{type(exc).__name__}: {exc}"}
-            finally:
-                info.setdefault(
-                    "built_by", f"{os.environ.get('PYTEST_XDIST_WORKER', 'main')}:{os.getpid()}"
-                )
-                tmp = root / "done.json.tmp"
-                tmp.write_text(json.dumps(info))
-                os.replace(tmp, done)
-                os.rmdir(lock)
-    if not done.exists():
-        info = {"error": f"another worker's toy build did not finish within {TOY_WAIT_S:.0f} s"}
-    else:
-        info = json.loads(done.read_text())
+    info = _locks.shared_build(root, dirname, lambda: _run_toy_precompute(root, grid, shards))
     return ToyBuild(
         root=root,
         base=root / "A",
@@ -282,15 +260,32 @@ def _session_build(
     )
 
 
+#: Environment switches that change what volsto code does; a test starts with none of them
+#: (and sets one itself when it tests it): a developer's or an agent's shell must not leak in.
+ISOLATED_ENV: tuple[str, ...] = (
+    "VOLSTO_BACKTEST_REQUIRE_PATHS",
+    "VOLSTO_FORBID_CALIBRATION",
+    "VOLSTO_CALIBRATION_MARKERS",
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clear :data:`ISOLATED_ENV` for every test (restored afterwards by ``monkeypatch``)."""
+    for name in ISOLATED_ENV:
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture(scope="session")
 def toy_build(tmp_path_factory: pytest.TempPathFactory) -> ToyBuild:
     """The toy store + cache + outputs, built **exactly once per pytest run** (module
     docstring).  Under ``pytest -n auto`` the workers share the build under the controller's
-    base temporary directory: the first worker to ``os.mkdir`` the lock builds and writes
-    ``done.json`` (atomically), the others wait for it up to :data:`TOY_WAIT_S`.  The fixture
-    never skips by itself — a failed or slow build is returned with its reason so every consumer
-    skips uniformly through :meth:`ToyBuild.require`.  Consumers must leave the directory
-    intact (copy it before writing anything)."""
+    base temporary directory: the first worker to take the lock (``tests/_locks.py``: a
+    directory holding its pid, renamed into place atomically) builds and writes ``done.json``
+    (atomically), the others wait for it while its builder is alive.  The fixture
+    never fails by itself — a failed build is returned with its reason so every consumer fails
+    uniformly through :meth:`ToyBuild.require`.  Consumers must leave the directory intact (copy
+    it before writing anything)."""
     return _session_build(tmp_path_factory, "toy_precompute", TOY_GRID, TOY_SHARDS)
 
 

@@ -71,37 +71,46 @@ code's version, informational only) and, for results and skips, ``rows.parquet``
 published by ONE rename, its id ``<status>-<digest>`` the SHA-256 of its file listing (any
 attempt verifies on its own).  The one mutable object is ``dates/<date>/CURRENT``, a pointer
 (version, attempt id, status, the SHA-256 of every file) replaced by ONE ``os.replace`` of a
-synced temporary, the directory synced; publishing and pointing happen under the date's
-``flock`` (``dates/<date>/.lock``).  Attempt checks ignore exactly Finder's ``.DS_Store`` and
-the AppleDouble ``._<name>`` of a file the attempt holds.  **The pointer rule**
-(:func:`choose_pointer`, one place): attempts are ranked — done > a pending ok > incomplete > a
-pending incomplete > any other attempt whose files verify and hold results (stale ones
-included) > anything without results; ``CURRENT`` moves to the new attempt when it ranks at
-least as high as the current one and as any attempt of this config, else to the best attempt of
-this config when that ranks higher; an attempt without results never becomes current while any
-attempt of the date holds results, and an attempt of another config is never adopted.  The
-decision is taken under the date's lock from a fresh read.  A failed or skipped attempt next to
-results is only recorded (``status`` notes a later failure; a skip still drops its date from the
-calendar when its own record verifies).  ``run`` never deletes an attempt; after its refusals
-and after writing its skips it **adopts** (:func:`adopt`) for each selected date the attempt the
-rule prefers — what a writer killed between publishing and pointing left.  ``volsto-backtest
-gc`` (:func:`collect_garbage`) is conservative and bound to the config: refused unless the store
-header names the given config; under every date's lock it applies the rule, then removes the
-non-current attempts only of dates whose full verdict is done (each holds no results or is
-superseded by the current done attempt; symbolic links skipped), plus pointer temporaries,
-staging directories of dead writers and migrated leftovers.  A store of the flat layout of
-earlier versions (``dates/<date>/{rows.parquet, fit.json, done.json, failure.json}`` and
-``<out>/.staging``) is migrated in place on first open by ``run`` (after its header check),
-``status``, ``migrate`` or ``gc`` — only when its header names the given config
-(:func:`migrate_store`: files copied into ``attempts/legacy-<status>-<digest>``, ``CURRENT``
-written from their hashes, a leftover of another config never made current, the flat files
-removed last and those no attempt holds moved to ``quarantine/``, leftovers renamed
-``*.imported`` before removal, snapshots bound only when a fresh import reproduces them,
-``migrations.json``); stage 2 asks for the migration.  **The flat-layout code (volsto-backtest
-before the attempts) and this code must never write the same store** — the date lock does not
-survive the directory renames of the flat layout.  Every step of the commit and migration paths
-calls :data:`CRASH_HOOK`, and a lock-free reader calls :data:`READ_HOOK` after each read (tests
-inject crashes and races there).
+synced temporary, the directory synced; publishing and pointing happen under the date's lock:
+``flock`` on the date DIRECTORY, every mutation made through that locked descriptor
+(``dir_fd``-relative renames, replaces, unlinks and removals; :meth:`BacktestStore.lock` argues
+why a swapped path cannot split the lock).  A ``CURRENT`` of another pointer version (a newer
+volsto-backtest) is a refusal for every mutating command, never damage to overwrite.  Attempt
+checks ignore exactly Finder's ``.DS_Store`` and the AppleDouble ``._<name>`` of a file the
+attempt holds — regular files only (a directory of any name is listed and fails the check).
+**The pointer rule** (:func:`choose_pointer`, one place): attempts are ranked — done > a pending
+ok > incomplete > a pending incomplete > any other attempt whose files verify and hold results
+(stale ones included) > anything without results; ``CURRENT`` moves to the new attempt when it
+ranks at least as high as the current one and as any attempt of this config, else to the best
+attempt of this config when that ranks higher; an attempt without results never becomes current
+while any attempt of the date holds results, and an attempt of another config is never adopted.
+The decision is taken under the date's lock from a fresh read.  Nothing moves while a verdict
+involved is ``unsettled``.  A failed or skipped attempt next to results is only recorded
+(``status`` notes a later failure, read from verified bytes only and never part of a
+classification; a skip still drops its date from the calendar when its own record verifies).
+``run`` never deletes an attempt; after its refusals and after writing its skips it **adopts**
+(:func:`adopt`) for each selected date the attempt the rule prefers — what a writer killed
+between publishing and pointing left.  ``volsto-backtest gc`` (:func:`collect_garbage`) is
+conservative and bound to the config: refused (before any write) unless the store header names
+the given config; under every date's lock it applies the rule, then removes the non-current
+attempts only of dates whose full verdict is done (each holds no results or is superseded by the
+current done attempt; symbolic links skipped), plus pointer temporaries, the staging directories
+of dead writers on this host (other hosts' are kept and counted: ``status`` lists them) and
+migrated leftovers.  A store of the flat layout of earlier versions
+(``dates/<date>/{rows.parquet, fit.json, done.json, failure.json}`` and ``<out>/.staging``) is
+migrated in place by ``run`` (after all its refusals, evaluated on the flat files), ``status``,
+``migrate`` or ``gc`` — refused (exit 2, nothing written) unless its header names the given
+config (:func:`migrate_store`: under the store lock, JOURNALLED in ``migrations.json`` — an
+``in_progress`` entry before the first destructive step, each date's report after it, the
+binding and the final record resumable; files copied into ``attempts/legacy-<status>-<digest>``;
+``CURRENT`` set by the pointer rule alone; the flat files removed last and those no attempt
+holds moved to ``quarantine/``; leftovers renamed ``*.imported`` before removal; snapshots bound
+only when a fresh import reproduces them); a flat store that cannot be written is a clear error
+before any lock; stage 2 asks for the migration.  **The flat-layout code (volsto-backtest before
+the attempts) and this code must never write the same store** — the date lock does not survive
+the directory renames of the flat layout.  Every step of the commit and migration paths calls
+:data:`CRASH_HOOK`, and a lock-free reader calls :data:`READ_HOOK` after each read (tests inject
+crashes and races there).
 
 **Integrity** (:class:`Ledger`, :func:`dependency_record`).  A date is ``done`` iff its
 ``CURRENT`` pointer verifies — the reader reads ``CURRENT`` and every file of the attempt it
@@ -115,34 +124,44 @@ entry up to the date); the calibration code tag; the digest of the date's snapsh
 (:func:`snapshot_digest`: the file it was marked from, its creation-time line aside); the
 checksum and row count of ``rows.parquet`` and the checksum of ``fit.json``; the leverage key
 recomputed from the snapshot, the stored fit and the base spec, complete in the configured
-cache; the previous calendar date and whether its leverage was used; the **state link**
-(:func:`state_link`: snapshot digest, fitted parameters, leverage key) of every date whose
-marked state the rows use — the previous date and the live trades' inception dates — and the
-snapshot digest of every date whose close is in a live trade's realised history
-(:func:`dependencies_of`).  The verdicts chain: a date is confirmed only when its previous date
-and its state dependencies are, so a changed input makes its date and every later date stale,
-and recomputing a date into another state (another spot, another fit) makes every date that
-used its state or its close stale.  The chain carries states, not files — the rows and the fit
-of a date carry timings, so a bit-identical recomputation of d−1 leaves d confirmed; it is the
-only chain contiguous shards can satisfy, since a block's first date is computed from its
-predecessor's state before the other shard stores that predecessor.  Until then such a date is
-``pending`` (``--resume`` leaves an ``ok`` one alone; stage 2 requires the date it waits for).
-``status``, ``run --resume`` (its selection and a check before each date, so a date confirmed by
-the dates recomputed before it is skipped), both refusals of ``run``, the pointer rule and the
-study's requirements and selection all read :meth:`Ledger.verdict`.  Statuses: ``done``;
-``incomplete`` (valuations stored, some P&L missing — the previous date unavailable, e.g. its
-leverage missing under ``--no-calibrate``, or rows unpriced; the reasons and the recompute
-command are stored; ``--resume`` recomputes it; exit 2 when a missing leverage is the cause, else
-1); ``failed``; ``skipped`` (below); ``pending``; ``stale`` (the first mismatch is the reason);
-``missing``.  **Snapshots are bound to the vendor**: at import, an import record
+cache, and the digest of its NUMBERS (:func:`leverage_content_digest`: every array of
+``leverage.npz`` but its metadata, memoised by file identity; record version 2 — version-1
+records of earlier stores are still judged at their version); the previous calendar date and
+whether its leverage was used; the **state link** (:func:`state_link`: snapshot digest, fitted
+parameters, leverage key and, version 2, leverage content) of every date whose marked state the
+rows use — the previous date and the live trades' inception dates — and the snapshot digest of
+every date whose close is in a live trade's realised history (:func:`dependencies_of`); for a
+skip, its cause (the day file is absent), re-derived.  ``run`` records what it USED
+(:class:`_UsedInputs`: the digests of the snapshot bytes it parsed, the content digest of the
+leverage bytes it priced with, read once by :class:`_RecordingCache`); nothing is read again at
+commit.  The verdicts chain: a date is confirmed only when its previous date and its state
+dependencies are, so a changed input makes its date and every later date stale, and recomputing
+a date into another state (another spot, another fit) makes every date that used its state or
+its close stale.  The chain carries states, not files — the rows and the fit of a date carry
+timings, so a bit-identical recomputation of d−1 leaves d confirmed; it is the only chain
+contiguous shards can satisfy, since a block's first date is computed from its predecessor's
+state before the other shard stores that predecessor.  Until then such a date is ``pending``
+(``--resume`` leaves an ``ok`` one alone; stage 2 requires the date it waits for). ``status``,
+``run --resume`` (its selection and a check before each date, so a date confirmed by the dates
+recomputed before it is skipped), both refusals of ``run``, the pointer rule and the study's
+requirements and selection all read :meth:`Ledger.verdict`.  Statuses: ``done``; ``incomplete``
+(valuations stored, some P&L missing — the previous date unavailable, e.g. its leverage missing
+under ``--no-calibrate``, or rows unpriced; the reasons and the recompute command are stored;
+``--resume`` recomputes it; exit 2 when a missing leverage is the cause, else 1); ``failed``;
+``skipped`` (below); ``pending``; ``unsettled`` (a consistent read could not be had while
+writers changed the store: never acted on, never stale); ``stale`` (the first mismatch is the
+reason); ``missing``.  **Snapshots are bound to the vendor**: at import, an import record
 (``<snapshots>/<underlying>_<date>.import.json``, :func:`bind_snapshot`) stores the snapshot's
 content digest with the day-file and manifest-entry digests; a snapshot is reused only when both
 still match (:func:`snapshot_bound`) — an edited snapshot is re-imported.
 
-**Refusals** (exit 2, before any migration, skip, adoption or pointer move; both read the
-verdicts).  A store whose
-``backtest.json`` hash differs, and a date to compute or its previous date whose current attempt
-was computed under another config hash, unless ``--force`` (:func:`hash_refusals`).  Under
+**Refusals** (exit 2, before ANY write — header, migration, skip, adoption, probe, import;
+each prints the commands that would proceed).  A ``CURRENT`` of another pointer version
+(:func:`foreign_pointer_refusal`).  A store whose ``backtest.json`` hash differs
+(:func:`header_refusal`), and a date to compute or its previous date whose stored outcome — in
+attempts or still in the flat layout — was computed under another config hash, unless
+``--force`` (:func:`hash_refusals`, through :func:`computed_under_another_config`, the one
+judgement stage 2's commands use too).  Under
 ``--no-calibrate`` (:func:`leverage_refusals`): a date to compute whose current results name a
 leverage the configured cache lacks; the previous date of a date to compute — with or without
 stored results of its own — when its leverage is lacking and it has results or the date's stored
@@ -150,15 +169,18 @@ P&L used it (its key from the date's ``previous_cache_key``, or by marking it).
 
 **Missing closes** (``data.missing_close``, required).  The calendar is the vendor's day files
 inside ``[start, end]`` plus the dates its manifest lists as ``trading_days_missing``.  ``run``
-imports every date up to its last one first (the realised histories need every close).  With
-``fail`` a date whose day file is absent or unreadable fails with a message naming the date and
-the fix, a trade whose history spans it is ``unpriced`` (its dates are ``incomplete``), and the
-trades struck after it proceed.  With ``skip_date`` the date is dropped from the calendar before
-the shard blocks are cut (every process imports the whole selection first; ``done.json`` status
-``skipped``): the 252-day fixing grid then runs over the remaining vendor dates, so every later
-fixing of a trade spanning the gap lands one exchange day late and the return across the gap
-counts as one daily return — the rows record their ``gaps`` and study.md states it.  A day that
-is neither present nor listed by the manifest is invisible (no exchange calendar is available).
+imports every date up to its last one first (the realised histories need every close).  A date
+whose close cannot be had fails with a message naming the date and the fix, a trade whose
+history spans it is ``unpriced`` (its dates are ``incomplete``), and the trades struck after it
+proceed — under ``skip_date`` too when the day file exists (an import that raises is a failure,
+retried by ``--resume``, never a calendar gap).  With ``skip_date`` a date whose day file is
+ABSENT (the one deterministic cause, :data:`SKIP_CAUSE`, recorded and re-derived by the verdict)
+is dropped from the calendar before the shard blocks are cut (a pure check of the inputs;
+``done.json`` status ``skipped``): the 252-day fixing grid then runs over the remaining vendor
+dates, so every later fixing of a trade spanning the gap lands one exchange day late and the
+return across the gap counts as one daily return — the rows record their ``gaps`` and study.md
+states it.  A day that is neither present nor listed by the manifest is invisible (no exchange
+calendar is available).
 
 **Dates and sharding.**  The k-th calendar date after a trade's inception is its trading index
 k (the seasoning date map).  The fixed
@@ -179,30 +201,38 @@ rebuilt from the snapshot (so a date's fit is a function of the file alone, whic
 computes it).  (2) :func:`~volsto.calibration.fit_2f.fit_2f_marking` at ``(ssr_target,
 skew_eps)``, stage 3 **off** (the SPX (1.0, 0.10) fit fails the stage-3 engine-bias assertion,
 SPEC §15; the fit's first-order SSR is what is marked); an ``infeasible`` fit fails the date (no
-model, as ``volsto-precompute`` does).  The per-pillar history quantities (VS vol, ATMF vol, ATMF
-skew, ln spot) are stored for the realised SSR.  (3) The leverage through
+model, as ``volsto-precompute`` does).  The per-pillar history quantities (VS vol, ATMF vol,
+ATMF skew, ln spot) are stored for the realised SSR.  (3) The leverage through
 ``LeverageCache.get_or_calibrate`` (``--no-calibrate``: cache only, under
 :func:`volsto.calibration.guard.calibration_forbidden`; a miss fails the date with the command).
-(4) Each live trade is seasoned to the date (:func:`volsto.products.seasoning.replay`, the date's
-discount curve) and priced on one engine whose builder is based on the previous date's state (so
-the previous date's value, the attribution and today's value share one memo and one seed); a
-settled trade carries its deterministic cash.  (5) The P&L of ``(d−1, d]`` is ``V(d) − V(d−1) +
-flows dated d``: for an attributed trade by :func:`volsto.risk.attribution.explain` in the
-configured mode and detail (``dt = 1/252``, ``product_1`` the trade seasoned to d,
+(4) Each live trade is seasoned to the date (:func:`volsto.products.seasoning.replay`, the
+date's discount curve) and priced on one engine whose builder is based on the previous date's
+state (so the previous date's value, the attribution and today's value share one memo and one
+seed); a settled trade carries its deterministic cash.  (5) The P&L of ``(d−1, d]`` is ``V(d) −
+V(d−1) + flows dated d``: for an attributed trade by :func:`volsto.risk.attribution.explain` in
+the configured mode and detail (``dt = 1/252``, ``product_1`` the trade seasoned to d,
 ``product_theta`` the trade seasoned with d's close held at d−1's), whose buckets plus the cash
 flows sum to it exactly; for the other trades by the paired CRN difference; on a settlement day
 by the settled cash (bucket ``settlement``).  The start-of-period Greeks the attribution priced
-(sticky-moneyness delta and gamma, the frozen-leverage vega and ladders, rho, repo, theta and its
-split, the parameter sensitivities of the parameters that moved) are read back from the engine's
-memo at no pricing cost and stored with their standard errors, as is every bucket's standard error
-(|move| × the Greek's standard error — the rates buckets are directional sensitivities along the
-day's curve moves, :func:`volsto.risk.attribution.curve_move_sensitivities`, so their standard
-error is their own).  The P&L's standard error is the direct paired one of ``V(d) − V(d−1)``
-(both prices are in the engine's memo) and the residual's is paired per path as well
-(:attr:`volsto.risk.attribution.Explain.residual_stderr`): a root sum of squares of the steps'
-errors ignores their covariance (0.72–1.79× the paired error on the 2022-10-27..11-01 rows).
-(6) The rows (:data:`ROW_COLUMNS`), the fit record and ``done.json`` (status, hash, digest,
-checksums, key, wall clock per step, whether this process calibrated).
+(sticky-moneyness delta and gamma, the frozen-leverage vega and ladders, rho, repo, theta and
+its split, the parameter sensitivities of the parameters that moved) are read back from the
+engine's memo at no pricing cost and stored with their standard errors, as is every bucket's
+standard error (the paired one of the per-path sum of the bucket's items,
+:attr:`volsto.risk.attribution.Explain.bucket_stderrs` — a ladder bucket's pillars share the
+seed; a single item's is |move| × the Greek's; the rates buckets are directional sensitivities
+along the day's curve moves, :func:`volsto.risk.attribution.curve_move_sensitivities`), with the
+paired errors of the bucket groups (``grp_<group>_stderr``, :data:`PAIRED_GROUPS`) and a flag
+when the residual's error had to be a root sum of squares.  The P&L's standard error is the
+direct paired one of ``V(d) − V(d−1)`` (both prices are in the engine's memo) and the residual's
+is paired per path as well (:attr:`volsto.risk.attribution.Explain.residual_stderr`): a root sum
+of squares of the steps' errors ignores their covariance (0.72–1.79× the paired error on the
+2022-10-27..11-01 rows). For every attributed trade the row also stores the cumulative P&L
+``V(d) − V(inception) + flows`` with its DIRECT paired error (``cum_pnl``, ``cum_pnl_stderr``):
+the date's value and the fresh trade at the inception state priced on common random numbers, one
+extra pricing per trade and date (none the day after inception, a memo hit), the inception state
+and leverage from the cache (calibrated if missing, except under ``--no-calibrate``: the date is
+then incomplete). (6) The rows (:data:`ROW_COLUMNS`), the fit record and ``done.json`` (status,
+hash, digest, checksums, key, wall clock per step, whether this process calibrated).
 
 **Projection** (:func:`project`, printed by ``dry-run`` and before ``run`` works).  A probe on
 the first two consecutive calendar dates that can be marked (imported into a temporary directory
@@ -224,17 +254,24 @@ warm build + new strips × strip``.  A calibration is charged to every date whos
 known to be cached (:func:`scaled_calibration_s`: the cache manifest's median at the configured
 particles and horizon, else the nearest size or the 140 s / 8·10⁵ / 3y reference scaled by
 particles × steps, never below :data:`CALIBRATION_MIN_S`; none under ``--no-calibrate``).
+The cumulative P&L is charged one pricing per attributed trade per date, and a block start the
+fit and calibration of every earlier inception of an attributed trade live there.
 Shards: the slowest contiguous block of the selection (+ its boundary calibration) and the sum,
 for 1, 2, 4, 8 and the requested count, each process at the probe's thread count.  ``run``
 reuses ``<out>/probe.json`` for the same config hash and thread count.
 
 **Study (stage 2).**  ``params: {backtest: <config>, store: <store dir relative to the outputs
 root, or null>}``; the study's ``seeds.pricing`` must equal the backtest's.  A stale date is a
-requirement with its command (exit 2).  Results: the window as the data shows it (dates, first
+requirement with its command (exit 2): a flat store is migrated first, and every date to
+recompute goes into one ``run`` line carrying ``--force`` exactly when ``run`` would refuse it
+otherwise; an ``unsettled`` date asks for a rerun once the writers finish.  The study pins the
+``CURRENT`` bytes it read.  Results: the window as the data shows it (dates, first
 and last close, return, realised vol; no regime adjective); the dates whose P&L is incomplete,
 with their reasons and commands (never dropped); the book and inception prices (one row per
-trade id); the cumulative P&L per fixed trade and per bucket, and per month
-for the fixed book; the daily series (figures); the fitted parameters with
+trade id, each in its own unit: % notional, % of the inception spot, vol points); the
+cumulative P&L per trade and per bucket, and per month, with a book total only over the fixed
+trades quoted in one unit (a total never adds units; tables and figures split by unit); the
+daily series (figures); the fitted parameters with
 :func:`~volsto.calibration.stability.flag_unidentified` on the marking fits — whose standard
 errors are NaN by construction (the marking targets carry no sampling error), so the flags there
 report "no usable standard error" — and the §15 Part 4 historical-mode rolling fit
@@ -244,9 +281,11 @@ the history is long enough; the realised SSR (rolling window from the stored pil
 with the reason before ``window + 1`` dates) against the marked target and the fit's first-order
 SSR; the VKO's marked price against its realised state (the realised outcome of a 12m trade is
 not observable inside the 2022 H2 window: stated); the fit statuses and the cost.  The
-monthly table carries every bucket and a ``check`` column (total minus their sum).  Cumulative
-standard errors are root sums of squares of the daily ones (the daily estimates share the seed,
-so this is indicative, and the narrative says so).
+monthly table carries every bucket and a ``check`` column (total minus their sum).  Every
+aggregate goes through :func:`aggregate`, which decides and labels its error: a trade's
+cumulative P&L takes the stored paired error when every P&L date since inception carries it;
+everything else — books, buckets and months over dates, a store written before the column — is
+the root sum of squares of correlated errors, labelled "not the error of the cumulative P&L".
 
 Checked by ``tests/test_backtest.py`` (a 5-date toy build calibrated once by the session fixture
 ``tests/_backtest_build.py::toy_backtest_build``; then, on copies, ``--no-calibrate`` shards
@@ -279,16 +318,18 @@ import logging
 import math
 import os
 import re
+import shlex
 import shutil
 import socket
+import stat
 import sys
 import tempfile
 import time
 import warnings
-from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final, NoReturn, cast
+from typing import IO, TYPE_CHECKING, Any, Final, NoReturn, Protocol, cast
 
 import numpy as np
 import pandas as pd
@@ -297,7 +338,9 @@ import yaml
 
 from volsto.calibration import guard
 from volsto.calibration.cache import (
+    LEVERAGE_NAME,
     XI0_MEMO,
+    CacheMissError,
     LeverageCache,
     atomic_write,
     build_market,
@@ -318,7 +361,6 @@ from volsto.config import (
     BergomiParams,
     CalibrationSpec,
     ConfigError,
-    MarketConfig,
     SimConfig,
     load_yaml,
     to_mapping,
@@ -422,7 +464,9 @@ TRADE_KEYS: dict[str, tuple[str, ...]] = {
     "ko_var": ("barrier", "strike"),
     "var_swap": ("strike",),
 }
-#: Units of the stored values (value × scale is in unit).
+#: Each product's unit and scale: the study reports ``scale × value`` in that unit — % of
+#: notional (notes, cliquet), % of the inception spot (VKO), vol points of vega notional
+#: (variance swaps) — and never adds two units (P2).
 TRADE_UNITS: dict[str, tuple[str, float]] = {
     "autocall": ("% notional", 100.0),
     "phoenix": ("% notional", 100.0),
@@ -431,9 +475,6 @@ TRADE_UNITS: dict[str, tuple[str, float]] = {
     "ko_var": ("vol pts (vega notional 1)", 100.0),
     "var_swap": ("vol pts (vega notional 1)", 100.0),
 }
-#: The unit of the study's value and P&L columns: product units x 100 — % of notional (notes,
-#: cliquet), % of the inception spot (VKO), vol points of vega notional (variance swaps).
-VALUE_UNIT = "x100"
 #: Store layout.
 HEADER_NAME = "backtest.json"
 PROBE_NAME = "probe.json"
@@ -444,7 +485,6 @@ DONE_NAME = "done.json"
 #: Storage (module docstring, *Storage*): per date the pointer, the attempts and the lock.
 CURRENT_NAME = "CURRENT"
 ATTEMPTS_DIR = "attempts"
-LOCK_NAME = ".lock"
 STAGING_PREFIX = ".staging-"
 POINTER_TMP_PREFIX = ".CURRENT.tmp-"
 POINTER_VERSION: Final[int] = 1
@@ -472,10 +512,7 @@ _ISO_PREFIX = re.compile(r"(\d{4}-\d{2}-\d{2})\.(?:new|old)-")
 _ATTEMPT_NAME = re.compile(rf"[a-z][a-z-]*-[0-9a-f]{{{ATTEMPT_DIGEST_CHARS}}}")
 #: Verdict reasons other code reads.
 NO_CURRENT = "no CURRENT"
-LEGACY_REASON = (
-    "stored in the flat layout of an older volsto-backtest (`volsto-backtest migrate` moves it "
-    "into attempts)"
-)
+LEGACY_REASON = "stored in the flat layout of an older volsto-backtest"
 STALE_HASH = "stored under another config hash"
 STALE_LEVERAGE = "its leverage is not in the configured cache"
 #: Exit statuses of the CLI.
@@ -540,6 +577,24 @@ def bucket_column(name: str) -> str:
     return "b_" + name.replace(".", "_")
 
 
+#: Bucket sums whose paired standard error an attributed row stores (``grp_<name>_stderr``,
+#: :attr:`~volsto.risk.attribution.Explain.group_stderrs`): the explained items of a step, the
+#: time bucket (decay + carry), every Greek bucket, and those with the recalibration.
+PAIRED_GROUPS: tuple[str, ...] = (
+    "spot",
+    "rates",
+    "surface",
+    "params",
+    "time",
+    "greeks",
+    "explained",
+)
+
+
+def group_column(name: str) -> str:
+    return f"grp_{name}_stderr"
+
+
 def _row_columns() -> tuple[str, ...]:
     cols = [
         "date",
@@ -558,14 +613,18 @@ def _row_columns() -> tuple[str, ...]:
         "flows_cum",
         "pnl",
         "pnl_stderr",
+        "cum_pnl",
+        "cum_pnl_stderr",
         "pnl_method",
         "pnl_note",
         "price_0",
         "price_0_stderr",
         "extra_pricings",
+        "residual_paired",
     ]
     for b in BUCKETS:
         cols += [bucket_column(b), bucket_column(b) + "_stderr"]
+    cols += [group_column(g) for g in PAIRED_GROUPS]
     for s in STEPS:
         cols += [f"s_{s}", f"s_{s}_stderr", f"s_{s}_explained"]
     for g in GREEKS:
@@ -1107,10 +1166,15 @@ class BacktestConfig:
         cache: str | Path | None = None,
         snapshots: str | Path | None = None,
     ) -> BacktestConfig:
-        """The config with CLI path overrides (cwd-relative, stored absolute)."""
+        """The config with CLI path overrides (cwd-relative, stored absolute); a blank override
+        is refused (it would resolve to the current directory)."""
         m = self.to_mapping()
         for key, value in (("out", out), ("cache", cache), ("snapshots", snapshots)):
             if value is not None:
+                if not str(value).strip():
+                    raise ConfigError(
+                        f"--{key}: empty path (it would resolve to the current directory)"
+                    )
                 m["paths"][key] = str(Path(value).expanduser().absolute())
         return BacktestConfig.from_mapping(m, source=self.source)
 
@@ -1429,11 +1493,14 @@ CRASH_POINTS: tuple[str, ...] = (
 
 #: The steps of a migration :data:`CRASH_HOOK` sees (:func:`migrate_store`).
 MIGRATION_CRASH_POINTS: tuple[str, ...] = (
+    "migrate.journalled",
     "migrate.published",
     "migrate.pointed",
     "migrate.flat_removed",
+    "migrate.reported",
     "migrate.leftover_marked",
     "migrate.leftover_removed",
+    "migrate.bound",
 )
 #: Race injection for the storage tests: called with ``(what, date)`` right after a lock-free
 #: reader read a date's ``CURRENT`` (``"pointer"``) and right after it read an attempt's files
@@ -1460,8 +1527,9 @@ def _fsync_path(path: Path) -> None:
         os.close(fd)
 
 
-#: Files every attempt check ignores (and only these): Finder's ``.DS_Store`` and the
-#: AppleDouble companion ``._<name>`` of a file ``<name>`` the attempt holds (macOS copies).
+#: REGULAR files every attempt check ignores (and only these): Finder's ``.DS_Store`` and the
+#: AppleDouble companion ``._<name>`` of a regular file ``<name>`` the attempt holds (macOS
+#: copies).  A directory (or any other non-regular entry) of those names is never ignored.
 METADATA_FILE = ".DS_Store"
 APPLEDOUBLE_PREFIX = "._"
 
@@ -1491,10 +1559,10 @@ def read_files(directory: Path) -> dict[str, bytes]:
     names = {n for n, q in paths.items() if q.is_file()}
     out: dict[str, bytes] = {}
     for n, q in paths.items():
-        if _ignored(n, names):
-            continue
         if n not in names:
-            out[f"{n}/"] = b""
+            out[f"{n}/"] = b""  # a non-regular entry is never ignored
+            continue
+        if _ignored(n, names):
             continue
         with open(q, "rb") as fh:
             out[n] = fh.read()
@@ -1606,7 +1674,8 @@ def _listing_mismatch(expected: Mapping[str, str], now: Mapping[str, str]) -> st
 class BacktestStore:
     """The per-date store (module docstring, *Storage*): ``<out>/backtest.json``,
     ``<out>/probe.json``, ``<out>/migrations.json`` and per date ``dates/<date>/CURRENT`` (the
-    pointer), ``dates/<date>/attempts/<id>/`` (immutable outcomes) and ``dates/<date>/.lock``.
+    pointer) and ``dates/<date>/attempts/<id>/`` (immutable outcomes); the locks are ``flock``s
+    on the date directories and the store root (:meth:`lock`, :meth:`store_lock`).
 
     Writes: an outcome is staged in ``attempts/.staging-*``, published by ONE rename to
     ``attempts/<id>`` and pointed to by ONE atomic replace of ``CURRENT``, both under the date's
@@ -1615,7 +1684,9 @@ class BacktestStore:
     new pointer."""
 
     def __init__(self, root: Path) -> None:
-        self.root = root
+        # resolved once: every process started before a swap of a symlinked root keeps working
+        # on (and locking) the same directories
+        self.root = Path(root).resolve()
 
     @property
     def dates_root(self) -> Path:
@@ -1718,29 +1789,54 @@ class BacktestStore:
         return out
 
     @contextlib.contextmanager
-    def locks(self, dates: Iterable[str]) -> Any:
-        """The locks of several dates, taken in date order (writers hold one lock at a time, so
-        this never deadlocks with them)."""
+    def locks(self, dates: Iterable[str]) -> Iterator[dict[str, DateLock]]:
+        """The locks of several dates, taken in date order (writers hold one date lock at a
+        time, so this never deadlocks with them)."""
         with contextlib.ExitStack() as stack:
-            for d in sorted(set(dates)):
-                stack.enter_context(self.lock(d))
-            yield
+            yield {d: stack.enter_context(self.lock(d)) for d in sorted(set(dates))}
 
     # -- writing ---------------------------------------------------------------------------------
 
     @contextlib.contextmanager
-    def lock(self, date: str) -> Any:
-        """The date's exclusive lock (``fcntl.flock`` on ``dates/<date>/.lock``: released by the
-        kernel when the holder dies)."""
+    def lock(self, date: str) -> Iterator[DateLock]:
+        """The date's exclusive lock: ``fcntl.flock`` on the date DIRECTORY itself, released by
+        the kernel when the holder dies (macOS and Linux lock directory descriptors alike).
+
+        Why this is sound where a lock file is not: ``flock`` excludes the holders of one inode.
+        A lock file's path can be unlinked or replaced while held, so a later locker gets its
+        own inode — and checking ``fstat``/``stat`` after locking does not help, since a
+        newcomer that creates the replacement sees them agree.  Here the locked inode is the
+        directory that holds the data, and every mutation made under the lock goes through the
+        locked descriptor (:class:`DateLock`: ``dir_fd``-relative renames, replaces, unlinks and
+        removals), never through the path again.  A process that resolves a swapped path locks
+        and writes a different directory, so two holders never mutate one directory; readers
+        take no lock and verify what they read by hash.  The store root is resolved once, when
+        the store object is made."""
         import fcntl
 
-        self.date_dir(date).mkdir(parents=True, exist_ok=True)
-        fd = os.open(self.date_dir(date) / LOCK_NAME, os.O_RDWR | os.O_CREAT, 0o644)
+        d = self.date_dir(date)
+        d.mkdir(parents=True, exist_ok=True)
+        fd = os.open(d, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        held = DateLock(date, fd)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
-            yield
+            yield held
         finally:
-            os.close(fd)  # releases the lock
+            held.close()  # closing the descriptor releases the lock
+
+    @contextlib.contextmanager
+    def store_lock(self) -> Iterator[int]:
+        """The store-wide exclusive lock (``flock`` on the store root directory): migrations
+        run under it, date locks nested inside in date order."""
+        import fcntl
+
+        self.root.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self.root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield fd
+        finally:
+            os.close(fd)
 
     def stage(self, date: str) -> Path:
         """A new empty staging directory ``attempts/.staging-<host>-<pid>-<random>``."""
@@ -1749,28 +1845,36 @@ class BacktestStore:
         prefix = f"{STAGING_PREFIX}{_host_tag()}-{os.getpid()}-"
         return Path(tempfile.mkdtemp(prefix=prefix, dir=root))
 
-    def publish(self, date: str, staged: Path, label: str) -> Attempt:
-        """Publish a complete staged directory as ``attempts/<label>-<digest>`` (one rename; an
-        attempt with the same content already published is kept and the staged copy dropped).
-        Call under :meth:`lock`."""
-        attempt = self.attempt(date, attempt_id(label, file_listing(staged)))
+    def publish(self, held: DateLock, staged: Path, label: str) -> Attempt:
+        """Publish a complete staged directory as ``attempts/<label>-<digest>`` (one rename,
+        relative to the locked date directory; an attempt with the same content already
+        published is kept and the staged copy dropped)."""
+        attempt = self.attempt(held.date, attempt_id(label, file_listing(staged)))
+        afd = held.attempts_fd()
         try:
-            os.rename(staged, attempt.path)
+            os.rename(staged.name, attempt.id, src_dir_fd=afd, dst_dir_fd=afd)
         except OSError:
-            if not attempt.path.is_dir():
+            if not _exists_at(attempt.id, afd):
                 raise
-            shutil.rmtree(staged, ignore_errors=True)  # identical content published before
+            shutil.rmtree(staged.name, dir_fd=afd, ignore_errors=True)  # identical content
         _crash_point("publish.renamed")
-        _fsync_path(attempt.path.parent)
+        os.fsync(afd)
         _crash_point("publish.synced")
         return attempt
 
-    def set_pointer(self, attempt: Attempt, status: str, listing: Mapping[str, str]) -> None:
-        """Point ``CURRENT`` at a published attempt: the pointer (attempt id, status, the SHA-256
-        of every file as the caller verified them) is written to a temporary file, synced, and
-        moved over ``CURRENT`` by one ``os.replace``; the directory is synced.  Call under
-        :meth:`lock`."""
-        d = self.date_dir(attempt.date)
+    def set_pointer(
+        self, held: DateLock, attempt: Attempt, status: str, listing: Mapping[str, str]
+    ) -> None:
+        """Point ``CURRENT`` at a published attempt: the pointer (version, attempt id, status,
+        the SHA-256 of every file as the caller verified them) is written to a temporary file,
+        synced, and moved over ``CURRENT`` by one ``os.replace`` — all relative to the locked
+        date directory, which is then synced.  A ``CURRENT`` of another pointer version is
+        refused (:class:`RefusedError`), never overwritten."""
+        if attempt.date != held.date:
+            raise ValueError(f"{attempt.id} is not an attempt of {held.date}")
+        foreign = _foreign_version(held.read_pointer())
+        if foreign:
+            raise RefusedError(f"{held.date}: {foreign}")
         data = {
             "version": POINTER_VERSION,
             "date": attempt.date,
@@ -1781,8 +1885,8 @@ class BacktestStore:
             "host": socket.gethostname(),
             "pid": os.getpid(),
         }
-        fd, name = tempfile.mkstemp(prefix=POINTER_TMP_PREFIX, dir=d)
-        tmp = Path(name)
+        name = f"{POINTER_TMP_PREFIX}{os.getpid()}-{os.urandom(6).hex()}"
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644, dir_fd=held.fd)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 fh.write(_dumps(data))
@@ -1790,23 +1894,102 @@ class BacktestStore:
                 fh.flush()
                 os.fsync(fh.fileno())
             _crash_point("pointer.synced")
-            os.replace(tmp, self.pointer_path(attempt.date))
+            os.replace(name, CURRENT_NAME, src_dir_fd=held.fd, dst_dir_fd=held.fd)
         except (Exception, KeyboardInterrupt):
-            tmp.unlink(missing_ok=True)
+            with contextlib.suppress(OSError):
+                os.unlink(name, dir_fd=held.fd)
             raise
         _crash_point("pointer.replaced")
-        _fsync_path(d)
+        os.fsync(held.fd)
         _crash_point("pointer.dir_synced")
 
-    def remove_attempt(self, attempt: Attempt) -> None:
-        """Remove a non-current attempt (``gc`` only; call under :meth:`lock`).  A symlinked
-        attempt is never followed or removed."""
-        ptr = self.pointer(attempt.date)
-        if ptr is not None and ptr.get("attempt") == attempt.id:
-            raise ValueError(f"{attempt.date}: {attempt.id} is the current attempt")
-        if attempt.path.is_symlink():
-            raise ValueError(f"{attempt.date}: {attempt.id} is a symbolic link")
-        shutil.rmtree(attempt.path)
+    def remove_attempt(self, held: DateLock, attempt: Attempt) -> None:
+        """Remove a non-current attempt (``gc`` only), relative to the locked date directory.  A
+        symbolic link is never followed or removed."""
+        if attempt.date != held.date:
+            raise ValueError(f"{attempt.id} is not an attempt of {held.date}")
+        ptr = parse_pointer(held.read_pointer())
+        if ptr is None or "invalid" in ptr or ptr.get("attempt") == attempt.id:
+            raise ValueError(f"{held.date}: {attempt.id} is current (or CURRENT is unusable)")
+        afd = held.attempts_fd()
+        if stat.S_ISLNK(os.stat(attempt.id, dir_fd=afd, follow_symlinks=False).st_mode):
+            raise ValueError(f"{held.date}: {attempt.id} is a symbolic link")
+        shutil.rmtree(attempt.id, dir_fd=afd)
+
+
+@dataclass
+class DateLock:
+    """A held date lock: the flock'ed descriptor of ``dates/<date>/``, through which every
+    mutation of the date goes (:meth:`BacktestStore.lock`)."""
+
+    date: str
+    fd: int
+    _attempts: int | None = None
+
+    def attempts_fd(self) -> int:
+        """The descriptor of ``attempts/`` inside the locked directory (created if needed)."""
+        if self._attempts is None:
+            with contextlib.suppress(FileExistsError):
+                os.mkdir(ATTEMPTS_DIR, 0o755, dir_fd=self.fd)
+            self._attempts = os.open(
+                ATTEMPTS_DIR, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0), dir_fd=self.fd
+            )
+        return self._attempts
+
+    def read_pointer(self) -> bytes | None:
+        """``CURRENT`` as seen through the locked directory."""
+        try:
+            fd = os.open(CURRENT_NAME, os.O_RDONLY, dir_fd=self.fd)
+        except FileNotFoundError:
+            return None
+        with os.fdopen(fd, "rb") as fh:
+            return fh.read()
+
+    def still_at(self, path: Path) -> bool:
+        """Whether ``path`` (followed through symbolic links) is still the locked directory.  A
+        sanity check that narrows, not closes, the window of an outside move of a live store."""
+        try:
+            st = os.stat(path)
+        except OSError:  # gone, not a directory, unreadable, a symlink loop: not the same
+            return False
+        fs = os.fstat(self.fd)
+        return (st.st_dev, st.st_ino) == (fs.st_dev, fs.st_ino)
+
+    def names(self) -> list[str]:
+        return sorted(os.listdir(self.fd))
+
+    def attempt_names(self) -> list[str]:
+        return sorted(os.listdir(self.attempts_fd())) if ATTEMPTS_DIR in self.names() else []
+
+    def unlink(self, name: str) -> None:
+        os.unlink(name, dir_fd=self.fd)
+
+    def release_attempts(self) -> None:
+        """Close the ``attempts/`` descriptor (a store-wide command holds one lock per date:
+        one descriptor each is enough)."""
+        if self._attempts is not None:
+            os.close(self._attempts)
+            self._attempts = None
+
+    def close(self) -> None:
+        self.release_attempts()
+        os.close(self.fd)
+
+
+def _exists_at(name: str, dir_fd: int) -> bool:
+    try:
+        os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _foreign_version(data: bytes | None) -> str:
+    """``""`` unless ``data`` is a ``CURRENT`` written by another pointer version (a refusal)."""
+    ptr = parse_pointer(data)
+    if ptr is not None and ptr.get("foreign_version") is not None:
+        return str(ptr["invalid"])
+    return ""
 
 
 def parse_pointer(data: bytes | None) -> dict[str, Any] | None:
@@ -1822,8 +2005,10 @@ def parse_pointer(data: bytes | None) -> dict[str, Any] | None:
         return {"invalid": "not a pointer"}
     if ptr.get("version") != POINTER_VERSION:
         return {
-            "invalid": f"pointer version {ptr.get('version')!r} (this code reads "
-            f"{POINTER_VERSION})"
+            "invalid": f"CURRENT has pointer version {ptr.get('version')!r}, written by another "
+            f"volsto-backtest (this code reads version {POINTER_VERSION}): refused, never "
+            "overwritten",
+            "foreign_version": ptr.get("version"),
         }
     if not _ATTEMPT_NAME.fullmatch(str(ptr.get("attempt", ""))):
         return {"invalid": f"names no attempt ({ptr.get('attempt')!r})"}
@@ -1851,24 +2036,6 @@ def _staging_owner_alive(path: Path) -> bool:
 class RefusedError(RuntimeError):
     """The store or the cache refuses the run (exit 2): a changed config hash, a missing
     leverage under ``--no-calibrate``."""
-
-
-def check_store(cfg: BacktestConfig, store: BacktestStore, *, force: bool) -> None:
-    """Write the header of a new store; refuse a store built from another config hash."""
-    header = store.header()
-    h = cfg.content_hash()
-    if header is None:
-        store.write_header(cfg)
-        return
-    if header.get("config_hash") != h:
-        if not force:
-            raise RefusedError(
-                f"the store {store.root} was built from config hash "
-                f"{str(header.get('config_hash'))[:12]} and this config hashes to {h[:12]}: "
-                "a changed config would mix results. Use another --out, or --force to recompute "
-                "every date under the new config"
-            )
-        store.write_header(cfg)
 
 
 def manifest_file(cfg: BacktestConfig) -> Path:
@@ -1950,8 +2117,20 @@ class InputIndex:
 # integrity: the dependency record (module docstring, *Integrity*)
 # --------------------------------------------------------------------------------------------
 
-#: Layout version of the dependency record (a record of another version is stale).
-RECORD_VERSION: Final[int] = 1
+#: Layout version of the dependency record this code writes (2: the leverage content digest),
+#: and the versions it verifies (a record of any other version is stale).
+RECORD_VERSION: Final[int] = 2
+RECORD_VERSIONS: tuple[int, ...] = (1, 2)
+#: What a version-1 record with results cannot confirm (:attr:`Verdict.legacy_unverified`).
+LEGACY_UNVERIFIED = "leverage content not verified (record version 1)"
+#: What recomputing such dates does (``status`` and study.md say it with the command).
+LEGACY_RECOMPUTE = (
+    "recomputing them records version 2: their rows and standard errors are recomputed under "
+    "the current code, and a leverage taken from the cache records no calibration (their "
+    "calibration count drops)"
+)
+#: The one cause a ``skip_date`` skip may record (re-derived by every verdict).
+SKIP_CAUSE = "absent day file"
 #: The link of a dependency whose marked state was unavailable to the date that recorded it.
 UNAVAILABLE = "unavailable"
 #: Stored statuses whose date directory holds results (rows and fit).
@@ -1978,6 +2157,11 @@ def bytes_digest(data: bytes | None) -> str:
     return ABSENT if data is None else _sha256(data)
 
 
+def snapshot_bytes_digest(data: bytes | None) -> str:
+    """:func:`snapshot_digest` of bytes already read (``"absent"`` for none)."""
+    return ABSENT if data is None else _sha256(_CREATED_LINE.sub(b"", data))
+
+
 def rows_fingerprint(data: bytes | None) -> dict[str, Any]:
     """``{"sha256", "n"}`` of a ``rows.parquet`` from its bytes (``n`` ``None`` when absent or
     unreadable)."""
@@ -1990,6 +2174,21 @@ def rows_fingerprint(data: bytes | None) -> dict[str, Any]:
     return {"sha256": bytes_digest(data), "n": n}
 
 
+def leverage_content_digest(path: Path | IO[bytes]) -> str:
+    """SHA-256 of the NUMERIC content of a ``leverage.npz``: the sorted ``(name, dtype, shape,
+    bytes)`` of every member but ``metadata`` (whose creation time and commit change on every
+    recalibration that reproduces the same numbers).  Raises on an unreadable archive."""
+    h = hashlib.sha256()
+    with np.load(path, allow_pickle=False) as z:
+        for name in sorted(z.files):
+            if name == "metadata":
+                continue
+            arr = np.ascontiguousarray(z[name])
+            h.update(f"{name}|{arr.dtype.str}|{arr.shape}|".encode())
+            h.update(arr.tobytes())
+    return h.hexdigest()
+
+
 def state_params(params: Any) -> dict[str, float]:
     """The fitted model parameters as the fit record stores them (:data:`PARAMS`)."""
     return {
@@ -1997,10 +2196,26 @@ def state_params(params: Any) -> dict[str, float]:
     }
 
 
-def state_link(date: str, snapshot: str, params: Mapping[str, float], key: str) -> str:
+def state_link(
+    date: str,
+    snapshot: str,
+    params: Mapping[str, float],
+    key: str,
+    content: str | None = None,
+    *,
+    version: int = RECORD_VERSION,
+) -> str:
     """What a later date consumes of ``date``: its marked state — the snapshot digest, the fitted
-    parameters and the leverage key — as one SHA-256."""
-    payload = {"date": date, "snapshot": snapshot, "params": state_params(params), "key": key}
+    parameters, the leverage key and (record version 2) the leverage content digest — as one
+    SHA-256.  Version 1 links (stores written before the content digest) omit the content."""
+    payload: dict[str, Any] = {
+        "date": date,
+        "snapshot": snapshot,
+        "params": state_params(params),
+        "key": key,
+    }
+    if version >= 2:
+        payload["leverage_content"] = content
     return hashlib.sha256(_canonical(payload).encode()).hexdigest()
 
 
@@ -2013,15 +2228,17 @@ class Verdict:
     """``done`` (an ``ok`` outcome whose ``CURRENT`` pointer and dependency record verify, its
     dependencies' verdicts included), ``incomplete``, ``failed``, ``skipped`` (the same for
     those outcomes), ``pending`` (it verifies, but a date it depends on is not stored yet — a
-    shard boundary or an ``--only-dates`` window — so it cannot be confirmed), ``stale``
-    (anything else; :attr:`reason` says what) or ``missing`` (no ``CURRENT``)."""
+    shard boundary or an ``--only-dates`` window — so it cannot be confirmed), ``unsettled`` (a
+    consistent read could not be obtained while other writers changed the store: unknown, never
+    acted on), ``stale`` (anything else; :attr:`reason` says what) or ``missing`` (no
+    ``CURRENT``)."""
     reason: str = ""
     doc: Mapping[str, Any] | None = None
     """The confirmed (or pending) outcome: the current attempt's ``done.json``."""
     attempt: Attempt | None = None
     """The attempt judged (the current one, or a candidate)."""
-    link: str | None = None
-    """The date's state link (:func:`state_link`, or :data:`UNAVAILABLE`) when confirmed."""
+    links: Mapping[int, str] = field(default_factory=dict)
+    """The date's state links by record version (:func:`state_link`) when confirmed."""
     leverage: bool = False
     """Whether the date's leverage is complete in the configured cache (confirmed dates)."""
     waits: tuple[str, ...] = ()
@@ -2031,11 +2248,28 @@ class Verdict:
     date it depends on)."""
     stored: Mapping[str, Any] | None = None
     """The attempt's ``done.json`` whenever its files verify, even when its record no longer
-    does (what the refusals and the pointer rule read)."""
+    does (what the refusals and the pointer rule read); for a date still in the flat layout, its
+    flat ``done.json`` (so the refusals see it before any migration)."""
     content: AttemptContent | None = None
     """The verified bytes of the attempt (set with :attr:`stored`): what stage 2 reads."""
     pointer_sha256: str = ""
     """The SHA-256 of the ``CURRENT`` bytes this verdict read."""
+    note: str = ""
+    """Display only (never a classification): e.g. a later failed attempt, from verified
+    bytes."""
+    flat: bool = False
+    """The date is still in the flat layout (it needs :func:`migrate_store`)."""
+    foreign: bool = False
+    """Its ``CURRENT`` was written by another pointer version (a refusal for every writer)."""
+    legacy_unverified: str = ""
+    """Non-empty (:data:`LEGACY_UNVERIFIED`) for an outcome with results whose record is of
+    version 1: it verifies, but the numbers of its own leverage were never recorded, so only
+    the key and its completeness are checked — reported by ``status`` and the study, never
+    silent (the owner's decision for the 25-date proof of concept, 2026-09-17)."""
+
+    @property
+    def link(self) -> str:
+        return self.links.get(RECORD_VERSION, UNAVAILABLE)
 
     @property
     def settled(self) -> bool:
@@ -2079,6 +2313,13 @@ class Verdict:
         return str((self.stored or {}).get("created_utc", ""))
 
 
+def computed_under_another_config(v: Verdict, config_hash: str) -> bool:
+    """**The one judgement** of "this date's stored outcome was computed under another config":
+    its verified (or flat) ``done.json`` names another config hash.  Used by the ``--force``
+    refusal of ``run`` and by the commands stage 2 prints."""
+    return v.stored is not None and v.stored_hash != config_hash
+
+
 def verdict_rank(v: Verdict) -> int:
     """How much an attempt protects: ``done`` 5, a pending ``ok`` 4, ``incomplete`` 3, a pending
     ``incomplete`` 2, any other attempt whose files verify and hold results (stale ones included)
@@ -2092,6 +2333,11 @@ def verdict_rank(v: Verdict) -> int:
     return 1 if v.results_bearing else 0
 
 
+def _record_version(v: Verdict) -> object:
+    record = (v.stored or {}).get("record")
+    return record.get("version") if isinstance(record, Mapping) else None
+
+
 def choose_pointer(
     current: Verdict,
     attempts: Sequence[Verdict],
@@ -2100,13 +2346,26 @@ def choose_pointer(
 ) -> Verdict | None:
     """**The pointer rule** — the attempt ``CURRENT`` should name, or ``None`` to keep it.
 
-    Among the published attempts (``attempts``, the new one included) only those of this config
-    are eligible.  The new attempt is taken when it protects at least as much as the current one
-    and as much as any eligible attempt (:func:`verdict_rank`); otherwise the best eligible
-    attempt (the newest among equals) is taken when it protects more than the current one.  An
-    attempt without results never becomes current while any attempt of the date — current or
-    not, of any config — holds verified results."""
-    eligible = [v for v in attempts if v.attempt is not None and v.stored_hash == config_hash]
+    Nothing moves while any verdict involved is ``unsettled``.  Among the published attempts
+    (``attempts``, the new one included) only those of this config are eligible.  The new
+    attempt is taken when it protects at least as much as the current one and as much as any
+    eligible attempt (:func:`verdict_rank`); otherwise the best eligible attempt (the newest
+    among equals) is taken when it protects more than the current one.  An attempt without
+    results never becomes current while any attempt of the date — current or not, of any
+    config — holds verified results.  Once the date has an attempt recorded at
+    :data:`RECORD_VERSION`, an attempt of an older record version is never made current (it
+    stays done only while it already is: its evidence is weaker, never a fallback)."""
+    if current.status == "unsettled" or any(v.status == "unsettled" for v in attempts):
+        return None
+    has_current_record = any(_record_version(v) == RECORD_VERSION for v in (current, *attempts))
+    eligible = [
+        v
+        for v in attempts
+        if v.attempt is not None
+        and not computed_under_another_config(v, config_hash)
+        and v.stored is not None
+        and not (has_current_record and _record_version(v) != RECORD_VERSION)
+    ]
     if not eligible:
         return None
     rank_now = verdict_rank(current)
@@ -2148,6 +2407,8 @@ def _record_mismatch(stored: Mapping[str, Any], expected: Mapping[str, Any]) -> 
             if b == ABSENT:
                 return "its snapshot is missing"
             return "its snapshot differs from the one it was computed from"
+        if name == "cause":
+            return f"the cause of its skip no longer holds ({b})"
         if name in ("rows", "fit"):
             file = ROWS_NAME if name == "rows" else FIT_NAME
             now = b if isinstance(b, Mapping) else {"sha256": b}
@@ -2164,6 +2425,8 @@ def _record_mismatch(stored: Mapping[str, Any], expected: Mapping[str, Any]) -> 
                 return "its leverage key no longer follows from its snapshot, fit and base spec"
             if not b.get("complete"):
                 return STALE_LEVERAGE
+            if a.get("content") != b.get("content"):
+                return "its leverage's numbers differ from the ones it was priced with"
             return "its leverage is now in the configured cache"
         if name == "previous" and isinstance(a, Mapping) and isinstance(b, Mapping):
             if a.get("date") != b.get("date"):
@@ -2191,6 +2454,41 @@ def _reread_pause(k: int) -> None:
     time.sleep(min(0.05, 0.001 * 2**k))
 
 
+@dataclass(frozen=True)
+class SnapshotRead:
+    """A snapshot as one read saw it: its digest, and the spec parsed from the same bytes."""
+
+    digest: str
+    spec: CalibrationSpec | None
+    error: str = ""
+
+
+def read_snapshot(base: CalibrationSpec, path: Path) -> tuple[SnapshotRead, bytes | None]:
+    """Read a snapshot ONCE: its :func:`snapshot_digest` and the spec parsed from those bytes
+    (through a private copy, so a concurrent re-import cannot mix two versions)."""
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError:
+        return SnapshotRead(ABSENT, None, "absent"), None
+    digest = snapshot_bytes_digest(data)
+    try:
+        with tempfile.TemporaryDirectory(prefix="volsto-snap-") as tmp:
+            copy = Path(tmp) / path.name
+            copy.write_bytes(data)
+            spec = snapshot_spec(base, copy)
+    except (OSError, KeyError, TypeError, ValueError, ConfigError, yaml.YAMLError) as exc:
+        return SnapshotRead(digest, None, f"{type(exc).__name__}: {exc}"), data
+    return SnapshotRead(digest, spec), data
+
+
+class RecordInputs(Protocol):
+    """Where :func:`dependency_record` reads the snapshot digests and the leverage."""
+
+    def snapshot(self, date: str) -> str: ...
+
+    def leverage(self, date: str, params: Any, version: int) -> dict[str, Any]: ...
+
+
 class Ledger:
     """The one reader of a backtest store (module docstring, *Integrity*).
 
@@ -2200,7 +2498,8 @@ class Ledger:
     the date's ``CURRENT`` and every file of the attempt it names ONCE, checks those bytes
     against the pointer's hashes and parses the same bytes — never the files again — and then
     recomputes the attempt's dependency record with :func:`dependency_record`, the function the
-    run wrote it with.  An attempt that vanishes while ``CURRENT`` changes is read again."""
+    run wrote it with.  An attempt that vanishes while ``CURRENT`` changes is read again; when
+    that keeps happening the verdict is ``unsettled``."""
 
     def __init__(
         self,
@@ -2224,6 +2523,8 @@ class Ledger:
         self._trades: list[TradeInstance] | None = None
         self._keys: dict[tuple[str, str], str] = {}
         self._skip_cache: dict[str, Verdict] | None = None
+        self._snapshots: dict[str, SnapshotRead] = {}
+        self._leverage: dict[tuple[str, int, int, int], tuple[bool, str | None]] = {}
 
     @classmethod
     def of(cls, cfg: BacktestConfig, *, snapshots: Path | None = None) -> Ledger:
@@ -2252,14 +2553,76 @@ class Ledger:
             return f"unavailable: {exc}"
 
     def invalidate(self, date: str | None = None) -> None:
-        """Forget the verdicts from ``date`` on (all of them without a date) and the calendar:
-        a commit of ``date`` can change every later verdict."""
+        """Forget the verdicts from ``date`` on, the calendar and the skips (a commit of ``date``
+        can change every later verdict); without a date, everything, this pass's snapshot reads
+        included (a commit never changes a snapshot; an import invalidates everything)."""
         for d in list(self._verdicts):
             if date is None or d >= date:
                 del self._verdicts[d]
         self._calendar = None
         self._trades = None
         self._skip_cache = None
+        if date is None:
+            self._snapshots.clear()
+
+    # -- what a record reads (RecordInputs) ------------------------------------------------------
+
+    def read_snapshot(self, date: str) -> SnapshotRead:
+        """The date's snapshot, read once per pass (:func:`read_snapshot`)."""
+        hit = self._snapshots.get(date)
+        if hit is None:
+            hit = self._snapshots[date] = read_snapshot(self.base, self.snapshot_path(date))[0]
+        return hit
+
+    def snapshot(self, date: str) -> str:
+        return self.read_snapshot(date).digest
+
+    def leverage_state(self, key: str) -> tuple[bool, str | None]:
+        """``(complete, content digest)`` of a cache entry, memoised by its file identity (the
+        one completeness test, :meth:`~volsto.calibration.cache.LeverageCache.has_key`, then
+        :func:`leverage_content_digest`)."""
+        path = self.cache.root / key / LEVERAGE_NAME
+        try:
+            st_ = path.stat()
+        except OSError:
+            return False, None
+        memo = (key, st_.st_ino, st_.st_mtime_ns, st_.st_size)
+        hit = self._leverage.get(memo)
+        if hit is None:
+            complete = self.cache.has_key(key)
+            content: str | None = None
+            if complete:
+                try:
+                    content = leverage_content_digest(path)
+                except Exception:  # an archive that opens but does not load is incomplete
+                    complete = False
+            hit = self._leverage[memo] = (complete, content)
+        return hit
+
+    def leverage(self, date: str, params: Any, version: int = RECORD_VERSION) -> dict[str, Any]:
+        """``{"key", "complete"[, "content"]}``: the leverage key recomputed from the date's
+        snapshot (as :meth:`read_snapshot` parsed it), the fitted parameters and the base spec
+        (memoised: content-addressed), whether the configured cache holds it complete and
+        (record version 2) the digest of its numbers."""
+        snap = self.read_snapshot(date)
+        try:
+            if snap.spec is None:
+                raise ValueError(snap.error or "no snapshot")
+            memo = (snap.digest, _canonical(state_params(params)))
+            key = self._keys.get(memo)
+            if key is None:
+                spec = dataclasses.replace(snap.spec, model=BergomiParams(**state_params(params)))
+                key = self._keys[memo] = spec_key(spec)
+        except (KeyError, TypeError, ValueError, ConfigError) as exc:
+            out: dict[str, Any] = {"key": f"unrecoverable: {type(exc).__name__}", "complete": False}
+            if version >= 2:
+                out["content"] = None
+            return out
+        complete, content = self.leverage_state(key)
+        out = {"key": key, "complete": complete}
+        if version >= 2:
+            out["content"] = content
+        return out
 
     # -- the effective calendar ----------------------------------------------------------------
 
@@ -2270,8 +2633,9 @@ class Ledger:
     def _skip_verdicts(self) -> dict[str, Verdict]:
         """A date is skipped when one of its skip attempts — the current one or, since a skip
         never displaces results (:func:`choose_pointer`), a newer one next to them — verifies:
-        its files hash to its address and its record (inputs digest included) recomputes equal.
-        A skip record has no dependencies, so this needs no calendar."""
+        its files hash to its address, its record (inputs digest included) recomputes equal, and
+        its cause — the day file is absent — still holds.  A skip record has no dependencies,
+        so this needs no calendar."""
         if self.cfg.missing_close != "skip_date":
             return {}
         if self._skip_cache is not None:
@@ -2283,6 +2647,11 @@ class Ledger:
                 for a in self.store.attempts(d)
                 if a.id.rsplit("-", 1)[0] in ("skipped", f"{LEGACY_PREFIX}skipped")
             ]
+            try:  # the one cause a skip may have: the day file is absent (re-derived here)
+                if skips and self.inputs.file_sha(d) != ABSENT:
+                    continue
+            except (DateFailure, OSError):
+                continue
             for a in reversed(skips):
                 try:
                     content = a.read()
@@ -2299,13 +2668,7 @@ class Ledger:
                     mismatch = f"{type(exc).__name__}: {exc}"
                 if not mismatch:
                     out[d] = Verdict(
-                        d,
-                        "skipped",
-                        _outcome_reason(doc),
-                        doc,
-                        a,
-                        stored=doc,
-                        content=content,
+                        d, "skipped", _outcome_reason(doc), doc, a, stored=doc, content=content
                     )
                     break
         self._skip_cache = out
@@ -2334,28 +2697,6 @@ class Ledger:
         """:func:`dependencies_of` on the effective calendar."""
         cal = self.calendar()
         return dependencies_of(self.cfg, cal, self.trades(), date) if date in cal else ([], [])
-
-    def close_digests(self, date: str) -> dict[str, str]:
-        """The snapshot digest of every date whose close ``date``'s rows use."""
-        return {e: snapshot_digest(self.snapshot_path(e)) for e in self.dependencies(date)[1]}
-
-    def leverage(self, date: str, params: Any) -> dict[str, Any]:
-        """``{"key", "complete"}``: the leverage key recomputed from the date's snapshot, the
-        fitted parameters and the base spec (memoised by the snapshot digest and parameters:
-        content-addressed), and whether the configured cache holds it complete
-        (:meth:`~volsto.calibration.cache.LeverageCache.has_key`)."""
-        path = self.snapshot_path(date)
-        try:
-            memo = (snapshot_digest(path), _canonical(state_params(params)))
-            key = self._keys.get(memo)
-            if key is None:
-                spec = dataclasses.replace(
-                    snapshot_spec(self.base, path), model=BergomiParams(**state_params(params))
-                )
-                key = self._keys[memo] = spec_key(spec)
-        except (OSError, KeyError, TypeError, ValueError, ConfigError, yaml.YAMLError) as exc:
-            return {"key": f"unrecoverable: {type(exc).__name__}", "complete": False}
-        return {"key": key, "complete": self.cache.has_key(key)}
 
     # -- verdicts ------------------------------------------------------------------------------
 
@@ -2431,22 +2772,28 @@ class Ledger:
     def candidate(self, date: str, attempt: Attempt) -> Verdict:
         """The verdict ``attempt`` would have as the date's current attempt (not memoised), from
         one read of its files verified against its content address."""
+        content, doc, why = self._read_candidate(date, attempt)
+        if why or content is None or doc is None:
+            return Verdict(date, "stale", why, attempt=attempt, origin=(date, why))
+        return self._attempt_verdict(date, content, doc)
+
+    def _read_candidate(
+        self, date: str, attempt: Attempt
+    ) -> tuple[AttemptContent | None, dict[str, Any] | None, str]:
         try:
             content = attempt.read()
         except OSError as exc:
-            why = f"its attempt {attempt.id} is unreadable ({type(exc).__name__})"
-            return Verdict(date, "stale", why, attempt=attempt, origin=(date, why))
+            return None, None, f"its attempt {attempt.id} is unreadable ({type(exc).__name__})"
         why = attempt.verify(None, content)
-        doc: dict[str, Any] | None = None
-        if not why:
-            try:
-                doc = content.json(DONE_NAME)
-            except (KeyError, ValueError, UnicodeDecodeError):
-                why = f"its {DONE_NAME} is unreadable"
-        if why or doc is None or doc.get("date") != date:
-            why = why or f"its {DONE_NAME} names another date"
-            return Verdict(date, "stale", why, attempt=attempt, origin=(date, why))
-        return self._attempt_verdict(date, content, doc)
+        if why:
+            return None, None, why
+        try:
+            doc = content.json(DONE_NAME)
+        except (KeyError, ValueError, UnicodeDecodeError):
+            return None, None, f"its {DONE_NAME} is unreadable"
+        if doc.get("date") != date:
+            return None, None, f"its {DONE_NAME} names another date"
+        return content, doc, ""
 
     def attempt_verdicts(self, date: str, current: Verdict) -> list[Verdict]:
         """The candidate verdicts of every published attempt of a date (the verified attempt
@@ -2458,7 +2805,7 @@ class Ledger:
                 and current.attempt is not None
                 and a.id == current.attempt.id
             ):
-                out.append(dataclasses.replace(current, reason=_outcome_reason(current.stored)))
+                out.append(current)
             else:
                 out.append(self.candidate(date, a))
         return out
@@ -2470,8 +2817,8 @@ class Ledger:
             except _Reread:
                 _reread_pause(k)
                 continue
-        why = f"its {CURRENT_NAME} kept changing while it was read"
-        return Verdict(date, "stale", why, origin=(date, why))
+        why = f"its {CURRENT_NAME} kept changing while it was read ({READ_RETRIES} reads)"
+        return Verdict(date, "unsettled", why, origin=(date, why))
 
     def _judge_once(self, date: str) -> Verdict:
         data, att, content, why = self._read_current(date)
@@ -2482,49 +2829,100 @@ class Ledger:
                 return dataclasses.replace(skip, pointer_sha256=sha)
         if why == NO_CURRENT:
             if self.store.legacy_files(date):
-                return Verdict(date, "stale", LEGACY_REASON, origin=(date, LEGACY_REASON))
+                return self._flat_verdict(date)
             n = len(self.store.attempts(date))
-            reason = (
-                "not computed"
-                if n == 0
-                else (
-                    f"no {CURRENT_NAME} ({n} published attempt(s): `volsto-backtest run` "
-                    "adopts the best confirmed one)"
+            if n == 0:
+                reason = "not computed"
+            elif foreign_pointer_refusal(self.store):  # no writer of this version may adopt
+                reason = f"no {CURRENT_NAME} ({n} published attempt(s))"
+            else:
+                reason = (
+                    f"no {CURRENT_NAME} ({n} published attempt(s): "
+                    f"{backtest_command(self.cfg, 'run', [date])} adopts the best confirmed one)"
                 )
-            )
             return Verdict(date, "missing", reason)
         if why or content is None:
-            return Verdict(date, "stale", why, attempt=att, origin=(date, why), pointer_sha256=sha)
+            return Verdict(
+                date,
+                "stale",
+                why,
+                attempt=att,
+                origin=(date, why),
+                pointer_sha256=sha,
+                foreign=bool(_foreign_version(data)),
+            )
         v = self._attempt_verdict(date, content, content.json(DONE_NAME))
-        v = dataclasses.replace(v, pointer_sha256=sha)
-        later = [
+        return dataclasses.replace(v, pointer_sha256=sha, note=self._later_failure(date, v))
+
+    def _later_failure(self, date: str, v: Verdict) -> str:
+        """A display note about a failed attempt newer than the current one — from VERIFIED
+        bytes only (its files hash to its address)."""
+        current = v.attempt.id if v.attempt is not None else ""
+        failed = [
             a
             for a in self.store.attempts(date)
-            if a.id != content.attempt.id
-            and (a.doc() or {}).get("status") == "failed"
-            and a.created() > v.created
+            if a.id != current and a.id.rsplit("-", 1)[0] in ("failed", f"{LEGACY_PREFIX}failed")
         ]
-        if later:
-            note = f"a later attempt failed: {(later[-1].doc() or {}).get('error', '')}"
-            v = dataclasses.replace(v, reason="; ".join(x for x in (v.reason, note) if x))
-        return v
+        best: tuple[str, str] | None = None
+        for a in failed:
+            _, doc, why = self._read_candidate(date, a)
+            if why or doc is None or doc.get("status") != "failed":
+                continue
+            created = str(doc.get("created_utc", ""))
+            if created > v.created and (best is None or created > best[0]):
+                best = (created, str(doc.get("error", "")))
+        return "" if best is None else f"a later attempt failed: {best[1]}"
+
+    def _flat_verdict(self, date: str) -> Verdict:
+        """A date still in the flat layout: ``stale`` (it needs the migration), with its flat
+        outcome judged as the attempt the migration would publish — so the refusals see its
+        results and its config before anything is migrated."""
+        stored: dict[str, Any] | None = None
+        try:
+            data = (self.store.date_dir(date) / DONE_NAME).read_bytes()
+            doc = json.loads(data.decode("utf-8"))
+            if isinstance(doc, dict) and doc.get("date") == date:
+                stored = doc
+        except (OSError, ValueError, UnicodeDecodeError):
+            stored = None
+        header = self.store.header() or {}
+        # the config the outcome names (its own done.json), else the store header's
+        owner = str((stored or {}).get("config_hash") or header.get("config_hash") or "")
+        if owner and owner != self.hash:
+            reason = (
+                f"{LEGACY_REASON}, under config hash {owner[:12]}: migrate it with that config "
+                f"(this config hashes to {self.hash[:12]})"
+            )
+        else:
+            reason = (
+                f"{LEGACY_REASON}: {backtest_command(self.cfg, 'migrate')} moves it into attempts"
+            )
+        return Verdict(date, "stale", reason, origin=(date, reason), stored=stored, flat=True)
 
     def _attempt_verdict(self, date: str, content: AttemptContent, doc: dict[str, Any]) -> Verdict:
         att = content.attempt
         try:
-            why, waits, root = self._check(date, doc, content)
+            why, waits, root, unsettled = self._check(date, doc, content)
         except _Reread:
             raise
         except Exception as exc:  # never a crash: an unusable record is a mismatch
             why = f"its record cannot be checked: {type(exc).__name__}: {exc}"
-            waits, root = (), None
+            waits, root, unsettled = (), None, False
+        if unsettled:
+            return Verdict(
+                date, "unsettled", why, attempt=att, origin=root, stored=doc, content=content
+            )
         if why:
             origin = root if root is not None else (date, why)
             return Verdict(
                 date, "stale", why, attempt=att, origin=origin, stored=doc, content=content
             )
         status = str(doc["status"])
-        link, leverage = self._own_link(date, doc, content)
+        links, leverage = self._own_links(date, doc, content)
+        record = doc.get("record") or {}
+        legacy = (
+            LEGACY_UNVERIFIED if record.get("version") == 1 and status in RESULT_STATUSES else ""
+        )
         if waits:
             reason = f"waits for {', '.join(waits)} (not stored yet); stored as {status}"
             return Verdict(
@@ -2533,11 +2931,12 @@ class Ledger:
                 reason,
                 doc,
                 att,
-                link,
+                links,
                 leverage,
                 waits,
                 stored=doc,
                 content=content,
+                legacy_unverified=legacy,
             )
         state = "done" if status == "ok" else status
         return Verdict(
@@ -2546,24 +2945,34 @@ class Ledger:
             _outcome_reason(doc),
             doc,
             att,
-            link,
+            links,
             leverage,
             stored=doc,
             content=content,
+            legacy_unverified=legacy,
         )
 
     def _check(
         self, date: str, doc: Mapping[str, Any], content: AttemptContent
-    ) -> tuple[str, tuple[str, ...], tuple[str, str] | None]:
-        """``(mismatch, waits, origin)`` of one stored outcome with its verified files:
-        ``mismatch`` is ``""`` when its record recomputes equal (:func:`dependency_record`);
-        ``origin`` names the stale dependency a mismatch comes from."""
+    ) -> tuple[str, tuple[str, ...], tuple[str, str] | None, bool]:
+        """``(mismatch, waits, origin, unsettled)`` of one stored outcome with its verified
+        files: ``mismatch`` is ``""`` when its record recomputes equal (:func:`dependency_record`,
+        at the record's own version); ``origin`` names the stale dependency a mismatch comes
+        from; ``unsettled`` when a dependency could not be read consistently."""
         stored = doc.get("record")
         if not isinstance(stored, Mapping):
-            return "stored without a dependency record (an older volsto-backtest)", (), None
+            return "stored without a dependency record (an older volsto-backtest)", (), None, False
+        version = stored.get("version")
+        if version not in RECORD_VERSIONS:
+            return (
+                f"record version {version!r} (this code reads {RECORD_VERSIONS})",
+                (),
+                None,
+                False,
+            )
         status = str(doc.get("status"))
         if status not in (*RESULT_STATUSES, "failed", "skipped"):
-            return f"unknown stored status {status!r}", (), None
+            return f"unknown stored status {status!r}", (), None, False
         waits: list[str] = []
         judged: dict[str, Verdict] = {}
         if status != "skipped":
@@ -2577,9 +2986,11 @@ class Ledger:
                     waits.append(e)
                 elif v.status == "pending":
                     waits += v.waits
+                elif v.status == "unsettled":
+                    return f"depends on unsettled {e}: {v.reason}", (), (e, v.reason), True
                 elif v.status == "stale":
                     origin = v.origin if v.origin is not None else (e, v.reason)
-                    return f"depends on stale {origin[0]}: {origin[1]}", (), origin
+                    return f"depends on stale {origin[0]}: {origin[1]}", (), origin, False
         raw_links, raw_prev = stored.get("links"), stored.get("previous")
         links: Mapping[str, Any] = raw_links if isinstance(raw_links, Mapping) else {}
         prev: Mapping[str, Any] = raw_prev if isinstance(raw_prev, Mapping) else {}
@@ -2589,29 +3000,35 @@ class Ledger:
             if v.status == "missing":  # unconfirmable yet: the stored link stands in (pending)
                 lev = bool(prev.get("leverage")) if prev.get("date") == e else False
                 return links.get(e), lev
-            return v.link, v.leverage
+            return v.links.get(int(version), UNAVAILABLE), v.leverage
 
-        expected = dependency_record(self, date, doc, content.files, link_of)
-        return _record_mismatch(stored, expected), tuple(dict.fromkeys(waits)), None
+        expected = dependency_record(
+            self, date, doc, content.files, link_of, inputs=self, version=int(version)
+        )
+        return _record_mismatch(stored, expected), tuple(dict.fromkeys(waits)), None, False
 
-    def _own_link(
+    def _own_links(
         self, date: str, doc: Mapping[str, Any], files: AttemptContent
-    ) -> tuple[str, bool]:
-        """The date's state link from the verified bytes (never a new read of the files)."""
+    ) -> tuple[dict[int, str], bool]:
+        """The date's state links (every record version) from the verified bytes — never a new
+        read of the attempt's files; a version-1 record has no leverage content, so its
+        version-2 link takes the content of the cache entry its key names."""
         record = doc["record"]
         lev = record.get("leverage")
         if not isinstance(lev, Mapping):
-            return UNAVAILABLE, False
+            return {}, False
         if doc.get("status") in RESULT_STATUSES:
             params = files.json(FIT_NAME).get("params")
         else:
             params = doc.get("params")
         if params is None:
-            return UNAVAILABLE, False
-        return (
-            state_link(date, str(record["snapshot"]), state_params(params), str(lev["key"])),
-            bool(lev.get("complete")),
-        )
+            return {}, False
+        key = str(lev["key"])
+        content = lev["content"] if "content" in lev else self.leverage_state(key)[1]
+        snap = str(record["snapshot"])
+        p = state_params(params)
+        links = {v: state_link(date, snap, p, key, content, version=v) for v in RECORD_VERSIONS}
+        return links, bool(lev.get("complete"))
 
 
 def _outcome_reason(doc: Mapping[str, Any]) -> str:
@@ -2625,36 +3042,46 @@ def dependency_record(
     doc: Mapping[str, Any],
     files: Mapping[str, bytes],
     link_of: Callable[[str], tuple[str | None, bool]],
+    *,
+    inputs: RecordInputs,
+    version: int = RECORD_VERSION,
 ) -> dict[str, Any]:
-    """**The integrity function**: the dependency record of the stored outcome ``doc`` of
-    ``date``, computed from the world as it is — the config hash; the inputs digest
-    (:class:`InputIndex`); the calibration code tag; the snapshot digest
-    (:func:`snapshot_digest`); for results, the checksum and row count of ``rows.parquet`` and
-    the checksum of ``fit.json`` (both from ``files``, the outcome's bytes), the leverage key
-    recomputed from the snapshot, the fitted parameters and the base spec with its completeness
-    in the configured cache, the previous calendar date with whether its leverage was used, the
-    state link (:func:`state_link`) of every date whose marked state the rows use and the
-    snapshot digest of every date whose close they use (:func:`dependencies_of`), the links
-    given by ``link_of`` as ``(link, leverage complete)``; for a failure, the previous date and,
-    when the date was marked, the leverage of its own parameters; for a skip, its (empty) files.
+    """**The integrity function**: the dependency record (at record ``version``) of the stored
+    outcome ``doc`` of ``date`` — the config hash; the inputs digest (:class:`InputIndex`); the
+    calibration code tag; the snapshot digest; for results, the checksum and row count of
+    ``rows.parquet`` and the checksum of ``fit.json`` (both from ``files``, the outcome's
+    bytes), the leverage key recomputed from the snapshot, the fitted parameters and the base
+    spec, its completeness in the configured cache and (version 2) the digest of its numbers,
+    the previous calendar date with whether its leverage was used, the state link
+    (:func:`state_link`) of every date whose marked state the rows use and the snapshot digest of
+    every date whose close they use (:func:`dependencies_of`), the links given by ``link_of`` as
+    ``(link, leverage complete)``; for a failure, the previous date and, when the date was
+    marked, the leverage of its own parameters; for a skip, its (empty) files and (version 2) its
+    cause, re-derived: the day file is absent.
 
-    ``run`` stores what this returns in the outcome (``record``), with ``files`` the staged
-    bytes and ``link_of`` the states it used; :meth:`Ledger.verdict` calls it again on the bytes
-    it verified, with the dependencies' confirmed links, and the date is confirmed iff the two
-    are equal."""
+    ``inputs`` says where the snapshot digests and the leverage come from: ``run`` passes what
+    it USED (the digests of the bytes it parsed, the leverage it priced with) and stores the
+    result in the outcome (``record``); :meth:`Ledger.verdict` passes itself (the world as it is)
+    with the dependencies' confirmed links, and the date is confirmed iff the two are equal."""
     status = str(doc.get("status"))
     record: dict[str, Any] = {
-        "version": RECORD_VERSION,
+        "version": version,
         "date": date,
         "status": status,
         "config_hash": ledger.hash,
         "inputs_digest": ledger.inputs_digest(date),
         "calibration_code_tag": CALIBRATION_CODE_TAG,
-        "snapshot": snapshot_digest(ledger.snapshot_path(date)),
+        "snapshot": inputs.snapshot(date),
     }
     if status in (*RESULT_STATUSES, "skipped"):
         record["rows"] = rows_fingerprint(files.get(ROWS_NAME))
         record["fit"] = bytes_digest(files.get(FIT_NAME))
+    if status == "skipped" and version >= 2:
+        try:
+            absent = ledger.inputs.file_sha(date) == ABSENT
+        except (DateFailure, OSError):
+            absent = False
+        record["cause"] = SKIP_CAUSE if absent else "the day file exists"
     if status in RESULT_STATUSES:
         params: Any = None
         if FIT_NAME in files:
@@ -2662,19 +3089,20 @@ def dependency_record(
                 params = json.loads(files[FIT_NAME].decode("utf-8")).get("params")
             except (ValueError, UnicodeDecodeError, AttributeError):
                 params = None
-        record["leverage"] = (
-            ledger.leverage(date, params)
-            if isinstance(params, Mapping)
-            else {"key": "unrecoverable: no fitted parameters", "complete": False}
-        )
+        if isinstance(params, Mapping):
+            record["leverage"] = inputs.leverage(date, params, version)
+        else:
+            record["leverage"] = {"key": "unrecoverable: no fitted parameters", "complete": False}
+            if version >= 2:
+                record["leverage"]["content"] = None
         p = ledger.previous(date)
         record["previous"] = None if p is None else {"date": p, "leverage": link_of(p)[1]}
         record["links"] = {e: link_of(e)[0] for e in ledger.dependencies(date)[0]}
-        record["closes"] = ledger.close_digests(date)
+        record["closes"] = {e: inputs.snapshot(e) for e in ledger.dependencies(date)[1]}
     elif status == "failed":
         params = doc.get("params")
         if isinstance(params, Mapping):
-            record["leverage"] = ledger.leverage(date, params)
+            record["leverage"] = inputs.leverage(date, params, version)
         p = ledger.previous(date)
         record["previous"] = None if p is None else {"date": p}
     return record
@@ -2685,13 +3113,66 @@ def dependency_record(
 # --------------------------------------------------------------------------------------------
 
 
+def header_refusal(cfg: BacktestConfig, store: BacktestStore, *, force: bool) -> str:
+    """Why this config may not write into the store (``""`` when it may) — a PURE check: the
+    store header names another config hash and ``--force`` was not given."""
+    header = store.header()
+    h = cfg.content_hash()
+    if header is None or header.get("config_hash") == h or force:
+        return ""
+    return (
+        f"the store {store.root} was built from config hash "
+        f"{str(header.get('config_hash'))[:12]} and this config hashes to {h[:12]}: a changed "
+        "config would mix results. Recompute every date under this config with: "
+        f"{backtest_command(cfg, 'run', [], extras=['--force'])} — or write elsewhere (replace "
+        f"{NEW_STORE}): {elsewhere_command(cfg, [])}"
+    )
+
+
+def foreign_pointer_refusal(store: BacktestStore) -> str:
+    """Why no mutating command may touch the store (``""`` when none): a ``CURRENT`` written
+    by another pointer version (a newer volsto-backtest).  A pure check."""
+    bad = [d for d in store.dates() if _foreign_version(store.pointer_bytes(d))]
+    if not bad:
+        return ""
+    more = " ..." if len(bad) > 3 else ""
+    return (
+        f"{len(bad)} date(s) of {store.root} ({', '.join(bad[:3])}{more}) "
+        f"have a CURRENT of another pointer version (this code reads version "
+        f"{POINTER_VERSION}): a newer volsto-backtest wrote them; use that version"
+    )
+
+
+def bind_header(cfg: BacktestConfig, store: BacktestStore) -> None:
+    """Write the header when it is missing or names another config (after every refusal)."""
+    header = store.header()
+    if header is None or header.get("config_hash") != cfg.content_hash():
+        store.write_header(cfg)
+
+
+def check_store(cfg: BacktestConfig, store: BacktestStore, *, force: bool) -> None:
+    """:func:`header_refusal` then :func:`bind_header` (``run`` calls them apart, with its other
+    refusals in between)."""
+    why = header_refusal(cfg, store, force=force)
+    if why:
+        raise RefusedError(why)
+    bind_header(cfg, store)
+
+
 def _decide(
-    store: BacktestStore, ledger: Ledger, date: str, new: Attempt | None
+    store: BacktestStore, ledger: Ledger, held: DateLock, new: Attempt | None
 ) -> tuple[Verdict | None, Verdict, Verdict | None]:
     """``(choice, current, new's verdict)`` of the pointer rule for one date, from a fresh read
-    (call under the date's lock)."""
+    under the date's lock (:func:`choose_pointer`).  A ``CURRENT`` of another pointer version is
+    refused, never judged."""
+    date = held.date
+    foreign = _foreign_version(held.read_pointer())
+    if foreign:
+        raise RefusedError(f"{date}: {foreign}")
     ledger.invalidate(date)
     current = ledger.verdict(date)
+    if current.flat:  # not migrated yet: there is no CURRENT to protect
+        current = Verdict(date, "missing", current.reason)
     verdicts = ledger.attempt_verdicts(date, current)
     new_v = next(
         (
@@ -2702,21 +3183,21 @@ def _decide(
         None,
     )
     choice = choose_pointer(current, verdicts, ledger.hash, new_v)
-    named, _, why = ledger.verify_current(date)
+    ptr = parse_pointer(held.read_pointer())
+    named = None if ptr is None or "invalid" in ptr else ptr.get("attempt")
     if (
         choice is not None
         and choice.attempt is not None
-        and named is not None
-        and not why
-        and choice.attempt.id == named.id
+        and current.stored is not None
+        and choice.attempt.id == named
     ):
         choice = None  # already current (and its pointer verifies)
     return choice, current, new_v
 
 
-def _point(store: BacktestStore, choice: Verdict) -> None:
+def _point(store: BacktestStore, held: DateLock, choice: Verdict) -> None:
     assert choice.attempt is not None and choice.content is not None
-    store.set_pointer(choice.attempt, choice.stored_status, choice.content.listing)
+    store.set_pointer(held, choice.attempt, choice.stored_status, choice.content.listing)
 
 
 def publish_outcome(
@@ -2725,16 +3206,25 @@ def publish_outcome(
     """Publish a complete staged outcome and apply the pointer rule, all under the date's lock,
     from a fresh consistent read of the store: ``(attempt, its verdict, whether CURRENT names
     it)``."""
-    with store.lock(date):
+    with store.lock(date) as held:
         _crash_point("lock.acquired")
-        attempt = store.publish(date, staged, label)
+        foreign = _foreign_version(held.read_pointer())
+        if foreign:  # refused before anything is published into a date another version owns
+            raise RefusedError(f"{date}: {foreign}")
+        attempt = store.publish(held, staged, label)
         ledger.invalidate()
-        choice, current, new_v = _decide(store, ledger, date, attempt)
+        choice, _, new_v = _decide(store, ledger, held, attempt)
         _crash_point("pointer.decided")
         if choice is not None:
-            _point(store, choice)
-        named = choice.attempt if choice is not None else current.attempt
-        is_current = named is not None and named.id == attempt.id
+            _point(store, held, choice)
+        ptr = parse_pointer(held.read_pointer())
+        is_current = ptr is not None and ptr.get("attempt") == attempt.id
+        if not held.still_at(store.date_dir(date)):
+            raise RefusedError(
+                f"{date}: the date directory {store.date_dir(date)} was moved or replaced while "
+                f"it was locked: the attempt {attempt.id} went into the moved directory, not "
+                "into the store (moving a store that a writer uses is not supported)"
+            )
     _crash_point("lock.released")
     ledger.invalidate(date)
     if new_v is None:
@@ -2742,84 +3232,121 @@ def publish_outcome(
     return attempt, new_v, is_current
 
 
+def _adopt_held(
+    store: BacktestStore, ledger: Ledger, held: Mapping[str, DateLock], dates: Sequence[str]
+) -> list[str]:
+    adopted: list[str] = []
+    ledger.invalidate()
+    for d in dates:
+        choice, _, _ = _decide(store, ledger, held[d], None)
+        if choice is not None:
+            _point(store, held[d], choice)
+            adopted.append(d)
+            log.warning(
+                "%s: adopted the published attempt %s (%s)",
+                d,
+                choice.attempt.id if choice.attempt else "",
+                choice.status,
+            )
+            ledger.invalidate(d)
+    return adopted
+
+
 def adopt(store: BacktestStore, ledger: Ledger, dates: Sequence[str]) -> list[str]:
     """Apply the pointer rule without a new attempt to every date of ``dates`` that has
     published attempts (under their locks, taken together, from one fresh read): ``CURRENT``
     moves to an attempt of this config that protects more — what a writer killed between
-    publishing and pointing left, or an older result that verifies again."""
+    publishing and pointing left, or an older result that verifies again.  Refused (before any
+    write) when a ``CURRENT`` of another pointer version exists."""
+    why = foreign_pointer_refusal(store)
+    if why:
+        raise RefusedError(why)
     todo = [d for d in sorted(set(dates)) if store.attempts_dir(d).is_dir()]
-    adopted: list[str] = []
     if not todo:
-        return adopted
-    with store.locks(todo):
-        ledger.invalidate()
-        for d in todo:
-            choice, _, _ = _decide(store, ledger, d, None)
-            if choice is not None:
-                _point(store, choice)
-                adopted.append(d)
-                log.warning(
-                    "%s: adopted the published attempt %s (%s)",
-                    d,
-                    choice.attempt.id if choice.attempt else "",
-                    choice.status,
-                )
-                ledger.invalidate(d)
-    return adopted
+        return []
+    with store.locks(todo) as held:
+        return _adopt_held(store, ledger, held, todo)
 
 
-def collect_garbage(store: BacktestStore, ledger: Ledger) -> dict[str, int]:
-    """``volsto-backtest gc`` (conservative and bound to the config).  Refused unless the store
-    header names this config.  Under every date's lock (taken together; writers wait): the
-    pointer rule is applied (:func:`adopt`), then — from one fresh read — a date whose FULL
-    verdict is ``done`` loses its non-current attempts (each either holds no results or is
-    superseded by the current done attempt; symbolic links are skipped with a warning); any
-    other date keeps all of its attempts.  Pointer temporaries, the staging directories of dead
-    writers and removed-migration leftovers go too."""
+def gc_refusal(store: BacktestStore, ledger: Ledger) -> str:
+    """Why ``gc`` may not run (``""`` when it may): a store whose header is not this config's,
+    or a ``CURRENT`` of another pointer version.  A pure check."""
     header = store.header()
     if header is None or header.get("config_hash") != ledger.hash:
-        raise RefusedError(
+        return (
             f"gc: the store {store.root} was built from config hash "
             f"{str((header or {}).get('config_hash'))[:12]} and this config hashes to "
             f"{ledger.hash[:12]}: gc only runs with the store's own config"
         )
-    counts = {"attempts": 0, "kept": 0, "symlinks": 0, "staging": 0, "pointer": 0, "flat": 0}
+    return foreign_pointer_refusal(store)
+
+
+def collect_garbage(store: BacktestStore, ledger: Ledger) -> dict[str, int]:
+    """``volsto-backtest gc`` (conservative and bound to the config).  Refused (before any
+    write) unless the store header names this config and every ``CURRENT`` is of this pointer
+    version.  Under every date's lock (taken together; writers wait), every mutation through the
+    locked descriptors: the pointer rule is applied (:func:`adopt`), then — from one fresh read
+    — a date whose FULL verdict is ``done`` loses its non-current attempts (each either holds no
+    results or is superseded by the current done attempt; symbolic links are skipped with a
+    warning); any other date keeps all of its attempts.  Pointer temporaries and the staging
+    directories of dead writers on this host go too; those of other hosts are kept and
+    counted.  Migrated flat leftovers are removed under the store lock."""
+    why = gc_refusal(store, ledger)
+    if why:
+        raise RefusedError(why)
+    counts = {
+        "attempts": 0,
+        "kept": 0,
+        "symlinks": 0,
+        "staging": 0,
+        "staging_kept": 0,
+        "pointer": 0,
+        "flat": 0,
+    }
     dates = store.dates()
-    with store.locks(dates):
+    with store.locks(dates) as held:
+        judged = [
+            d for d in dates if d in ledger.vendor_calendar and store.attempts_dir(d).is_dir()
+        ]
+        _adopt_held(store, ledger, held, judged)
         ledger.invalidate()
         for d in dates:
-            if d in ledger.vendor_calendar and store.attempts_dir(d).is_dir():
-                choice, _, _ = _decide(store, ledger, d, None)
-                if choice is not None:
-                    _point(store, choice)
-        ledger.invalidate()
-        for d in dates:
+            h = held[d]
             v = ledger.verdict(d) if d in ledger.vendor_calendar else None
-            attempts = store.attempts(d)
             done = (
                 v is not None and v.status == "done" and v.attempt is not None and v.results_bearing
             )
-            for a in attempts:
-                if v is not None and v.attempt is not None and a.id == v.attempt.id:
+            names = h.attempt_names()
+            for name in names:
+                if name.startswith(STAGING_PREFIX):
+                    if _staging_owner_alive(Path(name)):
+                        counts["staging_kept"] += 1
+                    else:
+                        shutil.rmtree(name, dir_fd=h.attempts_fd(), ignore_errors=True)
+                        counts["staging"] += 1
+                    continue
+                if not _ATTEMPT_NAME.fullmatch(name):
+                    continue
+                if v is not None and v.attempt is not None and name == v.attempt.id:
                     continue
                 if not done:
                     counts["kept"] += 1
-                elif a.path.is_symlink():
-                    log.warning("gc: %s: %s is a symbolic link: skipped", d, a.id)
+                    continue
+                mode = os.stat(name, dir_fd=h.attempts_fd(), follow_symlinks=False).st_mode
+                if stat.S_ISLNK(mode):
+                    log.warning("gc: %s: %s is a symbolic link: skipped", d, name)
                     counts["symlinks"] += 1
-                else:
-                    store.remove_attempt(a)
-                    counts["attempts"] += 1
-            for q in store.date_dir(d).glob(f"{POINTER_TMP_PREFIX}*"):
-                q.unlink(missing_ok=True)  # writers write pointers under this lock only
-                counts["pointer"] += 1
-            if store.attempts_dir(d).is_dir():
-                for q in store.attempts_dir(d).glob(f"{STAGING_PREFIX}*"):
-                    if not _staging_owner_alive(q):
-                        shutil.rmtree(q, ignore_errors=True)
-                        counts["staging"] += 1
-        counts["flat"] = _remove_imported_leftovers(store)
+                    continue
+                store.remove_attempt(h, store.attempt(d, name))
+                counts["attempts"] += 1
+            for name in h.names():
+                if name.startswith(POINTER_TMP_PREFIX):
+                    h.unlink(name)  # writers write pointers under this lock only
+                    counts["pointer"] += 1
+            h.release_attempts()
         ledger.invalidate()
+    with store.store_lock():
+        counts["flat"] = _remove_imported_leftovers(store)
     return counts
 
 
@@ -2828,33 +3355,51 @@ def import_record_path(snapshot: Path) -> Path:
     return snapshot.with_name(snapshot.stem + IMPORT_SUFFIX)
 
 
-def snapshot_bound(cfg: BacktestConfig, path: Path, source_sha: str, manifest_sha: str) -> bool:
-    """A stored snapshot is reused only when its import record binds its current content digest
-    (:func:`snapshot_digest`) to the current day-file and manifest-entry digests and the
-    configured eSSVI / calendar-repair settings (the provenance agreeing as well)."""
+def snapshot_bound(
+    cfg: BacktestConfig,
+    path: Path,
+    source_sha: str,
+    manifest_sha: str,
+    data: bytes | None = None,
+) -> bool:
+    """A stored snapshot is reused only when its import record binds its content digest
+    (:func:`snapshot_digest`; of ``data``, the bytes the caller read, when given) to the current
+    day-file and manifest-entry digests and the configured eSSVI / calendar-repair settings (the
+    provenance of the same bytes agreeing as well)."""
     rec = _read_json(import_record_path(path))
     if rec is None:
         return False
+    if data is None:
+        try:
+            data = path.read_bytes()
+        except OSError:
+            return False
     surf = cfg.section("surface")
     return bool(
-        rec.get("snapshot") == snapshot_digest(path)
+        rec.get("snapshot") == snapshot_bytes_digest(data)
         and rec.get("day_file_sha256") == source_sha
         and rec.get("manifest_sha256") == manifest_sha
         and rec.get("essvi") == bool(surf["essvi"])
         and rec.get("calendar_repair") == bool(surf["calendar_repair"])
-        and _snapshot_ok(cfg, path, source_sha, manifest_sha)
+        and _snapshot_ok(cfg, data, source_sha, manifest_sha)
     )
 
 
 def bind_snapshot(
-    cfg: BacktestConfig, path: Path, source_sha: str, manifest_sha: str, how: str
+    cfg: BacktestConfig,
+    path: Path,
+    source_sha: str,
+    manifest_sha: str,
+    how: str,
+    digest: str,
 ) -> None:
-    """Write the import record of a snapshot (after the snapshot itself)."""
+    """Write the import record of a snapshot whose content digest is ``digest`` (computed by
+    the caller from the bytes it wrote or checked)."""
     surf = cfg.section("surface")
     _write_json(
         import_record_path(path),
         {
-            "snapshot": snapshot_digest(path),
+            "snapshot": digest,
             "day_file_sha256": source_sha,
             "manifest_sha256": manifest_sha,
             "essvi": bool(surf["essvi"]),
@@ -2868,8 +3413,9 @@ def bind_snapshot(
 
 def import_snapshot(
     cfg: BacktestConfig, date: str, source_sha: str, manifest_sha: str, dest: Path
-) -> None:
-    """Import a vendor day into ``dest`` (with the backtest's provenance entry), atomically."""
+) -> str:
+    """Import a vendor day into ``dest`` (with the backtest's provenance entry), atomically;
+    returns the snapshot digest of the bytes written."""
     surf = cfg.section("surface")
     try:
         cfg_map, _, _, _ = import_day(
@@ -2880,13 +3426,20 @@ def import_snapshot(
             calendar_repair=DEFAULT_CALENDAR_REPAIR if surf["calendar_repair"] else None,
         )
     except Exception as exc:
-        raise DateFailure(f"{date}: import failed: {type(exc).__name__}: {exc}") from exc
+        raise ImportFailure(f"{date}: import failed: {type(exc).__name__}: {exc}") from exc
     cfg_map["provenance"][SNAPSHOT_INPUTS] = {
         "day_file_sha256": source_sha,
         "manifest_sha256": manifest_sha,
     }
+    digest: list[str] = []
+
+    def write(tmp: Path) -> None:
+        write_snapshot(cfg_map, tmp)
+        digest.append(snapshot_bytes_digest(tmp.read_bytes()))  # the bytes renamed to dest
+
     dest.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write(dest, lambda tmp: write_snapshot(cfg_map, tmp))
+    atomic_write(dest, write)
+    return digest[0]
 
 
 def _stage_copy(store: BacktestStore, date: str, files: Mapping[str, Path]) -> Path:
@@ -2898,87 +3451,95 @@ def _stage_copy(store: BacktestStore, date: str, files: Mapping[str, Path]) -> P
     return staged
 
 
-def _quarantine(store: BacktestStore, date: str, files: Sequence[Path]) -> str:
-    """Move flat files no attempt holds into ``quarantine/<date>-<digest>/`` (never deleted)."""
-    listing = {p.name: _file_sha256(p) for p in files}
-    dest = store.quarantine_root / f"{date}-{listing_digest(listing)[:16]}"
+def _quarantine(store: BacktestStore, held: DateLock, names: Sequence[str]) -> str:
+    """Move flat files no attempt holds into ``quarantine/<date>-<digest>/`` (never deleted),
+    relative to the locked date directory."""
+    listing = {n: _file_sha256(store.date_dir(held.date) / n) for n in names}
+    rel = f"{held.date}-{listing_digest(listing)[:16]}"
+    dest = store.quarantine_root / rel
     dest.mkdir(parents=True, exist_ok=True)
-    for p in files:
-        target = dest / p.name
-        if target.exists() and _file_sha256(target) == listing[p.name]:
-            p.unlink()  # moved there by an interrupted earlier migration
-        else:
-            os.replace(p, target)
-    _fsync_path(dest)
-    return str(dest.relative_to(store.root))
+    qfd = os.open(dest, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        for n in names:
+            if _exists_at(n, qfd) and _sha256((dest / n).read_bytes()) == listing[n]:
+                held.unlink(n)  # moved there by an interrupted earlier migration
+            else:
+                os.replace(n, n, src_dir_fd=held.fd, dst_dir_fd=qfd)
+        os.fsync(qfd)
+    finally:
+        os.close(qfd)
+    return f"{QUARANTINE_DIR}/{rel}"
+
+
+def _legacy_label(done: Path) -> str:
+    """``legacy-<status>`` of a flat ``done.json`` (``legacy-unknown`` when it is torn or its
+    status is not a plain word: the attempt is judged by its content anyway)."""
+    status = str((_read_json(done) or {}).get("status", "unknown"))
+    return LEGACY_PREFIX + (status if re.fullmatch(r"[a-z][a-z-]*", status) else "unknown")
 
 
 def _migrate_date(
-    store: BacktestStore, ledger: Ledger, date: str, leftovers: Sequence[Path]
+    store: BacktestStore, ledger: Ledger, held: DateLock, leftovers: Sequence[Path]
 ) -> dict[str, Any]:
-    """One date of :func:`migrate_store`, under its lock."""
+    """One date of :func:`migrate_store`, under its lock, every mutation through ``held``."""
+    date = held.date
     d = store.date_dir(date)
-    flat = {p.name: p for p in store.legacy_files(date)}
+    flat = [n for n in LEGACY_FILES if n in held.names() and (d / n).is_file()]
     entry: dict[str, Any] = {
-        "flat_files": {n: _file_sha256(p) for n, p in sorted(flat.items())},
+        "flat_files": {n: _file_sha256(d / n) for n in flat},
         "attempts": [],
         "leftovers": [p.name for p in leftovers],
     }
-    results: Attempt | None = None
     published: list[Attempt] = []
     if DONE_NAME in flat:
-        files = {n: flat[n] for n in (ROWS_NAME, FIT_NAME, DONE_NAME) if n in flat}
-        status = str((_read_json(flat[DONE_NAME]) or {}).get("status", "unknown"))
-        results = store.publish(date, _stage_copy(store, date, files), f"{LEGACY_PREFIX}{status}")
-        published.append(results)
+        files = {n: d / n for n in (ROWS_NAME, FIT_NAME, DONE_NAME) if n in flat}
+        label = _legacy_label(d / DONE_NAME)
+        published.append(store.publish(held, _stage_copy(store, date, files), label))
     if FAILURE_NAME in flat:
-        failed = _stage_copy(store, date, {DONE_NAME: flat[FAILURE_NAME]})
-        published.append(store.publish(date, failed, f"{LEGACY_PREFIX}failed"))
+        failed = _stage_copy(store, date, {DONE_NAME: d / FAILURE_NAME})
+        published.append(store.publish(held, failed, f"{LEGACY_PREFIX}failed"))
     for p in leftovers:  # complete directories of an interrupted flat-layout commit
-        names = {q.name: q for q in p.iterdir() if q.is_file()}
+        try:
+            names = {q.name: q for q in p.iterdir() if q.is_file()}
+        except FileNotFoundError:
+            continue  # handled by another process
         body = {n: names[n] for n in (ROWS_NAME, FIT_NAME, DONE_NAME) if n in names}
         if DONE_NAME in body:
-            status = str((_read_json(body[DONE_NAME]) or {}).get("status", "unknown"))
-            staged = _stage_copy(store, date, body)
-            published.append(store.publish(date, staged, f"{LEGACY_PREFIX}{status}"))
+            label = _legacy_label(body[DONE_NAME])
+            published.append(store.publish(held, _stage_copy(store, date, body), label))
         if FAILURE_NAME in names:
             staged = _stage_copy(store, date, {DONE_NAME: names[FAILURE_NAME]})
-            published.append(store.publish(date, staged, f"{LEGACY_PREFIX}failed"))
+            published.append(store.publish(held, staged, f"{LEGACY_PREFIX}failed"))
     entry["attempts"] = [a.id for a in published]
     _crash_point("migrate.published")
-    ledger.invalidate(date)
-    if store.pointer(date) is None and results is not None:
-        # what the flat layout held as the date's outcome, verified by its content address
-        content = results.read()
-        doc = content.json(DONE_NAME)
-        store.set_pointer(results, str(doc.get("status")), content.listing)
-    else:
-        choice, _, _ = _decide(store, ledger, date, None)
-        if choice is not None:
-            _point(store, choice)
-    entry["current"] = (store.pointer(date) or {}).get("attempt")
+    # always the pointer rule (config, rank and results checks included)
+    choice, _, _ = _decide(store, ledger, held, None)
+    if choice is not None:
+        _point(store, held, choice)
+    entry["current"] = (parse_pointer(held.read_pointer()) or {}).get("attempt")
     _crash_point("migrate.pointed")
-    held = {h for a in published for h in a.listing().values()}
-    lost = [p for p in flat.values() if _file_sha256(p) not in held]
-    for p in flat.values():
-        if p not in lost:  # its bytes are inside a published attempt
-            p.unlink()
+    kept = {h for a in published for h in a.listing().values()}
+    lost = [n for n in flat if _file_sha256(d / n) not in kept]
+    for n in flat:
+        if n not in lost:  # its bytes are inside a published attempt
+            held.unlink(n)
     if lost:
-        entry["quarantined"] = _quarantine(store, date, lost)
+        entry["quarantined"] = _quarantine(store, held, lost)
         log.warning(
             "%s: %d flat file(s) held by no attempt moved to %s",
             date,
             len(lost),
             entry["quarantined"],
         )
-    _fsync_path(d)
+    os.fsync(held.fd)
     _crash_point("migrate.flat_removed")
     ledger.invalidate(date)
     return entry
 
 
 def _remove_imported_leftovers(store: BacktestStore) -> int:
-    """Remove the flat-layout leftovers a migration marked imported, then an empty ``.staging``."""
+    """Remove the flat-layout leftovers a migration marked imported, then an empty ``.staging``
+    (call under :meth:`BacktestStore.store_lock`)."""
     root = store.root / LEGACY_STAGING_DIR
     n = 0
     if not root.is_dir():
@@ -2991,88 +3552,271 @@ def _remove_imported_leftovers(store: BacktestStore) -> int:
     return n
 
 
+def _flat_leftovers(store: BacktestStore) -> dict[str, list[Path]]:
+    out: dict[str, list[Path]] = {}
+    flat_staging = store.root / LEGACY_STAGING_DIR
+    try:
+        entries = sorted(flat_staging.iterdir())
+    except (FileNotFoundError, NotADirectoryError):  # none, or removed by a migration meanwhile
+        return out
+    for p in entries:
+        m = _ISO_PREFIX.match(p.name)
+        if (
+            p.is_dir()
+            and m
+            and not p.name.endswith(IMPORTED_SUFFIX)
+            and any((p / n).is_file() for n in (DONE_NAME, FAILURE_NAME))
+        ):
+            out.setdefault(m.group(1), []).append(p)
+    return out
+
+
+def _migration_journal(store: BacktestStore) -> tuple[list[dict[str, Any]], str]:
+    """``(history, problem)``: the migration journal, or ``([], why)`` when ``migrations.json``
+    exists but cannot be read as one (it is then kept as it is, never overwritten)."""
+    path = store.root / MIGRATIONS_NAME
+    if not path.exists():
+        return [], ""
+    data = _read_json(path)
+    history = None if data is None else data.get("migrations")
+    if not isinstance(history, list) or not all(isinstance(e, dict) for e in history):
+        return [], (
+            f"{_display(path)} exists but is not a readable migration journal (kept as it is, "
+            "never overwritten)"
+        )
+    return list(history), ""
+
+
+def _migration_log(store: BacktestStore) -> list[dict[str, Any]]:
+    history, problem = _migration_journal(store)
+    if problem:
+        raise RefusedError(f"migrate: {problem}")
+    return history
+
+
+def _write_migration_log(store: BacktestStore, history: list[dict[str, Any]]) -> None:
+    _write_json(store.root / MIGRATIONS_NAME, {"migrations": history})
+
+
+def _stored_config_hash(store: BacktestStore, date: str) -> str:
+    """The config hash a stored date names — its flat ``done.json``, else the ``done.json`` of
+    the attempt its ``CURRENT`` names (unverified: a refusal reads it) — or ``""``."""
+    d = store.date_dir(date)
+    doc = _read_json(d / DONE_NAME)
+    if doc is None:
+        cur = store.current(date)
+        doc = None if cur is None else _read_json(cur.path / DONE_NAME)
+    return str((doc or {}).get("config_hash") or "")
+
+
+def migration_refusal(store: BacktestStore, ledger: Ledger, *, rebinding: bool = False) -> str:
+    """Why this config may not migrate the store (``""`` when it may or there is nothing to
+    migrate) — a pure check, made by ``run`` with its other refusals before anything is
+    written: an unreadable journal (kept); another config's header — or, without a header, a
+    stored date computed under another config (every stored date is judged: calendar dates by
+    :func:`computed_under_another_config`, the others by the config hash they name); an
+    interrupted migration another config started; a CURRENT of another version.  With
+    ``rebinding`` (``run --force``, which binds this config's header first) the header and
+    headerless checks are what ``--force`` accepts."""
+    history, problem = _migration_journal(store)
+    flat = any(store.legacy_files(d) for d in store.dates()) or bool(_flat_leftovers(store))
+    pending = bool(history) and history[-1].get("state") == "in_progress"
+    if problem and flat:
+        return (
+            f"migrate: {problem}; move it aside (e.g. into {_display(store.quarantine_root)}/) "
+            "and rerun: the dates an interrupted migration had moved are then recorded from their "
+            "legacy-* attempts"
+        )
+    if not (flat or pending):
+        return ""
+    started = str(history[-1].get("config_hash", "")) if pending else ""
+    header = store.header()
+    owner = str((header or {}).get("config_hash") or "")
+    if header is not None and owner != ledger.hash and not rebinding:
+        who = started if started and started != owner else owner
+        return (
+            f"migrate: the store {store.root} was built from config hash {owner[:12]} and this "
+            f"config hashes to {ledger.hash[:12]}: migrate it with config hash {who[:12]}, "
+            + (
+                "which started the interrupted migration"
+                if who != owner
+                else "the store's own config"
+            )
+            + " (or rebuild it with run --force)"
+        )
+    if header is None and not rebinding:
+        foreign: dict[str, str] = {}
+        for d in store.dates():
+            if d in ledger.vendor_calendar:
+                v = ledger.verdict(d)
+                if computed_under_another_config(v, ledger.hash):
+                    foreign[d] = v.stored_hash
+            else:
+                h = _stored_config_hash(store, d)
+                if h and h != ledger.hash:
+                    foreign[d] = h
+        if foreign:
+            dates = sorted(foreign)
+            hashes = sorted({h[:12] for h in foreign.values() if h})
+            more = " ..." if len(dates) > 4 else ""
+            return (
+                f"migrate: the store {store.root} has no header and {len(dates)} date(s) "
+                f"({', '.join(dates[:4])}{more}) hold results computed under config hash "
+                f"{', '.join(hashes) or 'unknown'} (this config hashes to {ledger.hash[:12]}): "
+                "migrate it with that config (or rebuild it with run --force)"
+            )
+    if started and started != ledger.hash:
+        return (
+            f"migrate: an interrupted migration of {store.root} was started under config hash "
+            f"{started[:12]} and this config hashes to {ledger.hash[:12]}: finish it with that "
+            "config"
+        )
+    return foreign_pointer_refusal(store)
+
+
 def migrate_store(store: BacktestStore, ledger: Ledger) -> dict[str, dict[str, Any]]:
     """Move a store of the flat layout (``dates/<date>/{rows.parquet, fit.json, done.json,
-    failure.json}`` and the ``.staging`` directory of its commits) into attempts, in place — only
-    when the store header names this config (or there is none).  Each flat outcome is copied
-    into ``attempts/legacy-<status>-<digest>/`` (content-addressed: re-running an interrupted
-    migration finds it published); ``CURRENT`` is written from the hashes of the flat results
-    when present, else by the pointer rule (an attempt of another config never becomes current);
-    only then are the flat files removed — those no attempt holds are moved to ``quarantine/``
-    instead; leftovers are renamed ``*.imported`` before their removal (a crash there is
-    finished by the next open or ``gc``).  The migration is appended to ``migrations.json``.  The
-    snapshots of the migrated dates whose results verify are then bound to their sources only
-    if a fresh import of the day file reproduces their content digest (:func:`bind_snapshot`);
-    otherwise they stay unbound (the date is recomputed) and the mismatch is recorded."""
-    header = store.header()
-    if header is not None and header.get("config_hash") != ledger.hash:
-        if any(store.legacy_files(d) for d in store.dates()):
-            log.warning(
-                "store %s: not migrated: its header names config hash %s, not %s",
-                _display(store.root),
-                str(header.get("config_hash"))[:12],
-                ledger.hash[:12],
-            )
-        return {}
-    leftovers: dict[str, list[Path]] = {}
-    flat_staging = store.root / LEGACY_STAGING_DIR
-    if flat_staging.is_dir():
-        for p in sorted(flat_staging.iterdir()):
-            m = _ISO_PREFIX.match(p.name)
-            if (
-                p.is_dir()
-                and m
-                and not p.name.endswith(IMPORTED_SUFFIX)
-                and any((p / n).is_file() for n in (DONE_NAME, FAILURE_NAME))
-            ):
-                leftovers.setdefault(m.group(1), []).append(p)
-    todo = sorted({d for d in store.dates() if store.legacy_files(d)} | set(leftovers))
-    report: dict[str, dict[str, Any]] = {}
-    for d in todo:
-        with store.lock(d):
-            report[d] = _migrate_date(store, ledger, d, leftovers.get(d, []))
-    for paths in leftovers.values():
-        for p in paths:
-            marked = p.with_name(p.name + IMPORTED_SUFFIX)
-            os.replace(p, marked)
-            _crash_point("migrate.leftover_marked")
-    _remove_imported_leftovers(store)
-    _crash_point("migrate.leftover_removed")
-    ledger.invalidate()
-    if not report:
-        return report
-    bound, unbound = _bind_migrated_snapshots(ledger, sorted(report))
-    log_path = store.root / MIGRATIONS_NAME
-    history = (_read_json(log_path) or {}).get("migrations", [])
-    history.append(
-        {
-            "from": "flat layout (dates/<date>/{rows.parquet, fit.json, done.json})",
-            "to": f"attempts + {CURRENT_NAME} (pointer version {POINTER_VERSION})",
-            "dates": report,
-            "snapshots_bound": bound,
-            "snapshots_unbound": unbound,
-            "utc": _utc_now(),
-            "code_version": code_version(),
-            "volsto_version": volsto_version(),
-            "host": socket.gethostname(),
-        }
+    failure.json}`` and the ``.staging`` directory of its commits) into attempts, in place.
+
+    Refused (:class:`RefusedError`, nothing written) unless the store header names this config
+    (or there is none) and no ``CURRENT`` is of another pointer version; a store that is not
+    writable raises :class:`ConfigError` before any lock.  The whole migration runs under the
+    store lock (a concurrent migration waits, then finds nothing to do), each date under its
+    lock, and is JOURNALLED: an ``in_progress`` entry of ``migrations.json`` is written before
+    the first destructive step, each date's report right after that date, and the entry is
+    completed after the snapshot binding — an interrupted migration is finished by the next
+    open (the reports of dates it had already moved are rebuilt from their ``legacy-*``
+    attempts).  Per date: each flat outcome is copied into ``attempts/legacy-<status>-<digest>/``
+    (content-addressed: re-running finds it published); ``CURRENT`` is set by the pointer rule
+    (:func:`choose_pointer`, so an attempt of another config, a torn ``done.json`` or a result
+    that ranks below a published one never becomes current); only then are the flat files
+    removed — those no attempt holds are moved to ``quarantine/``; leftovers are renamed
+    ``*.imported`` before their removal.  The snapshots of the migrated dates whose results
+    verify are then bound only if a fresh import of the day file reproduces their content
+    digest; otherwise they stay unbound (the date is recomputed) and the mismatch is recorded."""
+    why = migration_refusal(store, ledger)
+    if why:
+        raise RefusedError(why)
+    todo_hint = sorted(
+        {d for d in store.dates() if store.legacy_files(d)} | set(_flat_leftovers(store))
     )
-    _write_json(log_path, {"migrations": history})
+    history, problem = _migration_journal(store)
+    if problem:  # nothing flat (else refused above): the unreadable journal is left alone
+        return {}
+    resuming = bool(history) and history[-1].get("state") == "in_progress"
+    if not todo_hint and not resuming:
+        return {}
+    check_writable(store, ledger, todo_hint)
+    report: dict[str, dict[str, Any]] = {}
+    with store.store_lock():
+        leftovers = _flat_leftovers(store)
+        todo = sorted({d for d in store.dates() if store.legacy_files(d)} | set(leftovers))
+        history = _migration_log(store)
+        if history and history[-1].get("state") == "in_progress":
+            entry = history[-1]
+        else:
+            if not todo:
+                return {}
+            if not history:  # no journal: dates an unrecorded migration moved are recorded too
+                todo = sorted(
+                    set(todo)
+                    | {
+                        d
+                        for d in store.dates()
+                        if any(a.id.startswith(LEGACY_PREFIX) for a in store.attempts(d))
+                    }
+                )
+            entry = {
+                "state": "in_progress",
+                "config_hash": ledger.hash,
+                "from": "flat layout (dates/<date>/{rows.parquet, fit.json, done.json})",
+                "to": f"attempts + {CURRENT_NAME} (pointer version {POINTER_VERSION})",
+                "todo": todo,
+                "dates": {},
+                "started_utc": _utc_now(),
+                "code_version": code_version(),
+                "volsto_version": volsto_version(),
+                "host": socket.gethostname(),
+            }
+            history.append(entry)
+        entry["todo"] = sorted(set(entry.get("todo", [])) | set(todo))
+        _write_migration_log(store, history)
+        _crash_point("migrate.journalled")
+        for d in todo:
+            if not store.legacy_files(d) and d not in leftovers:
+                continue  # moved before (its report is rebuilt below)
+            with store.lock(d) as held:
+                report[d] = _migrate_date(store, ledger, held, leftovers.get(d, []))
+            entry["dates"][d] = report[d]
+            _write_migration_log(store, history)
+            _crash_point("migrate.reported")
+        for d in entry["todo"]:  # moved by an interrupted run, its report lost: rebuild it
+            if d not in entry["dates"]:
+                entry["dates"][d] = {
+                    "attempts": [a.id for a in store.attempts(d) if a.id.startswith(LEGACY_PREFIX)],
+                    "current": (store.pointer(d) or {}).get("attempt"),
+                    "rebuilt": True,
+                }
+        for paths in leftovers.values():
+            for p in paths:
+                with contextlib.suppress(FileNotFoundError):
+                    os.replace(p, p.with_name(p.name + IMPORTED_SUFFIX))
+                _crash_point("migrate.leftover_marked")
+        _remove_imported_leftovers(store)
+        _crash_point("migrate.leftover_removed")
+        ledger.invalidate()
+        bound, unbound = _bind_migrated_snapshots(ledger, sorted(entry["dates"]))
+        entry["snapshots_bound"] = sorted(set(entry.get("snapshots_bound", [])) | set(bound))
+        entry["snapshots_unbound"] = unbound
+        _crash_point("migrate.bound")
+        entry["state"] = "complete"
+        entry["utc"] = _utc_now()
+        _write_migration_log(store, history)
     log.warning(
         "store %s: migrated %d date(s) from the flat layout; bound %d snapshot(s), %d unbound",
         _display(store.root),
-        len(report),
+        len(entry["dates"]),
         len(bound),
         len(unbound),
     )
-    return report
+    return {**entry["dates"], **report}
+
+
+def check_writable(
+    store: BacktestStore,
+    ledger: Ledger,
+    dates: Sequence[str] | None = None,
+    *,
+    attempts: bool = False,
+) -> None:
+    """A store a mutating command must write (the flat layout to migrate included; with
+    ``attempts``, every date's ``attempts/`` too) but cannot: a clear :class:`ConfigError`,
+    before any lock or write."""
+    if dates is None:
+        dates = [d for d in store.dates() if store.legacy_files(d)]
+    paths = [store.root, store.dates_root, *(store.date_dir(d) for d in dates)]
+    if attempts:
+        paths += [store.attempts_dir(d) for d in dates]
+    paths += [store.root / LEGACY_STAGING_DIR, ledger.snapshots]
+    bad = [p for p in paths if p.exists() and not os.access(p, os.W_OK | os.X_OK)]
+    if bad:
+        flat = (
+            " is in the flat layout and must be migrated, but"
+            if any(store.legacy_files(d) for d in dates)
+            else ":"
+        )
+        raise ConfigError(
+            f"the store {store.root}{flat} {_display(bad[0])} is not writable: make it writable "
+            "(chmod -R u+w) or work on a copy"
+        )
 
 
 def _bind_migrated_snapshots(
     ledger: Ledger, dates: Sequence[str]
 ) -> tuple[list[str], dict[str, str]]:
     """Bind the snapshot of each migrated date whose results verify, when a fresh import of its
-    day file reproduces the snapshot's content digest (about 1 s per date)."""
+    day file reproduces the snapshot's content digest (about 1 s per date; dates already bound
+    are skipped, so an interrupted binding resumes)."""
     bound: list[str] = []
     unbound: dict[str, str] = {}
     for d in dates:
@@ -3082,30 +3826,37 @@ def _bind_migrated_snapshots(
         if not (v.has_results or (v.status == "pending" and v.results_bearing)):
             continue
         snap = ledger.snapshot_path(d)
-        if import_record_path(snap).is_file() or v.doc is None:
+        rec = _read_json(import_record_path(snap))
+        if rec is not None:  # bound already (by an interrupted run of this migration, say)
+            if str(rec.get("bound_by", "")).startswith("migration"):
+                bound.append(d)
+            continue
+        if v.doc is None:
             continue
         try:
             source, manifest = ledger.inputs.file_sha(d), ledger.inputs.manifest_sha(d)
         except (DateFailure, OSError) as exc:
             unbound[d] = f"inputs unavailable: {exc}"
             continue
-        digest = snapshot_digest(snap)
+        read, data = read_snapshot(ledger.base, snap)
+        digest = read.digest
         if v.doc["record"].get("snapshot") != digest or not _snapshot_ok(
-            ledger.cfg, snap, source, manifest
+            ledger.cfg, data or b"", source, manifest
         ):
             unbound[d] = "the snapshot is not the one the results were computed from"
             continue
         with tempfile.TemporaryDirectory(prefix="volsto-bind-") as tmp:
-            fresh = Path(tmp) / snap.name
             try:
-                import_snapshot(ledger.cfg, d, source, manifest, fresh)
+                fresh = import_snapshot(ledger.cfg, d, source, manifest, Path(tmp) / snap.name)
             except DateFailure as exc:
                 unbound[d] = str(exc)
                 continue
-            if snapshot_digest(fresh) != digest:
-                unbound[d] = "a fresh import of its day file gives another snapshot"
-                continue
-        bind_snapshot(ledger.cfg, snap, source, manifest, "migration (fresh import reproduced)")
+        if fresh != digest:
+            unbound[d] = "a fresh import of its day file gives another snapshot"
+            continue
+        bind_snapshot(
+            ledger.cfg, snap, source, manifest, "migration (fresh import reproduced)", digest
+        )
         bound.append(d)
     for d, why in unbound.items():
         log.warning("%s: snapshot left unbound (%s): the date will be recomputed if needed", d, why)
@@ -3131,6 +3882,17 @@ class DateFailure(RuntimeError):  # noqa: N818 — a date's outcome, not a bug
     """A date that cannot be marked (import, infeasible fit, missing leverage)."""
 
 
+class ImportFailure(DateFailure):
+    """The import of an existing day file raised: a date failure (retried by ``--resume``),
+    never a calendar gap."""
+
+
+class DayFileAbsent(DateFailure):
+    """The vendor manifest lists the date as a missing trading day and its file is absent: the
+    one deterministic cause ``data.missing_close: skip_date`` drops a date for
+    (:data:`SKIP_CAUSE`)."""
+
+
 class LeverageMissing(DateFailure):
     """A leverage absent from the cache under ``--no-calibrate``."""
 
@@ -3152,6 +3914,9 @@ class DateState:
     fit: FitResult
     record: dict[str, Any]
     timings: dict[str, float]
+    #: :func:`snapshot_digest` and SHA-256 of the snapshot bytes the state was parsed from
+    snapshot_digest: str = ""
+    snapshot_sha256: str = ""
 
     @property
     def state(self) -> RiskState:
@@ -3174,12 +3939,15 @@ class DateState:
 SNAPSHOT_INPUTS = "backtest_inputs"
 
 
-def _snapshot_ok(cfg: BacktestConfig, path: Path, source_sha: str, manifest_sha: str) -> bool:
-    """A stored snapshot is reused when the backtest imported it from the same day file and the
-    same manifest entry (:meth:`InputIndex.manifest_sha`: its rates), with the configured eSSVI
-    and calendar-repair settings."""
+def _snapshot_ok(
+    cfg: BacktestConfig, source: Path | bytes, source_sha: str, manifest_sha: str
+) -> bool:
+    """A stored snapshot (its bytes, or read from its path) is reused when the backtest imported
+    it from the same day file and the same manifest entry (:meth:`InputIndex.manifest_sha`: its
+    rates), with the configured eSSVI and calendar-repair settings."""
     try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        raw = source if isinstance(source, bytes) else source.read_bytes()
+        data = yaml.safe_load(raw)
         prov = data["provenance"]
         fit = prov["fit"]
         ins = prov[SNAPSHOT_INPUTS]
@@ -3262,6 +4030,61 @@ class DateOutcome:
     attempt: str = ""
 
 
+#: What the run records for an input it read twice with different content (never equal to a
+#: digest: the outcome is judged stale and recomputed).
+CHANGED_WHILE_USED = "changed while in use"
+
+
+def _note_use(used: dict[str, str | None], key: str, digest: str | None) -> None:
+    """Record the digest of what was used under ``key``; a second, different one marks the use
+    :data:`CHANGED_WHILE_USED`."""
+    if used.get(key) is None:
+        used[key] = digest
+    elif used[key] != digest:
+        used[key] = CHANGED_WHILE_USED
+
+
+class _RecordingCache(LeverageCache):
+    """The configured leverage cache, recording the numeric content digest
+    (:func:`leverage_content_digest`) of every leverage it loads, from the very bytes the model
+    is built from (read once)."""
+
+    def __init__(self, root: str | Path, used: dict[str, str | None]) -> None:
+        super().__init__(root)
+        self.used = used
+
+    def load(self, spec: CalibrationSpec) -> LeverageFunction:
+        key = self.key(spec)
+        try:
+            data = (self.entry_dir(spec) / LEVERAGE_NAME).read_bytes()
+        except FileNotFoundError:
+            raise CacheMissError(key) from None
+        _note_use(self.used, key, leverage_content_digest(io.BytesIO(data)))
+        return LeverageFunction.load(io.BytesIO(data))  # type: ignore[arg-type]
+
+
+class _UsedInputs:
+    """:class:`RecordInputs` of a run: the digests of the snapshot bytes it parsed and the
+    leverage it priced with (what :func:`dependency_record` records at commit — nothing is read
+    again then)."""
+
+    def __init__(self, run: BacktestRun) -> None:
+        self.run = run
+
+    def snapshot(self, date: str) -> str:
+        used = self.run.snapshots_used.get(date)
+        return self.run.ledger.snapshot(date) if used is None else used
+
+    def leverage(self, date: str, params: Any, version: int) -> dict[str, Any]:
+        st = self.run.marked(date)
+        if st is None or state_params(params) != state_params(st.fit.params):
+            return self.run.ledger.leverage(date, params, version)
+        out: dict[str, Any] = {"key": st.key, "complete": self.run.cache.has_key(st.key)}
+        if version >= 2:
+            out["content"] = self.run.leverage_content(st.key)
+        return out
+
+
 class BacktestRun:
     """Stage 1 (module docstring): marks, prices and attributes dates of one config."""
 
@@ -3284,7 +4107,10 @@ class BacktestRun:
                 f"{cfg.end}"
             )
         self.store = BacktestStore(cfg.path("out"))
-        self.cache = LeverageCache(cfg.path("cache"))
+        #: what this process used: snapshot digests by date, leverage content digests by key
+        self.snapshots_used: dict[str, str | None] = {}
+        self.leverage_used: dict[str, str | None] = {}
+        self.cache: LeverageCache = _RecordingCache(cfg.path("cache"), self.leverage_used)
         self.snapshots = snapshots if snapshots is not None else cfg.path("snapshots")
         self.base = cfg.base_spec()
         self.sim = cfg.sim(self.base)
@@ -3308,11 +4134,14 @@ class BacktestRun:
         self._set_calendar()
 
     def migrate(self) -> dict[str, dict[str, Any]]:
-        """:func:`migrate_store` (after the refusals of ``run``), the calendar refreshed."""
+        """:func:`migrate_store` (after the refusals of ``run``); after a migration the skips and
+        the calendar are read again (skips found but not yet written are then found again by
+        :meth:`new_skips`)."""
         self.migration = migrate_store(self.store, self.ledger)
-        self.ledger.invalidate()
-        self.skipped = self.ledger.skips()
-        self._set_calendar()
+        if self.migration:
+            self.ledger.invalidate()
+            self.skipped = self.ledger.skips()
+            self._set_calendar()
         return self.migration
 
     def _set_calendar(self) -> None:
@@ -3331,54 +4160,101 @@ class BacktestRun:
     def source_sha(self, date: str) -> str:
         sha = self.inputs.file_sha(date)
         if sha == ABSENT:
-            raise DateFailure(
+            raise DayFileAbsent(
                 f"{date}: no vendor file {_display(source_file(self.cfg, date))} (the vendor "
                 "manifest lists the date as a missing trading day)"
             )
         return sha
 
-    def ensure_snapshot(self, date: str) -> tuple[Path, float]:
-        """The date's snapshot (imported when absent or imported from other inputs);
-        ``(path, seconds)``."""
+    def ensure_snapshot(self, date: str) -> tuple[SnapshotRead, bytes, bool, float]:
+        """The date's snapshot, read ONCE — imported first when absent or not bound to its
+        sources: ``(the parse of the bytes, the bytes, imported here, seconds)``; the binding
+        is checked on the same bytes."""
         path = self.snapshot_path(date)
         sha = self.source_sha(date)
         manifest_sha = self.inputs.manifest_sha(date)
-        if path.is_file() and snapshot_bound(self.cfg, path, sha, manifest_sha):
-            return path, 0.0
-        if path.is_file():
+        read, data = read_snapshot(self.base, path)
+        if data is not None and snapshot_bound(self.cfg, path, sha, manifest_sha, data):
+            if read.spec is None:
+                raise DateFailure(f"{date}: unreadable snapshot {_display(path)}: {read.error}")
+            return read, data, False, 0.0
+        if data is not None:
             log.info("%s: the snapshot is not bound to its sources: re-importing it", date)
         t0 = time.perf_counter()
-        import_snapshot(self.cfg, date, sha, manifest_sha, path)
-        bind_snapshot(self.cfg, path, sha, manifest_sha, "import")
+        digest = import_snapshot(self.cfg, date, sha, manifest_sha, path)
+        bind_snapshot(self.cfg, path, sha, manifest_sha, "import", digest)
         self._closes.pop(date, None)
         self.ledger.invalidate()
+        read, data = read_snapshot(self.base, path)
+        if data is None or read.digest != digest or read.spec is None:
+            raise ImportFailure(
+                f"{date}: the snapshot {_display(path)} changed while it was imported "
+                f"({read.error or 'another content'}): rerun with --resume"
+            )
         seconds = time.perf_counter() - t0
         log.info("%s: imported the snapshot in %.1f s -> %s", date, seconds, _display(path))
-        return path, seconds
+        return read, data, True, seconds
 
     def close(self, date: str) -> float:
-        """The realised close of a date: its snapshot's spot."""
+        """The realised close of a date: the spot of its snapshot, as parsed (the digest of the
+        parsed bytes is what the records name)."""
         if date in self.unavailable:
             raise CloseUnavailable(self.unavailable[date])
         if date not in self._closes:
-            path, _ = self.ensure_snapshot(date)
-            self._closes[date] = float(load_yaml(path, MarketConfig, section="market").spot)
+            read, _, _, _ = self.ensure_snapshot(date)
+            assert read.spec is not None
+            _note_use(self.snapshots_used, date, read.digest)
+            self._closes[date] = float(read.spec.market.spot)
         return self._closes[date]
 
-    def missing_close_message(self, date: str, reason: str) -> str:
+    def missing_close_message(self, date: str, reason: str, *, absent: bool) -> str:
         src = _display(source_file(self.cfg, date))
+        if not absent:  # the day file exists: a failure, never a calendar gap
+            return (
+                f"the close of {date} is unavailable ({reason}); the day file {src} exists, so "
+                "the date is failed, not skipped: fix the file (or the importer) and rerun with "
+                "--resume"
+            )
         return (
             f"the close of {date} is unavailable ({reason}); fix: restore {src}, or set "
             f"data.missing_close: skip_date to drop {date} from the trading calendar (every "
             "later fixing of a trade spanning it then moves one vendor date)"
         )
 
-    def resolve_closes(self, last: str) -> list[str]:
-        """Import every vendor date up to ``last`` (the realised histories need their closes)
-        and apply ``data.missing_close``: ``skip_date`` drops a date whose import fails from the
-        calendar (returned, to be committed as ``skipped``); ``fail`` records it as
-        unavailable (its own date fails, a trade whose history spans it is unpriced)."""
-        newly: list[str] = []
+    def absent(self, date: str) -> bool:
+        """The deterministic cause of a skip: the manifest lists ``date`` and its day file is
+        absent (:data:`SKIP_CAUSE`)."""
+        try:
+            return self.inputs.file_sha(date) == ABSENT
+        except (DateFailure, OSError):
+            return False
+
+    def new_skips(self, last: str) -> list[str]:
+        """``skip_date``: the vendor dates up to ``last`` whose day file is absent and that are
+        not skipped yet — dropped from the calendar here (to be committed as ``skipped``).  A
+        pure check of the inputs: nothing is imported or written."""
+        if self.cfg.missing_close != "skip_date":
+            return []
+        newly = [
+            d
+            for d in self.vendor_calendar
+            if d <= last and d not in self.skipped and self.absent(d)
+        ]
+        for d in newly:
+            self.skipped[d] = self.missing_close_message(
+                d, f"{SKIP_CAUSE}: {_display(source_file(self.cfg, d))}", absent=True
+            )
+            log.warning("history: %s: dropped from the calendar (skip_date: %s)", d, SKIP_CAUSE)
+        if newly:
+            self._set_calendar()
+        return newly
+
+    def resolve_closes(self, last: str) -> None:
+        """Import every vendor date up to ``last`` (the realised histories need their closes).
+        A date whose close cannot be had is recorded as unavailable (its own date fails, a trade
+        whose history spans it is unpriced) — under ``skip_date`` too: only an absent day file
+        is a gap (:meth:`new_skips`), an import that raises is a failure retried by
+        ``--resume``."""
         for d in self.vendor_calendar:
             if d > last:
                 break
@@ -3389,16 +4265,8 @@ class BacktestRun:
             except CloseUnavailable:
                 continue
             except DateFailure as exc:
-                if self.cfg.missing_close == "skip_date":
-                    self.skipped[d] = str(exc)
-                    newly.append(d)
-                    log.warning("history: %s: dropped from the calendar (skip_date)", exc)
-                else:
-                    self.unavailable[d] = self.missing_close_message(d, str(exc))
-                    log.error("history: %s", self.unavailable[d])
-        if newly:
-            self._set_calendar()
-        return newly
+                self.unavailable[d] = self.missing_close_message(d, str(exc), absent=self.absent(d))
+                log.error("history: %s", self.unavailable[d])
 
     def history(self, inception: str, as_of: str) -> RealisedHistory:
         """The realised closes from ``inception`` to ``as_of`` on the (effective) calendar."""
@@ -3436,10 +4304,17 @@ class BacktestRun:
         self._states[date] = st
         return st
 
+    def marked(self, date: str) -> DateState | None:
+        """The date's state if this process marked it (never marks)."""
+        return self._states.get(date)
+
     def _mark(self, date: str) -> DateState:
-        path, import_s = self.ensure_snapshot(date)
+        read, data, _, import_s = self.ensure_snapshot(date)
+        path = self.snapshot_path(date)
+        _note_use(self.snapshots_used, date, read.digest)
         t0 = time.perf_counter()
-        spec = snapshot_spec(self.base, path)
+        assert read.spec is not None
+        spec = read.spec
         fc = ForwardCurve.from_config(spec.market)
         surface = surface_from_config(spec.surface, fc, fc.rate_curve)
         m = self.cfg.section("marking")
@@ -3452,7 +4327,7 @@ class BacktestRun:
         record = fit_record(fit)
         record["history"] = pillar_quantities(surface)
         record["history"]["ln_spot"] = math.log(float(spec.market.spot))
-        prov = yaml.safe_load(path.read_text(encoding="utf-8"))["provenance"]
+        prov = yaml.safe_load(data)["provenance"]
         record["calendar"] = {
             k: v for k, v in dict(prov.get("fit", {})).items() if str(k).startswith("calendar_")
         }
@@ -3468,11 +4343,22 @@ class BacktestRun:
             fit,
             record,
             {"import": import_s, "fit": fit_s, "history": hist_s},
+            snapshot_digest=read.digest,
+            snapshot_sha256=_sha256(data),
         )
 
+    def leverage_content(self, key: str) -> str | None:
+        """The numeric content digest of the leverage ``key`` as this process uses it: the one it
+        loaded for pricing, else the cache entry's when first consumed (memoised)."""
+        if self.leverage_used.get(key) is None:
+            _note_use(self.leverage_used, key, self.ledger.leverage_state(key)[1])
+        return self.leverage_used.get(key)
+
     def ensure_leverage(self, st: DateState) -> tuple[bool, float]:
-        """``(calibrated here, seconds)`` for the date's leverage."""
+        """``(calibrated here, seconds)`` for the date's leverage (its content digest noted as
+        used: a different one loaded for pricing later marks the use changed)."""
         if self.cache.has(st.spec):
+            self.leverage_content(st.key)
             return False, 0.0
         if not self.allow_calibrate:
             raise LeverageMissing(
@@ -3488,14 +4374,14 @@ class BacktestRun:
             st.spec.particle.horizon,
         )
         self.cache.get_or_calibrate(st.spec, allow_calibrate=True)
+        self.leverage_content(st.key)
         seconds = time.perf_counter() - t0
         log.info("%s: calibrated in %.1f s", st.date, seconds)
         return True, seconds
 
     def command(self, dates: Sequence[str]) -> str:
-        """The ``volsto-backtest run`` line producing ``dates`` (paths as run from the cwd)."""
-        src = self.cfg.source or "<config>"
-        return backtest_command(src, dates, self.cfg)
+        """The ``volsto-backtest run`` line producing ``dates`` (:func:`backtest_argv`)."""
+        return backtest_command(self.cfg, "run", dates)
 
     # -- trades --------------------------------------------------------------------------------
 
@@ -3518,7 +4404,10 @@ class BacktestRun:
             st = self.state(date)
         except DateFailure:
             return UNAVAILABLE, False
-        link = state_link(date, snapshot_digest(st.snapshot), state_params(st.fit.params), st.key)
+        snapshot = self.snapshots_used.get(date) or st.snapshot_digest
+        link = state_link(
+            date, snapshot, state_params(st.fit.params), st.key, self.leverage_content(st.key)
+        )
         return link, self.cache.has_key(st.key)
 
     def _commit(
@@ -3551,13 +4440,20 @@ class BacktestRun:
             if fit is not None:
                 _write_json(staged / FIT_NAME, fit)
             _crash_point("stage.fit")
-            # the record is computed from the staged bytes as written (read once)
-            record = dependency_record(self.ledger, date, done, read_files(staged), link_of)
+            # the record: the staged bytes as written (read once) and what the date USED
+            record = dependency_record(
+                self.ledger, date, done, read_files(staged), link_of, inputs=_UsedInputs(self)
+            )
             _crash_point("stage.record")
-            if used is not None and record.get("leverage") != {"key": used.key, "complete": True}:
-                raise RuntimeError(
-                    f"the dependency record does not reproduce the leverage the date used "
-                    f"({record.get('leverage')} against {used.key[:16]})"
+            lev = record.get("leverage") or {}
+            if used is not None and (
+                lev.get("key") != used.key
+                or lev.get("complete") is not True
+                or lev.get("content") in (None, CHANGED_WHILE_USED)
+            ):
+                raise DateFailure(
+                    f"{date}: the leverage {used.key[:16]} the date used is not complete in the "
+                    f"cache, or changed while it was used ({lev}): rerun with --resume"
                 )
             if record.get("status") != "skipped" and self.ledger.calendar() != self.calendar:
                 raise RuntimeError(
@@ -3573,8 +4469,9 @@ class BacktestRun:
             _crash_point("stage.synced")
             return publish_outcome(self.store, self.ledger, date, staged, str(done["status"]))
         except (Exception, KeyboardInterrupt):
-            if staged.is_dir():  # not published: nobody can see it
-                shutil.rmtree(staged, ignore_errors=True)
+            with contextlib.suppress(OSError):  # the store may be unreadable by then
+                if staged.is_dir():  # not published: nobody can see it
+                    shutil.rmtree(staged, ignore_errors=True)
             raise
         finally:
             self.ledger.invalidate(date)
@@ -3627,6 +4524,27 @@ class BacktestRun:
                     leverage_missing = isinstance(exc, LeverageMissing)
                     prev_note = f"no P&L: the previous date {d_prev} is unavailable: {exc}"
                     log.warning("%s: %s", date, prev_note)
+            # the cumulative P&L prices the fresh attributed trades at their inception states
+            if prev is not None:
+                for d_inc in sorted(
+                    {
+                        t.inception
+                        for t in self.live(date)
+                        if attributed(self.cfg, t) and self.index[t.inception] < i - 1
+                    }
+                ):
+                    try:
+                        done_inc, inc_s = self.ensure_leverage(self.state(d_inc))
+                    except DateFailure as exc:
+                        leverage_missing = leverage_missing or isinstance(exc, LeverageMissing)
+                        reasons.append(f"no cumulative P&L of the trades struck on {d_inc}: {exc}")
+                        log.warning("%s: %s", date, reasons[-1])
+                        continue
+                    if done_inc:
+                        calibrated.append(d_inc)
+                    timings["calibration_inception"] = (
+                        timings.get("calibration_inception", 0.0) + inc_s
+                    )
             base = prev if prev is not None else st
             builder = LSVBuilder(self.cache, base.state, allow_calibrate=False)
             engine = RiskEngine(
@@ -3660,7 +4578,7 @@ class BacktestRun:
                 "n_particles": st.spec.particle.n_particles,
                 "horizon": st.spec.particle.horizon,
                 "snapshot": _display(st.snapshot),
-                "snapshot_sha256": _file_sha256(st.snapshot),
+                "snapshot_sha256": st.snapshot_sha256,
                 "source_sha256": st.source_sha256,
                 "calibrated": date in calibrated,
                 "timings": timings,
@@ -3864,8 +4782,66 @@ class BacktestRun:
             row["pnl_note"] = prev_note
         else:
             self._pnl(row, trade, built, hist, rep0, rep1, st, prev, engine, flows_d)
+            if attributed(self.cfg, trade) and not _nan(row["pnl"]):
+                self._cumulative(row, trade, built, rep1, st, engine)
         row["seconds"] = time.perf_counter() - t0
         return row
+
+    def _cumulative(
+        self,
+        row: dict[str, Any],
+        trade: TradeInstance,
+        built: BuiltTrade,
+        rep1: Replay,
+        st: DateState,
+        engine: RiskEngine,
+    ) -> None:
+        """``cum_pnl`` = V(date) − V(inception) + every cash flow paid so far (holder sign) and
+        its DIRECT paired standard error: the date's value and the fresh trade at the inception
+        state priced on common random numbers — one extra pricing (the date's leg is the value,
+        already in the engine's memo); a settled trade's value is known cash, so the error is
+        the inception price's.  The inception state and its leverage come from the cache (the
+        date's own dependency record names the inception state)."""
+        try:
+            inc = self.state(trade.inception)
+        except DateFailure as exc:
+            row["pnl_note"] = f"{row['pnl_note']}; no cumulative P&L: {exc}".lstrip("; ")
+            return
+        p_inc = replay(
+            built.product,
+            self.history(trade.inception, trade.inception),
+            dt.date.fromisoformat(trade.inception),
+            discount=inc.discount,
+        ).result
+        if not isinstance(p_inc, Product):
+            return
+        flows = float(row["flows_cum"]) if not _nan(row["flows_cum"]) else 0.0
+        n0 = engine.n_pricings
+        try:
+            if isinstance(rep1.result, Product):
+                s = engine.paired(
+                    "cum_pnl",
+                    [
+                        (rep1.result, st.state, "recalibrate", 1.0),
+                        (p_inc, inc.state, "recalibrate", -1.0),
+                    ],
+                    unit="price",
+                    size=0.0,
+                    scheme="revaluation",
+                )
+                value, se = float(s.value), float(s.stderr)
+            else:
+                pr = engine.price(p_inc, inc.state)
+                value, se = float(row["value"]) - float(pr.mean), float(pr.stderr)
+        except CacheMissError as exc:
+            row["pnl_note"] = (
+                f"{row['pnl_note']}; no cumulative P&L: the inception leverage is not in the "
+                f"cache ({exc})"
+            ).lstrip("; ")
+            return
+        row["cum_pnl"] = value + flows
+        row["cum_pnl_stderr"] = se
+        row["extra_pricings"] = float(row["extra_pricings"] or 0.0) + (engine.n_pricings - n0)
 
     def _value(self, rep: Replay, st: DateState, engine: RiskEngine) -> tuple[float, float]:
         if isinstance(rep.result, Product):
@@ -3992,8 +4968,16 @@ class BacktestRun:
             row[bucket_column(name)] = float(value)
         for name, se in errors.items():
             row[bucket_column(name) + "_stderr"] = float(se)
-        # the paired residual stderr (explain: the per-path residual, no extra pricing)
+        # the residual's and the groups' stderrs: paired per path by explain (no extra pricing);
+        # a root sum of squares only for an item without a path, flagged
         row[bucket_column("residual") + "_stderr"] = float(ex.residual_stderr)
+        row["residual_paired"] = float(ex.residual_paired)
+        for name in PAIRED_GROUPS:
+            row[group_column(name)] = float(ex.group_stderrs.get(name, np.nan))
+        if ex.unpaired:
+            row["pnl_note"] = (
+                f"{row['pnl_note']}; " if row.get("pnl_note") else ""
+            ) + f"root-sum-of-squares stderrs (no per-path item): {', '.join(ex.unpaired)}"
         row[bucket_column("cash_flows")] = flows_d
         for s in ex.steps:
             row[f"s_{s.name}"] = float(s.actual)
@@ -4042,32 +5026,63 @@ def _numba_threads() -> int:
         return int(os.environ.get("NUMBA_NUM_THREADS", "0") or 0)
 
 
-def backtest_command(
-    config: str,
-    dates: Sequence[str],
-    cfg: BacktestConfig | None = None,
-    *,
-    extra: str = "",
+#: The placeholder a printed command uses for a store the user must name (shell-safe: it parses
+#: as a path and is replaced by a new directory).
+NEW_STORE = "NEW_STORE"
+
+
+def backtest_argv(
+    cfg: BacktestConfig,
     subcommand: str = "run",
+    dates: Sequence[str] = (),
+    *,
+    extras: Sequence[str] = (),
+    resume: bool = True,
+    config: str | None = None,
+    paths: Mapping[str, str] | None = None,
+) -> list[str]:
+    """**The one builder of every ``volsto-backtest`` command the module prints** — refusals,
+    the stage-2 requirements, ``status`` hints, verdict reasons and the command stored with an
+    incomplete or failed date: ``volsto-backtest <subcommand> <config>`` (``config``, else the
+    config's source, cwd-relative), the ``--only-dates`` selection of a run, ALWAYS explicit
+    ``--out``, ``--cache`` and ``--snapshots`` (``paths`` overrides them) — so the line runs as
+    printed after a relocation and under ``VOLSTO_BACKTEST_REQUIRE_PATHS=1`` — ``--resume`` for
+    a run line unless ``resume=False``, then ``extras``.  :func:`command_line` renders it."""
+    src = cfg.source if config is None else config
+    argv = ["volsto-backtest", subcommand, _cwd_path(_resolve(src)) if src else "<config>"]
+    if dates and subcommand in ("run", "dry-run"):
+        argv += ["--only-dates", *dates]
+    where = {k: _cwd_path(cfg.path(k)) for k in ("out", "cache", "snapshots")}
+    where.update(paths or {})
+    for key in ("out", "cache", "snapshots"):
+        argv += [f"--{key}", where[key]]
+    if subcommand == "run" and resume:
+        argv.append("--resume")
+    return [*argv, *extras]
+
+
+def command_line(argv: Sequence[str]) -> str:
+    """A printed command: :func:`backtest_argv` shell-quoted (``shlex.split`` gives it back)."""
+    return shlex.join(argv)
+
+
+def backtest_command(
+    cfg: BacktestConfig,
+    subcommand: str = "run",
+    dates: Sequence[str] = (),
+    **kwargs: Any,
 ) -> str:
-    """``volsto-backtest run <config> --only-dates ... --resume`` (with the path overrides a
-    relocated config carries); ``subcommand="migrate"`` gives the migration line."""
-    parts = ["volsto-backtest", subcommand, _cwd_path(_resolve(config)) if config else "<config>"]
-    if dates:
-        parts += ["--only-dates", *dates]
-    if cfg is not None and cfg.source:
-        try:
-            on_disk = load_backtest_config(_resolve(cfg.source))
-        except ConfigError:
-            on_disk = None
-        for key in ("out", "cache", "snapshots"):
-            if on_disk is None or on_disk.path(key) != cfg.path(key):
-                parts += [f"--{key}", _cwd_path(cfg.path(key))]
-    if subcommand == "run":
-        parts.append("--resume")
-    if extra:
-        parts.append(extra)
-    return " ".join(parts)
+    """``command_line(backtest_argv(...))``."""
+    return command_line(backtest_argv(cfg, subcommand, dates, **kwargs))
+
+
+def elsewhere_command(cfg: BacktestConfig, dates: Sequence[str]) -> str:
+    """The ``run`` line of ``dates`` into a new store :data:`NEW_STORE`, its snapshots inside it
+    — never into the refused store's snapshots, which a config with other surface settings would
+    re-import over."""
+    return backtest_command(
+        cfg, "run", dates, paths={"out": NEW_STORE, "snapshots": f"{NEW_STORE}/snapshots"}
+    )
 
 
 # --------------------------------------------------------------------------------------------
@@ -4106,8 +5121,10 @@ def start_greeks(
     detail: str,
 ) -> tuple[dict[str, Sensitivity], dict[str, float], dict[str, Any]]:
     """The Greeks :func:`explain` priced at the start of the period (read back through the
-    frozen-leverage wrapper from the engine's memo), each bucket's standard error (|move| × the
-    Greek's) and the ladders' per-pillar values."""
+    frozen-leverage wrapper from the engine's memo), each bucket's standard error — the paired
+    one of the per-path sum of its items (:attr:`Explain.bucket_stderrs`: a ladder bucket's
+    pillars are correlated), |move| × the Greek's for a single item — and the ladders'
+    per-pillar values."""
     w = FrozenLeverageEngine(engine, prev.state)
     s0 = prev.state
     steps = {s.name for s in ex.steps}
@@ -4167,6 +5184,9 @@ def start_greeks(
     for s in ex.steps:
         if s.name == "recalibration":
             err["recalibration"] = float(s.actual_stderr)
+    # the buckets' errors from explain's per-path sums (a ladder's pillars share the seed: the
+    # root sum of squares above is only the fallback of an item without a path)
+    err.update({k: float(v) for k, v in ex.bucket_stderrs.items() if k in err})
     return g, err, ladders
 
 
@@ -4267,6 +5287,16 @@ def flat_leverage(spec: CalibrationSpec, forward_curve: ForwardCurve) -> Leverag
     return LeverageFunction(times, k, np.ones((times.size, k.size)), forward_curve)
 
 
+def _bound_here(run: BacktestRun, date: str) -> bool:
+    """Whether the date's configured snapshot exists and is bound to this config's inputs."""
+    path = run.snapshot_path(date)
+    try:
+        sha = run.inputs.file_sha(date)
+        return path.is_file() and snapshot_bound(run.cfg, path, sha, run.inputs.manifest_sha(date))
+    except (DateFailure, OSError):
+        return False
+
+
 def run_probe(
     run: BacktestRun, dates: Sequence[str], stored_import_s: Sequence[float] = ()
 ) -> Probe:
@@ -4281,7 +5311,9 @@ def run_probe(
         probe_run = BacktestRun(cfg, allow_calibrate=False, snapshots=run.snapshots)
         imported: list[float] = []
         tried = list(dates[:PROBE_ATTEMPTS])
-        if any(not probe_run.snapshot_path(d).is_file() for d in tried[:2]):
+        if not all(_bound_here(probe_run, d) for d in tried):
+            # never (re)import into the configured snapshots from a probe: they may be another
+            # config's (a dry run of another config) or in use by a running writer
             probe_run.snapshots = Path(tmp)
         states: list[DateState] = []
         errors: list[str] = []
@@ -4419,6 +5451,7 @@ class DateCost:
     attribution_s: float = 0.0
     valuation_s: float = 0.0
     boundary_s: float = 0.0
+    cumulative_s: float = 0.0
 
     @property
     def total(self) -> float:
@@ -4430,6 +5463,7 @@ class DateCost:
             + self.attribution_s
             + self.valuation_s
             + self.boundary_s
+            + self.cumulative_s
         )
 
 
@@ -4566,16 +5600,30 @@ class _CostModel:
             elif attributed(cfg, t):
                 n = probe.attribution.get(t.spec.id, (fallback, 0))[0]
                 c.attribution_s += n * per
+                if run.index[t.inception] < i - 1:  # the day after inception: a memo hit
+                    c.cumulative_s += per  # the fresh trade at the inception state
             else:
                 c.valuation_s += 2 * per  # today's value and the previous one (paired P&L)
         return c
 
     def block_start(self, date: str) -> float:
-        """What a process starting at ``date`` adds: the previous date's fit and leverage."""
-        i = self.run.index[date]
+        """What a process starting at ``date`` adds: the previous date's fit and leverage, and
+        the fit and leverage of every earlier inception of an attributed trade live at ``date``
+        (the cumulative P&L prices the fresh trade at its inception state)."""
+        run = self.run
+        i = run.index[date]
         if i == 0:
             return 0.0
-        return self.probe.fit_s + self.calibration(self.run.calendar[i - 1])
+        prev = run.calendar[i - 1]
+        s = self.probe.fit_s + self.calibration(prev)
+        inceptions = {
+            t.inception
+            for t in run.live(date)
+            if attributed(run.cfg, t) and run.index[t.inception] < i - 1
+        }
+        for d in sorted(inceptions):
+            s += self.probe.fit_s + self.calibration(d)
+        return s
 
     def imports(self, last: str) -> int:
         """Snapshots a process computing up to ``last`` must import first."""
@@ -4687,10 +5735,20 @@ def format_projection(p: Projection, cfg: BacktestConfig) -> str:
             f"{p.calibration_s:.1f} s each, {p.calibration_source}; "
             f"{p.misses_assumed} miss(es) assumed",
         ),
-        ("shard-boundary calibration", "boundary_s", "previous date of a block start"),
+        (
+            "shard-boundary calibration",
+            "boundary_s",
+            "previous date and earlier inceptions of attributed trades, per block start",
+        ),
         ("model builds", "builds_s", "states x warm build + new strips x strip seconds"),
         ("attribution pricings", "attribution_s", "fixed book (or as configured)"),
         ("valuation pricings", "valuation_s", "inception + paired P&L of the other trades"),
+        (
+            "cumulative P&L pricings",
+            "cumulative_s",
+            "1 pricing per attributed trade per date (the fresh trade at its inception state, "
+            "paired with the date's value; none the day after inception)",
+        ),
     ]
     lines.append(f"  {'component':<28}{'per date':>12}{'total':>12}  source")
     for label, attr, src in rows:
@@ -4714,9 +5772,13 @@ def format_projection(p: Projection, cfg: BacktestConfig) -> str:
     return "\n".join(lines)
 
 
-def load_or_probe(run: BacktestRun, todo: Sequence[str], *, refresh: bool = False) -> Probe:
+def load_or_probe(
+    run: BacktestRun, todo: Sequence[str], *, refresh: bool = False, persist: bool = True
+) -> Probe:
     """``<out>/probe.json`` when it matches the config hash and the thread count, else a new
-    probe (written to the store when the store exists)."""
+    probe — written to the store only with ``persist`` (``run`` passes ``False`` for a dry run
+    that ``run`` would refuse), when the store exists and its header, if any, names this
+    config."""
     path = run.store.root / PROBE_NAME
     data = None if refresh else _read_json(path)
     if data is not None:
@@ -4737,8 +5799,13 @@ def load_or_probe(run: BacktestRun, todo: Sequence[str], *, refresh: bool = Fals
         if f and f.get("timings", {}).get("import"):
             stored.append(float(f["timings"]["import"]))
     probe = run_probe(run, run.calendar[max(start - 1, 0) :], stored)
-    if run.store.root.is_dir():
-        _write_json(path, probe.to_mapping())
+    header = run.store.header()
+    if (
+        persist
+        and run.store.root.is_dir()
+        and (header is None or header.get("config_hash") == run.hash)
+    ):
+        _write_json(path, probe.to_mapping())  # never into another config's store
     return probe
 
 
@@ -4849,15 +5916,15 @@ def _with_previous(run: BacktestRun, dates: Sequence[str]) -> list[str]:
 
 
 def hash_refusals(run: BacktestRun, todo: Sequence[str]) -> list[str]:
-    """The dates of ``todo`` and their previous dates whose current attempt verifies and was
-    computed under another config hash (:attr:`Verdict.stored`): recomputing next to them
-    would mix configs (``--force`` accepts that)."""
-    out = []
-    for d in _with_previous(run, todo):
-        v = run.ledger.verdict(d)
-        if v.stored is not None and v.stored.get("config_hash") != run.hash:
-            out.append(d)
-    return out
+    """The dates of ``todo`` and their previous dates whose stored outcome (verified, or still
+    in the flat layout) was computed under another config hash
+    (:func:`computed_under_another_config`): recomputing next to them would mix configs
+    (``--force`` accepts that)."""
+    return [
+        d
+        for d in _with_previous(run, todo)
+        if computed_under_another_config(run.ledger.verdict(d), run.hash)
+    ]
 
 
 def _results_key(v: Verdict) -> str | None:
@@ -4894,6 +5961,10 @@ def leverage_refusals(run: BacktestRun, todo: Sequence[str]) -> dict[str, str]:
                 continue
             why = f"used by the stored P&L of {d}; {p} has no stored results"
             pkey = v.stored.get("previous_cache_key")
+            if pkey is None and not _bound_here(run, p):
+                # marking would import first: a refusal must not write
+                out[p] = f"{p} (its leverage key is unknown until its snapshot is imported; {why})"
+                continue
             if pkey is None:
                 try:
                     pkey = run.state(p).key
@@ -4911,6 +5982,43 @@ def _refuse(message: str) -> None:
     print(f"REFUSED: {message}", file=sys.stderr, flush=True)
 
 
+def _refusal_command(run: BacktestRun, dates: Sequence[str], *extras: str) -> str:
+    return backtest_command(run.cfg, "run", dates, extras=extras)
+
+
+def up_front_refusal(
+    run: BacktestRun, todo: Sequence[str], *, force: bool, no_calibrate: bool
+) -> str:
+    """Both refusals of ``run`` (``""`` when none), read through the :class:`Ledger` verdicts —
+    of the flat layout too (:meth:`Ledger._flat_verdict`), so they come before its migration —
+    each with runnable commands.  Pure: nothing is written."""
+    if no_calibrate:
+        # a wrong --cache must not cost stored results or their P&L
+        lacking = leverage_refusals(run, todo)
+        if lacking:
+            dates = sorted(lacking)
+            # the printed line must pass the next refusal too
+            extra = ("--force",) if force or hash_refusals(run, dates) else ()
+            return (
+                f"the cache {_display(run.cache.root)} lacks the leverage of {len(lacking)} "
+                f"date(s): {'; '.join(lacking[d] for d in dates)}. Under --no-calibrate "
+                "recomputing the dates to compute could only fail or lose their P&L. Recalibrate "
+                f"them with: {_refusal_command(run, dates, *extra)} — or rerun with --cache "
+                "pointing at the cache that holds them"
+            )
+    stale = hash_refusals(run, todo)
+    if stale and not force:
+        return (
+            f"{len(stale)} date(s) to compute or before them hold results computed under "
+            f"another config hash ({', '.join(stale[:4])}{' ...' if len(stale) > 4 else ''}): "
+            "recomputing next to them would mix configs. Recompute them under this config with: "
+            f"{_refusal_command(run, todo, '--force')} — or keep them and write elsewhere "
+            f"(replace {NEW_STORE}): "
+            f"{elsewhere_command(run.cfg, todo)}"
+        )
+    return ""
+
+
 def cmd_run(args: argparse.Namespace, *, dry: bool) -> int:
     t0 = time.perf_counter()
     cfg = load_backtest_config(args.config).with_paths(
@@ -4920,66 +6028,52 @@ def cmd_run(args: argparse.Namespace, *, dry: bool) -> int:
     no_calibrate = bool(getattr(args, "no_calibrate", False))
     run = BacktestRun(cfg, allow_calibrate=not (dry or no_calibrate))
     only = _split_dates(args.only_dates)
+    force = bool(getattr(args, "force", False))
+
+    def select() -> tuple[list[str], list[str]]:
+        return select_dates(run, shard=shard, only=only, resume=args.resume, limit=args.limit)
+
+    # every refusal before ANY write (header, migration, skips, adoption, probe, imports)
+    why = foreign_pointer_refusal(run.store) or header_refusal(cfg, run.store, force=force)
+    if why and not dry:
+        _refuse(why)
+        return EXIT_REFUSED
+    # skip_date: the calendar is final before the shard blocks are cut (a pure check)
+    chosen = selection_of(run, only)
+    newly_skipped = run.new_skips(chosen[-1]) if chosen else []
+    todo, resumed = select()
     if not dry:
-        # refuse before touching anything: the header first (a store of another config is
-        # neither migrated nor adopted into), then the flat layout is migrated
-        try:
-            check_store(cfg, run.store, force=args.force)
-        except RefusedError as exc:
-            _refuse(str(exc))
+        why = up_front_refusal(run, todo, force=force, no_calibrate=no_calibrate) or (
+            migration_refusal(run.store, run.ledger, rebinding=force)
+        )
+        if why:
+            _refuse(why)
             return EXIT_REFUSED
+        check_writable(run.store, run.ledger)
+        if force:  # --force: this config takes the store over before migrating it
+            bind_header(cfg, run.store)
         if run.migrate():
             print(f"migrated {len(run.migration)} date(s) from the flat layout into attempts")
-
-    def refused(dates: Sequence[str]) -> bool:
-        """Both refusals (through the verdicts), before any skip, adoption or pointer move."""
-        if dry:
-            return False
-        if no_calibrate:
-            # a wrong --cache must not cost stored results or their P&L
-            lacking = leverage_refusals(run, dates)
-            if lacking:
-                _refuse(
-                    f"the cache {_display(run.cache.root)} lacks the leverage of {len(lacking)} "
-                    f"date(s): {'; '.join(lacking[d] for d in sorted(lacking))}. Under "
-                    "--no-calibrate recomputing the dates to compute could only fail or lose "
-                    "their P&L. Point --cache at the cache that holds them, or run without "
-                    "--no-calibrate to recalibrate them"
-                )
-                return True
-        stale = hash_refusals(run, dates)
-        if stale and not args.force:
-            _refuse(
-                f"{len(stale)} date(s) to compute or before them were computed under another "
-                f"config hash ({stale[0]} ...); --force recomputes next to them"
-            )
-            return True
-        return False
-
-    todo, resumed = select_dates(run, shard=shard, only=only, resume=args.resume, limit=args.limit)
-    if refused(todo):
-        return EXIT_REFUSED
-    newly_skipped: list[str] = []
-    if cfg.missing_close == "skip_date" and todo:
-        # the calendar must be final before the shard blocks are cut: every process (the dry run
-        # included) imports the whole selection first (module docstring)
-        newly_skipped = run.resolve_closes(selection_of(run, only)[-1])
-        if newly_skipped:
-            todo, resumed = select_dates(
-                run, shard=shard, only=only, resume=args.resume, limit=args.limit
-            )
-            if refused(todo):
-                return EXIT_REFUSED
-    if not dry:
+            chosen = selection_of(run, only)
+            newly_skipped = run.new_skips(chosen[-1]) if chosen else []
+        bind_header(cfg, run.store)  # after the migration: a refused one leaves no header
         if newly_skipped:
             run.write_skips(newly_skipped)
         # adoption after the skips are written (the calendar they define is the one judged)
         adopted = adopt(run.store, run.ledger, selection_of(run, only))
         if adopted:
             print(f"adopted a published attempt for {len(adopted)} date(s): {', '.join(adopted)}")
-            todo, resumed = select_dates(
-                run, shard=shard, only=only, resume=args.resume, limit=args.limit
-            )
+        todo, resumed = select()
+    else:
+        # the dry run judges what run would refuse (the per-date config check included); it
+        # then persists nothing into the store
+        why = (
+            why
+            or up_front_refusal(run, todo, force=force, no_calibrate=False)
+            or migration_refusal(run.store, run.ledger, rebinding=force)
+        )
+        if why:
+            print(f"dry run: a run would be refused: {why}")
     selection = todo
     if shard is not None:
         selection, _ = select_dates(run, shard=None, only=only, resume=args.resume, limit=None)
@@ -5011,7 +6105,7 @@ def cmd_run(args: argparse.Namespace, *, dry: bool) -> int:
         return EXIT_OK
     proj: Projection | None = None
     try:
-        probe = load_or_probe(run, todo, refresh=dry)
+        probe = load_or_probe(run, todo, refresh=dry, persist=not why)
         proj = project(
             run,
             todo,
@@ -5071,18 +6165,45 @@ def cmd_run(args: argparse.Namespace, *, dry: bool) -> int:
 
 
 def _stage1_run(args: argparse.Namespace) -> BacktestRun:
-    """The run of a stage-1 maintenance command (migrates a flat store first)."""
+    """The run of a stage-1 maintenance command (nothing written yet)."""
     cfg = load_backtest_config(args.config).with_paths(
         out=args.out, cache=args.cache, snapshots=args.snapshots
     )
-    return BacktestRun(cfg, allow_calibrate=False, migrate=True)
+    return BacktestRun(cfg, allow_calibrate=False)
+
+
+def _migrated(run: BacktestRun) -> int | None:
+    """Migrate a flat store (after its refusals); ``EXIT_REFUSED`` when refused."""
+    try:
+        run.migrate()
+    except RefusedError as exc:
+        _refuse(str(exc))
+        return EXIT_REFUSED
+    if run.migration:
+        print(f"migrated {len(run.migration)} date(s) from the flat layout into attempts")
+    return None
+
+
+def _staging_summary(store: BacktestStore) -> dict[str, list[Path]]:
+    """The staging directories by owner: ``dead`` (this host, writer gone: ``gc`` removes
+    them), ``live`` (this host, writer running) and ``other`` (another host: never removed
+    here)."""
+    out: dict[str, list[Path]] = {"dead": [], "live": [], "other": []}
+    for p in store.leftovers()["staging"]:
+        tag = p.name[len(STAGING_PREFIX) :].split("-")[0]
+        if tag != _host_tag():
+            out["other"].append(p)
+        else:
+            out["live" if _staging_owner_alive(p) else "dead"].append(p)
+    return out
 
 
 def cmd_status(args: argparse.Namespace) -> int:
     run = _stage1_run(args)
     cfg = run.cfg
-    if run.migration:
-        print(f"migrated {len(run.migration)} date(s) from the flat layout into attempts")
+    refused = _migrated(run)
+    if refused is not None:
+        return refused
     counts: dict[str, int] = {}
     wall = 0.0
     cal = 0
@@ -5095,11 +6216,14 @@ def cmd_status(args: argparse.Namespace) -> int:
         if args.verbose or v.status != "done":
             rows = doc.get("n_rows", "-")
             att = "" if v.attempt is None else f"  [{v.attempt.id[:24]}]"
+            note = "; ".join(x for x in (v.note, v.legacy_unverified) if x)
+            note = f" ({note})" if note else ""
             lines.append(
                 f"  {d}  {v.status:<10} rows {rows!s:>3}  "
                 f"wall {float(doc.get('wall_s') or 0.0):7.1f} s  "
-                f"calibrated {doc.get('calibrated', [])}  {v.reason}{att}"
+                f"calibrated {doc.get('calibrated', [])}  {v.reason}{note}{att}"
             )
+    legacy = [d for d, v in run.ledger.verdicts().items() if v.legacy_unverified]
     header = run.store.header()
     print(
         f"backtest {cfg.name}: store {_display(run.store.root)} "
@@ -5107,17 +6231,45 @@ def cmd_status(args: argparse.Namespace) -> int:
         f"{run.hash[:12]}); {len(run.vendor_calendar)} vendor dates: "
         + ", ".join(f"{k} {v}" for k, v in sorted(counts.items()))
         + f"; stored wall clock {_hours(wall)}; {cal} calibration(s) recorded"
+        + ("" if args.verbose else " (done dates listed with -v)")
     )
     for line in lines:
         print(line)
+    if legacy:
+        more = " ..." if len(legacy) > 6 else ""
+        print(
+            f"  {len(legacy)} date(s) with results carry a {LEGACY_UNVERIFIED}: "
+            f"{', '.join(legacy[:6])}{more} (their leverage is checked by key and completeness "
+            f"only; {LEGACY_RECOMPUTE}: {backtest_command(cfg, 'run', legacy, resume=False)})"
+        )
+    gc_line = backtest_command(cfg, "gc")
+    _, problem = _migration_journal(run.store)
+    if problem:
+        print(f"  {problem}")
     left = run.store.leftovers()
+    staging = _staging_summary(run.store)
     n_attempts = sum(len(run.store.attempts(d)) for d in run.store.dates())
     n_current = sum(1 for d in run.store.dates() if run.store.pointer(d) is not None)
-    if n_attempts > n_current or any(left.values()):
+    if n_attempts > n_current or left["pointer"]:
         print(
-            f"  {n_attempts - n_current} non-current attempt(s), {len(left['staging'])} staging "
-            f"directory(ies) and {len(left['pointer'])} pointer temporary(ies) of interrupted or "
-            "running writers (`volsto-backtest gc` removes them when no writer runs)"
+            f"  {n_attempts - n_current} non-current attempt(s) and {len(left['pointer'])} "
+            f"pointer temporary(ies) ({gc_line} removes those of done dates and the "
+            "temporaries, waiting for running writers)"
+        )
+    if staging["dead"] or staging["live"]:
+        print(
+            f"  {len(staging['dead'])} staging directory(ies) of finished writers on this host "
+            f"({gc_line} removes them) and {len(staging['live'])} of running ones"
+        )
+    if staging["other"]:
+        hosts = sorted({p.name[len(STAGING_PREFIX) :].split("-")[0] for p in staging["other"]})
+        print(
+            f"  {len(staging['other'])} staging directory(ies) of writers on other hosts "
+            f"({', '.join(hosts)}): gc here keeps them (it cannot tell whether they still run); "
+            f"run {gc_line} on that host, or remove them by hand once its writers "
+            "have finished: "
+            + " ".join(_display(p) for p in staging["other"][:3])
+            + (" ..." if len(staging["other"]) > 3 else "")
         )
     finished = counts.get("done", 0) + counts.get("skipped", 0)
     return EXIT_OK if finished == len(run.vendor_calendar) else EXIT_FAILED
@@ -5125,7 +6277,10 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 def cmd_migrate(args: argparse.Namespace) -> int:
     run = _stage1_run(args)
-    moved = sum(len(e["attempts"]) for e in run.migration.values())
+    refused = _migrated(run)
+    if refused is not None:
+        return refused
+    moved = sum(len(e.get("attempts", [])) for e in run.migration.values())
     print(
         f"backtest {run.cfg.name}: migrated {len(run.migration)} date(s) ({moved} attempt(s)) "
         f"from the flat layout into attempts under {_display(run.store.dates_root)}"
@@ -5135,29 +6290,32 @@ def cmd_migrate(args: argparse.Namespace) -> int:
 
 
 def cmd_gc(args: argparse.Namespace) -> int:
-    cfg = load_backtest_config(args.config).with_paths(
-        out=args.out, cache=args.cache, snapshots=args.snapshots
-    )
-    run = BacktestRun(cfg, allow_calibrate=False)
+    run = _stage1_run(args)
+    why = gc_refusal(run.store, run.ledger)
+    if why:
+        _refuse(why)
+        return EXIT_REFUSED
+    check_writable(run.store, run.ledger, run.store.dates(), attempts=True)
+    refused = _migrated(run)
+    if refused is not None:
+        return refused
     try:
-        header = run.store.header()
-        if header is None or header.get("config_hash") != run.hash:
-            raise RefusedError(
-                f"gc: the store {run.store.root} was built from config hash "
-                f"{str((header or {}).get('config_hash'))[:12]} and this config hashes to "
-                f"{run.hash[:12]}: gc only runs with the store's own config"
-            )
-        run.migrate()
         counts = collect_garbage(run.store, run.ledger)
     except RefusedError as exc:
         _refuse(str(exc))
         return EXIT_REFUSED
+    except OSError as exc:  # a partly read-only store: nothing current was touched
+        raise ConfigError(
+            f"gc on {run.store.root}: {exc}: make the store writable (chmod -R u+w) and run gc "
+            "again"
+        ) from exc
     print(
         f"backtest {run.cfg.name}: removed {counts['attempts']} non-current attempt(s) of done "
-        f"dates, {counts['staging']} staging directory(ies) of finished writers, "
+        f"dates, {counts['staging']} staging directory(ies) of finished writers on this host, "
         f"{counts['pointer']} pointer temporary(ies) and {counts['flat']} migrated flat "
-        f"leftover(s); kept {counts['kept']} attempt(s) of dates that are not done; skipped "
-        f"{counts['symlinks']} symbolic link(s)"
+        f"leftover(s); kept {counts['kept']} attempt(s) of dates that are not done and "
+        f"{counts['staging_kept']} staging directory(ies) of running writers or of other hosts "
+        f"(run gc on those hosts); skipped {counts['symlinks']} symbolic link(s)"
     )
     return EXIT_OK
 
@@ -5168,54 +6326,122 @@ class _Parser(argparse.ArgumentParser):
         self.exit(EXIT_FAILED, f"{self.prog}: error: {message}\n")
 
 
+#: Opt-in guard (``=1``): every command refuses unless ``--out``, ``--cache`` and
+#: ``--snapshots`` are given — for harnesses that must never fall back on a config's paths.
+REQUIRE_PATHS_ENV = "VOLSTO_BACKTEST_REQUIRE_PATHS"
+
+EXIT_CODES_HELP = (
+    "exit codes: 0 success; 1 failure (a date failed, or bad arguments); 2 refused (nothing "
+    "written: another config's store, a CURRENT of a newer volsto-backtest, a leverage missing "
+    "under --no-calibrate).  With VOLSTO_BACKTEST_REQUIRE_PATHS=1 in the environment, a command "
+    "without all of --out, --cache and --snapshots (non-blank) is refused (exit 2) before "
+    "anything is read or written: set it for agents and scripted runs, so the config's paths.* "
+    "are never used."
+)
+
+_SUBCOMMANDS: dict[str, tuple[str, str]] = {
+    "run": (
+        "compute dates (the only M10 path that calibrates)",
+        "Compute the selected dates into the store: every refusal is checked before anything is "
+        "written; then the header is bound, a flat store migrated, skips recorded, published "
+        "attempts adopted, and each date marked, priced, attributed and published as an "
+        "immutable attempt.",
+    ),
+    "dry-run": (
+        "print the projected wall clock only",
+        "Print what `run` would compute and its projected wall clock (one process and shards). "
+        "Writes nothing but snapshots and probe.json (the latter only into a store of this "
+        "config).",
+    ),
+    "status": (
+        "per-date verdicts of the store",
+        "Print the verdict of every vendor date (done dates only with -v), the stored wall "
+        "clock and the leftovers of writers (staging directories of this and other hosts). "
+        "Migrates a flat store first (refused for another config). Exit 0 when every date is "
+        "done or skipped, 1 otherwise, 2 when refused.",
+    ),
+    "migrate": (
+        "move a store of the flat layout into attempts",
+        "Move the flat layout (dates/<date>/{rows.parquet, fit.json, done.json}) into immutable "
+        "attempts and CURRENT pointers, journalled in migrations.json (an interrupted "
+        "migration finishes on the next open). Refused (exit 2) for a store of another config.",
+    ),
+    "gc": (
+        "remove non-current attempts and leftovers of finished writers",
+        "Remove the non-current attempts of done dates, pointer temporaries and staging "
+        "directories of finished writers on this host (other hosts' are kept and counted). "
+        "Refused (exit 2) unless the store header names this config.",
+    ),
+}
+
+
 def build_parser() -> argparse.ArgumentParser:
-    p = _Parser(prog="volsto-backtest", description="Rolling date-by-date backtest (M10 Part 3)")
+    p = _Parser(
+        prog="volsto-backtest",
+        description="Rolling date-by-date backtest (M10 Part 3)",
+        epilog=EXIT_CODES_HELP,
+    )
     sub = p.add_subparsers(dest="command", required=True)
-    for name, text in (
-        ("run", "compute dates (the only M10 path that calibrates)"),
-        ("dry-run", "print the projected wall clock only"),
-    ):
-        q = sub.add_parser(name, help=text)
-        q.add_argument("config")
+
+    def add(name: str) -> argparse.ArgumentParser:
+        short, long = _SUBCOMMANDS[name]
+        q = sub.add_parser(name, help=short, description=long, epilog=EXIT_CODES_HELP)
+        q.add_argument("config", help="the backtest config (configs/backtest/*.yaml)")
+        q.add_argument("--out", help="the per-date store (overrides paths.out)")
+        q.add_argument("--cache", help="the leverage cache (overrides paths.cache)")
+        q.add_argument("--snapshots", help="the snapshot directory (overrides paths.snapshots)")
+        return q
+
+    for name in ("run", "dry-run"):
+        q = add(name)
         q.add_argument(
             "--shard",
-            help="i/n: the i-th of n contiguous blocks of the selected dates (--only-dates, else "
-            "the calendar)",
+            metavar="I/N",
+            help="the I-th of N contiguous blocks of the selected dates (--only-dates, else the "
+            "calendar); blocks are cut before --resume and --limit",
         )
-        q.add_argument("--resume", action="store_true", help="skip dates already done")
-        q.add_argument("--limit", type=int, help="compute at most N dates")
+        q.add_argument(
+            "--resume",
+            action="store_true",
+            help="leave dates alone that are done (or pending an unstored dependency)",
+        )
+        q.add_argument("--limit", type=int, metavar="N", help="compute at most N dates")
         q.add_argument(
             "--only-dates",
             nargs="+",
+            metavar="DATE",
             help="dates YYYY-MM-DD or ranges YYYY-MM-DD..YYYY-MM-DD (comma or space separated)",
         )
-        q.add_argument("--out", help="per-date store (overrides paths.out)")
-        q.add_argument("--cache", help="leverage cache (overrides paths.cache)")
-        q.add_argument("--snapshots", help="snapshot directory (overrides paths.snapshots)")
-        q.add_argument("-v", "--verbose", action="store_true")
+        q.add_argument("-v", "--verbose", action="store_true", help="debug logging")
         if name == "run":
             q.add_argument(
                 "--no-calibrate",
                 action="store_true",
-                help="read leverages from the cache only (calibration forbidden)",
+                help="read leverages from the cache only (calibration forbidden; refused when "
+                "the cache lacks a leverage stored results need)",
             )
             q.add_argument(
                 "--force",
                 action="store_true",
-                help="recompute dates stored under another config hash",
+                help="accept a store or dates computed under another config hash: rebind the "
+                "header and recompute next to them",
             )
-    for name, text in (
-        ("status", "per-date verdicts of the store (migrates a flat store first)"),
-        ("migrate", "move a store of the flat layout into attempts"),
-        ("gc", "remove non-current attempts and leftovers of finished writers"),
-    ):
-        q = sub.add_parser(name, help=text)
-        q.add_argument("config")
-        q.add_argument("--out")
-        q.add_argument("--cache")
-        q.add_argument("--snapshots")
-        q.add_argument("-v", "--verbose", action="store_true")
+    for name in ("status", "migrate", "gc"):
+        q = add(name)
+        q.add_argument(
+            "-v",
+            "--verbose",
+            action="store_true",
+            help="list done dates too (status) and debug logging",
+        )
     return p
+
+
+def missing_path_flags(args: argparse.Namespace) -> list[str]:
+    """The path flags a parsed command lacks or gives blank (what
+    ``VOLSTO_BACKTEST_REQUIRE_PATHS=1`` refuses)."""
+    given = {k: str(getattr(args, k, None) or "").strip() for k in ("out", "cache", "snapshots")}
+    return [f"--{k}" for k, v in given.items() if not v]
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -5225,6 +6451,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not root.handlers:
         logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logging.getLogger("volsto").setLevel(level)
+    if os.environ.get(REQUIRE_PATHS_ENV) == "1":
+        lacking = missing_path_flags(args)
+        if lacking:
+            _refuse(
+                f"{REQUIRE_PATHS_ENV}=1: pass {', '.join(lacking)} (the config's paths.* are "
+                "not used, so a command whose overrides were dropped writes nothing)"
+            )
+            return EXIT_REFUSED
     try:
         if args.command == "status":
             return cmd_status(args)
@@ -5233,8 +6467,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "gc":
             return cmd_gc(args)
         return cmd_run(args, dry=args.command == "dry-run")
+    except RefusedError as exc:
+        _refuse(str(exc))
+        return EXIT_REFUSED
     except (ConfigError, ValueError, FileNotFoundError) as exc:
         log.error("%s: %s", type(exc).__name__, exc)
+        print(f"ERROR: {exc}", file=sys.stderr, flush=True)
         if getattr(args, "verbose", False):
             raise
         return EXIT_FAILED
@@ -5251,7 +6489,6 @@ QUESTION = (
 )
 REQUIRED_PARAMS: tuple[str, ...] = ("backtest", "store")
 OPTIONAL_PARAMS: tuple[str, ...] = ()
-BOOK_ROW = "book (fixed)"
 
 
 def validate_params(params: Mapping[str, Any]) -> None:
@@ -5319,41 +6556,96 @@ def _study_ledger(ctx: StudyContext) -> tuple[BacktestConfig, str, Ledger]:
 def unconfirmed(
     ctx: StudyContext, cfg: BacktestConfig, rel: str, verdicts: Mapping[str, Verdict]
 ) -> MissingRequirements | None:
-    """Every date the ledger does not confirm, as requirements with the ``volsto-backtest run``
-    lines that produce them: another config hash (``--force``), stale or missing dates, and the
-    dates a pending one waits for."""
-    stale = {d: v for d, v in verdicts.items() if v.status == "stale"}
-    missing = [d for d, v in verdicts.items() if v.status == "missing"]
-    pending = {d: v for d, v in verdicts.items() if v.status == "pending"}
-    if not (stale or missing or pending):
+    """Every date the ledger does not confirm, as requirements with the commands that produce
+    them — the same judgements as ``run``'s refusals: a flat store of this config is migrated
+    first; every date to recompute goes into ONE ``run`` line, which carries ``--force`` exactly
+    when ``run`` would refuse it otherwise (:func:`computed_under_another_config` on the dates
+    and their previous dates, or a store header of another config); the dates a pending one
+    waits for are computed; an ``unsettled`` date (writers were active) gets no run line, and a
+    ``CURRENT`` of a newer volsto-backtest — which every writer of this version refuses — makes
+    that refusal the only command."""
+    bad = {d: v for d, v in verdicts.items() if v.status in UNCONFIRMED_STATUSES}
+    if not bad:
         return None
-    legacy = [d for d, v in stale.items() if v.reason == LEGACY_REASON]
-    rehash = [d for d, v in stale.items() if v.reason == STALE_HASH]
-    rerun = sorted(
-        {d for d in stale if d not in rehash and d not in legacy}
-        | set(missing)
-        | {w for v in pending.values() for w in v.waits}
+    h = cfg.content_hash()
+    store = BacktestStore(cfg.path("out"))
+    header = store.header()
+    flat = [d for d, v in bad.items() if v.flat]
+    # a store run --force must rebind: another config's header, or no header and a flat date
+    # of another config (which migrate refuses, as run does)
+    foreign_header = (header is not None and header.get("config_hash") != h) or (
+        header is None and any(computed_under_another_config(bad[d], h) for d in flat)
     )
-    src = str(ctx.params["backtest"])
+    migrate_first = bool(flat) and not foreign_header
+    rerun = sorted(
+        {
+            d
+            for d, v in bad.items()
+            if v.status in ("stale", "missing")
+            and not v.foreign
+            and (not v.flat or foreign_header or computed_under_another_config(v, h))
+        }
+        | {w for v in bad.values() if v.status == "pending" for w in v.waits}
+    )
+    around = set(rerun) | {p for d in rerun if (p := _previous(verdicts, d)) is not None}
+    force = foreign_header or any(
+        computed_under_another_config(verdicts[e], h) and not verdicts[e].flat
+        for e in around
+        if e in verdicts
+    )
     reloc = _relocated(cfg, ctx)
-    cmd_migrate = backtest_command(src, [], reloc, subcommand="migrate") if legacy else ""
-    cmd_force = backtest_command(src, rehash, reloc, extra="--force") if rehash else ""
-    cmd_run = backtest_command(src, rerun, reloc) if rerun else ""
+    cmd_migrate = backtest_command(reloc, "migrate") if migrate_first else ""
+    cmd_run = (
+        backtest_command(reloc, "run", rerun, extras=["--force"] if force else []) if rerun else ""
+    )
+    cmd_status = backtest_command(reloc, "status")
+    refused = foreign_pointer_refusal(store)
+    if refused:
+        cmd_migrate = cmd_run = ""
     reqs: list[Requirement] = []
-    for d, v in verdicts.items():
-        if v.status not in ("stale", "missing", "pending"):
-            continue
+    for d, v in bad.items():
         what = {
             "stale": f"backtest {cfg.name} date {d} is stale: {v.reason}",
             "missing": f"backtest {cfg.name} date {d} is not computed ({v.reason})",
             "pending": f"backtest {cfg.name} date {d} is unconfirmed: {v.reason}",
+            "unsettled": f"backtest {cfg.name} date {d} could not be read consistently while "
+            f"writers changed the store ({v.reason}): rerun the study once they finish",
         }[v.status]
-        cmd = cmd_migrate if d in legacy else cmd_force if d in rehash else cmd_run
+        if v.foreign:
+            cmd = f"# {d}: {v.reason} — use the volsto-backtest that wrote it"
+        elif refused:
+            cmd = f"# {refused}"
+        elif v.status == "unsettled":
+            cmd = cmd_status
+        elif d in flat and migrate_first and d not in rerun:
+            cmd = cmd_migrate
+        else:
+            cmd = cmd_run or cmd_status
         reqs.append(Requirement("artefact", f"{rel}/{DATES_DIR}/{d}/{CURRENT_NAME}", what, cmd))
-    commands = [c for c in (cmd_migrate, cmd_force, cmd_run) if c]
+    commands = [c for c in (cmd_migrate, cmd_run) if c]
     if cmd_migrate:
         commands[1:] = [f"# after the migration: {c}" for c in commands[1:]]
+    unsettled = sorted(d for d, v in bad.items() if v.status == "unsettled")
+    if unsettled:
+        commands.append(
+            f"# {len(unsettled)} date(s) were being written ({', '.join(unsettled[:3])}): "
+            f"rerun the study once the writers finish ({cmd_status})"
+        )
+    commands += sorted({str(r.command) for r in reqs if str(r.command).startswith("# ")})
     return MissingRequirements(reqs, commands)
+
+
+#: The verdict statuses stage 2 cannot read.
+UNCONFIRMED_STATUSES: tuple[str, ...] = ("stale", "missing", "pending", "unsettled")
+
+
+def _previous(verdicts: Mapping[str, Verdict], date: str) -> str | None:
+    """The previous date of the effective calendar the verdicts describe (skips left out)."""
+    cal = [d for d, v in verdicts.items() if v.status != "skipped"]
+    if date not in cal:
+        return None
+    i = cal.index(date)
+    return cal[i - 1] if i > 0 else None
 
 
 def requirements(ctx: StudyContext) -> list[Requirement]:
@@ -5366,13 +6658,12 @@ def requirements(ctx: StudyContext) -> list[Requirement]:
     if missing is not None:
         raise missing
     reloc = _relocated(cfg, ctx)
-    src = str(ctx.params["backtest"])
     return [
         Requirement(
             "artefact",
             f"{rel}/{DATES_DIR}/{d}/{CURRENT_NAME}",
             f"backtest {cfg.name} date {d} ({v.status}, attempt {v.files.name})",
-            backtest_command(src, [d], reloc),
+            backtest_command(reloc, "run", [d]),
         )
         for d, v in verdicts.items()
     ]
@@ -5392,6 +6683,11 @@ def compute(ctx: StudyContext) -> Results:
     dates = list(ledger.vendor_calendar)
     h = cfg.content_hash()
     ctx.record("backtest_inputs_verified", True)
+    legacy = [d for d in dates if verdicts[d].legacy_unverified]
+    ctx.record(
+        "backtest_legacy_unverified",
+        {"what": LEGACY_UNVERIFIED, "count": len(legacy), "dates": legacy},
+    )
     dones = {d: dict(verdicts[d].doc or {}) for d in dates}
     ok = [d for d in dates if verdicts[d].has_results]
     # read what was verified: the bytes the verdicts checked, parsed here (never re-read)
@@ -5401,11 +6697,14 @@ def compute(ctx: StudyContext) -> Results:
         if any(not f.empty for f in frames)
         else pd.DataFrame(columns=list(ROW_COLUMNS))
     )
+    # a store written before a column existed (cum_pnl, the paired group errors) reads NaN
+    rows = rows.reindex(columns=list(dict.fromkeys([*ROW_COLUMNS, *rows.columns])))
     fits = {d: verdicts[d].verified.json(FIT_NAME) for d in ok}
-    for d in dates:
-        ctx.artefacts.setdefault(
-            f"{rel}/{DATES_DIR}/{d}/{CURRENT_NAME}", verdicts[d].pointer_sha256
-        )
+    for d in dates:  # pin the CURRENT bytes compute() read (not the ones requirements() saw)
+        sha = verdicts[d].pointer_sha256
+        if not sha:
+            raise ConfigError(f"{d}: the verdict read no {CURRENT_NAME} ({verdicts[d].status})")
+        ctx.artefacts[f"{rel}/{DATES_DIR}/{d}/{CURRENT_NAME}"] = sha
     live_counts = {
         d: len(live_trades(cfg, ledger.calendar(), ledger.trades(), d))
         for d in dates
@@ -5434,6 +6733,16 @@ def compute(ctx: StudyContext) -> Results:
             )
     b = ResultsBuilder()
     _setup_results(b, cfg, dates, dones, rows, ctx.mode)
+    b.add_exact(
+        "setup",
+        "backtest",
+        "n_legacy_unverified",
+        float(len(legacy)),
+        unit="",
+        source=SRC,
+        note=", ".join(legacy),
+    )
+
     _window_results(b, cfg, ok, fits)
     _missing_pnl_results(b, dates, dones, rows, live_counts)
     _trade_results(b, rows)
@@ -5537,7 +6846,7 @@ def _trade_results(b: ResultsBuilder, rows: pd.DataFrame) -> None:
     for tid, g in rows.groupby("trade_id", sort=False):
         g = g.sort_values("date")
         first, last = g.iloc[0], g.iloc[-1]
-        unit, scale = VALUE_UNIT, float(first["scale"])
+        unit, scale = str(first["unit"]), float(first["scale"])
         axes = {"fixed": float(first["book"] == "fixed")}
         note = (
             f"{first['book']} {first['kind']} from {first['inception']} in {first['unit']}; "
@@ -5590,17 +6899,6 @@ def _trade_results(b: ResultsBuilder, rows: pd.DataFrame) -> None:
                 note=str(tid),
                 axes={"fixed": float(first["book"] == "fixed")},
             )
-
-
-def _group_sum(g: pd.DataFrame, names: Sequence[str]) -> tuple[float, float]:
-    """Sum of buckets over rows and its root-sum-square stderr (NaN rows skipped)."""
-    v = 0.0
-    se2 = 0.0
-    for n in names:
-        col = bucket_column(n)
-        v += float(np.nansum(g[col].to_numpy(dtype=float)))
-        se2 += float(np.nansum(g[col + "_stderr"].to_numpy(dtype=float) ** 2))
-    return v, math.sqrt(se2)
 
 
 #: The stored rows keep the holder's sign, ``V(d) − V(d−1) + flows``; every study table, figure
@@ -5701,141 +6999,281 @@ def _desk(holder_pnl: float) -> float:
     return 100.0 * DESK_SIGN * float(holder_pnl) + 0.0
 
 
-def _pnl_results(b: ResultsBuilder, rows: pd.DataFrame) -> None:
-    """Desk-sign P&L tables and series (:data:`DESK_SIGN`), x100 of product units."""
+#: What a stage-2 standard error is (:func:`aggregate` puts one of these in every note).
+SE_PAIRED_CUMULATIVE = (
+    "stderr: paired stderr of the cumulative P&L V(last) - V(inception) + cash flows"
+)
+SE_RSS_DATES = (
+    "stderr: root sum of squares of correlated daily errors - not the error of the cumulative P&L"
+)
+SE_RSS_TRADES = (
+    "stderr: root sum of squares of the date's per-trade errors, which share one seed - not "
+    "the error of the sum"
+)
+SE_RSS_BUCKETS = (
+    "stderr: root sum of squares of correlated bucket errors (a store without paired group "
+    "errors) - indicative"
+)
+SE_RSS_PILLARS = (
+    "stderr of a ladder bucket: root sum of squares of correlated pillar errors (a store "
+    "without paired group errors) - indicative"
+)
+#: Buckets whose stored stderr was a root sum of squares over pillars before paired groups.
+LADDER_BUCKETS: tuple[str, ...] = ("surface.vega_T", "surface.skew_T", "surface.curvature_T")
+#: The buckets of each paired group (:data:`PAIRED_GROUPS`).
+PAIRED_GROUP_BUCKETS: dict[str, frozenset[str]] = {
+    "spot": frozenset({"spot.delta", "spot.gamma"}),
+    "rates": frozenset({"rates.rho", "rates.repo"}),
+    "surface": frozenset(
+        {"surface.parallel_vega", "surface.vega_T", "surface.skew_T", "surface.curvature_T"}
+    ),
+    "params": frozenset(f"params.{p}" for p in PARAMS),
+    "time": frozenset({"time.decay", "time.carry"}),
+    "greeks": frozenset(GREEK_BUCKETS),
+    "explained": frozenset({*GREEK_BUCKETS, "recalibration"}),
+}
 
+
+@dataclass(frozen=True)
+class Aggregate:
+    """A sum of stored P&L numbers, its standard error and what that error is (``note``:
+    ``""`` for a row's own paired error)."""
+
+    value: float
+    stderr: float
+    note: str = ""
+
+
+def _cell_float(r: Mapping[str, Any], col: str) -> float:
+    x = r.get(col, np.nan)
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _row_buckets(r: Mapping[str, Any], names: Sequence[str]) -> Aggregate:
+    """A sum of buckets of ONE row: one bucket's own error; a stored paired group's error when
+    the buckets are that group up to buckets that are zero on the row; the root sum of squares
+    otherwise (labelled)."""
+    value = float(np.nansum([_cell_float(r, bucket_column(n)) for n in names]))
+    ses = {n: _cell_float(r, bucket_column(n) + "_stderr") for n in names}
+    nonzero = [n for n, se in ses.items() if math.isfinite(se) and se != 0.0]
+    old_ladder = [
+        n
+        for n in nonzero
+        if n in LADDER_BUCKETS and not math.isfinite(_cell_float(r, group_column("surface")))
+    ]
+    note = SE_RSS_PILLARS if old_ladder else ""
+    if len(nonzero) <= 1:
+        return Aggregate(value, ses[nonzero[0]] if nonzero else 0.0, note)
+    wanted = set(names)
+    for g, members in PAIRED_GROUP_BUCKETS.items():
+        se = _cell_float(r, group_column(g))
+        if not math.isfinite(se):
+            continue
+        differ = (members - wanted) | (wanted - members)
+        if all(
+            _cell_float(r, bucket_column(n)) in (0.0,)
+            or not math.isfinite(_cell_float(r, bucket_column(n)))
+            for n in differ
+        ):
+            return Aggregate(value, se, note)
+    rss = math.sqrt(sum(ses[n] ** 2 for n in nonzero))
+    return Aggregate(value, rss, SE_RSS_BUCKETS)
+
+
+def aggregate(g: pd.DataFrame, what: str | Sequence[str]) -> Aggregate:
+    """**The one stage-2 aggregation** of stored P&L rows (P1): the sum over the rows of ``g``
+    of the daily P&L (``what="pnl"``) or of the buckets ``what``, with its standard error and a
+    note saying what that error is — every table, figure and sentence of the study uses it.
+
+    * one row: the row's own paired error; a sum of buckets takes the row's paired group error
+      (:data:`PAIRED_GROUPS`, stored from round 5 on) when the buckets are that group, else the
+      root sum of squares, labelled :data:`SE_RSS_BUCKETS`;
+    * one trade's P&L over its dates: the direct paired error of its cumulative P&L (the last
+      row's ``cum_pnl_stderr``) when the rows are every P&L date since its inception and the
+      last one carries it; otherwise the root sum of squares of the daily errors, labelled
+      :data:`SE_RSS_DATES`;
+    * buckets over dates, or several trades: the root sum of squares, labelled
+      :data:`SE_RSS_DATES` (several dates) or :data:`SE_RSS_TRADES` (one date) — the dates and
+      the trades share one seed, and no pricing-free estimator gives their covariance."""
+    if g.empty:
+        return Aggregate(0.0, 0.0)
+    names = ["pnl"] if isinstance(what, str) else list(what)
+    records = [{str(k): v for k, v in rec.items()} for rec in g.to_dict("records")]
+    if len(records) == 1:
+        r = records[0]
+        if isinstance(what, str):
+            return Aggregate(_cell_float(r, "pnl"), _cell_float(r, "pnl_stderr"))
+        return _row_buckets(r, names)
+    if isinstance(what, str):
+        value = float(np.nansum(g["pnl"].to_numpy(dtype=float)))
+        if g["trade_id"].nunique() == 1:
+            ordered = g.sort_values("date")
+            ages = [int(a) for a in ordered["age"].to_numpy(dtype=float)]
+            last = (
+                float(ordered["cum_pnl_stderr"].iloc[-1])
+                if "cum_pnl_stderr" in ordered
+                else float("nan")
+            )
+            if ages == list(range(1, len(ages) + 1)) and math.isfinite(last):
+                return Aggregate(value, last, SE_PAIRED_CUMULATIVE)
+        se = math.sqrt(float(np.nansum(g["pnl_stderr"].to_numpy(dtype=float) ** 2)))
+    pillars = False
+    if not isinstance(what, str):
+        parts = [_row_buckets(r, names) for r in records]
+        value = float(sum(p.value for p in parts))
+        se = math.sqrt(sum(p.stderr**2 for p in parts if math.isfinite(p.stderr)))
+        pillars = any(p.note == SE_RSS_PILLARS for p in parts)
+    label = SE_RSS_DATES if g["date"].nunique() > 1 else SE_RSS_TRADES
+    return Aggregate(value, se, f"{label}; {SE_RSS_PILLARS}" if pillars else label)
+
+
+def unit_slug(unit: str) -> str:
+    """A table-name part for a trade unit."""
+    known = {
+        "% notional": "pct_notional",
+        "% of inception spot": "pct_spot",
+        "vol pts (vega notional 1)": "vol_pts",
+    }
+    return known.get(unit) or re.sub(r"[^a-z0-9]+", "_", unit.lower()).strip("_") or "unit"
+
+
+def book_row(unit: str) -> str:
+    """The row of the fixed trades quoted in ``unit``: a book total never adds units (P2)."""
+    return f"book (fixed, {unit})"
+
+
+def _add(
+    b: ResultsBuilder,
+    table: str,
+    row: str,
+    column: str,
+    a: Aggregate,
+    unit: str,
+    *,
+    axes: Mapping[str, Any] | None = None,
+    note: str = "",
+) -> None:
+    """A desk-sign aggregate (x100 of ``unit``) with its error's note."""
+    b.add(
+        table,
+        row,
+        column,
+        _desk(a.value),
+        100.0 * a.stderr,
+        unit=unit,
+        source=SRC,
+        note="; ".join(x for x in (note, a.note) if x),
+        axes=axes,
+    )
+
+
+def _pnl_results(b: ResultsBuilder, rows: pd.DataFrame) -> None:
+    """Desk-sign P&L tables and series (:data:`DESK_SIGN`), x100 in each trade's own unit (its
+    rows' ``unit``); a book total adds only the fixed trades quoted in one unit (P2); every
+    standard error comes from :func:`aggregate`, whose note says what it is (P1)."""
     pnl = rows[rows["pnl"].notna()] if len(rows) else rows
     if pnl.empty:
         b.add_exact("pnl_trade", "none", "n_days", 0.0, unit="", source=SRC, note="no P&L rows yet")
         return
     fixed = pnl[pnl["book"] == "fixed"]
-    groups = [(str(t), g) for t, g in pnl.groupby("trade_id", sort=False)]
-    if not fixed.empty:
-        groups.append((BOOK_ROW, fixed))
-    for tid, g in groups:
-        total = float(g["pnl"].sum())
-        total_se = math.sqrt(float((g["pnl_stderr"] ** 2).sum()))
+    trades = [(str(t), str(g["unit"].iloc[0]), g) for t, g in pnl.groupby("trade_id", sort=False)]
+    books = [
+        (book_row(str(u)), str(u), g)
+        for u, g in fixed.groupby("unit", sort=False)
+        if g["trade_id"].nunique() > 1
+    ]
+    for tid, unit, g in trades + books:
+        axes = {"fixed": float(tid.startswith(("fixed:", "book (")))}
+        members = (
+            "" if tid in {t for t, _, _ in trades} else ", ".join(sorted(g["trade_id"].unique()))
+        )
+        _add(b, "pnl_trade", tid, "pnl", aggregate(g, "pnl"), unit, axes=axes, note=members)
         att = g[g["pnl_method"] == "attributed"]
-        explained = sum(_group_sum(att, [n])[0] for n in GREEK_BUCKETS)
-        explained_se = math.sqrt(sum(_group_sum(att, [n])[1] ** 2 for n in GREEK_BUCKETS))
-        axes = {"fixed": float(tid == BOOK_ROW or tid.startswith("fixed:"))}
-        b.add(
-            "pnl_trade",
-            tid,
-            "pnl",
-            _desk(total),
-            100.0 * total_se,
-            unit=VALUE_UNIT,
-            source=SRC,
-            axes=axes,
-        )
-        b.add(
-            "pnl_trade",
-            tid,
-            "explained",
-            _desk(explained),
-            100.0 * explained_se,
-            unit=VALUE_UNIT,
-            source=SRC,
-            axes=axes,
-        )
-        for gname in ("recalibration", "residual", "cash_flows", "settlement", "unattributed"):
-            v, se = _group_sum(g, dict(BUCKET_GROUPS)[gname])
+        if att.empty:  # nothing was attributed: a missing number, not 0 +/- 0
             b.add(
                 "pnl_trade",
                 tid,
-                gname,
-                _desk(v),
-                100.0 * se,
-                unit=VALUE_UNIT,
+                "explained",
+                float("nan"),
+                float("nan"),
+                unit=unit,
                 source=SRC,
+                axes=axes,
+                note="not attributed (attribution.trades): its P&L is in 'paired, not attributed'",
+            )
+        else:
+            _add(b, "pnl_trade", tid, "explained", aggregate(att, GREEK_BUCKETS), unit, axes=axes)
+        for gname in ("recalibration", "residual", "cash_flows", "settlement", "unattributed"):
+            _add(
+                b,
+                "pnl_trade",
+                tid,
+                gname,
+                aggregate(g, dict(BUCKET_GROUPS)[gname]),
+                unit,
                 axes=axes,
             )
         b.add_exact(
             "pnl_trade", tid, "n_attributed", float(len(att)), unit="", source=SRC, axes=axes
         )
         b.add_exact("pnl_trade", tid, "n_days", float(len(g)), unit="", source=SRC, axes=axes)
-    for tid, g in groups:
-        if not (tid == BOOK_ROW or tid.startswith("fixed:")):
-            continue
-        for gname, names in BUCKET_GROUPS:
-            v, se = _group_sum(g, names)
-            b.add("pnl_bucket", gname, tid, _desk(v), 100.0 * se, unit=VALUE_UNIT, source=SRC)
+    for tid, unit, g in trades + books:
+        if tid.startswith(("fixed:", "book (")):
+            for gname, names in BUCKET_GROUPS:
+                _add(b, "pnl_bucket", gname, tid, aggregate(g, names), unit)
     if fixed.empty:
         return
     fixed = fixed.assign(month=fixed["date"].str[:7])
-    for month, g in fixed.groupby("month", sort=True):
-        parts = 0.0
-        for gname, names in BUCKET_GROUPS:
-            v, se = _group_sum(g, names)
-            parts += v
-            b.add("pnl_month", str(month), gname, _desk(v), 100.0 * se, unit=VALUE_UNIT, source=SRC)
-        tot = float(g["pnl"].sum())
-        se_t = math.sqrt(float((g["pnl_stderr"] ** 2).sum()))
-        b.add(
-            "pnl_month", str(month), "total", _desk(tot), 100.0 * se_t, unit=VALUE_UNIT, source=SRC
-        )
-        b.add_exact(
-            "pnl_month",
-            str(month),
-            "check",
-            _desk(tot - parts),
-            unit="",
-            source=SRC,
-            note="total minus the sum of every bucket (0 up to rounding)",
-        )
-    dates = sorted(fixed["date"].unique())
-    for i, d in enumerate(dates):
-        g = fixed[fixed["date"] == d]
-        ax = {"t": float(i)}
-        b.add(
-            "daily_book",
-            str(d),
-            "pnl",
-            _desk(float(g["pnl"].sum())),
-            100.0 * math.sqrt(float((g["pnl_stderr"] ** 2).sum())),
-            unit=VALUE_UNIT,
-            source=SRC,
-            axes=ax,
-        )
-        for gname, names in BUCKET_GROUPS:
-            v, se = _group_sum(g, names)
-            b.add(
-                "daily_book",
-                str(d),
-                gname,
-                _desk(v),
-                100.0 * se,
-                unit=VALUE_UNIT,
+    for u, gu in fixed.groupby("unit", sort=False):
+        for month, g in gu.groupby("month", sort=True):
+            row = f"{month} ({u})"
+            parts = 0.0
+            for gname, names in BUCKET_GROUPS:
+                a = aggregate(g, names)
+                parts += a.value
+                _add(b, "pnl_month", row, gname, a, str(u))
+            tot = aggregate(g, "pnl")
+            _add(b, "pnl_month", row, "total", tot, str(u))
+            b.add_exact(
+                "pnl_month",
+                row,
+                "check",
+                _desk(tot.value - parts),
+                unit="",
                 source=SRC,
-                axes=ax,
+                note="total minus the sum of every bucket (0 up to rounding)",
             )
+    dates = sorted(fixed["date"].unique())
+    pos_book = {d: float(i) for i, d in enumerate(dates)}
+    for (bu, d), g in fixed.groupby(["unit", "date"], sort=True):
+        ax = {"t": pos_book[str(d)]}
+        row = f"{d}|{bu}"
+        _add(b, "daily_book", row, "pnl", aggregate(g, "pnl"), str(bu), axes=ax)
+        for gname, names in BUCKET_GROUPS:
+            _add(b, "daily_book", row, gname, aggregate(g, names), str(bu), axes=ax)
     all_dates = sorted(rows["date"].unique())
     pos = {d: float(i) for i, d in enumerate(all_dates)}
-    for _, r in fixed.iterrows():
+    for rec in fixed.to_dict("records"):
+        r = {str(k): v for k, v in rec.items()}
         label = f"{r['date']}|{r['trade_id']}"
         ax = {"t": pos[str(r["date"])]}
-        b.add(
-            "daily_trade",
-            label,
-            "pnl",
-            _desk(float(r["pnl"])),
-            100.0 * float(r["pnl_stderr"]),
-            unit=VALUE_UNIT,
-            source=SRC,
-            note=str(r["trade_id"]),
-            axes=ax,
-        )
+        unit = str(r["unit"])
+        one = pd.DataFrame([r])
+        _add(b, "daily_trade", label, "pnl", aggregate(one, "pnl"), unit, axes=ax)
         if r["pnl_method"] == "attributed":
-            expl = float(sum(float(r[bucket_column(n)]) for n in GREEK_BUCKETS))
-            b.add_exact(
+            _add(b, "daily_trade", label, "explained", aggregate(one, GREEK_BUCKETS), unit, axes=ax)
+        cum, cum_se = _cell_float(r, "cum_pnl"), _cell_float(r, "cum_pnl_stderr")
+        if math.isfinite(cum) and math.isfinite(cum_se):
+            _add(
+                b,
                 "daily_trade",
                 label,
-                "explained",
-                _desk(expl),
-                unit=VALUE_UNIT,
-                source=SRC,
-                note=str(r["trade_id"]),
+                "cum_pnl",
+                Aggregate(cum, cum_se, SE_PAIRED_CUMULATIVE),
+                unit,
                 axes=ax,
             )
 
@@ -5944,7 +7382,16 @@ def _flag_rows(b: ResultsBuilder, table: str, flags: pd.DataFrame, note: str) ->
                 source=SRC,
                 note=note if col == "share_beyond_se" else "",
             )
-        b.add_exact(table, p, "unidentified", float(bool(rec["unidentified"])), unit="", source=SRC)
+        share = float(rec["share_beyond_se"])
+        b.add_exact(
+            table,
+            p,
+            "unidentified",
+            float(bool(rec["unidentified"])) if math.isfinite(share) else float("nan"),
+            unit="",
+            source=SRC,
+            note="" if math.isfinite(share) else "no usable standard error: cannot flag",
+        )
 
 
 def _history(ok: Sequence[str], fits: Mapping[str, Mapping[str, Any]]) -> SurfaceHistory | None:
@@ -6291,54 +7738,105 @@ def _columns_or(results: Results, table: str, default: tuple[str, ...]) -> list[
     return results.columns(table) if table in results.tables() else list(default)
 
 
-def pnl_trade_spec() -> TableSpec:
-    """The per-trade cumulative P&L table."""
-    return TableSpec(
-        "pnl_trade",
-        "Cumulative desk P&L (the desk is short the book) per trade and for the fixed book, "
-        "x100 of product units: the Greek-explained part, the recalibration bucket, the "
-        "residual, cash flows, settlements and the paired P&L of the trades not attributed. "
-        "Standard errors: root sum of squares of the daily ones.",
-        "pnl_trade",
-        (
-            Column("pnl", "desk P&L"),
-            Column("explained", "explained"),
-            Column("recalibration", "recalibration"),
-            Column("residual", "residual"),
-            Column("cash_flows", "cash flows"),
-            Column("settlement", "settlement"),
-            Column("unattributed", "paired, not attributed"),
-            Column("n_attributed", "attributed days", digits=3),
-        ),
-        row_header="trade",
-    )
+def _units(results: Results, table: str, column: str) -> dict[str, list[str]]:
+    """``{unit: rows}`` of one column of a results table (row order kept)."""
+    if table not in results.tables() or column not in results.columns(table):
+        return {}
+    long = results.long(table, column)
+    out: dict[str, list[str]] = {}
+    for row, unit in zip(long["row"], long["unit"]):
+        out.setdefault(str(unit), []).append(str(row))
+    return out
+
+
+def stderr_caption(results: Results, table: str, rows: Sequence[str]) -> str:
+    """What the standard errors of ``rows`` of ``table`` are (from :func:`aggregate`'s notes)."""
+    long = results.long(table)
+    long = long[long["row"].isin(list(rows)) & ~long["exact"].astype(bool)]
+    kinds: dict[str, set[str]] = {}
+    for col, note in zip(long["column"], long["note"]):
+        for kind in (
+            SE_PAIRED_CUMULATIVE,
+            SE_RSS_DATES,
+            SE_RSS_TRADES,
+            SE_RSS_BUCKETS,
+            SE_RSS_PILLARS,
+        ):
+            if kind in str(note):
+                kinds.setdefault(kind.removeprefix("stderr: "), set()).add(str(col))
+    if not kinds:
+        return "Standard errors: each number's own paired one."
+    parts = [f"{k} ({', '.join(sorted(cols))})" for k, cols in kinds.items()]
+    return "Standard errors: " + "; ".join(parts) + "."
+
+
+def pnl_trade_specs(results: Results) -> list[TableSpec]:
+    """The cumulative P&L tables, one per unit (a column never mixes units)."""
+    specs = []
+    for unit, rows in _units(results, "pnl_trade", "pnl").items():
+        specs.append(
+            TableSpec(
+                f"pnl_trade_{unit_slug(unit)}",
+                f"Cumulative desk P&L (the desk is short the book), x100 in {unit}: per trade "
+                "and, for fixed trades quoted in this unit, their book; the Greek-explained part, "
+                "the recalibration bucket, the residual, cash flows, settlements and the paired "
+                "P&L of the trades not attributed. " + stderr_caption(results, "pnl_trade", rows),
+                "pnl_trade",
+                tuple(
+                    Column(key, header, unit=unit if key != "n_attributed" else "", digits=d)
+                    for key, header, d in (
+                        ("pnl", "desk P&L", 4),
+                        ("explained", "explained", 4),
+                        ("recalibration", "recalibration", 4),
+                        ("residual", "residual", 4),
+                        ("cash_flows", "cash flows", 4),
+                        ("settlement", "settlement", 4),
+                        ("unattributed", "paired, not attributed", 4),
+                        ("n_attributed", "attributed days", 3),
+                    )
+                ),
+                rows=tuple(rows),
+                row_header="trade",
+            )
+        )
+    return specs
 
 
 def tables(results: Results) -> list[TableSpec]:
-    specs = [
-        TableSpec(
-            "trades",
-            "The book: first and last marked values (holder's value, Monte Carlo, 1 stderr), "
-            "x100 of each trade's unit.",
-            "trades",
-            (
-                Column("maturity", "maturity [y]", digits=3),
-                Column("strike", "strike", digits=5),
-                Column("first_value", "first value (holder)"),
-                Column("last_value", "last value (holder)"),
-                Column("n_dates", "dates", digits=3),
-            ),
-            row_header="trade",
-        ),
-    ]
-    if "inception" in results.tables():
+    specs = []
+    for unit, rows in _units(results, "trades", "first_value").items():
         specs.append(
             TableSpec(
+                f"trades_{unit_slug(unit)}",
+                f"The book, trades quoted in {unit}: first and last marked values (holder's "
+                "value, Monte Carlo, 1 stderr), x100.",
+                "trades",
+                (
+                    Column("maturity", "maturity [y]", digits=3),
+                    Column("strike", "strike", digits=5),
+                    Column("first_value", "first value (holder)", unit=unit),
+                    Column("last_value", "last value (holder)", unit=unit),
+                    Column("n_dates", "dates", digits=3),
+                ),
+                rows=tuple(rows),
+                row_header="trade",
+            )
+        )
+    if not specs and "trades" in results.tables():
+        specs.append(
+            TableSpec(
+                "trades", "The book: no rows yet.", "trades", (Column("n_rows", "rows", digits=3),)
+            )
+        )
+    for unit, rows in _units(results, "inception", "value").items():
+        specs.append(
+            TableSpec(
+                f"inception_{unit_slug(unit)}",
+                f"Inception prices of the fixed and rolling trades quoted in {unit} (the rolling "
+                "book strikes on the first date of each month), x100.",
                 "inception",
-                "Inception prices of the fixed and rolling trades (the rolling book strikes on "
-                "the first date of each month).",
-                "inception",
-                (Column("value", "value at inception (holder)"),),
+                (Column("value", "value at inception (holder)", unit=unit),),
+                rows=tuple(rows),
                 row_header="trade",
             )
         )
@@ -6354,30 +7852,39 @@ def tables(results: Results) -> list[TableSpec]:
             )
         )
     else:
-        specs.append(pnl_trade_spec())
+        specs += pnl_trade_specs(results)
     if "pnl_bucket" in results.tables():
         cols = tuple(Column(c, c.replace("fixed:", "")) for c in results.columns("pnl_bucket"))
         specs.append(
             TableSpec(
                 "pnl_bucket",
-                "Cumulative desk P&L by attribution bucket (x100): fixed trades and the fixed "
-                "book.",
+                "Cumulative desk P&L by attribution bucket (x100): fixed trades and the books of "
+                "fixed trades sharing a unit; each column in its trade's (or book's) unit. "
+                + stderr_caption(results, "pnl_bucket", results.rows("pnl_bucket")),
                 "pnl_bucket",
                 cols,
                 row_header="bucket",
             )
         )
-    if "pnl_month" in results.tables():
-        keep = (*(g for g, _ in BUCKET_GROUPS), "total", "check")
+    keep = (*(g for g, _ in BUCKET_GROUPS), "total", "check")
+    for unit, rows in _units(results, "pnl_month", "total").items():
         specs.append(
             TableSpec(
-                "pnl_month",
-                "Fixed book desk P&L per month by bucket (x100); every bucket is shown, so they "
-                "add up to the total ('check' is the difference, 0 up to rounding).",
+                f"pnl_month_{unit_slug(unit)}",
+                f"Desk P&L per month by bucket of the fixed trades quoted in {unit} (x100); every "
+                "bucket is shown, so they add up to the total ('check' is the difference, 0 up to "
+                "rounding). " + stderr_caption(results, "pnl_month", rows),
                 "pnl_month",
                 tuple(
-                    Column(c, c.replace("_", " "), digits=3 if c == "check" else 4) for c in keep
+                    Column(
+                        c,
+                        c.replace("_", " "),
+                        unit="" if c == "check" else unit,
+                        digits=3 if c == "check" else 4,
+                    )
+                    for c in keep
                 ),
+                rows=tuple(rows),
                 row_header="month",
             )
         )
@@ -6494,28 +8001,48 @@ def tables(results: Results) -> list[TableSpec]:
 # -- figures ---------------------------------------------------------------------------------
 
 
+def _unit_panels(n: int) -> tuple[Figure, list[Any]]:
+    """One panel per unit (at least one)."""
+    fig, axes = style.new_figure(1, max(n, 1), width=4.6 * max(n, 1), height=3.8)
+    return fig, list(np.atleast_1d(axes).ravel())
+
+
 def _draw_book(results: Results) -> Figure:
-    fig, ax = style.new_figure()
     if "daily_book" not in results.tables():
+        fig, ax = style.new_figure()
         ax.text(0.5, 0.5, "no P&L rows yet", ha="center", transform=ax.transAxes)
         return fig
-    df = results.pivot("daily_book")
-    t = np.arange(len(df))
-    for k, (label, groups) in enumerate(FIGURE_GROUPS, start=1):
-        cols = [g for g in groups if g in df]
-        if not cols:
-            continue
-        series = np.nansum(np.column_stack([df[c].to_numpy() for c in cols]), axis=1)
-        ax.plot(t, np.cumsum(series), label=label, color=style.series_color(k))
-    total = np.nancumsum(df["pnl"].to_numpy())
-    se = np.sqrt(np.nancumsum(df["pnl_stderr"].to_numpy() ** 2))
-    style.mc_errorbar(ax, t, total, se, label="desk P&L (cumulative, 1 stderr)", series=0)
-    ax.set_xlabel("trading date index")
-    _integer_ticks(ax)
-    ax.set_ylabel("desk P&L x100 (product units)")
-    ax.set_title("Fixed book: cumulative desk P&L and its attribution")
-    _integer_ticks(ax)
-    ax.legend(fontsize=7)
+    long = results.long("daily_book")
+    units = list(dict.fromkeys(long["unit"]))
+    fig, axes = _unit_panels(len(units))
+    for ax, unit in zip(axes, units):
+        df = long[long["unit"] == unit]
+        wide = df.pivot(index="row", columns="column", values="value")
+        errs = df.pivot(index="row", columns="column", values="stderr")
+        order = df.drop_duplicates("row").sort_values("axis_t")["row"].tolist()
+        wide, errs = wide.reindex(order), errs.reindex(order)
+        t = np.arange(len(wide))
+        for k, (label, groups) in enumerate(FIGURE_GROUPS, start=1):
+            cols = [g for g in groups if g in wide]
+            if not cols:
+                continue
+            series = np.nansum(np.column_stack([wide[c].to_numpy() for c in cols]), axis=1)
+            ax.plot(t, np.cumsum(series), label=label, color=style.series_color(k))
+        total = np.nancumsum(wide["pnl"].to_numpy())
+        se = np.sqrt(np.nancumsum(errs["pnl"].to_numpy() ** 2))
+        style.mc_errorbar(
+            ax,
+            t,
+            total,
+            se,
+            label="desk P&L, cumulative (bars: RSS of daily errors)",
+            series=0,
+        )
+        ax.set_xlabel("trading date index")
+        _integer_ticks(ax)
+        ax.set_ylabel(f"desk P&L x100 [{unit}]")
+        ax.set_title(f"Fixed trades in {unit}")
+        ax.legend(fontsize=6)
     return fig
 
 
@@ -6537,62 +8064,80 @@ def _integer_ticks(ax: Any) -> None:
     ax.xaxis.set_major_locator(MaxNLocator(integer=True))
 
 
+def _trade_of(row: str) -> str:
+    return row.split("|", 1)[1] if "|" in row else row
+
+
 def _draw_trades(results: Results) -> Figure:
-    fig, ax = style.new_figure()
     if "daily_trade" not in results.tables():
+        fig, ax = style.new_figure()
         ax.text(0.5, 0.5, "no P&L rows yet", ha="center", transform=ax.transAxes)
         return fig
-    long = results.long("daily_trade", "pnl")
-    for k, (tid, g) in enumerate(long.groupby("note", sort=False)):
-        if k >= len(style.PALETTE):
-            break
-        g = g.sort_values("axis_t")
-        style.mc_errorbar(
-            ax,
-            g["axis_t"].to_numpy(),
-            np.cumsum(g["value"].to_numpy()),
-            np.sqrt(np.cumsum(g["stderr"].to_numpy() ** 2)),
-            series=k,
-            label=str(tid).replace("fixed:", ""),
-        )
-    ax.set_xlabel("trading date index")
-    _integer_ticks(ax)
-    ax.set_ylabel("cumulative desk P&L x100")
-    ax.set_title("Fixed trades: cumulative desk P&L (1 stderr)")
-    ax.legend(fontsize=7)
+    long = results.long("daily_trade")
+    long = long.assign(trade=[_trade_of(str(r)) for r in long["row"]])
+    units = list(dict.fromkeys(long["unit"]))
+    fig, axes = _unit_panels(len(units))
+    k = 0
+    for ax, unit in zip(axes, units):
+        for tid, g in long[long["unit"] == unit].groupby("trade", sort=False):
+            daily = g[g["column"] == "pnl"].sort_values("axis_t")
+            cum = g[g["column"] == "cum_pnl"].sort_values("axis_t")
+            name = str(tid).replace("fixed:", "")
+            if len(cum) == len(daily) and len(cum):
+                # the stored cumulative P&L with its direct paired error
+                x, y, e = (cum[c].to_numpy() for c in ("axis_t", "value", "stderr"))
+                label = f"{name} (paired stderr)"
+            else:
+                x = daily["axis_t"].to_numpy()
+                y = np.cumsum(daily["value"].to_numpy())
+                e = np.sqrt(np.cumsum(daily["stderr"].to_numpy() ** 2))
+                label = f"{name} (RSS of daily errors, not the cumulative error)"
+            style.mc_errorbar(ax, x, y, e, series=k % len(style.PALETTE), label=label)
+            k += 1
+        ax.set_xlabel("trading date index")
+        _integer_ticks(ax)
+        ax.set_ylabel(f"cumulative desk P&L x100 [{unit}]")
+        ax.set_title(f"Fixed trades in {unit} (1 stderr)")
+        ax.legend(fontsize=6)
     return fig
 
 
 def _draw_explained(results: Results) -> Figure:
-    fig, ax = style.new_figure()
     if "daily_trade" not in results.tables() or "explained" not in results.columns("daily_trade"):
+        fig, ax = style.new_figure()
         ax.text(0.5, 0.5, "no attributed day yet", ha="center", transform=ax.transAxes)
         return fig
-    df = results.pivot("daily_trade")
-    ok = df["explained"].notna()
-    x = df.loc[ok, "pnl"].to_numpy()
-    y = df.loc[ok, "explained"].to_numpy()
-    ax.errorbar(
-        x,
-        y,
-        xerr=df.loc[ok, "pnl_stderr"].to_numpy(),
-        fmt="o",
-        ms=3,
-        color=style.series_color(0),
-        label="daily desk P&L per trade (x: 1 stderr)",
-    )
-    lim = float(np.nanmax(np.abs(np.concatenate([x, y])))) if x.size else 1.0
-    ax.plot(
-        [-lim, lim],
-        [-lim, lim],
-        color=style.INK["spine"],
-        linewidth=0.8,
-        label="explained = actual",
-    )
-    ax.set_xlabel("actual daily desk P&L x100")
-    ax.set_ylabel("Greek-explained daily desk P&L x100")
-    ax.set_title("Attribution: explained against actual (fixed trades)")
-    ax.legend(fontsize=7)
+    long = results.long("daily_trade")
+    units = list(dict.fromkeys(long.loc[long["column"] == "explained", "unit"]))
+    fig, axes = _unit_panels(len(units))
+    for ax, unit in zip(axes, units):
+        df = long[long["unit"] == unit]
+        val = df.pivot(index="row", columns="column", values="value")
+        err = df.pivot(index="row", columns="column", values="stderr")
+        ok = val["explained"].notna()
+        x, y = val.loc[ok, "pnl"].to_numpy(), val.loc[ok, "explained"].to_numpy()
+        ax.errorbar(
+            x,
+            y,
+            xerr=err.loc[ok, "pnl"].to_numpy(),
+            yerr=err.loc[ok, "explained"].to_numpy(),
+            fmt="o",
+            ms=3,
+            color=style.series_color(0),
+            label="daily desk P&L per trade (x, y: 1 stderr)",
+        )
+        lim = float(np.nanmax(np.abs(np.concatenate([x, y])))) if x.size else 1.0
+        ax.plot(
+            [-lim, lim],
+            [-lim, lim],
+            color=style.INK["spine"],
+            linewidth=0.8,
+            label="explained = actual",
+        )
+        ax.set_xlabel(f"actual daily desk P&L x100 [{unit}]")
+        ax.set_ylabel(f"Greek-explained x100 [{unit}]")
+        ax.set_title(f"Explained against actual ({unit})")
+        ax.legend(fontsize=6)
     return fig
 
 
@@ -6701,19 +8246,22 @@ def figures(results: Results) -> list[FigureSpec]:
     specs = [
         FigureSpec(
             "book_pnl",
-            "Fixed book: cumulative desk P&L (1 stderr bars) and the cumulative attribution "
-            "buckets, desk sign.",
+            "Fixed trades, one panel per unit: cumulative desk P&L and the cumulative "
+            "attribution buckets, desk sign (bars: root sum of squares of correlated daily "
+            "errors - not the error of the cumulative P&L).",
             _draw_book,
         ),
         FigureSpec(
             "trade_pnl",
-            "Cumulative desk P&L of each fixed trade (1 stderr bars).",
+            "Cumulative desk P&L of each fixed trade, one panel per unit (1 stderr bars: the "
+            "stored paired stderr of the cumulative P&L where the legend says so, else the "
+            "root sum of squares of correlated daily errors).",
             _draw_trades,
         ),
         FigureSpec(
             "explained",
-            "Greek-explained against actual daily desk P&L of the fixed trades (x bars: 1 "
-            "stderr of the paired P&L).",
+            "Greek-explained against actual daily desk P&L of the fixed trades, one panel per "
+            "unit (x bars: the paired P&L's stderr; y bars: the explained sum's).",
             _draw_explained,
         ),
         FigureSpec(
@@ -6831,6 +8379,97 @@ def _missing_sentence(results: Results) -> str:
     return "\n".join(lines)
 
 
+def _book_sentence(results: Results) -> str:
+    """The cumulative desk P&L of the fixed trades, one sentence per unit (P2: a book adds only
+    trades quoted in one unit)."""
+    if "pnl_trade" not in results.tables() or "pnl" not in results.columns("pnl_trade"):
+        return "No stored date carries a P&L yet."
+    units = _units(results, "pnl_trade", "pnl")
+    out = []
+    for unit, rows in units.items():
+        books = [r for r in rows if r.startswith("book (")]
+        fixed = [r for r in rows if r.startswith("fixed:")]
+        subject = books[0] if books else (fixed[0] if len(fixed) == 1 else "")
+        if not subject:
+            continue
+        v, se = _v(results, "pnl_trade", subject, "pnl")
+        ex, ex_se = _v(results, "pnl_trade", subject, "explained")
+        rc, rc_se = _v(results, "pnl_trade", subject, "recalibration")
+        rs, rs_se = _v(results, "pnl_trade", subject, "residual")
+        members = _note(results, "pnl_trade", subject, "pnl").split(";")[0]
+        members = members.replace("fixed:", "")
+        who = (
+            f"the fixed trades quoted in {unit} ({members})"
+            if books
+            else f"`{subject}` (the only fixed trade quoted in {unit})"
+        )
+        out.append(
+            f"- {who}: cumulative desk P&L {_fmt(v, se)} x100 {unit}, of which the Greeks explain "
+            f"{_fmt(ex, ex_se)}; recalibration {_fmt(rc, rc_se)}, residual {_fmt(rs, rs_se)}."
+        )
+    if not out:
+        return "No fixed trade carries a P&L yet."
+    return "\n".join(["The fixed book, unit by unit (no total adds two units):", "", *out])
+
+
+def _stderr_sentence(results: Results) -> str:
+    """What the cumulative standard errors are (from :func:`aggregate`'s notes)."""
+    if "pnl_trade" not in results.tables() or "pnl" not in results.columns("pnl_trade"):
+        return ""
+    long = results.long("pnl_trade", "pnl")
+    paired = [str(r) for r, n in zip(long["row"], long["note"]) if SE_PAIRED_CUMULATIVE in str(n)]
+    rss = [str(r) for r, n in zip(long["row"], long["note"]) if SE_RSS_DATES in str(n)]
+    head = (
+        f"The standard error of the cumulative P&L of {len(paired)} trade(s) is the direct "
+        "paired one of V(last) - V(inception) + cash flows (each date stores it for its "
+        "attributed trades, at one extra pricing per trade and date). "
+        if paired
+        else "This store predates the stored cumulative P&L error. "
+    )
+    tail = (
+        f"For the other {len(rss)} P&L row(s) of the table, the books, the buckets, the months "
+        "and the daily book, the error shown is the root sum of squares of correlated daily "
+        "errors - not the error of the cumulative P&L: the dates share one seed, and so do the "
+        "trades of one date, and no pricing-free estimator gives their covariance."
+        if rss or not paired
+        else "The books, the buckets, the months and the daily book show the root sum of squares "
+        "of correlated errors - not the error of their sum."
+    )
+    return head + tail
+
+
+def _legacy_sentence(results: Results) -> str:
+    """The dates whose stored record cannot confirm their leverage's numbers (never silent)."""
+    n, _ = _v(results, "setup", "backtest", "n_legacy_unverified")
+    if not math.isfinite(n) or n == 0:
+        return ""
+    dates = _note(results, "setup", "backtest", "n_legacy_unverified")
+    return (
+        f"**{int(n)} date(s) carry a {LEGACY_UNVERIFIED}**: {dates}. They were written before "
+        "the record held the digest of the leverage's numbers, so their verdict checks the "
+        "leverage by key and completeness only (a cache entry rewritten with other numbers "
+        "under the same key would go unnoticed for these dates; a date recorded at version 2 "
+        f"that uses their state does check those numbers). Note: {LEGACY_RECOMPUTE}; "
+        "`volsto-backtest status` prints the command. The manifest lists them "
+        "(`backtest_legacy_unverified`)."
+    )
+
+
+def _repair_sentence(results: Results) -> str:
+    """Whether the marked window exercises the calendar-repaired surfaces."""
+    n, _ = _v(results, "fits", "calendar repaired", "n_dates")
+    if not math.isfinite(n):
+        return ""
+    if n == 0:
+        return (
+            "No marked date of this window is calendar-repaired, so the backtest does not "
+            "exercise the repaired-surface path of stage 1 here (in 2022 H2 the 25 repaired days "
+            "run from 2022-10-21 to 2022-12-30, M10 Part 0; a shard over 2022-10-21..2022-10-28 "
+            "would)."
+        )
+    return f"{int(n)} marked date(s) use a calendar-repaired surface."
+
+
 def narrative(results: Results) -> str:
     n_dates, _ = _v(results, "setup", "backtest", "n_dates")
     n_ok, _ = _v(results, "setup", "backtest", "n_ok")
@@ -6839,6 +8478,8 @@ def narrative(results: Results) -> str:
     name = _note(results, "setup", "backtest", "fast")
     parts = [
         "## Scope",
+        "",
+        _legacy_sentence(results),
         "",
         f"Backtest `{name}` over {int(n_dates)} vendor dates ({rng}) of the "
         f"{_note(results, 'setup', 'backtest', 'data')}; {int(n_ok)} are marked"
@@ -6851,8 +8492,11 @@ def narrative(results: Results) -> str:
         _window_sentence(results),
         "",
         "A single window this short is a proof of concept, too short for a conclusion about the "
-        "models. The multi-year run waits on the paid end-of-day archive; it is a one-line "
-        "change of the backtest config (`dates` and `data.root`).",
+        "models. The multi-year run waits on the paid end-of-day archive; it needs only a config "
+        "change - `dates.start`, `dates.end` and `data.root` - plus a new store (`paths.out` "
+        "and `paths.snapshots`, or `--out` and `--snapshots`): `dates.start` is part of the "
+        "config hash, so `run` refuses the old store (`dates.end` and `data.root` are not "
+        "hashed; the inputs digest of each date follows its day files).",
         "",
         "{{table:window}}",
         "",
@@ -6901,38 +8545,35 @@ def narrative(results: Results) -> str:
         "",
         "## Book and inception prices",
         "",
-        "{{table:trades}}",
+        "Every value is x100 in its trade's own unit: % of notional (notes, cliquet), % of the "
+        "inception spot (vol knock-out put), vol points of vega notional 1 (variance swaps); "
+        "the tables are split by unit and no total adds two units.",
         "",
-        "{{table:inception}}",
+        "{{tables:trades}}",
+        "",
+        "{{tables:inception}}",
         "",
         "## P&L attribution",
         "",
-    ]
-    v, se = _v(results, "pnl_trade", BOOK_ROW, "pnl")
-    ex, ex_se = _v(results, "pnl_trade", BOOK_ROW, "explained")
-    rc, rc_se = _v(results, "pnl_trade", BOOK_ROW, "recalibration")
-    rs, rs_se = _v(results, "pnl_trade", BOOK_ROW, "residual")
-    parts += [
         f"Sign convention: {DESK_CONVENTION}. Every P&L number below is a desk P&L.",
         "",
-        f"The fixed book's cumulative desk P&L is {_fmt(v, se)} (x100 of product units, mixed "
-        f"units), of which the Greeks explain {_fmt(ex, ex_se)}; the recalibration bucket "
-        f"carries {_fmt(rc, rc_se)} and the residual {_fmt(rs, rs_se)}. Per trade the buckets, "
-        "the recalibration, the residual and the cash flows sum exactly to the P&L of each day. "
-        "The rates bucket is the first-order P&L along each day's actual rate and dividend "
-        "curve moves (a directional sensitivity), not a parallel shift. "
-        "Cumulative standard errors are root sums of squares of the daily ones; the daily "
-        "estimates share one seed, so these are indicative.",
+        _book_sentence(results),
+        "",
+        "Per trade the buckets, the recalibration, the residual and the cash flows sum exactly "
+        "to the P&L of each day. The rates bucket is the first-order P&L along each day's actual "
+        "rate and dividend curve moves (a directional sensitivity), not a parallel shift.",
+        "",
+        _stderr_sentence(results),
         "",
         _missing_sentence(results),
         "",
         "{{table:pnl_missing}}",
         "",
-        "{{table:pnl_trade}}",
+        "{{tables:pnl_trade}}",
         "",
         "{{table:pnl_bucket}}",
         "",
-        "{{table:pnl_month}}",
+        "{{tables:pnl_month}}",
         "",
         "{{figure:book_pnl}}",
         "",
@@ -6999,17 +8640,31 @@ def narrative(results: Results) -> str:
         "",
         "{{table:fits}}",
         "",
+        _repair_sentence(results),
+        "",
         "{{table:cost}}",
     ]
     # place only the tables and figures this results set declares (a window without any
-    # P&L, or fewer than two marked dates, has no book, monthly or window tables)
-    declared = {f"{{{{table:{t.name}}}}}" for t in tables(results)}
+    # P&L, or fewer than two marked dates, has no book, monthly or window tables); a
+    # ``{{tables:<name>}}`` line stands for every table of that family (one per unit)
+    names = [t.name for t in tables(results)]
+    declared = {f"{{{{table:{n}}}}}" for n in names}
     declared |= {f"{{{{figure:{f.name}}}}}" for f in figures(results)}
-    kept = [x for x in parts if not (_PLACEHOLDER.fullmatch(x) and x not in declared)]
+    kept: list[str] = []
+    for x in parts:
+        family = _FAMILY.fullmatch(x)
+        if family is not None:
+            base = family.group(1)
+            members = [n for n in names if n == base or n.startswith(base + "_")]
+            kept += [line for n in members for line in (f"{{{{table:{n}}}}}", "")][:-1]
+            continue
+        if not (_PLACEHOLDER.fullmatch(x) and x not in declared):
+            kept.append(x)
     return "\n".join(kept)
 
 
 _PLACEHOLDER = re.compile(r"\{\{(table|figure):[A-Za-z0-9_]+\}\}")
+_FAMILY = re.compile(r"\{\{tables:([A-Za-z0-9_]+)\}\}")
 
 
 if __name__ == "__main__":  # pragma: no cover

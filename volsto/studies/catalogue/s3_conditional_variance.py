@@ -70,6 +70,10 @@ grid holds: ``configs/grids/s3_ko_var.yaml`` carries them.
 * verdict 0 = consistent with zero (``|z| ≤ 2``); 1 = significant but within the floor;
   2 = beyond the floor.
 
+``z`` is recorded with the nominal stderr 1 of a z-score; the floor and the tolerance are Monte
+Carlo numbers with delta-method stderrs (the influence of ``|d| + 2 se`` and of the LV's leg
+strike and count); the verdict is an exact flag, the decision at the stated thresholds.
+
 The floor is a heuristic, not a bound: the residual of the variance swap can sit in part of the
 spot range and move one leg by more than the total.  A verdict of 0 or 1 therefore does not prove
 the invariance below the floor, and a 2 is a flag, not a proof of non-invariance.
@@ -113,6 +117,7 @@ from volsto.products.conditional_variance import (
 from volsto.products.variance import VarianceSwap
 from volsto.studies import style
 from volsto.studies.catalogue._common import (
+    ERROR_STAT_NOTE,
     LV_GRID_NOTE,
     LV_LABEL,
     PAIRED_NOTE,
@@ -122,9 +127,11 @@ from volsto.studies.catalogue._common import (
     Estimate,
     FloatArray,
     ModelPoint,
+    add_z,
     axis,
     axis_text,
     empty_panel,
+    floor_estimate,
     leverage_requirements,
     load_model,
     lv_grid_sentence,
@@ -176,6 +183,17 @@ REQUIRED_PARAMS = (
     "monitoring_order",
 )
 OPTIONAL_PARAMS: tuple[str, ...] = ()
+#: What every exact row of this study is (``_common.unclassified_exact_rows``; the walking test
+#: fails on any other exact row): ``(table regex, column regex, kind)``.
+EXACT_KINDS: tuple[tuple[str, str, str], ...] = (
+    ("gyongy", "verdict", "flag"),  # the decision at the stated thresholds
+    ("gyongy_floor", "same_grid", "flag"),
+    ("pairing", "steps|own_steps", "count"),
+    ("pairing", "same_grid", "flag"),
+    # an identical inline and stored number: the difference and its z are exactly 0
+    ("store_check_(vol|ratio)", "diff|n_se", "closed form"),
+    ("setup", "value", "input"),  # the selection's counts and the config's inputs
+)
 
 VOL = "vol pts"
 VAR = "vol pts^2"
@@ -522,7 +540,8 @@ def _add_difference(
     src: str,
     axes: Mapping[str, Any],
 ) -> None:
-    """A paired difference, with its quadrature error and correlation as exact companions."""
+    """A paired difference, with its quadrature error and correlation beside it (Monte Carlo
+    numbers with their own delta-method stderrs)."""
     note = PAIRED_NOTE + ("" if d.same_grid else "; the two grids differ (still paired by path)")
     b.add(
         table,
@@ -535,26 +554,43 @@ def _add_difference(
         note=note,
         axes=axes,
     )
-    b.add_exact(
+    finite = math.isfinite(d.value)
+    b.add(
         table,
         row,
         f"{col}_se_quadrature",
-        scale * d.stderr_quadrature,
+        scale * d.stderr_quadrature if finite else math.nan,
+        scale * d.quadrature_se if finite else math.nan,
         unit=unit,
-        source="computed",
-        note="the quadrature error of the same difference, for comparison",
+        source=src,
+        note="the quadrature error of the same difference, for comparison; " + ERROR_STAT_NOTE,
         axes=axes,
     )
-    b.add_exact(
+    b.add(
         table,
         row,
         f"{col}_correlation",
-        d.correlation,
-        unit="",
-        source="computed",
-        note="per-pair correlation of the two estimates",
+        d.correlation if finite else math.nan,
+        d.correlation_se if finite else math.nan,
+        unit=DIMENSIONLESS,
+        source=src,
+        note="per-pair correlation of the two estimates; " + ERROR_STAT_NOTE,
         axes=axes,
     )
+
+
+def _tolerance(floor: Estimate, k_leg: Estimate, count: Estimate) -> Estimate:
+    """``floor / (2 VP K_leg c_leg)`` (vol points) with its delta-method influence; every
+    input is a statistic of the same path set (the floor of the paired difference, the LV's
+    leg strike and count)."""
+    k, c = k_leg.value, count.value
+    n = floor.influence.size
+    if not (k > 0 and c > 0 and math.isfinite(floor.value)) or n != k_leg.influence.size:
+        return Estimate(math.nan, np.full(n, math.nan))
+    scale = 1.0 / (2.0 * VP * k * c)
+    t = scale * floor.value
+    infl = scale * floor.influence - t * (k_leg.influence / k + count.influence / c)
+    return Estimate(t, infl)
 
 
 def _diff_rows(
@@ -574,7 +610,8 @@ def _diff_rows(
     ax = {**mp.axes, "same_grid": float(same)}
     d_var = diff("var")
     d_var2 = diff("var2")
-    floor = abs(d_var2.value) + FLOOR_SE * d_var2.stderr
+    floor_est = floor_estimate(d_var2, FLOOR_SE)
+    floor = floor_est.value
     _add_difference(b, "gyongy_floor", mp.label, "d_var", d_var, VP, VOL, src, ax)
     b.add(
         "gyongy_floor",
@@ -587,24 +624,18 @@ def _diff_rows(
         note=PAIRED_NOTE,
         axes=ax,
     )
-    b.add_exact(
-        "gyongy_floor",
-        mp.label,
-        "z_var",
-        d_var.z,
-        unit="",
-        source="computed",
-        note="d / paired stderr",
-        axes=ax,
+    add_z(
+        b, "gyongy_floor", mp.label, "z_var", d_var.z, source=src, note="d / paired stderr", axes=ax
     )
-    b.add_exact(
+    b.add(
         "gyongy_floor",
         mp.label,
         "floor",
         floor,
+        floor_est.stderr if math.isfinite(floor) else math.nan,
         unit=VAR,
-        source="computed",
-        note=f"|d(K_var^2)| + {FLOOR_SE:g} stderr",
+        source=src,
+        note=f"|d(K_var^2)| + {FLOOR_SE:g} stderr; a Monte Carlo number (delta-method stderr)",
         axes=ax,
     )
     b.add_exact(
@@ -620,9 +651,8 @@ def _diff_rows(
     for B in cond:
         for leg, label, indicator in LEGS:
             d = diff(f"{leg}_{B}")
-            lv_k = ref.est[f"{leg}_{B}"].value
-            lv_c = ref.est[f"{leg}_cnt_{B}"].value
-            tol = floor / (2.0 * VP * lv_k * lv_c) if lv_k > 0 and lv_c > 0 else math.nan
+            tol_est = _tolerance(floor_est, ref.est[f"{leg}_{B}"], ref.est[f"{leg}_cnt_{B}"])
+            tol = tol_est.value
             z = d.z
             if not math.isfinite(z):
                 verdict = math.nan
@@ -635,24 +665,17 @@ def _diff_rows(
             row = f"{mp.label} | {label} {btag(B)}%"
             cax = {**ax, "leg": leg, "indicator": indicator, "barrier": B}
             _add_difference(b, "gyongy", row, "d", d, VP, VOL, src, cax)
-            b.add_exact(
-                "gyongy",
-                row,
-                "z",
-                z,
-                unit="",
-                source="computed",
-                note="d / paired stderr",
-                axes=cax,
-            )
-            b.add_exact(
+            add_z(b, "gyongy", row, "z", z, source=src, note="d / paired stderr", axes=cax)
+            b.add(
                 "gyongy",
                 row,
                 "tolerance",
                 tol,
+                tol_est.stderr if math.isfinite(tol) else math.nan,
                 unit=VOL,
-                source="computed",
-                note="the variance-swap floor at this leg's level",
+                source=src,
+                note="the variance-swap floor at this leg's level; a Monte Carlo number "
+                "(delta-method stderr)",
                 axes=cax,
             )
             b.add_exact(
@@ -767,7 +790,14 @@ def _store_check(
                 axes=ax,
             )
             b.add_exact(
-                tbl, row, "n_se", 0.0, unit="", source="computed", note="identical", axes=ax
+                tbl,
+                row,
+                "n_se",
+                0.0,
+                unit=DIMENSIONLESS,
+                source="computed",
+                note="identical",
+                axes=ax,
             )
             continue
         d_se = scale * rss(s, ss)
@@ -782,12 +812,12 @@ def _store_check(
             note="inline minus store; " + QUADRATURE_NOTE + (f"; {grid_note}" if grid_note else ""),
             axes=ax,
         )
-        b.add_exact(
+        add_z(
+            b,
             tbl,
             row,
             "n_se",
             scale * abs(v - sv) / d_se if d_se > 0 else math.nan,
-            unit="",
             source="computed",
             note="|d| over the quadrature error (not the exact error)",
             axes=ax,
@@ -1327,7 +1357,8 @@ def figures(results: Results) -> list[FigureSpec]:
             "gyongy_check",
             "LSV minus LV of the corridor, conditional up and conditional down strikes per "
             "barrier and model, error bars 1 paired stderr; the short horizontal ticks at +/- "
-            "the tolerance mark each model's variance-swap floor at the leg's level (exact).",
+            "the tolerance mark each model's variance-swap floor at the leg's level (a Monte "
+            "Carlo number whose own error is in the gyongy table, not drawn).",
             _draw_gyongy,
         ),
         FigureSpec(

@@ -38,6 +38,7 @@ from volsto.config import (
     from_mapping,
 )
 from volsto.models.leverage import LeverageFunction
+from volsto.models.lsv import LSV
 from volsto.products import (
     EuropeanOption,
     KnockOutVarianceSwap,
@@ -48,7 +49,7 @@ from volsto.products import (
     season,
 )
 from volsto.risk.attribution import attribution_cost, explain
-from volsto.risk.engine import BSBuilder, LSVBuilder, RiskEngine, RiskState, held_in_moneyness
+from volsto.risk.engine import BSBuilder, LSVBuilder, RiskEngine, RiskState
 
 ROOT = Path(__file__).resolve().parents[1]
 REPO_CACHE = ROOT / "cache"
@@ -196,22 +197,42 @@ def test_sticky_leverage_ladders_run_without_calibration(tmp_path: Path) -> None
 
 
 def test_recalibration_bucket_vanishes_on_a_pure_spot_move(tmp_path: Path) -> None:
-    """The particle method is homogeneous in ``k``: the recalibration after a sticky-moneyness
-    move is ``L₀`` in ``k`` (stored so here).  The bucket is zero within its stderr; the spot-fixed
-    re-anchoring (the builder's ``"sticky_leverage"``) is not, which is why the attribution holds
-    ``L₀`` in ``k``."""
+    """A pure sticky-moneyness spot move whose stored refit is ``L₀`` held in ``k`` — what the
+    particle method's homogeneity in ``k`` produces (measured on genuinely refitted leverages by
+    :func:`test_recalibration_bucket_on_the_real_recalibrated_spot_pair`, not here).  The refit
+    is built here without :func:`held_in_moneyness` (``L₀``'s grid values on the moved forward
+    curve), so the two legs of the bucket — the cached refit and the attribution's frozen
+    leverage — are the same model only if the frozen leverage is held in ``k``: the bucket is
+    then exactly zero with a zero stderr (an identity, not a Monte Carlo statement).  A frozen
+    leverage re-anchored in spot would book the spot-fixed difference measured below (z ≈ 100),
+    which is why the attribution holds ``L₀`` in ``k``; the frozen model's leverage is also
+    checked against ``L₀``'s values and against the spot re-anchoring directly."""
     state_0 = RiskState(_spec())
     state_1 = state_0.with_spot(102.0)
     lev0 = _leverage(state_0.spec)
     fc1, _, _ = build_market(state_1.spec)
-    cache = _cache(tmp_path, [(state_0.spec, lev0), (state_1.spec, held_in_moneyness(lev0, fc1))])
+    refit = LeverageFunction(lev0.times, lev0.k_grid, lev0.values, fc1, {"refit": "L0 in k"})
+    cache = _cache(tmp_path, [(state_0.spec, lev0), (state_1.spec, refit)])
     builder = LSVBuilder(cache, state_0, allow_calibrate=False)
     engine = RiskEngine(builder, SIM)
     call = _call(state_0)
     ex = explain(engine, call, state_0, state_1, mode="sticky_leverage")
     assert [s.name for s in ex.steps] == ["spot", "recalibration"]
     recal = ex.steps[-1]
-    assert abs(recal.actual) <= 2.0 * recal.actual_stderr
+    # the stored refit IS L0 held in k: both legs are one model, path by path
+    assert recal.actual == 0.0 and recal.actual_stderr == 0.0
+    # the frozen model's leverage, independently of held_in_moneyness: L0's values on the moved
+    # forward curve (L held in k), not the spot re-anchoring of the builder's sticky mode
+    frozen = builder.build(state_1, "frozen_leverage")
+    assert isinstance(frozen, LSV)
+    np.testing.assert_array_equal(frozen.leverage.values, lev0.values)
+    assert np.array_equal(frozen.leverage.times, lev0.times)
+    assert float(frozen.leverage(0.0, 102.0)) == float(lev0(0.0, 100.0))  # at the money: k = 0
+    reanchored = lev0.reanchored(frozen.kernel.forward_curve).values
+    assert float(np.max(np.abs(reanchored - lev0.values))) > 1e-3
+    sticky = builder.build(state_1, "sticky_leverage")
+    assert isinstance(sticky, LSV)
+    np.testing.assert_array_equal(sticky.leverage.values, reanchored)
     spot_fixed = engine.combination(
         "recal vs spot-fixed leverage",
         call,

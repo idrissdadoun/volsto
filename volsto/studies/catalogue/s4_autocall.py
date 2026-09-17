@@ -13,11 +13,11 @@ the LSV-minus-LV difference by leg, and the forward-skew diagnostic.
   point without M6 cells is, with ``price_missing``, priced here by
   :func:`volsto.studies.m6.run_m6_headline` from its cached leverage (``cache:<key>``;
   ``computed`` for the local vol).
-* **LSV minus LV by leg**: priced here, every model runs on the study's shared step schedule
-  and seed and the difference carries the **paired** stderr (the quadrature error is reported
-  beside it); read from the store, the difference carries the quadrature error, which is not
-  the exact error: the two estimates share random numbers and the store keeps no per-path
-  samples to measure their correlation.
+* **LSV minus LV by leg**: priced here, every model runs on the study's shared step schedule and
+  seed and the difference carries the **paired** stderr (the quadrature error is reported beside it;
+  both errors carry their own delta-method stderrs); read from the store, the difference carries the
+  quadrature error, which is not the exact error: the two estimates share random numbers and the
+  store keeps no per-path samples to measure their correlation.
 * **Beyond the horizon**: a leverage calibrated to a horizon shorter than the notes' 3y maturity
   (the CI toy build, 1y) holds its last slice to maturity; every number of such a model says so
   in its note, the ``horizon`` table lists the models and the narrative states it.
@@ -68,6 +68,7 @@ from volsto.models.base import Model
 from volsto.products.base import Product
 from volsto.studies import style
 from volsto.studies.catalogue._common import (
+    ERROR_STAT_NOTE,
     PAIRED_NOTE,
     QUADRATURE_NOTE,
     VP,
@@ -111,6 +112,18 @@ QUESTION = (
 )
 REQUIRED_PARAMS = ("models", "price_missing", "pricing", "lv_exposure", "store_risk")
 OPTIONAL_PARAMS: tuple[str, ...] = ()
+#: What every exact row of this study is (``_common.unclassified_exact_rows``; the walking test
+#: fails on any other exact row): ``(table regex, column regex, kind)``.
+EXACT_KINDS: tuple[tuple[str, str, str], ...] = (
+    ("horizon", "horizon", "input"),
+    ("horizon", "notes_beyond", "flag"),
+    ("fwd_skew", "beyond_horizon", "flag"),
+    ("spot_skew", r"skew_[\d_]+", "closed form"),  # of the target surface
+    # a leg whose bumped and base payoffs coincide on every path: exactly zero
+    ("fwd_skew_lv", r"exposure_[\d.]+y", "closed form"),
+    ("fwd_skew_lv_size", r"achieved_[\d.]+y", "closed form"),  # the bump actually applied
+    ("setup", "value", "input"),  # the selection's counts and the config's inputs
+)
 
 PCT = "% notional"
 VOL = "vol pts"
@@ -471,26 +484,27 @@ def _differences(
                         "" if diff.same_grid else "; the grids differ (still paired by path)"
                     )
                     value, se = diff.value, diff.stderr
-                    b.add_exact(
-                        f"se_{slug}",
-                        mp.label,
-                        f"{col}_quadrature",
-                        scale * diff.stderr_quadrature,
-                        unit=unit,
-                        source="computed",
-                        note="the quadrature error, for comparison" + beyond,
-                        axes=ax,
-                    )
-                    b.add_exact(
-                        f"se_{slug}",
-                        mp.label,
-                        f"{col}_paired",
-                        scale * diff.stderr,
-                        unit=unit,
-                        source="computed",
-                        note="the paired stderr" + beyond,
-                        axes=ax,
-                    )
+                    finite = math.isfinite(diff.value)
+                    for suffix, err, err_se, what in (
+                        (
+                            "quadrature",
+                            diff.stderr_quadrature,
+                            diff.quadrature_se,
+                            "the quadrature error, for comparison",
+                        ),
+                        ("paired", diff.stderr, diff.stderr_se, "the paired stderr"),
+                    ):
+                        b.add(
+                            f"se_{slug}",
+                            mp.label,
+                            f"{col}_{suffix}",
+                            scale * err if finite else math.nan,
+                            scale * err_se if finite else math.nan,
+                            unit=unit,
+                            source=src,
+                            note=f"{what}; {ERROR_STAT_NOTE}{beyond}",
+                            axes=ax,
+                        )
                 else:
                     rv, rs = ref.cells[key]
                     value, se = v - rv, rss(s, rs)

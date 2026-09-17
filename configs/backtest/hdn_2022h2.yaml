@@ -11,7 +11,8 @@
 # `volsto-backtest dry-run ...` prints the projected wall clock; stage 2:
 # `volsto-study run configs/studies/catalogue/backtest_2022h2.yaml`.
 # One regime and too short for a conclusion; the multi-year run waits on the paid EOD archive and
-# is a one-line change: dates.start / dates.end and data.root.
+# needs only a config change: dates.start / dates.end and data.root, plus a new store
+# (paths.out, paths.snapshots, or --out / --snapshots): dates.start is hashed.
 # Variance products (var_swap, ko_var) are struck at the inception surface's log-contract
 # variance-swap strike (strike: vs_strip) with variance notional 1/(2 K_vol): vega notional 1,
 # values in vol points x 100.  This differs from M8b, whose KO var had strike 0 in variance
@@ -24,10 +25,13 @@ data:
   vendor: hdn                                     # the only importer (volsto.market.import_hdn)
   root: data/hdn_sample/options_sample_2022H2     # a day_by_date/ directory; not hashed
   underlying: SPX
-  missing_close: fail      # fail: an unreadable day file fails its date and leaves the
-                           # trades spanning it unpriced (the message names the fix);
-                           # skip_date: drop it from the calendar (every later fixing
-                           # of a trade spanning it moves one vendor date; stated)
+  missing_close: fail      # fail: a date whose close cannot be had (absent or unreadable
+                           # day file) fails and leaves the trades spanning it unpriced
+                           # (the message names the fix); skip_date: drop a manifest-listed
+                           # date whose day file is ABSENT from the calendar (every later
+                           # fixing of a trade spanning it moves one vendor date; stated);
+                           # an unreadable existing file still fails its date (--resume
+                           # retries it)
 dates:
   start: "2022-07-01"      # the fixed book's inception; hashed
   end: "2022-12-30"        # not hashed: extending the range keeps the computed dates
@@ -72,7 +76,8 @@ attribution:
   trades: fixed            # the fixed book; rolling trades are priced at inception only
   pillars: [0.25, 0.5, 1.0, 2.0, 3.0]   # the fitted pillars (46 states a date, not 62)
   bump: 0.01
-  max_halvings: 6          # the curvature ladder on repaired eSSVI needs up to 6 (SPEC §7.12.1)
+  max_halvings: 6          # eSSVI curvature ladders need up to 6 (per-pillar rho,
+                           # not the calendar repair; SPEC §13.2)
 ssr:
   window: 20               # realised SSR: the minimum window (MIN_INCREMENTS), SPEC §15 Part 2
   pillars: [0.25, 0.5, 1.0]

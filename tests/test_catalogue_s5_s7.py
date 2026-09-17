@@ -40,7 +40,8 @@ What is asserted:
 * S5 fast (``toy_marking_build``): the binding map reproduces the stored fits, realised SSR
   with stderr, the forward window beyond the 1y horizon flagged, the placeholder warning, the
   recorded M7 fits labelled, |L-1| exact with its note and drawn without error bars, the cache
-  and the store unchanged;
+  and the store unchanged; with the full config's two 1y-long windows every forward-skew
+  column (the spot skew included) is keyed by its window, so the build does not collide;
 * S5 Greeks (the synthetic store's risk rows, real ``skew_tent[..]`` naming): the stored
   fractions of notional x 100 in ``% notional <store unit>`` with their stderr; the forward
   90/110 skew's stderr the sum of the two strikes' errors (0.10 vol pts there, not the
@@ -51,7 +52,24 @@ What is asserted:
   grid (the repository's ``outputs/store`` is built from ``placeholder_cached.yaml``) the line
   still names the configured grid and a note names the recorded one;
 * every S5–S7 config loads strictly against its module; the helpers never record a Monte Carlo
-  value without its stderr.
+  value without its stderr;
+* derived numbers (review of M10): every z-score of S5–S7 carries stderr 1 (not exact); S6's
+  ratios of runs sharing the world seed carry :func:`volsto.studies.m8b.ratio_stderr_bound`
+  (pinned against the exact first-order formula over every correlation, including the
+  opposite-sign case where the independent figure understates), its simulated / static ratio is
+  labelled "not a bound", no study text calls an error "conservative"; S5's cost of a mark
+  carries the shared ``QUADRATURE_NOTE``; S7's ranks are exact with their note and each carries
+  its "decided at 2 se" flag (recomputed from the table's values: the two ``value +/- 2 se``
+  intervals of consecutive ranks; the headline set against every farther ranked regime, with a
+  synthetic table where that differs from the boundary pair), its spread carries the sum of the two extreme errors and is
+  shown over its noise floor ``d_k`` x the mean error (a Monte Carlo ratio); S7's
+  gate reads the repaired eSSVI history's verdict and names it, falls back to the M8b file (and
+  says so) only when that file is absent, and prints the repaired run's command when neither
+  exists; S5 and the precompute share one marking-fit helper;
+* exact rows: every exact row of every S5–S7 run is declared in its module's ``EXACT_KINDS``
+  (``_common.unclassified_exact_rows``), each rank with its flag column;
+* LaTeX: asserted when Tectonic ran; a skipped check is reported as a pytest skip at the end of
+  the test instead of passing silently.
 
 Wall clocks are printed, never asserted.
 """
@@ -73,6 +91,11 @@ from _synthetic_store import SYNTHETIC_C_MISSING, SYNTHETIC_VERDICT
 
 from volsto.studies import latex, m8b, runner
 from volsto.studies.catalogue import s5_marking, s6_shadow_rotation, s7_hedging
+from volsto.studies.catalogue._common import (
+    QUADRATURE_NOTE,
+    parse_exact_kinds,
+    unclassified_exact_rows,
+)
 from volsto.studies.results import Column, Results, ResultsBuilder, TableSpec
 from volsto.viewers.store import ResultsStore
 
@@ -201,14 +224,35 @@ def _check_outputs(
     assert (out / "study.tex").is_file()
     latex_check = manifest["latex"]
     print(f"latex: {latex_check['status']} {latex_check.get('reason', '')[:200]}")
-    if runner.find_tectonic() is not None:
+    if latex_check["status"] != "skipped":  # a skip is reported by _latex_ok_or_skip, last
         assert latex_check["status"] == "ok", latex_check
         assert (out / "study.pdf").is_file()
     results = Results.read(out / "results.parquet")
     frame = results.frame
     mc = frame[~frame["exact"] & frame["value"].notna()]
     assert mc["stderr"].notna().all() and (mc["stderr"] >= 0).all()
+    _check_exact_kinds(results, question)
     return results, manifest
+
+
+def _check_exact_kinds(results: Results, question: str) -> None:
+    """Every exact row is declared in the study's ``EXACT_KINDS`` (ranks with their flag)."""
+    module = next(m for m in MODULES.values() if question == m.QUESTION)
+    bad = unclassified_exact_rows(results, module.EXACT_KINDS)
+    listed = bad.drop_duplicates(["table", "column"])
+    assert bad.empty, "undeclared exact rows: " + "; ".join(
+        f"{t}.{c}" for t, c in zip(listed["table"], listed["column"], strict=True)
+    )
+
+
+def _latex_ok_or_skip(manifest: dict[str, Any]) -> None:
+    """The last step of a test that ran the LaTeX check: without Tectonic the check was skipped
+    by the runner (exit 0) — say so as a pytest skip instead of passing silently."""
+    status = manifest["latex"]["status"]
+    if status == "skipped":
+        pytest.skip(runner.TECTONIC_MISSING)
+    assert status == "ok", manifest["latex"]
+    assert runner.find_tectonic() is not None
 
 
 def _check_render_and_rerun(out: Path, tmp: Path) -> None:
@@ -411,7 +455,7 @@ def test_s6_fast_on_the_toy_outputs(
             v, se = res.value("ordering_sim", product, f"ratio@{label}")
             assert v == pytest.approx(vc["recal_pnl_desk"] / va["recal_pnl_desk"], rel=1e-12)
             assert se == pytest.approx(
-                m8b.ratio_stderr(
+                m8b.ratio_stderr_bound(
                     vc["recal_pnl_desk"],
                     vc["recal_pnl_desk_se"],
                     va["recal_pnl_desk"],
@@ -428,7 +472,19 @@ def test_s6_fast_on_the_toy_outputs(
     assert disagree  # the synthetic contaminated column is of the opposite sign
     ordering = md[md.index("## Policy ordering") :]
     assert f"they differ on {len(disagree)} ({', '.join(disagree)})" in ordering
+    # z-scores carry their sampling sd 1; ratios of same-seed runs carry the bound
+    for rec in _records_of(res, "agreement", "z"):
+        if math.isfinite(rec["value"]):
+            assert not rec["exact"] and rec["stderr"] == 1.0 and "sampling sd" in rec["note"]
+    for rec in _records_of(res, "agreement", "nonlinearity"):
+        if math.isfinite(rec["value"]):
+            assert rec["note"] == s6_shadow_rotation.BOUND_NOTE
+    for rec in _records_of(res, "agreement", "ratio"):
+        if math.isfinite(rec["value"]):
+            assert rec["note"] == s6_shadow_rotation.AGREEMENT_SE_NOTE
+    assert "conservative" not in md
     _check_render_and_rerun(out, tmp_path / "s6_rerun")
+    _latex_ok_or_skip(manifest)
 
 
 @pytest.mark.parametrize(
@@ -461,6 +517,37 @@ def test_s6_classifies_at_two_stderr(ratio: float, stderr: float, expected: str)
 )
 def test_s6_ordering_sides(ratio: float, stderr: float, expected: float) -> None:
     assert s6_shadow_rotation.ordering_side(ratio, stderr) == expected
+
+
+def _records_of(res: Results, table: str, column: str) -> list[dict[str, Any]]:
+    long = res.long(table, column)
+    return [{str(k): v for k, v in r.items()} for r in long.to_dict("records")]
+
+
+@pytest.mark.parametrize(
+    ("num", "num_se", "den", "den_se"), [(1.0, 0.1, -2.0, 0.2), (1.0, 0.1, 2.0, 0.2)]
+)
+def test_ratio_stderr_bound(num: float, num_se: float, den: float, den_se: float) -> None:
+    """The first-order stderr of num/den for correlation rho is
+    |r| sqrt(a² + b² − 2 rho a b s) with a = se_n/n, b = se_d/d (absolute), s = sign(n d):
+    the bound is its maximum over rho ∈ [−1, 1]; the independent figure understates it for
+    opposite signs and a positive correlation (and for same signs and a negative one)."""
+    r = num / den
+    a, b = num_se / abs(num), den_se / abs(den)
+    sign = math.copysign(1.0, num * den)
+    exact = [
+        abs(r) * math.sqrt(max(a * a + b * b - 2.0 * rho * a * b * sign, 0.0))
+        for rho in [i / 20.0 for i in range(-20, 21)]
+    ]
+    bound = m8b.ratio_stderr_bound(num, num_se, den, den_se)
+    independent = m8b.ratio_stderr(num, num_se, den, den_se)
+    assert bound == pytest.approx(max(exact), rel=1e-12)
+    assert all(e <= bound + 1e-15 for e in exact)
+    assert independent <= bound <= math.sqrt(2.0) * independent + 1e-15
+    rho = 0.8 if sign < 0 else -0.8  # the correlation that makes the independent figure too small
+    understated = abs(r) * math.sqrt(a * a + b * b - 2.0 * rho * a * b * sign)
+    assert independent < understated <= bound
+    assert math.isnan(m8b.ratio_stderr_bound(0.0, 0.1, 1.0, 0.1))
 
 
 def _set_row(
@@ -602,7 +689,8 @@ def test_s7_fast_on_the_toy_outputs(
     assert code == 0, text
     res, manifest = _check_outputs(out, S7_TABLES, S7_FIGURES, s7_hedging.QUESTION)
     arts = {a["path"] for a in manifest["artefacts"]}
-    assert {f"m8b/m8b_table_{x}.csv" for x in "ABD"} | {"m8b/discriminator_verdict.json"} <= arts
+    assert {f"m8b/m8b_table_{x}.csv" for x in "ABD"} | {s7_hedging.VERDICT_REPAIRED} <= arts
+    assert "m8b/discriminator_verdict.json" not in arts  # the fallback is not read
     md = (out / "study.md").read_text()
     assert m8b.STUDY_D_HEADLINE in md
     assert SYNTHETIC_VERDICT["reason"] in md and "**Skipped:** world(s) historical" in md
@@ -618,8 +706,27 @@ def test_s7_fast_on_the_toy_outputs(
         assert res.value("d_summary", product, "headline_holds")[0] == 1.0, product
     v, se = res.value("a_ranking", "2F | cliquet 1y | delta only", "desk_mean")
     assert math.isfinite(v) and se == pytest.approx(0.05)
-    # the spread of the implied MV deltas: a Monte Carlo number with a conservative stderr (the
-    # two extreme regime rows' stderrs in quadrature), equal to the table's own spread
+    # the gate read the repaired history's verdict and says so; its z carries stderr 1
+    assert res.value("gate", "discriminator", "repaired_history")[0] == 1.0
+    assert "uses the repaired eSSVI history" in md and "eSSVI repaired" in md
+    repaired = json.loads((toy.outputs_root / s7_hedging.VERDICT_REPAIRED).read_text())
+    for rec in repaired["table"]:
+        row = f"T={rec['T']:.4g}y window={rec['window']:g}d"
+        assert res.value("gate_pillars", row, "ssr_fitted") == pytest.approx(
+            (rec["ssr_ssvi"], rec["se_ssvi"])
+        )
+        z, z_se = res.value("gate_pillars", row, "z")
+        assert z == pytest.approx(rec["z"]) and z_se == 1.0
+        assert not res.is_exact("gate_pillars", row, "z")
+    for rec in _records_of(res, "d_ranking", "mv_z"):
+        if math.isfinite(rec["value"]):
+            assert not rec["exact"] and rec["stderr"] == 1.0
+    for col in ("std_rank", "distance_rank"):
+        for rec in _records_of(res, "d_ranking", col):
+            assert rec["exact"] and rec["note"] == s7_hedging.RANK_NOTE
+    _check_rank_flags(res, toy.outputs_root / "m8b")
+    # the spread of the implied MV deltas: the sum of the two extreme rows' stderrs (a bound
+    # whatever their correlation), equal to the table's own spread; its noise floor d_k x mean se
     table_d = pd.read_csv(toy.outputs_root / "m8b" / "m8b_table_D.csv")
     for product in res.rows("d_common"):
         rows = table_d[(table_d["product"] == product) & (table_d["regime"] != "min_variance")]
@@ -628,9 +735,243 @@ def test_s7_fast_on_the_toy_outputs(
         v, se = res.value("d_common", product, "mv_common_spread")
         assert not res.is_exact("d_common", product, "mv_common_spread")
         assert v == pytest.approx(hi["mv_delta_implied"] - lo["mv_delta_implied"], rel=1e-12)
-        assert se == pytest.approx(math.hypot(hi["mv_delta_implied_se"], lo["mv_delta_implied_se"]))
+        assert se == pytest.approx(hi["mv_delta_implied_se"] + lo["mv_delta_implied_se"])
         assert res.value("d_common", product, "spread_matches_rows")[0] == 1.0
+        # the spread over its noise floor d_k x mean se: a Monte Carlo ratio (the floor fixed)
+        floor = s7_hedging.RANGE_FACTORS[len(rows)] * float(rows["mv_delta_implied_se"].mean())
+        ratio, ratio_se = res.value("d_common", product, "spread_over_noise")
+        assert not res.is_exact("d_common", product, "spread_over_noise")
+        assert ratio == pytest.approx(v / floor, rel=1e-12)
+        assert ratio_se == pytest.approx(se / floor, rel=1e-12)
+        assert f"floor {floor:.4g}" in res.record("d_common", product, "spread_over_noise")["note"]
+    assert "conservative" not in md
     _check_render_and_rerun(out, tmp_path / "s7_rerun")
+    _latex_ok_or_skip(manifest)
+
+
+def _decided(v: float, se: float, v_next: float, se_next: float) -> float:
+    """The reference rule: the upper end of the row's 2-se interval lies below the lower end of
+    the next-ranked row's (the ranks ascend with the value)."""
+    return 1.0 if v + 2 * se < v_next - 2 * se_next else 0.0
+
+
+def _check_rank_flags(res: Results, m8b_dir: Path) -> None:
+    """Every rank's "decided at 2 se" flag, recomputed from the source tables: 1 / 0 against the
+    next-ranked row of its group, NaN for the last or an unranked row; both values occur."""
+    table_a = pd.read_csv(m8b_dir / "m8b_table_A.csv")
+    table_d = pd.read_csv(m8b_dir / "m8b_table_D.csv")
+    table_d["abs_distance"] = table_d["distance_to_mv"].abs()
+    cases = (
+        (table_a, ["pricing", "product"], "rank", "std", "std_se", "a_ranking", "rank"),
+        (table_d, ["product"], "std_rank", "std", "std_se", "d_ranking", "std_rank"),
+        (
+            table_d,
+            ["product"],
+            "distance_rank",
+            "abs_distance",
+            "distance_to_mv_se",
+            "d_ranking",
+            "distance_rank",
+        ),
+    )
+    headline = runner.load_study_config(CATALOGUE / "s7_fast.yaml").params["headline_regimes"]
+    seen: set[float] = set()
+    for frame, keys, rank_col, v_col, se_col, table, col in cases:
+        for _, g in frame.groupby(keys):
+            by_rank = {int(r[rank_col]): r for _, r in g.iterrows() if r[rank_col] >= 1}
+            for _, r in g.iterrows():
+                if table == "a_ranking":
+                    row = f"{r['pricing']} | {r['product']} | {r['strategy']}"
+                else:
+                    row = f"{r['product']} | {r['regime']}"
+                flag = res.value(table, row, f"{col}_decided")[0]
+                assert res.is_exact(table, row, f"{col}_decided")
+                nxt = by_rank.get(int(r[rank_col]) + 1) if r[rank_col] >= 1 else None
+                if nxt is None:
+                    assert math.isnan(flag), (table, row, col)
+                    continue
+                expected = _decided(r[v_col], r[se_col], nxt[v_col], nxt[se_col])
+                assert flag == expected, (table, row, col)
+                seen.add(flag)
+        if table == "d_ranking" and col == "distance_rank":
+            for product, g in frame.groupby("product"):
+                model = g[g["regime"] == "model"].iloc[0]
+                assert res.value("d_summary", str(product), "model_rank_decided")[0] == (
+                    pytest.approx(
+                        res.value("d_ranking", f"{product} | model", "distance_rank_decided")[0],
+                        nan_ok=True,
+                    )
+                )
+                assert res.value("d_summary", str(product), "model_rank")[0] == float(
+                    model["distance_rank"]
+                )
+                # the headline set against every farther ranked regime
+                k = len(headline)
+                ranked = g[g["distance_rank"] >= 1]
+                inside = ranked[ranked["distance_rank"] <= k]
+                outside = ranked[ranked["distance_rank"] > k]
+                top = float((inside["abs_distance"] + 2 * inside["distance_to_mv_se"]).max())
+                bottom = float((outside["abs_distance"] - 2 * outside["distance_to_mv_se"]).min())
+                assert res.value("d_summary", str(product), "headline_decided")[0] == (
+                    1.0 if top < bottom else 0.0
+                )
+    assert seen == {0.0, 1.0}, seen
+
+
+@pytest.mark.parametrize(
+    ("entries", "expected"),
+    [
+        # separated at 2 se: 1.0 + 2*0.1 = 1.2 < 2.0 - 2*0.1 = 1.8
+        ([("a", 1, 1.0, 0.1), ("b", 2, 2.0, 0.1)], {"a": 1.0, "b": math.nan}),
+        # overlapping: 1.0 + 0.4 = 1.4 >= 1.5 - 0.4 = 1.1
+        ([("a", 1, 1.0, 0.2), ("b", 2, 1.5, 0.2)], {"a": 0.0, "b": math.nan}),
+        # the boundary (difference = 2 (se + se_next)) is not decided
+        ([("a", 1, 1.0, 0.25), ("b", 2, 2.0, 0.25)], {"a": 0.0, "b": math.nan}),
+        # unranked (-1), the reference row (0), a gap in the ranks, a missing stderr
+        (
+            [
+                ("mv", 0, 0.0, 0.1),
+                ("x", -1, 5.0, 0.1),
+                ("a", 1, 1.0, math.nan),
+                ("b", 2, 3.0, 0.1),
+                ("c", 4, 9.0, 0.1),
+            ],
+            {"mv": math.nan, "x": math.nan, "a": math.nan, "b": math.nan, "c": math.nan},
+        ),
+        # the ranks, not the input order, decide the pairs
+        (
+            [("c", 3, 3.0, 0.1), ("a", 1, 1.0, 0.4), ("b", 2, 2.0, 0.1)],
+            {"a": 0.0, "b": 1.0, "c": math.nan},
+        ),
+    ],
+)
+def test_s7_decided_flags(
+    entries: list[tuple[str, float, float, float]], expected: dict[str, float]
+) -> None:
+    got = s7_hedging.decided_flags(entries)
+    assert got.keys() == expected.keys()
+    for k, v in expected.items():
+        assert got[k] == pytest.approx(v, nan_ok=True), k
+
+
+@pytest.mark.parametrize(
+    ("inside", "outside", "expected"),
+    [
+        ([(0.05, 0.001), (0.06, 0.001)], [(0.08, 0.001), (0.09, 0.001)], 1.0),
+        # a member with a wide error reaches past the nearest farther regime
+        ([(0.05, 0.030), (0.06, 0.001)], [(0.08, 0.001), (0.09, 0.001)], 0.0),
+        # a farther regime with a wide error reaches into the set
+        ([(0.05, 0.001), (0.06, 0.001)], [(0.08, 0.001), (0.12, 0.030)], 0.0),
+        # the boundary (top == bottom) is not decided
+        ([(0.05, 0.005)], [(0.07, 0.005)], 0.0),
+        ([(0.05, 0.001)], [], math.nan),
+        ([], [(0.05, 0.001)], math.nan),
+        ([(0.05, math.nan)], [(0.08, 0.001)], math.nan),
+    ],
+)
+def test_s7_set_decided(
+    inside: list[tuple[float, float]], outside: list[tuple[float, float]], expected: float
+) -> None:
+    assert s7_hedging.set_decided(inside, outside) == pytest.approx(expected, nan_ok=True)
+
+
+def _table_d_row(
+    regime: str, dist: float, dist_se: float, rank: int, std_rank: int
+) -> dict[str, Any]:
+    mv = regime == "min_variance"
+    return {
+        "product": "autocall 3y",
+        "regime": regime,
+        "status": "ok",
+        "unit": "% of notional",
+        "std": 8.0 + std_rank,
+        "std_stderr": 0.01,
+        "std_rank": std_rank,
+        "mean_delta": 0.3,
+        "mean_delta_stderr": 0.001,
+        "lambda_star": 1.0,
+        "lambda_star_stderr": 0.001,
+        "std_at_lambda": 1.7,
+        "std_at_lambda_stderr": 0.01,
+        "mv_delta_implied": 0.30,
+        "mv_delta_implied_stderr": 0.001,
+        "distance_to_mv": dist,
+        "distance_to_mv_stderr": dist_se,
+        "distance_rank": rank,
+        "mv_valid": True if mv else None,
+        "mv_z": 0.1 if mv else None,
+        "mv_note": "",
+        "mv_common": 0.3,
+        "mv_common_stderr": 0.001,
+        "mv_common_spread": 0.0,
+        "mv_common_rows": 4,
+    }
+
+
+@pytest.mark.parametrize(("strike_se", "expected"), [(0.030, 0.0), (0.001, 1.0)])
+def test_s7_headline_decided_tests_the_whole_closest_set(strike_se: float, expected: float) -> None:
+    """The boundary row (sticky_skew, rank 2) is ahead of the next (model) at 2 stderr in both
+    cases; with sticky_strike's wide error (rank 1) the closest set is nevertheless not decided —
+    the flag follows the set, not the boundary pair."""
+    df = pd.DataFrame(
+        [
+            _table_d_row("sticky_strike", 0.050, strike_se, 1, 2),
+            _table_d_row("sticky_skew", 0.060, 0.001, 2, 3),
+            _table_d_row("model", 0.080, 0.001, 3, 4),
+            _table_d_row("sticky_moneyness", 0.090, 0.001, 4, 5),
+            _table_d_row("min_variance", 0.0, 0.001, 0, 1),
+        ]
+    )
+    b = ResultsBuilder()
+    s7_hedging._table_d(b, df, ["sticky_strike", "sticky_skew"], "computed")
+    res = b.build()
+    assert res.value("d_ranking", "autocall 3y | sticky_skew", "distance_rank_decided")[0] == 1.0
+    assert res.value("d_summary", "autocall 3y", "headline_holds")[0] == 1.0
+    assert res.value("d_summary", "autocall 3y", "headline_decided")[0] == expected
+    assert unclassified_exact_rows(res, s7_hedging.EXACT_KINDS).empty
+
+
+def test_exact_kinds_are_declared() -> None:
+    for module in MODULES.values():
+        kinds = parse_exact_kinds(module.EXACT_KINDS)
+        assert kinds
+    ranks = [k for k in parse_exact_kinds(s7_hedging.EXACT_KINDS) if k.kind == "rank"]
+    assert {(k.table, k.column, k.decided_flag) for k in ranks} == {
+        ("a_ranking", "rank", "rank_decided"),
+        ("d_ranking", "std_rank", "std_rank_decided"),
+        ("d_ranking", "distance_rank", "distance_rank_decided"),
+        ("d_summary", "model_rank", "model_rank_decided"),
+    }
+
+
+def test_s7_gate_falls_back_to_the_m8b_verdict(
+    toy_build: Any, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Without the repaired history's verdict the gate reads the M8b file (the documented
+    fallback) and study.md says the table uses the pre-repair history; without either, exit 2
+    with the repaired run's command."""
+    toy = toy_build.require()
+    outputs = _copy_outputs(toy.outputs_root, tmp_path / "outputs")
+    (outputs / s7_hedging.VERDICT_REPAIRED).unlink()
+    out = tmp_path / "s7"
+    code, text, _ = _run("s7_fast.yaml", out, capsys, "--outputs", str(outputs), "--no-latex-check")
+    assert code == 0, text
+    res = Results.read(out / "results.parquet")
+    manifest = json.loads((out / "manifest.json").read_text())
+    assert s7_hedging.VERDICT_FALLBACK in {a["path"] for a in manifest["artefacts"]}
+    rec = res.record("gate", "discriminator", "repaired_history")
+    assert rec["value"] == 0.0 and "fallback" in rec["note"]
+    assert s7_hedging.FALLBACK_FITTED_HISTORY in rec["note"]
+    fallback = json.loads((outputs / s7_hedging.VERDICT_FALLBACK).read_text())
+    first = fallback["table"][0]
+    row = f"T={first['T']:.4g}y window={first['window']:g}d"
+    assert res.value("gate_pillars", row, "ssr_fitted")[0] == pytest.approx(first["ssr_ssvi"])
+    md = (out / "study.md").read_text()
+    assert "uses the pre-repair history" in md
+    (outputs / s7_hedging.VERDICT_FALLBACK).unlink()
+    code, text, _ = _run("s7_fast.yaml", tmp_path / "s7_none", capsys, "--outputs", str(outputs))
+    assert code == runner.EXIT_MISSING, text
+    assert s7_hedging.VERDICT_REPAIRED_COMMAND in text
 
 
 def test_s7_missing_table_prints_its_command(
@@ -806,10 +1147,82 @@ def test_s5_fast_on_the_toy_marking_build(
     fig = s5_marking._draw_leverage(res)
     bars = [c for ax in fig.axes for c in ax.containers if hasattr(c, "has_yerr")]
     assert bars and not any(c.has_yerr for c in bars)
+    # the cost of a mark: quadrature labelled as such; its z-score carries stderr 1
+    for rec in _records_of(res, "mark_cost", "atm_vol"):
+        assert rec["note"].endswith(QUADRATURE_NOTE)
+    for rec in _records_of(res, "mark_cost_z", "atm_vol"):
+        assert not rec["exact"] and rec["stderr"] == 1.0
+    assert "conservative" not in md
     walls = manifest["records"]["binding_map_fit_seconds"]
     print(f"inline fits: {walls}")
     _check_render_and_rerun(out, tmp_path / "s5_rerun")
     assert _files(Path(toy.cache_root)) == cache_before
+    _latex_ok_or_skip(manifest)
+
+
+def test_s5_two_forward_windows_of_equal_length(
+    toy_marking_build: Any, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The shipped full config's windows [[1, 2], [2, 3]] are both 1y long: every forward-skew
+    column, the spot skew included, is keyed by its window, so the build does not collide."""
+    toy = toy_marking_build.require()
+    out = tmp_path / "s5_windows"
+    full = runner.load_study_config(CATALOGUE / "s5.yaml").params["forward_windows"]
+    windows = [[float(a), float(b)] for a, b in full]
+    assert len(windows) == 2 and len({b - a for a, b in windows}) == 1
+    code, text, _ = _run(
+        "s5_fast.yaml",
+        out,
+        capsys,
+        "--grid",
+        str(toy.grid_path),
+        "--store",
+        str(toy.store_root),
+        "--cache",
+        str(toy.cache_root),
+        "--outputs",
+        str(toy.outputs_root),
+        "--set",
+        f"forward_windows={json.dumps(windows)}",
+        "--no-latex-check",
+    )
+    assert code == 0, text
+    res = Results.read(out / "results.parquet")
+    _check_exact_kinds(res, s5_marking.QUESTION)
+    labels = [s5_marking.window_label(a, b) for a, b in windows]
+    fwd = res.pivot("forward_skew")
+    assert len(fwd) == 4
+    for w in labels:
+        for stem in ("spot_skew", "fwd_skew", "ratio", "beyond_horizon"):
+            assert f"{stem}@{w}" in fwd.columns, (stem, w, sorted(fwd.columns))
+    long = res.long("forward_skew")
+    spot = long[long["column"].str.startswith("spot_skew@")]
+    assert not spot.duplicated(["row", "column"]).any()
+    assert sorted(set(spot["column"])) == sorted(f"spot_skew@{w}" for w in labels)
+    # the same tenor on the same snapshot: one spot skew, recorded under each window
+    a, b = (f"spot_skew@{w}" for w in labels)
+    assert (fwd[a] == fwd[b]).all()
+
+
+def test_s5_and_the_precompute_share_one_marking_fit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """S5's binding map and the precompute's marking points go through one helper,
+    :func:`volsto.viewers.grid.marking_fit`: S5 imports it, and ``resolve_marking`` calls it."""
+    from volsto.viewers import grid as grid_mod
+
+    assert vars(s5_marking)["marking_fit"] is grid_mod.marking_fit
+
+    class CalledError(Exception):
+        pass
+
+    def stub(surface: Any, ssr_target: float, skew_eps: float) -> Any:
+        raise CalledError((ssr_target, skew_eps))
+
+    monkeypatch.setattr(grid_mod, "marking_fit", stub)
+    g = grid_mod.load_grid(ROOT / "configs" / "grids" / "toy_marking.yaml")
+    point = next(p for p in grid_mod.enumerate_points(g) if p.mode == "marking")
+    with pytest.raises(CalledError) as info:
+        grid_mod.resolve_marking(point, surface=None)  # type: ignore[arg-type]
+    assert info.value.args[0] == (point.axes["ssr_target"], point.axes["skew_eps"])
 
 
 def _synthetic_marking_store(tmp: Path) -> tuple[Path, Path]:

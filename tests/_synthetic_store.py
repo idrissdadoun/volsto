@@ -25,7 +25,9 @@ and the M7 marking tables (``m7/*.csv``) with the real headers, so the marking a
 paths render against them; since M10 Part 2 (the S6 / S7 catalogue studies) also the M8b summary
 tables B, C and D built by the real builders (:func:`volsto.studies.m8b.table_B` / ``table_C`` /
 ``table_D``) from synthetic task results, the study-C static greeks ``m8b/C/static_*.json`` and
-the discriminator verdict ``m8b/discriminator_verdict.json`` (:func:`make_synthetic_m8b_tables`;
+the discriminator verdicts — the M8b gate's ``m8b/discriminator_verdict.json`` (pre-repair, no
+fitted history named) and the repaired eSSVI history's
+``essvi_gate/discriminator/discriminator_verdict.json`` (:func:`make_synthetic_m8b_tables`;
 two products per study, one configured study-C row deliberately absent, the ``sabr_linked`` rows
 contaminated, the ``sticky_breakeven`` rows clean, every recalibration row recording its guarded
 fallbacks — all refits but one — and ``sabr_linked`` one capped correlation target from +2 on).
@@ -888,6 +890,49 @@ def _d_result(product: str, regime: str) -> TaskResult:
     )
 
 
+#: The repaired history's verdict (under the outputs root) and the fitted SSRs of the two files
+#: at the 1m and 1y pillars (raw SSRs are common: the raw slices do not depend on the fit).
+SYNTHETIC_REPAIRED_VERDICT = "essvi_gate/discriminator/discriminator_verdict.json"
+SYNTHETIC_RAW = ((1.0 / 12.0, 0.942, 0.153), (1.0, 0.770, 0.060))
+SYNTHETIC_FITTED_PRE = ((0.808, 0.112), (0.840, 0.070))
+SYNTHETIC_FITTED_REPAIRED = ((0.874, 0.117), (0.834, 0.068))
+SYNTHETIC_REPAIRED_HISTORY = ("outputs/essvi_gate/hdn_history_repaired.csv", "eSSVI repaired")
+
+
+def _verdict(fitted: tuple[tuple[float, float], ...], *, named: bool) -> dict[str, Any]:
+    doc: dict[str, Any] = {
+        **SYNTHETIC_VERDICT,
+        "n_dates_used": 127,
+        "n_dates_dropped": 0,
+        "wall_seconds": 114.0 if named else 271.8,
+        "recalibrated": False,
+        "table": [
+            {
+                "T": T,
+                "window": 60,
+                "ssr_raw": raw,
+                "se_raw": se_raw,
+                "ssr_ssvi": fit,
+                "se_ssvi": se_fit,
+                "diff": raw - fit,
+                "se_diff": math.hypot(se_raw, se_fit),
+                "z": (raw - fit) / math.hypot(se_raw, se_fit),
+                "slope_raw": -0.4,
+                "slope_ssvi": -0.42,
+                "mean_skew_raw": -0.43,
+                "mean_skew_ssvi": -0.52,
+                "r2_raw": 0.35,
+                "r2_ssvi": 0.39,
+                "n": 60,
+            }
+            for (T, raw, se_raw), (fit, se_fit) in zip(SYNTHETIC_RAW, fitted, strict=True)
+        ],
+    }
+    if named:
+        doc["fitted_history"], doc["fitted_label"] = SYNTHETIC_REPAIRED_HISTORY
+    return doc
+
+
 def make_synthetic_m8b_tables(root: str | Path) -> dict[str, Path]:
     """Write the M8b tables B, C and D, the study-C static greeks and the discriminator verdict
     under ``<root>/m8b`` from synthetic task results through the real table builders (module
@@ -940,37 +985,14 @@ def make_synthetic_m8b_tables(root: str | Path) -> dict[str, Path]:
     pd_ = m8b / "m8b_table_D.csv"
     table_D(d_results).to_csv(pd_, index=False)
     out["hedging_table_D"] = pd_
-    verdict = {
-        **SYNTHETIC_VERDICT,
-        "n_dates_used": 127,
-        "n_dates_dropped": 0,
-        "wall_seconds": 271.8,
-        "recalibrated": False,
-        "table": [
-            {
-                "T": T,
-                "window": 60,
-                "ssr_raw": raw,
-                "se_raw": se_raw,
-                "ssr_ssvi": ssvi,
-                "se_ssvi": se_ssvi,
-                "diff": raw - ssvi,
-                "se_diff": math.hypot(se_raw, se_ssvi),
-                "z": (raw - ssvi) / math.hypot(se_raw, se_ssvi),
-                "slope_raw": -0.4,
-                "slope_ssvi": -0.42,
-                "mean_skew_raw": -0.43,
-                "mean_skew_ssvi": -0.52,
-                "r2_raw": 0.35,
-                "r2_ssvi": 0.39,
-                "n": 60,
-            }
-            for T, raw, se_raw, ssvi, se_ssvi in (
-                (1.0 / 12.0, 0.942, 0.153, 0.808, 0.112),
-                (1.0, 0.770, 0.060, 0.840, 0.070),
-            )
-        ],
-    }
+    # the M8b gate's own verdict (pre-repair plain SSVI: the file names no fitted history) and
+    # the repaired eSSVI history's run (M10 Part 0), with different fitted SSRs
+    verdict = _verdict(SYNTHETIC_FITTED_PRE, named=False)
+    repaired = _verdict(SYNTHETIC_FITTED_REPAIRED, named=True)
+    pr = Path(root) / SYNTHETIC_REPAIRED_VERDICT
+    pr.parent.mkdir(parents=True, exist_ok=True)
+    pr.write_text(json.dumps(repaired, indent=1))
+    out["discriminator_verdict_repaired"] = pr
     pv = m8b / "discriminator_verdict.json"
     pv.write_text(json.dumps(verdict, indent=1))
     out["discriminator_verdict"] = pv

@@ -24,6 +24,13 @@ work is done. Every rule here was set by the owner and each has a reason recorde
   `toy_marking_build` in `tests/conftest.py`, and `toy_backtest_build` in
   `tests/_backtest_build.py` (imported by `tests/test_backtest.py`; it runs `volsto-backtest run`,
   the one M10 path that calibrates).
+- **A toy build that raises, exits non-zero or whose builder dies fails** every test that requires it
+  (`ToyBuild.require()`); it never skips (the build has no optional input) and its wall clock is
+  printed, never used to skip. Only an absent optional input (the HDN sample, the Tectonic engine)
+  may skip, with its reason.
+- **Scripted and agent `volsto-backtest` runs set `VOLSTO_BACKTEST_REQUIRE_PATHS=1`**, so a command
+  without explicit `--out`/`--cache`/`--snapshots` is refused instead of writing into the
+  repository's `outputs/` and `cache/` (an M10 verifier once did).
 - **Studies never calibrate.** `volsto-study run` and `render` forbid calibration at the entry of
   `calibrate_leverage` (`volsto/calibration/guard.py`, inherited by child processes) and record
   whether one started; `volsto-backtest run` is the only M10 command that calibrates.
@@ -68,3 +75,16 @@ How to apply it: count occurrences across review rounds, not within one. On the 
 writing another fix, write down the invariant in one sentence ("no page draws a Monte Carlo
 number without a finite stderr"), find the single place that can enforce it, and write the walking
 test first — it will fail on every unlisted site, which is the point.
+
+Applied since (M10, 2026-09-16/17):
+- **Studies:** every catalogue study declares its exact (error-free) numbers by kind in
+  `EXACT_KINDS`; the walker in `volsto/studies/catalogue/_common.py` (run by
+  `tests/test_catalogue_s1_s4.py` over every fast config) refuses any undeclared exact number, and
+  `results.py` refuses a Monte Carlo number without a finite stderr.
+- **Aggregate errors:** the backtest's stage 2 computes every aggregate error in one helper
+  (`aggregate()`), which uses a paired error where one is stored and labels every root sum of
+  squares of correlated errors as such.
+- **Backtest storage:** after four rounds of "results destroyed / a done date that does not follow
+  from its inputs", the store became immutable attempts plus one atomic pointer per date, read by
+  one verdict function, with a walking test over every recorded input and a crash matrix over every
+  file operation.

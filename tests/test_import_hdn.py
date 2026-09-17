@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -392,3 +393,74 @@ def test_cli_no_calendar_repair(tmp_path: Path) -> None:
     assert rc == 0
     doc = load_ssvi_surface(tmp_path / f"spx_{DAY}.yaml")
     assert isinstance(doc, ESSVISurface)
+
+
+def _gate_script() -> Any:
+    """``scripts/essvi_calendar_gate.py`` as a module (its per-day chain and summary are reused,
+    not duplicated)."""
+    spec = importlib.util.spec_from_file_location(
+        "essvi_calendar_gate", ROOT / "scripts" / "essvi_calendar_gate.py"
+    )
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["essvi_calendar_gate"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@pytest.mark.slow
+def test_part0_gate_on_the_127_day_sample() -> None:
+    """M10 Part 0's gate (owner: "eSSVI passes on >= 95% of days, and the 2y-3y skew is no longer
+    extrapolated on passing days") on the whole 2022 H2 sample, through the gate script's own
+    per-day chain (:func:`run_day`: the unrepaired, repaired and plain-SSVI fits of one day) and
+    summary (:func:`summarise`); single core, no Monte Carlo, nothing written.
+
+    Asserted: the repaired eSSVI passes on at least ``GATE_PASS_FRACTION`` of the days with no
+    fallback; every day's surface carries the importer's proof (floor 1e-4 on ``|k| ≤ 3``) and
+    re-proves it independently (certificate at the margin on ``±3``); the repaired / bit-equal
+    split and the pillar counts SPEC §13.1 records.  The owner's second criterion cannot be met by
+    any repair (SPEC §13.1, disagreement 3): on 118 of the 127 days the last fitted pillar is at
+    or below 2y (P = 5 / 6 / 7 pillars on 1 / 117 / 9 days, one day quotes at or beyond 3y), so
+    the 3y skew is flat-forward-variance extrapolation whatever the parametrisation.  The test
+    pins that measured count instead of asserting the criterion, and asserts what the repair
+    delivers instead: on every passing day the 2y/3y skew is the eSSVI ``ρ_T``'s, not the
+    single-``ρ`` fallback's (the medians of SPEC §13.1)."""
+    gate = _gate_script()
+    from volsto.calibration.history import hdn_available_dates
+
+    dates = hdn_available_dates(SAMPLE)
+    assert len(dates) == 127
+    t0 = time.perf_counter()
+    df = pd.DataFrame([gate.run_day(SAMPLE, d, with_ssvi=True) for d in dates])
+    wall = time.perf_counter() - t0
+    s = gate.summarise(df, wall, True)
+    passing, pillars, skew = s["passing"], s["pillars"], s["skew"]
+    print(
+        f"Part 0 gate: {passing['repaired']}/{len(df)} repaired eSSVI pass (unrepaired "
+        f"{passing['base']}), {passing['n_repaired']} repaired, fallbacks {passing['fallbacks']}, "
+        f"min proven bound {passing['min_proven_lower_bound']:.4e}; P {pillars['P_distribution']}; "
+        f"wall clock {wall:.1f} s (recalibrated: no)"
+    )
+    # the owner's threshold, with no fallback
+    assert passing["repaired_fraction"] >= gate.GATE_PASS_FRACTION and passing["gate_met"]
+    assert df["fallback"].isna().all() and passing["fallbacks"] == {}
+    assert df["rep_essvi"].all() and passing["repaired"] == len(df)
+    # the invariant, proven on every day (the importer's proof and an independent certificate)
+    assert (df["proven_floor"] == gate.MARGIN).all() and (df["proven_k_abs"] == gate.K_WIDE).all()
+    assert (df["proven_lower_bound"] >= gate.MARGIN).all()
+    assert (df["rep_certm_k3"] == "certified").all()
+    assert (df["rep_certm_k3_lb"] >= gate.MARGIN).all()
+    repaired = df[df["repaired"]]
+    assert len(repaired) == 25 and (repaired["rep_certm_k3"] == "certified").all()
+    assert passing["n_identity_bit_equal"] == 102  # the other days are returned bit-equal
+    assert (df["rep_dense_min_dw_dt"] >= gate.MARGIN - 1e-12).all()
+    # the second criterion: measured, not met (SPEC §13.1)
+    last = df["last_pillar"]
+    assert int((last <= 2.0 + 1e-9).sum()) == 118
+    assert pillars["P_distribution"] == {"5": 1, "6": 117, "7": 9}
+    assert pillars["days_quote_at_or_beyond_3y"] == 1
+    # what the repair delivers instead: the eSSVI rho_T's 2y/3y skew, not the SSVI fallback's
+    for tenor, rep, ssvi in (("2y", -0.1966, -0.2240), ("3y", -0.1626, -0.1910)):
+        assert skew["rep"][tenor] == pytest.approx(rep, abs=1e-4)
+        assert skew["ssvi"][tenor] == pytest.approx(ssvi, abs=1e-4)
+    assert skew["median_gap_vs_ssvi"]["rep_on_passing_days_n"] == len(df)

@@ -18,8 +18,16 @@ What is asserted:
   the same manifest rows and the same files by size and mtime —, at least one table and one
   figure are written, ``study.md`` starts with the title and the one-sentence question, and
   ``volsto-study render`` rebuilds byte-identical ``.tex`` tables and the same figure set from
-  ``results.parquet`` alone; then the study's own checks for S1–S4 (below);
-* S1: every toy model read from the store, the headline / smile / LSV-minus-LV (with the
+  ``results.parquet`` alone; **no number derived from Monte Carlo values is exact**
+  (``check_exact_rows``: a study declaring ``EXACT_KINDS`` classifies every exact row as a
+  count, a flag, a fitted parameter, a closed form, an input, or a rank whose table carries its
+  declared "decided at 2 se" flag column; for a study without the declaration no exact row is
+  named like a z-score, an error, a rank or a median); then the study's own
+  checks for S1–S4 (below); last, the LaTeX check compiled — or the test **skips** with the
+  runner's reason when tectonic is missing, never a silent pass;
+* S1: the per-window put-wing invariance line in study.md names every headline model beyond 2
+  quadrature errors at k = 0.8 (and says "not invariant" exactly when there is one); every toy
+  model read from the store, the headline / smile / LSV-minus-LV (with the
   z lower bounds) / cliquet-ladder / regression tables present, the budgets reported as different from the baseline's; a point
   removed from a store copy is priced from its cached leverage (``price_missing``) or, with
   ``price_missing: false``, is a missing requirement whose command names the config's grid and
@@ -46,9 +54,19 @@ What is asserted:
   reported missing with its ``--risk light`` line and the tents' mismatch; the like-for-like
   sentence on hand-made pillar sets;
 * the pairing helpers: ``paired_difference`` against the per-sample difference, the quadrature
-  error and the correlation; the quadrature-versus-paired sentence from its numbers; ``ratio_estimate`` against ``ratio_of_means``; ``shell_block``
-  pastes back into the same command; on the repository store (skipped
-  when absent) the stored M6 fractions are converted to % of notional and noted;
+  error and the correlation; the delta-method stderrs of the stderr, the quadrature error, the
+  correlation and the S3 floor against their spread over 200 replicates; the
+  quadrature-versus-paired sentence from its numbers; ``ratio_estimate`` against
+  ``ratio_of_means``; ``unclassified_exact_rows`` (the rank kind with and without its decided
+  flag) and the undeclared-study name rule on hand-made results; ``shell_block`` pastes back
+  into the same command; on the repository store (skipped when absent) the stored M6 fractions
+  are converted to % of notional and noted;
+* a failed toy build (an exception, a dead builder, a non-zero exit) **fails** the tests that
+  require it, whatever its wall clock, for the toy and the toy-marking shard shapes; the shared
+  build's lock paths in ``conftest._session_build`` (the shared ``tests/_locks.py`` helpers)
+  without calibrating: a live builder's lock
+  is waited for until its ``done.json`` appears, a dead builder's lock (no ``done.json``) fails
+  every consumer naming its pid;
 * the requirement lines of ``s1_grid.yaml`` and ``s3.yaml`` against the repository store and
   cache (skipped when absent): exit 2 and the **config's** grid in the printed command;
 * ``toy_marking_build`` builds (the S5 fixture): the LV point and the four marking points, one
@@ -60,18 +78,25 @@ Wall clocks are printed, never asserted.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import io
+import json
 import math
+import os
 import re
 import shutil
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
+import _locks
+import conftest
 import numpy as np
 import pandas as pd
 import pytest
+from conftest import TOY_MARKING_SHARDS, TOY_SHARDS, ToyBuild
 
 from volsto.calibration.cache import LeverageCache
 from volsto.studies import runner
@@ -80,15 +105,18 @@ from volsto.studies.catalogue._common import (
     LV_LABEL,
     PAIRED_NOTE,
     Estimate,
+    add_z,
     axis,
+    floor_estimate,
     lv_grid_sentence,
     mean_estimate,
     paired_difference,
     quadrature_comparison,
     ratio_estimate,
     shell_block,
+    unclassified_exact_rows,
 )
-from volsto.studies.results import Results, ResultsBuilder
+from volsto.studies.results import DIMENSIONLESS, Results, ResultsBuilder
 from volsto.studies.runner import ConfigOverrides, StudyRun
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -228,6 +256,39 @@ def coordinates(axes: dict[str, Any]) -> str:
     return repr(sorted(own.items()))
 
 
+#: Column / table names of numbers derived from Monte Carlo values (z-scores, errors, ranks,
+#: medians): never exact in a study that declares no ``EXACT_KINDS`` (a threshold is left out:
+#: it may be an input constant).
+MC_DERIVED_NAME = re.compile(
+    r"(?:^|[_:])(?:z|n_se|se|stderr|rank|median|quadrature|correlation)(?:$|[_:])"
+)
+
+
+def check_exact_rows(module: Any, results: Results) -> None:
+    """No number derived from Monte Carlo values is exact.  A study that declares
+    ``EXACT_KINDS`` must classify every exact row as a count, a flag, a fitted parameter, a
+    closed form, an input, or a rank whose table carries the declared "decided at 2 se" flag
+    column (0 / 1); for a study without the declaration, no exact row may carry the name of a
+    z-score, an error, a rank or a median."""
+    kinds = getattr(module, "EXACT_KINDS", None)
+    if kinds is not None:
+        bad = unclassified_exact_rows(results, kinds)
+        why = "exact rows not declared in EXACT_KINDS (or ranks without their decided flag)"
+    else:
+        frame = results.frame
+        exact = frame[frame["exact"] & np.isfinite(frame["value"].to_numpy(float))]
+        named = exact["column"].str.contains(MC_DERIVED_NAME) | exact["table"].str.contains(
+            MC_DERIVED_NAME
+        )
+        bad = exact[named]
+        why = "exact rows named like Monte Carlo statistics (z / error / rank / median)"
+    listed = bad.drop_duplicates(["table", "column"]).head(20)
+    assert bad.empty, f"{module.__name__}: {len(bad)} {why}: " + "; ".join(
+        f"{t}.{c} ({str(n)[:80]})"
+        for t, c, n in zip(listed["table"], listed["column"], listed["note"], strict=True)
+    )
+
+
 def check_s1_beyond(r: Results) -> None:
     """Every S1 number whose product ends beyond the calibration horizon says so, in any table:
     the forward-vol rows by their flag, the smile / wing cells by their axis, the headline and
@@ -353,6 +414,23 @@ def check_s1(run: StudyRun) -> None:
     # the local vol is the reference of the ladder
     assert r.value("cliquet_ladder", "LV (ω=0)", "ratio_1y")[0] == 1.0
     check_s1_beyond(r)
+    text = (run.out_dir / "study.md").read_text()
+    for t1, t2 in s1_forward_vol.WINDOWS:
+        tag = s1_forward_vol.window_tag(t1, t2)
+        lead = (
+            f"- {s1_forward_vol.INVARIANCE_LEAD} {s1_forward_vol.window_label(t1, t2)} at k=0.8: "
+        )
+        line = next(x for x in text.splitlines() if x.startswith(lead))
+        # the verdict follows the wing rows: every model beyond 2 errors is named
+        wing = r.long(f"wing_vs_lv_{tag}")
+        wing = wing[
+            np.isclose(axis(wing, "k"), 0.8)
+            & wing["column"].isin(s1_forward_vol.headline_rows(r, "headline"))
+        ]
+        beyond = wing[wing["value"].abs() > 2.0 * wing["stderr"]]
+        assert ("not invariant" in line) == (len(beyond) > 0), line
+        for m in beyond["column"]:
+            assert f"{m} (" in line, (m, line)
     assert (
         "(model, window) forward-vol rows end beyond the calibration horizon"
         in (run.out_dir / "study.md").read_text()
@@ -546,9 +624,15 @@ def test_catalogue_fast_config_runs_without_calibration(
         p.name for p in (out / "figures").iterdir()
     )
     assert (copy / "study.md").read_text() == (out / "study.md").read_text()
+    check_exact_rows(module, run.results)
     check = STUDY_CHECKS.get(config.name)
     if check is not None:
         check(run)
+    # last: the LaTeX check compiled, or the test says why it could not
+    latex = m.get("latex") or {}
+    if latex.get("status") == "skipped":
+        pytest.skip(f"LaTeX not checked: {latex.get('reason') or runner.TECTONIC_MISSING}")
+    assert latex.get("status") == "ok", latex
 
 
 # --------------------------------------------------------------------------------------------
@@ -680,6 +764,192 @@ def test_paired_difference_against_the_quadrature_error() -> None:
     assert zero.value == 0.0 and zero.stderr == 0.0
 
 
+def test_error_statistics_carry_their_own_stderr() -> None:
+    """The delta-method stderrs of a paired stderr, a quadrature error, a correlation and the
+    S3 floor ``|d| + 2 se`` against the spread of each over independent replicates."""
+    rng = np.random.default_rng(5)
+    n, reps = 2000, 200
+    rows = []
+    for _ in range(reps):
+        common = rng.standard_normal(n) * (1.0 + 0.5 * rng.standard_normal(n) ** 2)
+        a = common + 0.5 * rng.standard_normal(n) + 0.3
+        b = 0.7 * common + 0.5 * rng.standard_normal(n)
+        d = paired_difference(mean_estimate(a), mean_estimate(b), same_grid=True)
+        f = floor_estimate(d, 2.0)
+        rows.append(
+            (
+                d.stderr,
+                d.stderr_se,
+                d.stderr_quadrature,
+                d.quadrature_se,
+                d.correlation,
+                d.correlation_se,
+                f.value,
+                f.stderr,
+            )
+        )
+    x = np.array(rows)
+    for name, i in (("stderr", 0), ("quadrature", 2), ("correlation", 4), ("floor", 6)):
+        ratio = x[:, i + 1].mean() / x[:, i].std(ddof=1)
+        print(f"{name}: delta-method / brute-force spread = {ratio:.3f}")
+        assert 0.8 < ratio < 1.25, (name, ratio)
+
+
+def test_exact_kinds_are_enforced() -> None:
+    b = ResultsBuilder()
+    b.add_exact("setup", "models", "value", 4.0, unit="", source="computed")
+    b.add_exact("gyongy", "m | leg", "z", 2.5, unit="", source="computed")
+    b.add_exact("gyongy", "m | leg", "verdict", 1.0, unit="", source="computed")
+    b.add("gyongy", "m | leg", "d", 0.1, 0.04, unit="vol pts", source="computed")
+    b.add_exact("gyongy", "m | other", "z", math.nan, unit="", source="computed")
+    r = b.build()
+    kinds = (("setup", "value", "input"), ("gyongy", "verdict", "flag"))
+    bad = unclassified_exact_rows(r, kinds)
+    assert list(zip(bad["table"], bad["column"])) == [("gyongy", "z")]
+    with pytest.raises(ValueError, match="unknown exact kind"):
+        unclassified_exact_rows(r, (("setup", "value", "a guess"),))
+
+    class Undeclared:
+        __name__ = "undeclared"
+
+    with pytest.raises(AssertionError, match="named like Monte Carlo statistics"):
+        check_exact_rows(Undeclared(), r)
+    # a rank is exact only beside its "decided at 2 se" flag column
+    rb = ResultsBuilder()
+    for row, rank, decided in (("a", 1.0, 1.0), ("b", 2.0, 0.0), ("c", 3.0, math.nan)):
+        rb.add("ranking", row, "distance", rank / 10.0, 0.01, unit="1", source="computed")
+        rb.add_exact("ranking", row, "rank", rank, unit="", source="computed")
+        rb.add_exact("ranking", row, "decided", decided, unit="", source="computed")
+    ranked = rb.build()
+    flag = ("ranking", "decided", "flag")
+    for form in (("ranking", "rank", "rank", "decided"), ("ranking", "rank", "rank:decided")):
+        assert unclassified_exact_rows(ranked, (form, flag)).empty, form
+    missing = unclassified_exact_rows(ranked, (("ranking", "rank", "rank", "absent"), flag))
+    assert set(missing["column"]) == {"rank"} and len(missing) == 3
+    for bad_entry in (("ranking", "rank", "rank"), ("ranking", "decided", "flag", "rank")):
+        with pytest.raises(ValueError, match="names its 'decided at 2 se' flag column"):
+            unclassified_exact_rows(ranked, (bad_entry,))
+    rb2 = ResultsBuilder()
+    rb2.add_exact("ranking", "a", "rank", 1.0, unit="", source="computed")
+    rb2.add_exact("ranking", "a", "decided", 2.0, unit="", source="computed")  # not a flag
+    not_flag = unclassified_exact_rows(
+        rb2.build(), (("ranking", "rank", "rank", "decided"), ("ranking", "decided", "flag"))
+    )
+    assert list(not_flag["column"]) == ["rank"]
+    with pytest.raises(AssertionError, match="named like Monte Carlo statistics"):
+        check_exact_rows(Undeclared(), ranked)
+    for module in (s1_forward_vol, s2_vko, s3_conditional_variance, s4_autocall):
+        assert module.EXACT_KINDS, module.__name__
+        unclassified_exact_rows(r, module.EXACT_KINDS)  # the kinds are valid names
+
+
+@pytest.mark.parametrize("shards", [TOY_SHARDS, TOY_MARKING_SHARDS], ids=["toy", "toy_marking"])
+def test_a_failed_toy_build_fails_its_consumers(shards: tuple[str, ...], tmp_path: Path) -> None:
+    """A build that raised, died or exited non-zero fails the test that requires it (never a
+    skip), whatever its wall clock; a good build is returned as it is."""
+
+    good = ToyBuild(
+        root=tmp_path,
+        base=tmp_path / "A",
+        grid_path=tmp_path / "grid.yaml",
+        return_codes=(0,) * len(shards),
+        wall_s={s: 1.0e6 for s in shards},  # far beyond any budget: irrelevant
+        stdout={},
+        log_messages={},
+        manifests={},
+        built_by="test",
+        shards=shards,
+    )
+    assert good.require() is good and good.failure_reason == ""
+    for bad in (
+        dataclasses.replace(good, error="RuntimeError: boom"),
+        dataclasses.replace(good, return_codes=(0,) * (len(shards) - 1) + (2,)),
+        dataclasses.replace(good, return_codes=()),
+    ):
+        with pytest.raises(pytest.fail.Exception, match="toy"):
+            bad.require()
+
+
+class _BaseTemp:
+    """The one method of ``pytest.TempPathFactory`` that ``conftest._session_build`` uses."""
+
+    def __init__(self, base: Path) -> None:
+        self._base = base
+
+    def getbasetemp(self) -> Path:
+        return self._base
+
+
+def _dead_pid() -> int:
+    pid = 999_999
+    while True:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return pid
+        except PermissionError:
+            pass
+        pid -= 1
+
+
+def _held_lock(root: Path, pid: int) -> None:
+    """Process ``pid``'s lock on the build under ``root``, taken through the shared helper
+    (``tests/_locks.py``) and then attributed to ``pid``."""
+    root.mkdir(parents=True)
+    assert _locks.take_lock(root / "lock")
+    assert not _locks.take_lock(root / "lock")  # held: nobody else takes it
+    (root / "lock" / "pid").write_text(str(pid))
+    assert _locks.owner(root / "lock") == f"pid {pid}"
+
+
+def _session_build(tmp_path: Path) -> ToyBuild:
+    factory = cast(pytest.TempPathFactory, _BaseTemp(tmp_path))
+    return conftest._session_build(factory, "b", Path("g.yaml"), ("1/1",))
+
+
+def test_toy_lock_dead_builder_fails_its_consumers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lock whose builder died without writing ``done.json``: the waiting process does not
+    build (nothing calibrates here), and every consumer fails naming the dead pid."""
+    monkeypatch.delenv("PYTEST_XDIST_WORKER", raising=False)
+    monkeypatch.setattr(conftest, "_run_toy_precompute", lambda *a: pytest.fail("built"))
+    pid = _dead_pid()
+    _held_lock(tmp_path / "b", pid)
+    build = _session_build(tmp_path)
+    with pytest.raises(pytest.fail.Exception, match=f"pid {pid}.*died without a result"):
+        build.require()
+
+
+def test_toy_lock_live_builder_is_waited_for(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lock held by a live process: the waiter polls until that process writes
+    ``done.json`` (after several polls — a delay, not a timing assertion) and returns its
+    build."""
+    monkeypatch.delenv("PYTEST_XDIST_WORKER", raising=False)
+    monkeypatch.setattr(_locks, "POLL_S", 0.05)
+    monkeypatch.setattr(conftest, "_run_toy_precompute", lambda *a: pytest.fail("built"))
+    root = tmp_path / "b"
+    _held_lock(root, os.getpid())  # alive for the whole test
+    info = {"return_codes": [0], "wall_s": {"1/1": 1.0}, "built_by": "other"}
+
+    def finish() -> None:
+        time.sleep(1.0)
+        tmp = root / "done.json.tmp"
+        tmp.write_text(json.dumps(info))
+        os.replace(tmp, root / "done.json")
+
+    worker = threading.Thread(target=finish)
+    worker.start()
+    try:
+        build = _session_build(tmp_path)
+    finally:
+        worker.join()
+    assert build.require() is build
+    assert build.built_by == "other" and build.return_codes == (0,)
+
+
 def test_quadrature_comparison_from_the_numbers() -> None:
     paired = np.array([1.0, 2.0, 4.0, np.nan])
     quad = np.array([1.5, 1.8, 6.0, 1.0])
@@ -720,7 +990,11 @@ def test_s3_store_check_discloses_the_local_vol_grid() -> None:
         unit="1",
         source="computed",
     )
+    # an identical row's z is an exact 0, the others' a z-score: one unit for the column
+    b.add_exact(table, "1F ω=1 / upvar_100", "n_se", 0.0, unit=DIMENSIONLESS, source="computed")
+    add_z(b, table, "LV (ω=0) / upvar_100", "n_se", 2.0, source="computed", note="|d| / se")
     r = b.build()
+    assert r.unit(table, "n_se") == DIMENSIONLESS
     lines = s3_conditional_variance._store_check_lines(r)
     text = "\n".join(lines)
     assert lines[0] == "## Store check"

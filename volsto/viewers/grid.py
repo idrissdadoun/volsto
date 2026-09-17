@@ -582,6 +582,15 @@ def marking_summary(r: FitResult) -> MarkingSummary:
     )
 
 
+def marking_fit(surface: ImpliedSurface, ssr_target: float, skew_eps: float) -> FitResult:
+    """The P1 marking fit of one mark on a surface — the one call a marking point is resolved by
+    (:func:`resolve_marking`) and the S5 catalogue study fits its binding map with
+    (:mod:`volsto.studies.catalogue.s5_marking`): :func:`~volsto.calibration.fit_2f.
+    fit_2f_marking` with the fitter's documented defaults (k2 0.2, ν cap 3.5, two-point skew
+    constraint) at ``skew_eps``, and ``ssr_target``; no stage 3, so no leverage is built."""
+    return fit_2f_marking(surface, BreakEvenFitConfig(skew_eps=skew_eps), ssr_target=ssr_target)
+
+
 def resolve_marking(point: GridPoint, surface: ImpliedSurface) -> GridPoint:
     """Run the marking fit of an unresolved marking point on its (already built) surface and
     return the resolved point: fitted model in ``spec``, ``status`` from the fit, ``cache_key``
@@ -591,7 +600,7 @@ def resolve_marking(point: GridPoint, surface: ImpliedSurface) -> GridPoint:
     if point.resolved:
         return point
     ssr, eps = point.axes["ssr_target"], point.axes["skew_eps"]
-    r = fit_2f_marking(surface, BreakEvenFitConfig(skew_eps=eps), ssr_target=ssr)
+    r = marking_fit(surface, ssr, eps)
     summary = marking_summary(r)
     spec = dataclasses.replace(point.spec, model=r.params)
     key = None if r.status == "infeasible" else spec_key(spec)

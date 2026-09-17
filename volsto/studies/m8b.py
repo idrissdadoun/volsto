@@ -37,15 +37,16 @@ product leg is ``payoff − V₀`` on every path, its recalibration P&L ``V(new)
 * **B — model mismatch (the model reserve).**  Pricing = the marking fit; world ∈ {(i) ``same``,
   (ii) ``historical`` — the FINAL historical fit on the 2022 H2 history
   (``configs/studies/m8b/world_historical.yaml``) **only if** the raw-slice discriminator's verdict
-  (``outputs/m8b/discriminator_verdict.json``) is ``real``, else the task list carries the row
-  "surface artefact, skipped" with the discriminator's reason (:func:`discriminator_gate`), (iii)
-  ``pure LV`` (Dupire of the SPX surface), (iv) ``nu x1.5`` (the marking fit with ``ν × 1.5``, the
-  leverage recalibrated on the same surface through the cache)} × the five products, the
-  per-product presets (:func:`~volsto.hedging.strategies.default_strategy`).  Per (world,
-  product): the desk leakage per path (mean ± se), std, the 5 / 95% quantiles, the regime
-  breakdown and the attribution; the **static spread** (the marked price minus the world's price at
-  ``t = 0``, both with stderr: the hedger's ``V₀`` under the pricing model and a direct Monte Carlo
-  price under the world model on the world's own draws — independent, the stderrs add in
+  (``outputs/essvi_gate/discriminator/discriminator_verdict.json``, the repaired eSSVI history; the
+  pre-repair ``outputs/m8b/discriminator_verdict.json`` as a fallback) is ``real``, else the task
+  list carries the row "surface artefact, skipped" with the discriminator's reason
+  (:func:`discriminator_gate`), (iii) ``pure LV`` (Dupire of the SPX surface), (iv) ``nu x1.5`` (the
+  marking fit with ``ν × 1.5``, the leverage recalibrated on the same surface through the cache)} ×
+  the five products, the per-product presets (:func:`~volsto.hedging.strategies.default_strategy`).
+  Per (world, product): the desk leakage per path (mean ± se), std, the 5 / 95% quantiles, the
+  regime breakdown and the attribution; the **static spread** (the marked price minus the world's
+  price at ``t = 0``, both with stderr: the hedger's ``V₀`` under the pricing model and a direct
+  Monte Carlo price under the world model on the world's own draws — independent, the stderrs add in
   quadrature) next to the **dynamic leakage** (desk leakage − static spread).  The leakage under
   (ii) is the model reserve the SSR = 1 mark implicitly carries.
 * **C — shadow rotation as P&L.**  Same book, pricing = the marking fit, world =
@@ -210,8 +211,15 @@ ROOT = Path(__file__).resolve().parents[2]
 MARKING_FIT = ROOT / "configs" / "studies" / "m7_p1_marking" / "spx_ssr1_eps0.1.yaml"
 #: the FINAL historical fit on the 2022 H2 history (A4): study B world (ii)
 WORLD_HISTORICAL = ROOT / "configs" / "studies" / "m8b" / "world_historical.yaml"
-#: the raw-slice discriminator's verdict (A4): gates world (ii)
-DISCRIMINATOR_VERDICT = ROOT / "outputs" / "m8b" / "discriminator_verdict.json"
+#: the raw-slice discriminator's verdict (A4): gates world (ii).  Since M10 Part 0 the gate reads
+#: the run on the REPAIRED eSSVI history (``outputs/essvi_gate/discriminator/``, the owner's
+#: condition "that lands with the M10 Part 0 eSSVI repair"); the M8b run on the plain-SSVI history
+#: (``outputs/m8b/discriminator_verdict.json``, the same verdict on 2026-09-16) is the fallback
+#: when the repaired run is absent (:func:`discriminator_gate`)
+DISCRIMINATOR_VERDICT = (
+    ROOT / "outputs" / "essvi_gate" / "discriminator" / "discriminator_verdict.json"
+)
+DISCRIMINATOR_VERDICT_PRE_REPAIR = ROOT / "outputs" / "m8b" / "discriminator_verdict.json"
 #: the SPX snapshot and the reference study spec the marking fit was built from
 #: (``scripts/m7_p1_marking.py::base_spec``): the base spec of the M7 rotation greek
 REF_SPEC = ROOT / "configs" / "studies" / "lsv_reference_2f.yaml"
@@ -483,6 +491,11 @@ def discriminator_gate(path: str | Path | None = None) -> Gate:
     """Read ``discriminator_verdict.json``; a missing or unreadable file disables world (ii)
     with that reason (the owner's rule: (ii) only if the discriminator confirmed the SSR)."""
     p = Path(path) if path is not None else DISCRIMINATOR_VERDICT
+    note = ""
+    if not p.exists() and p == DISCRIMINATOR_VERDICT and DISCRIMINATOR_VERDICT_PRE_REPAIR.exists():
+        # the documented fallback: the M8b run on the pre-repair plain-SSVI history
+        p = DISCRIMINATOR_VERDICT_PRE_REPAIR
+        note = f" [pre-repair discriminator {p.relative_to(ROOT)}: the repaired run is absent]"
     if not p.exists():
         return Gate(False, "missing", f"no discriminator verdict at {p}: world (ii) not confirmed")
     try:
@@ -490,7 +503,7 @@ def discriminator_gate(path: str | Path | None = None) -> Gate:
     except (OSError, ValueError) as exc:
         return Gate(False, "unreadable", f"discriminator verdict unreadable ({exc})")
     verdict = str(doc.get("verdict", "")).strip().lower()
-    reason = str(doc.get("reason", ""))
+    reason = str(doc.get("reason", "")) + note
     return Gate(verdict == "real", verdict or "missing", reason)
 
 
@@ -667,15 +680,31 @@ def first_order_agreement(
 
 def ratio_stderr(num: float, num_se: float, den: float, den_se: float) -> float:
     """Delta-method standard error of ``num / den`` for two Monte Carlo estimates with
-    independent errors: ``|num / den| · sqrt((se_num / num)² + (se_den / den)²)`` (NaN when
-    either estimate is 0 or not finite).  The study-C runs at different rotas share the world
-    seed, so their errors are positively correlated and this figure is conservative for the
-    ``nonlinearity`` ratio; the static greek is an independent run.  Test:
+    **independent** errors: ``|num / den| · sqrt((se_num / num)² + (se_den / den)²)`` (NaN when
+    either estimate is 0 or not finite).  With correlated errors (correlation ``ρ``) the exact
+    first-order variance adds ``−2ρ · (num/den)² · se_num se_den / (num · den)``: the independent
+    figure is conservative only when ``ρ ≥ 0`` **and** the two estimates have the same sign; for
+    opposite signs a positive correlation makes it understate.  The study-C runs at different
+    rotas share the world seed (their correlation is not measured), so a ratio of two of them
+    takes :func:`ratio_stderr_bound`; the static greek is a separate run.  Test:
     ``tests/test_m8b.py::test_tables_from_synthetic_results``."""
     num, den = float(num), float(den)
     if num == 0.0 or den == 0.0 or not (np.isfinite(num) and np.isfinite(den)):
         return float("nan")
     return float(abs(num / den) * np.hypot(float(num_se) / num, float(den_se) / den))
+
+
+def ratio_stderr_bound(num: float, num_se: float, den: float, den_se: float) -> float:
+    """A first-order standard error of ``num / den`` valid **for any correlation** of the two
+    errors: ``|num / den| · (|se_num / num| + |se_den / den|)`` — the maximum over ``ρ ∈ [−1, 1]``
+    of the delta-method error, at most ``√2`` times :func:`ratio_stderr` (NaN when either estimate
+    is 0 or not finite).  For ratios of estimates that share random numbers with an unmeasured
+    correlation (the study-C runs share the world seed).  Test:
+    ``tests/test_catalogue_s5_s7.py::test_ratio_stderr_bound``."""
+    num, den = float(num), float(den)
+    if num == 0.0 or den == 0.0 or not (np.isfinite(num) and np.isfinite(den)):
+        return float("nan")
+    return float(abs(num / den) * (abs(float(num_se) / num) + abs(float(den_se) / den)))
 
 
 def nonlinearity(pnl_rota: float, rota: float, pnl_one: float) -> float:

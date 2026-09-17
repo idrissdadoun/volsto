@@ -100,7 +100,11 @@ behind.
 **Errors in the catalogue** (SPEC §10.2). Every Monte Carlo number carries its standard error.
 Models priced inside a study share one step schedule and one seed, so an LSV − LV difference
 priced there carries a **paired** error; the quadrature error is shown beside it. A difference of
-two stored estimates carries the quadrature error, labelled an upper bound.
+two stored estimates (S1, and S4 when read from the store) carries the quadrature error, labelled
+"not the exact error": the estimates share random numbers, and quadrature bounds the exact error
+only when their correlation is non-negative, which no study checks. The forward 90/110 skew of
+stored smiles (S4, S5) carries the sum of the two strikes' errors, a bound whatever the
+correlation.
 
 ---
 
@@ -117,7 +121,8 @@ two stored estimates carries the quadrature error, labelled an upper bound.
 | S5 | `s5.yaml` | exits 2: the 36 marking points are missing | the default grid's marking points |
 | S6 | `s6.yaml` | runs (12 artefacts) | — (its claim follows study C's table) |
 | S7 | `s7.yaml` | runs (4 artefacts) | — |
-| Backtest | `backtest_2022h2.yaml` | exits 2: 127 dates missing | `volsto-backtest run configs/backtest/hdn_2022h2.yaml` |
+| Backtest | `backtest_2022h2.yaml` | exits 2: 102 of 127 dates missing (25 computed, 2022-07-01..2022-08-05) | `volsto-backtest run configs/backtest/hdn_2022h2.yaml --resume` |
+| Backtest PoC | `backtest_2022h2_poc.yaml` | runs (25 dates; 2453 numbers, 22 tables, 6 figures) | — (stage 1 of the window is done) |
 
 **Fast configs.**
 
@@ -312,6 +317,18 @@ forward skew?
 - **Cost of a mark.** Its price minus the price at the reference mark (1.0, 0.10), with
   errors in quadrature.
 
+**Surface.** The SPX 2022-12-30 surface is the committed plain-SSVI snapshot
+`configs/surfaces/snapshots/hdn_2022H2_ssvi/spx_2022-12-30.yaml` (a single $\rho$,
+`essvi: false`), not the repaired eSSVI surface of M10 Part 0
+(`outputs/essvi_gate/snapshots/spx_2022-12-30.yaml`; that day needed the calendar repair). The
+default grid's `spx_2022-12-30` entry points at it, and so does the SPX snapshot of the M7 greek
+and of M8b (`volsto.studies.m8b.SPX_SNAPSHOT`, `scripts/m7_p1_marking.py`). On that day the
+2y / 3y ATM skew is −0.2181 / −0.1910 under SSVI against −0.1940 / −0.1660 repaired
+(SPEC §13.1). The other two grid snapshots, `spx_2022-09-15` and `spx_2022-12-02`, are eSSVI
+and were not changed by the repair. Whether to switch to the repaired surface is the owner's
+decision; a switch changes the marking and LV cache keys and needs M8b studies C and D and
+S5–S7 re-run.
+
 **Run.**
 
 ```bash
@@ -357,6 +374,9 @@ own state: modification time, missing rows, and task results newer than the tabl
 classed at 2 se against $1 \pm 0.30$ as above, below, within or undecided. A policy column enters
 the claim only when it is clean. The claim is stated per rota as a desk loss or gain.
 
+**Surface.** The M7 greek and study C were computed on the SPX 2022-12-30 plain-SSVI snapshot
+(see S5, "Surface").
+
 **Run.**
 
 ```bash
@@ -367,9 +387,11 @@ volsto-study run configs/studies/catalogue/s6_fast.yaml --outputs <outputs root>
 The fast config is written for the synthetic outputs of `tests/_synthetic_store.py`; it also runs
 on the repository's `outputs`.
 
-**Status.** Runs today. Its claim is redrawn from whatever study C table is on disk. Rerun it
-after the study-C re-run lands. On the pre-re-run table (2026-09-16), `sabr_linked` was excluded
-as contaminated (SPEC §10.2).
+**Status.** Runs today. Its claim is redrawn from whatever study C table is on disk. On the
+re-run's table (2026-09-16, 23:20 UTC; every row has its task result) both policy columns are
+clean and enter the claim (SPEC §10.2; `outputs/studies/s6_shadow_rotation`, 45 of 45 rows, 0
+contaminated). Before the re-run (the 16:02 UTC table), `sabr_linked` was excluded as
+contaminated (15/15 rows).
 
 ---
 
@@ -386,6 +408,9 @@ artefacts only: M8b tables A, B and D, and the discriminator verdict. It reports
 - the historical world, carried as skipped with the verdict's reason (today: "surface artefact");
 - the study-D headline, quoted and checked against the table: the regimes' distance to the common
   minimum-variance delta.
+
+**Surface.** M8b tables A, B and D were computed on the SPX 2022-12-30 plain-SSVI snapshot (see
+S5, "Surface").
 
 **Run.**
 
@@ -415,22 +440,30 @@ it:
 3. gets the leverage through the cache;
 4. prices the book;
 5. attributes the P&L of $(d-1, d]$ with the sticky-leverage `explain`;
-6. writes `dates/<d>/{rows.parquet, fit.json, done.json}`.
+6. publishes the date's outcome (`rows.parquet`, `fit.json`, `done.json`) as an immutable
+   attempt `dates/<d>/attempts/<id>/` and points `dates/<d>/CURRENT` at it (SPEC §10.3,
+   Integrity).
 
 **The book.** A fixed book is struck on the first date: 3y autocall, 3y Phoenix, 1y cliquet,
 12m VKO put, 1y KO variance swap and 1y variance swap. A rolling book strikes the same trades on
 the first date of each month.
 
 **Stage 2** is the study `configs/studies/catalogue/backtest_2022h2.yaml`. It renders from that
-store and never calibrates. It reports:
+store and never calibrates. `configs/studies/catalogue/backtest_2022h2_poc.yaml` renders the
+proof-of-concept window 2022-07-01..2022-08-05 of the same store: its backtest config
+`configs/backtest/hdn_2022h2_poc.yaml` is `hdn_2022h2.yaml` with `dates.end` = 2022-08-05,
+which is not hashed, so both share one config hash and one store. Stage 2 reports:
 
-- P&L per trade, bucket and month;
+- the desk P&L (the desk short the book; the stored rows keep the holder's sign) per trade,
+  bucket and month;
 - the fitted parameters with stability flags;
 - the realised SSR against the target and the first-order SSR;
 - the VKO's mark against its realised state.
 
 `study.md` states that 2022 H2 is a proof of concept: one regime, too short for a conclusion.
-The multi-year run changes only `dates` and `data.root` in the config.
+The multi-year run changes `dates.start`, `dates.end` and `data.root` in the config, and needs a
+new store: `dates.start` is part of the config hash, so `run` refuses the old store. Set
+`paths.out` and `paths.snapshots` (or pass `--out` and `--snapshots`).
 
 **Run.**
 
@@ -440,21 +473,77 @@ volsto-backtest run     configs/backtest/hdn_2022h2.yaml [--shard i/n] [--resume
     [--only-dates 2022-07-01..2022-08-05] [--limit N] [--no-calibrate] [--force] \
     [--out DIR] [--cache DIR] [--snapshots DIR]
 volsto-backtest status  configs/backtest/hdn_2022h2.yaml
-volsto-study run configs/studies/catalogue/backtest_2022h2.yaml  # stage 2
+volsto-study run configs/studies/catalogue/backtest_2022h2.yaml      # stage 2, 127 dates
+volsto-study run configs/studies/catalogue/backtest_2022h2_poc.yaml  # stage 2, the 25 PoC dates
 ```
+
+With `VOLSTO_BACKTEST_REQUIRE_PATHS=1` in the environment, every `volsto-backtest` command that
+lacks any of `--out`, `--cache`, `--snapshots` (or gives one blank) is refused (exit 2) before
+anything is read or written. Set it for agents and scripted runs, so the config's `paths.*` are
+never used. A blank path override is refused in any case (it would resolve to the current
+directory). Every command `volsto-backtest` or the study prints (refusals, `status` hints,
+stage-2 requirements, the command stored with a failed date) carries explicit `--out`, `--cache`
+and `--snapshots`, shell-quoted, so it runs as printed under this variable and from paths with
+spaces. A "write elsewhere" line names its new store `NEW_STORE` (replace it), with the
+snapshots inside it.
 
 **Sharding and resuming.**
 
 - `--shard i/n` takes contiguous date blocks, because date $d$'s attribution needs date $d-1$'s
   leverage.
-- `--resume` skips dates whose `done.json` is ok under the same config hash and source checksum.
+- `--resume` leaves a date alone when its verdict is `done` or `skipped`, or when it is `pending`
+  on a date outside the selection. The verdict is read through the date's pointer
+  `dates/<date>/CURRENT`: the pointed attempt's file hashes, then its dependency record
+  recomputed (config hash, inputs, snapshot, leverage key and content, the verdicts of the dates
+  it depends on). `volsto-backtest status` prints every verdict that is not `done` (all of them
+  with `-v`).
 - Under `--no-calibrate` a missing leverage exits 2 with the command.
+- Every refusal (another config's store, dates computed under another config, a leverage
+  missing under `--no-calibrate`, a `CURRENT` of a newer volsto-backtest) comes before anything
+  is written, and prints the commands that would proceed.
 - The per-date store defaults to `outputs/backtest/hdn_2022h2` (`paths.out`).
 - The richer variant is `configs/backtest/hdn_2022h2_full.yaml`.
 
+**Bring shards together.** Shards run on other machines write their own copies of the store,
+the snapshots and the cache. Their dates are disjoint blocks. Their attempts are immutable and
+named by content, so copies never collide. Copy each shard back with `rsync -a` and never
+`--delete`, which would remove the other shards' dates, attempts and leverages. Paths below are
+those of `hdn_2022h2.yaml`; `$SHARD` is the shard machine and `$R` its checkout.
+
+```bash
+# 1. the attempts first, then the pointers (a reader in between never sees a CURRENT whose
+#    attempt has not arrived); in-flight writers' leftovers are not copied
+rsync -a --partial --exclude CURRENT --exclude '.staging-*' --exclude '.CURRENT.tmp-*' \
+  $SHARD:$R/outputs/backtest/hdn_2022h2/dates/ outputs/backtest/hdn_2022h2/dates/
+rsync -a --partial --exclude '.staging-*' --exclude '.CURRENT.tmp-*' \
+  $SHARD:$R/outputs/backtest/hdn_2022h2/dates/ outputs/backtest/hdn_2022h2/dates/
+# 2. the snapshots and their import records
+rsync -a --partial $SHARD:$R/outputs/backtest/hdn_2022h2/snapshots/ \
+  outputs/backtest/hdn_2022h2/snapshots/
+# 3. the leverages, without the cache manifest (merged below, never overwritten)
+rsync -a --partial --exclude manifest.parquet --exclude manifest.parquet.lock \
+  --exclude '.*.tmp*' $SHARD:$R/cache/ cache/
+rsync -a $SHARD:$R/cache/manifest.parquet /tmp/shard_manifest.parquet
+.venv/bin/python -c "
+import pandas as pd
+from volsto.calibration.cache import LeverageCache
+before, added = LeverageCache('cache').merge_manifest(pd.read_parquet('/tmp/shard_manifest.parquet'))
+print(before, '+', added, 'rows')"
+# 4. check: every date done (a block's first date turns from pending to done once the date
+#    before it has arrived)
+volsto-backtest status configs/backtest/hdn_2022h2.yaml
+```
+
+Leave the store header (`backtest.json`) and `probe.json` alone: each shard's copy names the same
+config hash. If both copies hold the same date (a date rerun on both machines), the pointer copied
+last wins. `volsto-backtest run --resume` then applies the pointer rule, and `status` shows the
+verdict. `LeverageCache.merge_manifest` adds only the keys the local manifest lacks, under the
+cache's lock, and publishes atomically.
+
 **Fast mode.** The toy backtest (`configs/backtest/hdn_2022h2_toy.yaml`) covers 5 dates across a
 month end, $2\cdot10^4$ particles, a 1y horizon and 2000 paths. It **calibrates** 5 leverages;
-SPEC §10.3 measured about 257–280 s. The test suite builds it in
+SPEC §10.3 measured 163 s on an empty cache (142 s projected; the test fixture builds in
+≈ 165 s). The test suite builds it in
 `tests/_backtest_build.py::toy_backtest_build`, like this:
 
 ```bash
@@ -467,8 +556,21 @@ volsto-study run configs/studies/catalogue/backtest_2022h2_fast.yaml \
 Both stages need the HistoricalData.net 2022 H2 sample under
 `data/hdn_sample/options_sample_2022H2` (git-ignored). This recipe was not run for this page.
 
-**Status.** Stage 2 exits 2 today: none of the 127 dates is computed. It prints
-`volsto-backtest run configs/backtest/hdn_2022h2.yaml --only-dates <127 dates> --resume`. Run
-`dry-run` for the current projection before starting. SPEC §10.3 records 25.9 h in one process
-for the configuration first written (ladders on 9 pillars, rolling book marked daily); the
-shipped config uses 5 pillars and prices the rolling book at inception only.
+**Status.**
+
+- `backtest_2022h2.yaml` exits 2 today: 25 of the 127 dates are computed (the proof-of-concept
+  window 2022-07-01..2022-08-05, SPEC §10.3; `outputs/backtest/hdn_2022h2`). It prints
+  `volsto-backtest run configs/backtest/hdn_2022h2.yaml --only-dates <102 dates> --resume`.
+- `backtest_2022h2_poc.yaml` runs today on those 25 dates: 2453 numbers, 22 tables (the trades,
+  inception, P&L and monthly tables split by unit) and 6 figures, about 11 s, recalibrated: no
+  (rendered into a scratch directory on 2026-09-17). Its 25 dates carry record version 1, so the
+  study states that their own leverage's numbers are not verified (key and completeness only)
+  and the manifest lists them (`backtest_legacy_unverified`). The committed render in
+  `outputs/studies/backtest_2022h2_poc` (1698 numbers, 14 tables; SPEC §10.3) predates the
+  per-unit split. The PoC's stage 1 took 3.30 h wall clock against 10 248 s projected, with 25
+  calibrations at 8·10⁵ particles.
+- Run `dry-run` for the current projection before starting; it depends on a timing probe and
+  moves between runs. SPEC §10.3 projects the shipped config (`hdn_2022h2.yaml`: ladders on 5
+  pillars, rolling book priced at inception only, 127 dates) at 18.35 h in one process, 9.21 h
+  on 2 shards and 4.71 h on 4. The configuration first written (ladders on 9 pillars, rolling
+  book marked daily, no ξ₀ memo) projected 25.9 h.

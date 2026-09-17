@@ -195,8 +195,16 @@ def theta(
     vols per ``(K, absolute expiry)`` (the ``"roll"`` perturbation), ``decay = [P(aged, surface
     held in residual maturity) − P(base)] / dt`` with the rates and dividends set to zero (pure
     time decay), ``carry`` = the same difference with the actual curves minus ``decay`` (the
-    rates/dividends part), ``roll_down = total − decay − carry``.  Aged products live on their own
-    grid, so the errors of the two prices add in quadrature (no CRN).
+    rates/dividends part), ``roll_down = total − decay − carry``.  Every item is a paired
+    combination on the engine's common random numbers (the aged product is priced on the same
+    paths): ``carry`` combines the four prices of the held and zero-rate differences and
+    ``roll_down`` the aged product's rolled and held prices, from the memo at no extra pricing, so
+    their standard errors include the covariance of the prices.  A root sum of squares of the
+    differences' errors does not: on the explain test case (a 9-month call,
+    ``tests/test_backtest.py``) it made the time group's error about 1.75× too wide, and a
+    brute-force check over 120–200 seeds (the round-6 verification: seed dispersion / paired
+    stderr ≈ 1) found it up to ~143× too wide for the carry and ~1000× for the roll-down (a
+    Black–Scholes variance swap).
 
     ``aged`` (M10 Part 3) is the product seen ``dt`` later with the state held, default
     ``product.aged(dt)`` — which raises for a fixing inside the roll window; a daily-fixed
@@ -221,32 +229,24 @@ def theta(
         size=dt,
         scheme="forward",
     )
-    held = engine.paired(
-        "theta.held",
-        [(aged, state, "recalibrate", 1.0 / dt), (product, state, "recalibrate", -1.0 / dt)],
+    carry = engine.paired(
+        "theta.carry",
+        [
+            (aged, state, "recalibrate", 1.0 / dt),
+            (product, state, "recalibrate", -1.0 / dt),
+            (aged, zero, "recalibrate", -1.0 / dt),
+            (product, zero, "recalibrate", 1.0 / dt),
+        ],
         unit="per year",
         size=dt,
         scheme="forward",
     )
-    carry = Sensitivity(
-        "theta.carry",
-        held.value - decay.value,
-        float(np.hypot(held.stderr, decay.stderr)),
-        "per year",
-        dt,
-        "forward",
-        (state.label,),
-        engine.sim.n_paths,
-    )
-    roll_down = Sensitivity(
+    roll_down = engine.paired(
         "theta.roll_down",
-        total.value - held.value,
-        float(np.hypot(total.stderr, held.stderr)),
-        "per year",
-        dt,
-        "forward",
-        (state.label,),
-        engine.sim.n_paths,
+        [(aged, rolled, "recalibrate", 1.0 / dt), (aged, state, "recalibrate", -1.0 / dt)],
+        unit="per year",
+        size=dt,
+        scheme="forward",
     )
     return ThetaReport(total, decay, carry, roll_down, dt)
 

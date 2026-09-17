@@ -52,7 +52,7 @@ from __future__ import annotations
 import dataclasses
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -60,6 +60,7 @@ import pandas as pd
 from numpy.typing import NDArray
 
 from volsto.config import ConfigError, SimConfig
+from volsto.studies.results import DIMENSIONLESS
 from volsto.studies.runner import Requirement, StudyContext
 from volsto.viewers.grid import GridPoint
 
@@ -70,21 +71,29 @@ if TYPE_CHECKING:
     from volsto.engine.mc import PriceResult
     from volsto.models.base import Model
     from volsto.products.base import Product
-    from volsto.studies.results import Results
+    from volsto.studies.results import Results, ResultsBuilder
 
 FloatArray = NDArray[np.float64]
 
 __all__ = [
+    "ERROR_STAT_NOTE",
+    "EXACT_KIND_NAMES",
     "LV_GRID_NOTE",
     "LV_LABEL",
     "PAIRED_NOTE",
     "QUADRATURE_NOTE",
+    "RANK_KIND",
     "VP",
+    "Z_NOTE",
+    "Z_STDERR",
     "Difference",
     "Estimate",
+    "ExactKind",
     "ModelPoint",
+    "add_z",
     "baseline_name",
     "cache_source",
+    "floor_estimate",
     "leverage_requirements",
     "load_model",
     "lv_grid_sentence",
@@ -94,13 +103,16 @@ __all__ = [
     "own_steps",
     "paired_difference",
     "paired_grid",
+    "parse_exact_kinds",
     "point_requirements",
     "price_paired",
     "pricing_sim",
     "quadrature_comparison",
     "rss",
     "select_models",
+    "stderr_estimate",
     "store_source",
+    "unclassified_exact_rows",
     "validate_selection",
 ]
 
@@ -401,6 +413,20 @@ def ratio_estimate(a: FloatArray, d: FloatArray) -> Estimate:
     return Estimate(r, (a - r * d) / dbar)
 
 
+def stderr_estimate(e: Estimate) -> Estimate:
+    """The stderr of ``e`` as an estimate itself: ``s = sqrt(mean(ψ²) / n)`` with the
+    delta-method influence ``(ψ² − mean ψ²) / (2 s n)``, so its own stderr reflects the tails of
+    the per-pair samples (no normality assumed)."""
+    return _rms_estimate(e.stderr, (e.influence - e.influence.mean()) ** 2)
+
+
+def _rms_estimate(value: float, g: FloatArray) -> Estimate:
+    n = g.size
+    if n < 2 or not (math.isfinite(value) and value > 0):
+        return Estimate(value, np.full(n, math.nan))
+    return Estimate(value, (g - g.mean()) / (2.0 * value * n))
+
+
 def sqrt_estimate(e: Estimate) -> Estimate:
     """``sqrt`` of a variance estimate (a vol), influence ``δv / (2 sqrt v)``."""
     if not (math.isfinite(e.value) and e.value > 0):
@@ -412,13 +438,20 @@ def sqrt_estimate(e: Estimate) -> Estimate:
 @dataclass(frozen=True)
 class Difference:
     """``a − b`` of two estimates on the same path index: the paired stderr, the quadrature
-    error for comparison, the per-pair correlation and whether the two grids coincided."""
+    error for comparison, the per-pair correlation and whether the two grids coincided.  The
+    three error statistics are Monte Carlo numbers too: ``stderr_se``, ``quadrature_se`` and
+    ``correlation_se`` are their own delta-method stderrs (from the per-pair samples), and
+    ``estimate`` is the difference with its influence function."""
 
     value: float
     stderr: float
     stderr_quadrature: float
     correlation: float
     same_grid: bool
+    stderr_se: float = math.nan
+    quadrature_se: float = math.nan
+    correlation_se: float = math.nan
+    estimate: Estimate | None = field(default=None, compare=False, repr=False)
 
     @property
     def z(self) -> float:
@@ -436,11 +469,163 @@ def paired_difference(a: Estimate, b: Estimate, *, same_grid: bool) -> Differenc
     if not (math.isfinite(a.value) and math.isfinite(b.value)) or n < 2:
         return Difference(math.nan, math.nan, math.nan, math.nan, same_grid)
     diff = a.influence - b.influence
-    se = float(diff.std(ddof=1) / math.sqrt(n))
+    est = Estimate(value, diff)
+    se = est.stderr
     quad = float(math.hypot(a.stderr, b.stderr))
+    ca, cb = a.influence - a.influence.mean(), b.influence - b.influence.mean()
+    quad_est = _rms_estimate(quad, ca**2 + cb**2)
     sa, sb = float(a.influence.std()), float(b.influence.std())
-    corr = float(np.mean(a.influence * b.influence) / (sa * sb)) if sa > 0 and sb > 0 else math.nan
-    return Difference(value, se, quad, corr, same_grid)
+    if sa > 0 and sb > 0:
+        u, v = a.influence / sa, b.influence / sb
+        corr = float(np.mean(u * v))
+        corr_se = Estimate(corr, u * v - corr * (u**2 + v**2) / 2.0).stderr
+    else:
+        corr, corr_se = math.nan, math.nan
+    return Difference(
+        value,
+        se,
+        quad,
+        corr,
+        same_grid,
+        stderr_se=stderr_estimate(est).stderr,
+        quadrature_se=quad_est.stderr,
+        correlation_se=corr_se,
+        estimate=est,
+    )
+
+
+def floor_estimate(d: Difference, k: float) -> Estimate:
+    """``|d| + k · stderr(d)`` with its delta-method influence (``sign(d) ψ`` plus ``k`` times
+    the stderr's own influence)."""
+    if d.estimate is None or not math.isfinite(d.value):
+        return Estimate(math.nan, np.full(0, math.nan))
+    e = d.estimate
+    s = stderr_estimate(e)
+    return Estimate(
+        abs(d.value) + k * s.value, math.copysign(1.0, d.value) * e.influence + k * s.influence
+    )
+
+
+#: Note of an error statistic recorded as a number (a stderr, a quadrature error, a correlation).
+ERROR_STAT_NOTE = (
+    "an error statistic of the Monte Carlo estimates, with its own delta-method stderr"
+)
+#: The stderr recorded for a z-score (the sampling sd of a standardised estimate).
+Z_STDERR = 1.0
+#: Note of a z-score (module docstring).
+Z_NOTE = (
+    "a z-score: its stderr is the nominal 1 of a standardised estimate (it moves with the "
+    "estimates it divides)"
+)
+
+
+def add_z(
+    b: ResultsBuilder,
+    table: str,
+    row: str,
+    column: str,
+    z: float,
+    *,
+    source: str,
+    note: str,
+    axes: Mapping[str, Any] | None = None,
+) -> None:
+    """A z-score as a Monte Carlo number with the nominal stderr :data:`Z_STDERR`."""
+    finite = math.isfinite(z)
+    b.add(
+        table,
+        row,
+        column,
+        z if finite else math.nan,
+        Z_STDERR if finite else math.nan,
+        unit=DIMENSIONLESS,
+        source=source,
+        note=f"{note}; {Z_NOTE}" if note else Z_NOTE,
+        axes=axes,
+    )
+
+
+# --------------------------------------------------------------------------------------------
+# exact rows: what each one is
+# --------------------------------------------------------------------------------------------
+
+#: The kinds of number a catalogue study may record as exact (``add_exact``); a number derived
+#: from Monte Carlo values (a z-score, an error, a median, a threshold built from a stderr)
+#: carries a stderr instead.  The one exception is ``"rank"``: a rank of Monte Carlo point
+#: estimates may be exact when its declaration names the companion flag column of the same
+#: table that says whether the ordering against the next-ranked row is decided at 2 stderr.
+EXACT_KIND_NAMES: tuple[str, ...] = (
+    "count",
+    "flag",
+    "fitted parameter",
+    "closed form",
+    "input",
+    "rank",
+)
+#: The kind that needs a companion "decided at 2 se" flag column.
+RANK_KIND = "rank"
+
+
+@dataclass(frozen=True)
+class ExactKind:
+    """One parsed ``EXACT_KINDS`` entry: ``(table regex, column regex, kind)``, or for a rank
+    ``(table regex, column regex, "rank", flag column)`` (``"rank:<flag column>"`` as the kind
+    is accepted too)."""
+
+    table: str
+    column: str
+    kind: str
+    decided_flag: str = ""
+
+
+def parse_exact_kinds(kinds: Sequence[Sequence[str]]) -> list[ExactKind]:
+    """Validate a study's ``EXACT_KINDS`` (unknown kinds, a rank without its flag column, and a
+    flag column on any other kind raise ``ValueError``)."""
+    out = []
+    for entry in kinds:
+        if len(entry) not in (3, 4):
+            raise ValueError(f"EXACT_KINDS entry {entry!r}: expected 3 or 4 strings")
+        table, column, kind = (str(x) for x in entry[:3])
+        flag = str(entry[3]) if len(entry) == 4 else ""
+        if kind.startswith(f"{RANK_KIND}:"):
+            kind, flag = RANK_KIND, kind.partition(":")[2].strip()
+        if kind not in EXACT_KIND_NAMES:
+            raise ValueError(f"unknown exact kind {kind!r}; expected one of {EXACT_KIND_NAMES}")
+        if (kind == RANK_KIND) != bool(flag):
+            raise ValueError(
+                f"EXACT_KINDS entry {entry!r}: a {RANK_KIND!r} entry, and only one, names its "
+                "'decided at 2 se' flag column"
+            )
+        out.append(ExactKind(table, column, kind, flag))
+    return out
+
+
+def unclassified_exact_rows(results: Results, kinds: Sequence[Sequence[str]]) -> pd.DataFrame:
+    """The exact rows of ``results`` that no entry of a study's ``EXACT_KINDS`` declares (full
+    matches; NaN values are missing, not exact numbers), plus the rank rows whose table lacks
+    the declared "decided at 2 se" flag column or whose flag column holds anything but 0, 1 or
+    NaN (:data:`EXACT_KIND_NAMES`)."""
+    parsed = parse_exact_kinds(kinds)
+    frame = results.frame
+    exact = frame[frame["exact"] & np.isfinite(frame["value"].to_numpy(float))]
+    ok = np.zeros(len(exact), dtype=bool)
+    for k in parsed:
+        hit = exact["table"].str.fullmatch(k.table).to_numpy(bool) & exact["column"].str.fullmatch(
+            k.column
+        ).to_numpy(bool)
+        if k.kind == RANK_KIND:
+            for table in set(exact.loc[hit, "table"]):
+                flags = frame[(frame["table"] == table) & (frame["column"] == k.decided_flag)]
+                values = flags["value"].to_numpy(float)
+                valid = (
+                    len(flags) > 0
+                    and bool(flags["exact"].all())
+                    and bool(np.all(np.isnan(values) | (values == 0.0) | (values == 1.0)))
+                )
+                if not valid:
+                    hit &= exact["table"].to_numpy() != table
+        ok |= hit
+    return exact[~ok]
 
 
 def paired_grid(

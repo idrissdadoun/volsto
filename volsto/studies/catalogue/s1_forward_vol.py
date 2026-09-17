@@ -14,17 +14,18 @@ with ``price_missing: false`` a missing point is a requirement (the run exits 2 
 precompute line) and nothing is priced.  ``volsto-study run configs/studies/catalogue/s1.yaml
 --set price_missing=false`` is the store-only run.
 
-**Cross-model differences** (the LSV-minus-LV forward smile per strike, the cliquet ratios)
-are differences of stored estimates: their stderr is the quadrature error.  The estimates share
-random numbers and the store keeps no per-path samples, so the correlation is not measured and
-the quadrature error is not the exact error (it bounds it only if the correlation is
-non-negative); each z is d over that error.  The put-wing reading compares the largest wing
-difference with the smallest at-the-money one, which guards the claim against the choice of
-model.  A number whose product ends beyond the calibration horizon (a forward window by the
-store's flag; a cliquet, and the 1y → 2y headline keys when no flag is at hand, against the
-point's horizon) says so in its note, in every table that shows it.  The
-"capped-cliquet ladder" is read as the study cliquet at its fixed 2% cap across the models (an
-interpretation, pending the owner).
+**Cross-model differences** (the LSV-minus-LV forward smile per strike, the cliquet ratios) are
+differences of stored estimates: their stderr is the quadrature error. The estimates share random
+numbers and the store keeps no per-path samples, so the correlation is not measured and the
+quadrature error is not the exact error (it bounds it only if the correlation is non-negative); each
+z is d over that error, recorded as a Monte Carlo number with the nominal stderr 1 of a z-score. The
+put-wing reading compares the largest wing difference with the smallest at-the-money one, which
+guards the claim against the choice of model, and states the invariance verdict per window and put
+strike from the wing rows: which models lie within 2 quadrature errors of the local vol and which do
+not. A number whose product ends beyond the calibration horizon (a forward window by the store's
+flag; a cliquet, and the 1y → 2y headline keys when no flag is at hand, against the point's horizon)
+says so in its note, in every table that shows it. The "capped-cliquet ladder" is read as the study
+cliquet at its fixed 2% cap across the models (an interpretation, pending the owner).
 
 **Params** (all required)::
 
@@ -42,9 +43,10 @@ key present in both, the tables ``regression_vol`` / ``regression_price`` / ``re
 carry the store value, the baseline, the difference (stderr: the two errors in quadrature — the
 "combined se"; with the same seed and leverage the two estimates are the same computation, so a
 non-zero difference is a code change or the baseline file's rounding, not noise, and the
-combined se is only a scale), ``|d| / combined se``, the regression
+combined se is only a scale), ``|d| / combined se`` (a z-score, nominal stderr 1), the regression
 tolerance of the test (``max(2 × store stderr, floor)``, floors 0.02 vol points, 0.02 % of
-notional, 0.002 for ratios and probabilities) and whether ``|d|`` is within it;
+notional, 0.002 for ratios and probabilities; exact when it is the floor, otherwise a Monte
+Carlo number with the normal-theory error of a stderr) and whether ``|d|`` is within it;
 ``regression_meta`` compares the particle counts, paths and seeds.
 
 Checked by ``tests/test_catalogue_s1_s4.py`` (the fast config on the toy store, the inline-pricing
@@ -71,6 +73,7 @@ from volsto.studies.catalogue._common import (
     QUADRATURE_NOTE,
     VP,
     ModelPoint,
+    add_z,
     axis,
     axis_text,
     band,
@@ -115,6 +118,19 @@ REQUIRED_PARAMS = (
     "baseline",
 )
 OPTIONAL_PARAMS: tuple[str, ...] = ()
+#: What every exact row of this study is (``_common.unclassified_exact_rows``; the walking test
+#: fails on any other exact row): ``(table regex, column regex, kind)``.
+EXACT_KINDS: tuple[tuple[str, str, str], ...] = (
+    ("provenance", "from_store", "flag"),
+    ("provenance", "n_particles|n_paths|seed|horizon", "input"),
+    ("forward_vols", "beyond_horizon", "flag"),
+    ("cliquet_ladder", r"ratio_[\d.]+y", "closed form"),  # the reference over itself
+    ("regression_meta", "match", "flag"),
+    ("regression_meta", r"(n_particles|n_paths|seed)(_baseline)?", "input"),
+    ("regression_(vol|price|ratio)", "tolerance", "input"),  # the test's floor
+    ("regression_(vol|price|ratio)", "within", "flag"),
+    ("setup", "value", "input"),  # the selection's counts and the config's inputs
+)
 
 #: The store's forward-start windows (:data:`volsto.viewers.precompute.FORWARD_WINDOWS`).
 WINDOWS: tuple[tuple[float, float], ...] = ((1.0, 2.0), (2.0, 3.0))
@@ -128,6 +144,8 @@ HEADLINE_KEYS = frozenset(k for k, _ in FWD_KEYS)
 #: Maturity (years) of the M4c conditional and VKO keys (``volsto.studies.m4`` prices them at 1y).
 M4_PRODUCT_T = 1.0
 VOL = "vol pts"
+#: |z| at or below which a difference is consistent with zero.
+Z_THRESHOLD = 2.0
 PCT = "% notional"
 #: Regression floors of ``tests/test_m4_regression.py`` in the tables' units.
 FLOOR_VOL_VP = 0.02
@@ -543,12 +561,12 @@ def compute(ctx: StudyContext) -> Results:
                     note="LSV minus LV; " + QUADRATURE_NOTE + tail,
                     axes=wing_axes,
                 )
-                b.add_exact(
+                add_z(
+                    b,
                     f"wing_z_{tag}",
                     row,
                     mp.label,
                     d / quad if quad > 0 else math.nan,
-                    unit="",
                     source="computed",
                     note="d over the quadrature error (not an exact significance)" + tail,
                     axes={**wing_axes, "headline": float(_in_headline(mp.axes, head))},
@@ -706,7 +724,6 @@ def _regression(
             d = scale * (sv - float(bv))
             comb = scale * rss(ss, float(bs))
             tol = max(2.0 * scale * ss, floor)
-            exact_unit = "" if unit == DIMENSIONLESS else unit
             beyond = _key_beyond(fr, mp, key)
             b.add(
                 table,
@@ -745,28 +762,46 @@ def _regression(
                 ),
                 axes=axes,
             )
-            b.add_exact(
+            add_z(
+                b,
                 table,
                 row,
                 "n_se",
                 abs(d) / comb if comb > 0 else math.nan,
-                unit="",
                 source="computed",
-                note=_join(
-                    "|d| / combined stderr (a deterministic function of the estimates)", beyond
-                ),
+                note=_join("|d| / combined stderr", beyond),
                 axes=axes,
             )
-            b.add_exact(
-                table,
-                row,
-                "tolerance",
-                tol,
-                unit=exact_unit,
-                source="computed",
-                note=_join("max(2 x store stderr, floor) of tests/test_m4_regression.py", beyond),
-                axes=axes,
-            )
+            rule = "max(2 x store stderr, floor) of tests/test_m4_regression.py"
+            if tol > floor:  # twice a Monte Carlo stderr: a Monte Carlo number itself
+                n_pairs = max(paths / 2.0, 2.0)
+                b.add(
+                    table,
+                    row,
+                    "tolerance",
+                    tol,
+                    tol / math.sqrt(2.0 * (n_pairs - 1.0)),
+                    unit=unit,
+                    source=fr.source,
+                    note=_join(
+                        rule,
+                        "2 x store stderr; its stderr is the normal-theory error of a stderr "
+                        f"over {n_pairs:.0f} antithetic pairs",
+                        beyond,
+                    ),
+                    axes=axes,
+                )
+            else:
+                b.add_exact(
+                    table,
+                    row,
+                    "tolerance",
+                    tol,
+                    unit=unit,
+                    source="computed",
+                    note=_join(rule, "the floor (an input of the test)", beyond),
+                    axes=axes,
+                )
             b.add_exact(
                 table,
                 row,
@@ -1164,13 +1199,13 @@ def _draw_regression(results: Results) -> Any:
     for i, t in enumerate(t for t in REGRESSION_TABLES if _has(results, t)):
         piv = results.pivot(t)
         ratio = (piv["diff"].abs() / piv["tolerance"]).to_numpy(dtype=float)
+        err = (piv["diff_stderr"] / piv["tolerance"]).to_numpy(dtype=float)
         xs = np.arange(x0, x0 + len(ratio), dtype=float)
         style.mc_errorbar(
             ax,
             xs,
             ratio,
-            np.zeros_like(ratio),
-            exact=np.ones_like(ratio, dtype=bool),
+            err,
             series=i,
             label=t.replace("regression_", "") + " keys",
             line=False,
@@ -1226,9 +1261,10 @@ def figures(results: Results) -> list[FigureSpec]:
         specs.append(
             FigureSpec(
                 "regression_ratio",
-                "|store - baseline| over the regression tolerance per key (a deterministic "
-                "function of the two estimates, whose errors the tolerance already carries: no "
-                "error bars); points above the dashed line are outside the tolerance.",
+                "|store - baseline| over the regression tolerance per key, error bars 1 combined "
+                "stderr over the tolerance (a scale only: with the same seed and leverage the "
+                "two numbers are the same computation); points above the dashed line are "
+                "outside the tolerance.",
                 _draw_regression,
             )
         )
@@ -1256,6 +1292,44 @@ def _horizon_lines(results: Results) -> list[str]:
         "window by the store's flag, a cliquet by its maturity): each says so in its note.",
         "",
     ]
+
+
+#: The lead of the per-window put-wing invariance verdict (tests read it).
+INVARIANCE_LEAD = "Put-wing invariance (|LSV - LV| within 2 quadrature errors) over"
+
+
+def _invariance(cells: pd.DataFrame, k: float, detail: bool) -> str:
+    """The invariance verdict at one put strike from its wing rows (one per headline LSV
+    model): which models are within 2 quadrature errors of the local vol, which are not."""
+    v = cells["value"].to_numpy(float)
+    se = cells["stderr"].to_numpy(float)
+    ok = np.isfinite(v) & np.isfinite(se)
+    within = ok & (np.abs(v) <= Z_THRESHOLD * se)
+    beyond = ok & ~within
+    n = int(ok.sum())
+    head = f"at k={k:g}: "
+    if not beyond.any():
+        return (
+            head
+            + f"consistent with invariance for all {n} models (largest |z| "
+            + (f"{float(np.max(np.abs(v[ok] / se[ok]))):.1f})" if n else "--)")
+        )
+    if not detail:
+        return head + (
+            f"**not invariant**: {int(beyond.sum())} of {n} models beyond 2 errors "
+            f"(|d| up to {float(np.max(np.abs(v[beyond]))):.2f} vol points)"
+        )
+    labels = cells["column"].to_numpy(str)
+    failed = ", ".join(
+        f"{labels[i]} ({format_value_text(float(v[i]), float(se[i]))} vp, "
+        f"z {v[i] / se[i]:+.1f})"
+        for i in np.flatnonzero(beyond)
+    )
+    held = ", ".join(labels[within]) or "none"
+    return head + (
+        f"**not invariant** for {int(beyond.sum())} of {n} models, {failed}; within 2 errors: "
+        f"{held}"
+    )
 
 
 def narrative(results: Results) -> str:
@@ -1360,6 +1434,12 @@ def narrative(results: Results) -> str:
             f"LSV models is {format_value_text(w_v, w_s)} vol points at {w['row']} "
             f"({w['column']}); the smallest at {a['row']} is {format_value_text(a_v, a_s)} "
             f"({a['column']}): {verdict}."
+        )
+        puts = [k for k in ks if k < atm_k - 1e-12]
+        lines.append(
+            f"- {INVARIANCE_LEAD} {window_label(t1, t2)} "
+            + "; ".join(_invariance(long[np.isclose(long["k"], k)], k, k == wing_k) for k in puts)
+            + "."
         )
     lines += [
         "",

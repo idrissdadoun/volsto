@@ -6,10 +6,11 @@ two dials").
 **What is computed here and what is read.**
 
 * **The binding map is computed inline.**  For every configured surface and every
-  ``(ssr_target, skew_eps)`` of ``params.binding_map`` the study runs the P1 marking fit exactly
-  as the precompute resolves a marking point (:func:`volsto.viewers.grid.resolve_marking`:
-  ``fit_2f_marking(surface, BreakEvenFitConfig(skew_eps=eps), ssr_target=ssr)``, k2 0.2, ν cap
-  3.5, two-point skew constraint) **without stage 3**: a deterministic parameter fit of a few
+  ``(ssr_target, skew_eps)`` of ``params.binding_map`` the study runs the P1 marking fit through
+  the one helper the precompute resolves a marking point with
+  (:func:`volsto.viewers.grid.marking_fit`, called by :func:`~volsto.viewers.grid.
+  resolve_marking`: ``fit_2f_marking`` at k2 0.2, ν cap 3.5, two-point skew constraint)
+  **without stage 3**: a deterministic parameter fit of a few
   seconds (first-order break-even closed forms, a 2-D QP per k1 and a ten-start SLSQP), **not a
   leverage calibration** — nothing is simulated and no leverage is built.  The runner's guard
   (:func:`volsto.studies.runner.calibration_forbidden`) stays active around it and would refuse
@@ -42,8 +43,11 @@ two dials").
   computed); a stored point without its light-tier risk rows prints the ``--risk light`` refresh
   line; a Greek name no stored point carries is a config error.
 * **The cost of a mark** is the price at a mark minus the price at ``params.reference_mark`` on
-  the same snapshot (the M8b marking, ssr 1 / eps 0.10), stderr in quadrature — conservative,
-  since the store prices every point on the same seed (positively correlated estimates).
+  the same snapshot (the M8b marking, ssr 1 / eps 0.10), stderr in quadrature, labelled
+  :data:`~volsto.studies.catalogue._common.QUADRATURE_NOTE`: not the exact error — the marks
+  share the store's pricing seed and their correlation is not measured, so the quadrature error
+  is a bound only if that correlation is non-negative.  Its z-score carries stderr 1 (the
+  sampling sd of a z-score).
   Positive = the mark prices the product higher than the reference mark (a desk short the
   product marks a larger liability; at inception it would charge a higher fee).
 * **Units.**  Store vols are converted to vol points.  The M6 cells (``autocall 3y:price``,
@@ -79,14 +83,10 @@ import numpy as np
 import pandas as pd
 
 from volsto.calibration.cache import build_market
-from volsto.calibration.fit_2f import (
-    BreakEvenFitConfig,
-    FitResult,
-    fit_2f_marking,
-    spot_skew_90_110,
-)
+from volsto.calibration.fit_2f import FitResult, spot_skew_90_110
 from volsto.config import ConfigError
 from volsto.studies import latex, style
+from volsto.studies.catalogue._common import QUADRATURE_NOTE
 from volsto.studies.latex import LONGTABLE_MIN_ROWS
 from volsto.studies.m6 import AUTOCALL_NAME
 from volsto.studies.results import (
@@ -102,6 +102,7 @@ from volsto.viewers import api
 from volsto.viewers.grid import (
     GridPoint,
     GridSpec,
+    marking_fit,
     marking_summary,
     reference_spec,
     surface_spec,
@@ -171,6 +172,9 @@ FWD_SKEW_SE_NOTE = (
 )
 BEYOND_NOTE = "1 = the window ends beyond the calibration horizon (last leverage slice held)"
 Z_NOTE = "z-score of the difference (stderrs in quadrature)"
+#: A z-score is a Monte Carlo quantity whose sampling sd is 1 (the catalogue's convention).
+Z_SD = 1.0
+Z_SD_NOTE = "stderr 1: the sampling sd of a z-score"
 PLACEHOLDER_WARNING = (
     "The placeholder SSVI is unsuitable for marking work (M7 report decision vii: nu past the "
     "cap, rho = -1, rho12 = +1): numbers on it are plumbing, not a marking result."
@@ -193,6 +197,31 @@ def _floats(v: Any, name: str, *, positive: bool = False) -> list[float]:
             raise ConfigError(f"{name}: {x!r} out of range")
         out.append(float(x))
     return out
+
+
+#: What each exact row is (:data:`volsto.studies.catalogue._common.EXACT_KIND_NAMES`, full-match
+#: regexes on table and column).  The marking fit is deterministic given the surface and the
+#: config, so its parameters and the numbers read off them are fitted parameters or closed
+#: forms; ``mean |L-1|`` is a functional of the cached leverage (a calibration output, whose
+#: particle-seed noise is not estimated upstream: :data:`L_NOTE`).  There are no ranks.
+EXACT_KINDS: tuple[tuple[str, ...], ...] = (
+    ("setup", "fast_mode|surface_kind", "flag"),
+    ("setup", "marks", "count"),
+    ("setup", "n_particles|horizon|pricing_n_paths|pricing_seed", "input"),
+    ("binding_map|marks|m7_fits", "status_code", "flag"),
+    ("binding_map|m7_fits", "nu|theta|k1|k2|rho12|rho_SX1|rho_SX2", "fitted parameter"),
+    # the fit's constraint gaps, first-order SVC miss, skew gap, and inline-minus-stored fit
+    ("binding_map", "gap_T_[sl]|max_svc_miss|mean_skew_gap|store_param_diff", "fitted parameter"),
+    (
+        "binding_map",
+        "edge_T_[sl]|nu_box|nu_at_cap|rho12_collapse|grid_point|store_status_match",
+        "flag",
+    ),
+    ("marks|m7_fits", "mean_abs_L_minus_1", "fitted parameter"),
+    ("marks", r"ssr_first_order@.+", "closed form"),  # the fit's first-order P1 SSR
+    ("forward_skew", r"spot_skew@.+", "closed form"),  # the snapshot SSVI's 90/110 skew
+    ("forward_skew", r"beyond_horizon@.+", "flag"),
+)
 
 
 def validate_params(params: Mapping[str, Any]) -> None:
@@ -447,8 +476,9 @@ def _setup(
 
 
 def _fit(surface: Any, ssr: float, eps: float) -> tuple[FitResult, float]:
+    """The precompute's own marking fit (:func:`volsto.viewers.grid.marking_fit`), timed."""
     t0 = time.perf_counter()
-    r = fit_2f_marking(surface, BreakEvenFitConfig(skew_eps=eps), ssr_target=ssr)
+    r = marking_fit(surface, ssr, eps)
     return r, time.perf_counter() - t0
 
 
@@ -658,12 +688,12 @@ def _forward_skew(
             b.add_exact(
                 "forward_skew",
                 row,
-                f"spot_skew@{t2 - t1:g}y",
+                f"spot_skew@{w}",
                 spot,
                 unit="vol pts",
                 source="computed",
                 axes=axes,
-                note="snapshot SSVI, exact",
+                note=f"snapshot SSVI at the window's length {t2 - t1:g}y, exact",
             )
             fs, fs_se, beyond = math.nan, math.nan, math.nan
             if not sm.empty:
@@ -786,17 +816,20 @@ def _prices(
                 unit=units[k][1],
                 source=src,
                 axes=axes,
-                note="price minus the reference mark's; stderrs in quadrature (conservative)",
+                note="price minus the reference mark's; " + QUADRATURE_NOTE,
             )
-            b.add_exact(
+            z = d / dse if math.isfinite(d) and dse > 0 else math.nan
+            add_mc(
+                b,
                 "mark_cost_z",
                 row,
                 k,
-                d / dse if math.isfinite(d) and dse > 0 else math.nan,
-                unit="",
+                z,
+                Z_SD if math.isfinite(z) else math.nan,
+                unit=DIMENSIONLESS,
                 source=src,
                 axes=axes,
-                note=Z_NOTE,
+                note=f"{Z_NOTE}; {QUADRATURE_NOTE}; {Z_SD_NOTE}",
             )
 
 
@@ -1083,8 +1116,8 @@ SURFACE_TABLES: dict[str, str] = {
     ),
     "mark_cost": (
         "what each mark costs or earns: price minus the price at the reference mark (stderrs "
-        "in quadrature, conservative for the store's common seed); positive = the mark prices "
-        "the product higher."
+        "in quadrature - not a bound: the store's same-seed estimates have an unmeasured "
+        "correlation); positive = the mark prices the product higher."
     ),
 }
 
@@ -1380,7 +1413,8 @@ def figures(results: Results) -> list[FigureSpec]:
                 FigureSpec(
                     f"mark_cost_{slug(sname)}",
                     f"{sname}: price at each mark minus the price at the reference mark, per "
-                    "product (error bars: 1 stderr, quadrature).",
+                    "product (error bars: 1 stderr in quadrature - not a bound, the same-seed "
+                    "correlation is not measured).",
                     functools.partial(_draw_cost, surface=sname),
                 )
             )

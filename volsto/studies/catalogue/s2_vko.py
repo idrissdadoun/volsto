@@ -28,7 +28,9 @@ leverage-slice times added), so its store-check rows are not the store's computa
   resamples of the antithetic pairs, replicate ``b`` drawn with ``default_rng([seeds.bootstrap,
   b])`` — the same resampling for every model, so quantile differences are paired;
 * LSV minus LV — **paired** (the same seed and step schedule; the stderr of the per-pair
-  difference of the influence functions; the quadrature error is reported beside it);
+  difference of the influence functions; the quadrature error and the per-pair correlation are
+  reported beside it, each with its own delta-method stderr, and every ``|d| / se`` is a z-score
+  with the nominal stderr 1);
 * the mechanism table scores two readings of the sign of the ratio difference ``d``, per LSV
   model and barrier, where ``d`` exceeds 2 stderr:
 
@@ -79,6 +81,7 @@ from volsto.products.base import daily_schedule
 from volsto.products.vko import VolKnockOutPut
 from volsto.studies import style
 from volsto.studies.catalogue._common import (
+    ERROR_STAT_NOTE,
     LV_GRID_NOTE,
     LV_LABEL,
     PAIRED_NOTE,
@@ -87,6 +90,7 @@ from volsto.studies.catalogue._common import (
     Estimate,
     FloatArray,
     ModelPoint,
+    add_z,
     axis,
     empty_panel,
     leverage_requirements,
@@ -129,6 +133,23 @@ QUESTION = (
 )
 REQUIRED_PARAMS = ("models", "vko", "n_paths", "bootstrap", "store_check", "realised")
 OPTIONAL_PARAMS: tuple[str, ...] = ()
+#: What every exact row of this study is (``_common.unclassified_exact_rows``; the walking test
+#: fails on any other exact row): ``(table regex, column regex, kind)``.
+EXACT_KINDS: tuple[tuple[str, str, str], ...] = (
+    ("itm_rv", "n_itm", "count"),
+    ("mechanism", "predicted_[pw]|agrees_[pw]|significant", "flag"),
+    ("pairing", "steps|own_steps", "count"),
+    ("pairing", "same_grid", "flag"),
+    # an identical inline and stored number: the difference and its z are exactly 0
+    ("store_check_(ratio|price|p_ko)", "diff|n_se", "closed form"),
+    ("realised", "knocked_out", "flag"),
+    ("realised", "budget_used|max_remaining_vol", "closed form"),  # of the price history
+    ("realised_path", "rv_to_date|spot", "closed form"),
+    ("realised_summary", "count", "count"),
+    ("realised_summary", "date", "input"),
+    ("realised_summary", "percent|vol", "closed form"),
+    ("setup", "value", "input"),  # the selection's counts and the config's inputs
+)
 
 VOL = "vol pts"
 PCT = "% notional"
@@ -572,36 +593,27 @@ def _lsv_minus_lv(
             note=note,
             axes=hax,
         )
-        b.add_exact(
-            "lsv_minus_lv_se",
-            mp.label,
-            f"se_paired_{t}",
-            d.stderr,
-            unit="",
-            source="computed",
-            note="paired stderr of the ratio difference",
-            axes=hax,
-        )
-        b.add_exact(
-            "lsv_minus_lv_se",
-            mp.label,
-            f"se_quadrature_{t}",
-            d.stderr_quadrature,
-            unit="",
-            source="computed",
-            note="the quadrature error of the same difference, for comparison",
-            axes=hax,
-        )
-        b.add_exact(
-            "lsv_minus_lv_se",
-            mp.label,
-            f"correlation_{t}",
-            d.correlation,
-            unit="",
-            source="computed",
-            note="per-pair correlation",
-            axes=hax,
-        )
+        for col, value, se, what in (
+            (f"se_paired_{t}", d.stderr, d.stderr_se, "paired stderr of the ratio difference"),
+            (
+                f"se_quadrature_{t}",
+                d.stderr_quadrature,
+                d.quadrature_se,
+                "the quadrature error of the same difference, for comparison",
+            ),
+            (f"correlation_{t}", d.correlation, d.correlation_se, "per-pair correlation"),
+        ):
+            b.add(
+                "lsv_minus_lv_se",
+                mp.label,
+                col,
+                value,
+                se if math.isfinite(value) else math.nan,
+                unit=DIMENSIONLESS,
+                source=src,
+                note=f"{what}; {ERROR_STAT_NOTE}",
+                axes=hax,
+            )
         b.add(
             "lsv_minus_lv_itm",
             mp.label,
@@ -740,7 +752,14 @@ def _store_check(
                     axes=ax,
                 )
                 b.add_exact(
-                    table, row, "n_se", 0.0, unit="", source="computed", note="identical", axes=ax
+                    table,
+                    row,
+                    "n_se",
+                    0.0,
+                    unit=DIMENSIONLESS,
+                    source="computed",
+                    note="identical",
+                    axes=ax,
                 )
                 continue
             d_se = rss(s, ss)
@@ -757,12 +776,12 @@ def _store_check(
                 + (f"; {grid_note}" if grid_note else ""),
                 axes=ax,
             )
-            b.add_exact(
+            add_z(
+                b,
                 table,
                 row,
                 "n_se",
                 abs(v - sv) / d_se if d_se > 0 else math.nan,
-                unit="",
                 source="computed",
                 note="|d| over the quadrature error (not an exact significance)",
                 axes=ax,

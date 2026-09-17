@@ -7,7 +7,7 @@ its vendor day file whose SPX close is moved by 0.5 % (the integrity walking tes
 the sticky-leverage attribution at parallel detail) into a pytest temporary directory — never
 the repository cache or outputs — once per pytest run, unsharded.  It is written so that the
 orchestrator can move it into ``tests/conftest.py`` verbatim (it imports nothing from
-``conftest``; the sharing helpers are private copies of the ``toy_build`` ones).  Consumers
+``conftest``; the build lock is ``tests/_locks.py``, the ``toy_build`` scheme).  Consumers
 import it (``from _backtest_build import toy_backtest_build  # noqa: F401``: the tests directory
 is on ``sys.path``, the repository root is not, so ``tests._backtest_build`` does not import
 under ``.venv/bin/pytest``).
@@ -24,8 +24,9 @@ Layout of the build (``BacktestBuild.base``)::
                                                  SPX close x 1.005, and that state's leverage
                                                  (a 6th calibration, same size)
 
-Under ``pytest -n auto`` the workers share one build (controller base temp + ``os.mkdir`` lock +
-``done.json`` marker, the ``toy_build`` scheme).  The wall clock, the captured stdout and the
+Under ``pytest -n auto`` the workers share one build (controller base temp + the pid lock of
+``tests/_locks.py``, never removed, + ``done.json`` marker; a waiting worker waits as long as
+the builder is alive, with no wall-clock limit).  The wall clock, the captured stdout and the
 ``volsto`` log records are recorded, never asserted.  The fixture never skips by itself: a
 missing HDN sample, a failed build or a non-zero exit is returned with its reason; through
 :meth:`BacktestBuild.require` a consumer skips on the absent sample and FAILS on a failed
@@ -46,6 +47,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import _locks
 import pytest
 
 BACKTEST_ROOT = Path(__file__).resolve().parents[1]
@@ -68,8 +70,6 @@ TOY_BACKTEST_STORE = "backtest/hdn_2022h2_toy"
 #: calibration at the same size), so the test can recompute the date into another state.
 TOY_SHIFTED_DATE = "2022-07-28"
 TOY_SHIFTED_SPOT = 1.005
-#: How long an xdist worker waits for another worker's build before reporting it unusable.
-TOY_BACKTEST_WAIT_S = 1800.0
 
 
 @dataclass(frozen=True)
@@ -287,42 +287,18 @@ def _calibrate_shifted(base: Path) -> dict[str, Any]:
 def toy_backtest_build(tmp_path_factory: pytest.TempPathFactory) -> BacktestBuild:
     """The toy backtest store + cache + snapshots, built **once per pytest run** with
     calibration (module docstring).  Consumers call ``.require()`` and copy before writing."""
-    root = _backtest_shared_root(tmp_path_factory) / "toy_backtest"
-    root.mkdir(exist_ok=True)
+    return shared_toy_backtest(_backtest_shared_root(tmp_path_factory))
+
+
+def shared_toy_backtest(base: Path) -> BacktestBuild:
+    """The build under ``<base>/toy_backtest`` through ``tests/_locks.py::shared_build`` (the
+    fixture's body, callable on its own)."""
+    root = base / "toy_backtest"
+    root.mkdir(parents=True, exist_ok=True)
     absent = _backtest_absent()
-    done, lock = root / "done.json", root / "lock"
-    info: dict[str, Any]
-    if absent:
-        info = {}
-    else:
-        if not done.exists():
-            try:
-                os.mkdir(lock)  # atomic: exactly one process builds
-            except FileExistsError:
-                t0 = time.perf_counter()
-                while not done.exists() and time.perf_counter() - t0 < TOY_BACKTEST_WAIT_S:
-                    time.sleep(0.5)
-            else:
-                info = {"error": "toy backtest build interrupted"}
-                try:
-                    info = _run_toy_backtest(root)
-                except Exception as exc:  # the consumers skip with the reason
-                    info = {"error": f"{type(exc).__name__}: {exc}"}
-                finally:
-                    info.setdefault(
-                        "built_by",
-                        f"{os.environ.get('PYTEST_XDIST_WORKER', 'main')}:{os.getpid()}",
-                    )
-                    tmp = root / "done.json.tmp"
-                    tmp.write_text(json.dumps(info))
-                    os.replace(tmp, done)
-                    os.rmdir(lock)
-        if done.exists():
-            info = json.loads(done.read_text())
-        else:
-            info = {
-                "error": f"another worker's backtest build did not finish in {TOY_BACKTEST_WAIT_S:.0f} s"
-            }
+    info: dict[str, Any] = (
+        {} if absent else _locks.shared_build(root, "toy_backtest", lambda: _run_toy_backtest(root))
+    )
     return BacktestBuild(
         root=root,
         base=root / "A",

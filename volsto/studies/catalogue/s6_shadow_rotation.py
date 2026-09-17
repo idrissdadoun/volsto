@@ -25,12 +25,21 @@ is SHORT the note, its P&L per +1 rota is −(d fee).
 ``recal_se`` / ``total_se`` / ``static_se`` and no ratio or nonlinearity error — gives the same
 numbers as one written with exact ``<value>_se`` twins; the read API
 :func:`volsto.viewers.api.get_hedging_table` normalises both): the first-order agreement
-``ratio = simulated / static`` with its delta-method stderr
-(:func:`volsto.studies.m8b.ratio_stderr`),
+``ratio = simulated / static`` with its delta-method stderr for independent errors
+(:func:`volsto.studies.m8b.ratio_stderr`, M8b's own figure: the static greek is a separate run
+whose correlation with the hedger's estimate is not measured — not a bound),
 ``z = (simulated − static) / sqrt(se² + se²)`` and the ``|ratio − 1| ≤ tolerance`` flag
 (:func:`volsto.studies.m8b.first_order_agreement`'s definitions, the tolerance from the config),
-and the nonlinearity ``P&L(rota) / (rota × P&L(+1)) − 1`` at +2 / +3 with the delta-method
-stderr (conservative: the runs share the world seed).
+and the nonlinearity ``P&L(rota) / (rota × P&L(+1)) − 1`` at +2 / +3.  The rota runs share the
+world seed with an unmeasured correlation, so a ratio of two of them — the nonlinearity, and the
+policy orderings below — carries the first-order stderr **valid for any correlation**
+(:func:`volsto.studies.m8b.ratio_stderr_bound`, at most √2 times the independent figure; the
+independent figure would understate it for opposite-sign estimates).
+
+**Derived numbers.**  A z-score is recorded with stderr 1 (the sampling sd of a z-score, so a
+rerun compares it at 2 stderr like its parents: :data:`Z_SD_NOTE`).  Class codes, counts and
+flags are exact: deterministic functions of the stored Monte Carlo values, which change only when
+those values change (possibly within their stderrs).
 
 **The restricted claim** (owner's decision of 2026-09-16, §8.2): a policy column enters the
 conclusion only when it is *clean* — every configured row present and ``ok`` and no refit at a
@@ -96,6 +105,7 @@ import pandas as pd
 from volsto.config import ConfigError
 from volsto.hedging.hedger import REFIT_CORRELATION_CAP
 from volsto.studies import latex, m8b, style
+from volsto.studies.catalogue._common import QUADRATURE_NOTE
 from volsto.studies.latex import LONGTABLE_MIN_ROWS
 from volsto.studies.results import (
     DIMENSIONLESS,
@@ -174,6 +184,24 @@ STATIC_GREEKS: tuple[str, ...] = (
 )
 MISSING_NOTE = "not reported: the value or its stderr is not finite (or the row is absent)"
 Z_NOTE = "z-score of the difference (stderrs in quadrature)"
+#: A z-score is a Monte Carlo quantity whose sampling sd is 1 (the catalogue's convention).
+Z_SD = 1.0
+Z_SD_NOTE = "stderr 1: the sampling sd of a z-score"
+#: The note of a ratio of two estimates that share the world seed (module docstring).
+BOUND_NOTE = (
+    "stderr: first-order bound valid for any error correlation (m8b.ratio_stderr_bound; the "
+    "runs share the world seed and their correlation is not measured)"
+)
+#: The note of the simulated / static ratio (module docstring).
+AGREEMENT_SE_NOTE = (
+    "stderr: delta method for independent errors (M8b's ratio_se; the static greek is a separate "
+    "run, its correlation with the hedger's estimate is not measured - not a bound)"
+)
+#: The M7 CSV and the static records against each other (:func:`_m7_vs_static`).
+SAME_COMPUTATION_NOTE = (
+    "the M7 CSV and the static records are the same computation (seed 2024, the same states); a "
+    "difference means the states changed"
+)
 #: Relative difference under which the M7 CSV and a static record hold the same number (the same
 #: seed and states computed twice: floating-point noise, not two samples).
 IDENTICAL_REL_TOL = 1e-9
@@ -200,6 +228,38 @@ CLASS_LEGEND = (
     "|simulated| smaller, or the opposite sign), 2 undecided (the interval straddles a band edge)"
 )
 IDENTICAL_NOTE = "identical to 1e-9 relative: the same seed and states (a reproduction)"
+
+#: What each exact row is (:data:`volsto.studies.catalogue._common.EXACT_KIND_NAMES`, full-match
+#: regexes on table and column).  The 2-stderr classes and ordering sides are flags (codes);
+#: the identical-reproduction difference is exactly 0 (:data:`IDENTICAL_NOTE`); the refit
+#: shares are ratios of counts.  There are no ranks.
+EXACT_KINDS: tuple[tuple[str, ...], ...] = (
+    ("setup", "first_order_tolerance", "input"),
+    ("table_c_state", "mtime_epoch_s", "input"),
+    (
+        "table_c_state",
+        "rows|rows_.+|recalibration_rows|contaminated_rows|at_bound_not_recorded"
+        "|fallback_recorded|result_files(_.+)?",
+        "count",
+    ),
+    ("table_c_missing", "missing", "flag"),
+    ("static_greek", "base_fit_is_marking_fit", "flag"),
+    ("static_greek", "n_paths|n_particles", "input"),
+    ("m7_vs_static", r"diff_.+", "closed form"),
+    ("pnl", "recal_pnl", "closed form"),  # no re-marking: exactly zero
+    ("agreement", "within_tol_point|class_2se|contaminated", "flag"),
+    ("agreement", "n_refits|refits_at_bound|refits_fallback|refits_capped", "count"),
+    ("claim_columns", "clean", "flag"),
+    ("claim_columns", "refits(_.+)?|rows_.+|mean_refits|fallback_share|capped_share", "count"),
+    (
+        "claim",
+        "pairs|above|within|undecided|below|decided|decided_static_not_larger|desk_gains"
+        "|desk_losses|sign_undecided",
+        "count",
+    ),
+    ("ordering", r".+_contaminated_rows", "count"),
+    ("ordering_sides", r"static|sim@.+|disagree@.+", "flag"),
+)
 
 
 def validate_params(params: Mapping[str, Any]) -> None:
@@ -255,6 +315,32 @@ class Found:
         if not (self.sim_se > 0 and abs(self.sim / self.sim_se) > SIGN_NSE):
             return 0
         return 1 if self.sim > 0 else -1
+
+
+def add_z(
+    b: ResultsBuilder,
+    table: str,
+    row: str,
+    column: str,
+    z: float,
+    *,
+    source: str,
+    axes: Mapping[str, Any],
+    note: str,
+) -> None:
+    """A z-score with its sampling sd 1 (:data:`Z_SD_NOTE`), or a missing number."""
+    add_mc(
+        b,
+        table,
+        row,
+        column,
+        z,
+        Z_SD if math.isfinite(z) else math.nan,
+        unit=DIMENSIONLESS,
+        source=source,
+        axes=axes,
+        note=f"{note}; {Z_SD_NOTE}",
+    )
 
 
 def classify(ratio: float, stderr: float, tol: float, nse: float = CLASSIFY_NSE) -> str:
@@ -698,12 +784,12 @@ def _m7_vs_static(
                     axes=axes,
                     note=IDENTICAL_NOTE,
                 )
-                b.add_exact(
+                add_z(
+                    b,
                     "m7_vs_static",
                     policy,
                     f"z_{name}",
                     0.0,
-                    unit="",
                     source=source,
                     axes=axes,
                     note=IDENTICAL_NOTE,
@@ -720,17 +806,17 @@ def _m7_vs_static(
                 unit=M7_UNIT,
                 source=source,
                 axes=axes,
-                note="treated as independent runs: stderrs in quadrature",
+                note=f"{SAME_COMPUTATION_NOTE}; {QUADRATURE_NOTE}",
             )
-            b.add_exact(
+            add_z(
+                b,
                 "m7_vs_static",
                 policy,
                 f"z_{name}",
                 (sv - mv) / se if se > 0 else math.nan,
-                unit="",
                 source=source,
-                note=Z_NOTE,
                 axes=axes,
+                note=f"{Z_NOTE}; {QUADRATURE_NOTE}",
             )
 
 
@@ -805,8 +891,9 @@ def _agreement(b: ResultsBuilder, ctx: StudyContext, rows: Sequence[Mapping[str,
             unit=DIMENSIONLESS,
             source=source,
             axes=axes,
+            note=AGREEMENT_SE_NOTE,
         )
-        b.add_exact("agreement", row, "z", z, unit="", source=source, axes=axes, note=Z_NOTE)
+        add_z(b, "agreement", row, "z", z, source=source, axes=axes, note=Z_NOTE)
         within = abs(ratio - 1.0) <= tol if math.isfinite(ratio) else False
         b.add_exact(
             "agreement",
@@ -835,7 +922,7 @@ def _agreement(b: ResultsBuilder, ctx: StudyContext, rows: Sequence[Mapping[str,
             if base is not None:
                 bv, bse = _sim(base)
                 nonlin = m8b.nonlinearity(sim, rota, bv)
-                nonlin_se = m8b.ratio_stderr(sim, sim_se, rota * bv, rota * bse)
+                nonlin_se = m8b.ratio_stderr_bound(sim, sim_se, rota * bv, rota * bse)
             else:
                 nonlin, nonlin_se = math.nan, math.nan
             add_mc(
@@ -848,7 +935,7 @@ def _agreement(b: ResultsBuilder, ctx: StudyContext, rows: Sequence[Mapping[str,
                 unit=DIMENSIONLESS,
                 source=source,
                 axes=axes,
-                note="delta-method stderr, conservative (the runs share the world seed)",
+                note=BOUND_NOTE,
             )
         for col in ("n_refits", "refits_at_bound", "refits_fallback", "refits_capped"):
             v = _num(rec.get(col)) if col in rec else NOT_RECORDED
@@ -1054,7 +1141,7 @@ def _ordering(
         add_mc(b, "ordering", product, f"static_{a}", *sa, unit=unit, source=src, axes=axes)
         add_mc(b, "ordering", product, f"static_{c}", *sc, unit=unit, source=src, axes=axes)
         s_ratio = sc[0] / sa[0] if sa[0] else math.nan
-        s_se = m8b.ratio_stderr(sc[0], sc[1], sa[0], sa[1])
+        s_se = m8b.ratio_stderr_bound(sc[0], sc[1], sa[0], sa[1])
         add_mc(
             b,
             "ordering",
@@ -1065,7 +1152,11 @@ def _ordering(
             unit=DIMENSIONLESS,
             source=src,
             axes=axes,
-            note="delta method, the two static runs treated as independent",
+            note=(
+                "stderr: first-order bound valid for any error correlation "
+                "(m8b.ratio_stderr_bound; the two static greeks share seed 2024 and the usual "
+                "rotation's paths)"
+            ),
         )
         static_side = ordering_side(s_ratio, s_se)
         b.add_exact(
@@ -1098,7 +1189,7 @@ def _ordering(
                 continue
             va, vc = _pair(ra, "recal_pnl_desk"), _pair(rc, "recal_pnl_desk")
             ratio = vc[0] / va[0] if va[0] else math.nan
-            ratio_se = m8b.ratio_stderr(vc[0], vc[1], va[0], va[1])
+            ratio_se = m8b.ratio_stderr_bound(vc[0], vc[1], va[0], va[1])
             label = _rota_label(rota)
             add_mc(
                 b,
@@ -1110,7 +1201,7 @@ def _ordering(
                 unit=DIMENSIONLESS,
                 source=tsrc,
                 axes={**axes, "rota": rota},
-                note="delta method; conservative (the runs share the world seed)",
+                note=BOUND_NOTE,
             )
             side = ordering_side(ratio, ratio_se)
             b.add_exact(
@@ -1285,7 +1376,8 @@ def tables(results: Results) -> list[TableSpec]:
         out.append(
             TableSpec(
                 f"agreement_{m8b.slug(product)}",
-                f"{product}: first-order agreement (simulated / static, delta-method stderr; z; "
+                f"{product}: first-order agreement (simulated / static, delta-method stderr; z "
+                "with its sampling sd 1; "
                 f"the {CLASS_LEGEND}), nonlinearity P&L(rota)/(rota P&L(+1)) - 1, refit counts "
                 "and flags (-1 = not recorded; contaminated = refits at a correlation bound). The "
                 "none rows compare the total hedged P&L with desk_pnl_usual x rota: a reference.",
@@ -1365,8 +1457,8 @@ def tables(results: Results) -> list[TableSpec]:
             TableSpec(
                 "ordering",
                 "The static policy ordering: the greek's desk shadow under each policy and their "
-                "signed ratio (delta method). Units: "
-                f"{_units_caption(results, 'ordering')}.",
+                "signed ratio (stderr: a first-order bound valid for any error correlation). "
+                f"Units: {_units_caption(results, 'ordering')}.",
                 "ordering",
                 tuple(
                     Column(
@@ -1385,8 +1477,8 @@ def tables(results: Results) -> list[TableSpec]:
             TableSpec(
                 "ordering_sim",
                 "The simulated policy ordering: the signed ratio of the simulated re-marking P&L "
-                "of the two policies at each rota (delta method, conservative: the runs share "
-                "the world seed).",
+                "of the two policies at each rota (stderr: a first-order bound valid for any "
+                "error correlation; the runs share the world seed).",
                 "ordering_sim",
                 tuple(
                     Column(k, k.replace("ratio@", "rota ")) for k in results.columns("ordering_sim")
@@ -1586,7 +1678,7 @@ def figures(results: Results) -> list[FigureSpec]:
             FigureSpec(
                 "ratio",
                 "First-order agreement simulated / static per rota (band: the tolerance; error "
-                "bars: 1 stderr, delta method).",
+                "bars: 1 stderr, delta method for independent errors - not a bound).",
                 lambda r: _draw_ratio(r, "ratio"),
             )
         )
@@ -1595,7 +1687,7 @@ def figures(results: Results) -> list[FigureSpec]:
                 FigureSpec(
                     "nonlinearity",
                     "Nonlinearity of the simulated P&L at +2 / +3 rota (error bars: 1 stderr, "
-                    "delta method, conservative).",
+                    "a first-order bound valid for any error correlation).",
                     lambda r: _draw_ratio(r, "nonlinearity"),
                 )
             )
@@ -2028,10 +2120,11 @@ def _m7_lines(results: Results) -> list[str]:
             mv, mse = results.value("m7_vs_static", policy, "m7_desk_pnl_shadow")
             sv, sse = results.value("m7_vs_static", policy, "static_desk_pnl_shadow")
             rec = results.record("m7_vs_static", policy, "z_desk_pnl_shadow")
+            same = results.record("m7_vs_static", policy, "diff_desk_pnl_shadow")["note"]
             verdict = (
                 "the same number (same seed and states: reproduced bit for bit up to "
                 "floating point)"
-                if rec["note"] == IDENTICAL_NOTE
+                if same == IDENTICAL_NOTE
                 else f"z {float(rec['value']):+.2f}"
             )
             lines.append(

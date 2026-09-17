@@ -173,9 +173,11 @@ Instance facts are from the providers' public listings (not re-checked when this
 written); check the price and availability yourself. Use Ubuntu 24.04 with **at least 100 GB of
 disk**. The run adds about 2,150 leverage entries of about 18 MB each (8·10⁵ particles), roughly
 39 GB: 123 base calibrations plus 16 risk-bump recalibrations for each of the 127 LSV points
-(the 17th state is the point's own leverage). That is on top of today's 5.3 GB cache, the venv
-and the store. On spot, put `$DATA` on a persistent volume (EBS) so an interruption keeps the
-finished points and leverages. The cache must be on a **local** file system (ext4 / xfs on the
+(the 17th state is the point's own leverage). That is on top of the existing cache (5.3 GB when
+this page was written at commit 0ca0897; 6.8 GB and 379 leverages on 2026-09-17, after the M10
+backtest proof of concept; check with `du -sh cache`), the venv and the store. On spot, put
+`$DATA` on a persistent volume (EBS) so an interruption keeps the finished points and
+leverages. The cache must be on a **local** file system (ext4 / xfs on the
 instance or an attached volume): the manifest lock (§13) is a POSIX `flock`, which is not
 reliable over NFS.
 
@@ -198,7 +200,10 @@ shasum -a 256 cache/manifest.parquet
 wc -l < /tmp/cache.sha256                            # 2 lines per leverage (npz + spec), more with diagnostics
 # the default projection, for the record (reads the cache manifest, computes nothing). Without
 # --cost-from it uses the cache manifest and the fallback costs, measured at 12 threads:
-# 126.52 process-hours, which is NOT the 1-thread figure of §0. The §0 figures come from --cost-from <a 1-thread store>, §1.
+# 126.52 process-hours at commit 0ca0897, 126.61 on 2026-09-17 (the manifest median moved to
+# 138.1 s over 211 entries once the backtest PoC added its leverages); the figure moves as the
+# cache grows. It is NOT the 1-thread figure of §0, which comes from --cost-from <a 1-thread
+# store>, §1.
 NUMBA_NUM_THREADS=2 .venv/bin/python -m volsto.viewers.precompute --grid configs/grids/default.yaml \
   --dry-run --store /tmp/vmdry --workers 24 --threads-per-worker 1
 scp /tmp/$REPO.bundle /tmp/cache.sha256 $VM:/tmp/
@@ -450,6 +455,18 @@ from volsto.calibration.cache import LeverageCache
 before, added = LeverageCache('cache').merge_manifest(pd.read_parquet('/tmp/vm_manifest.parquet'))
 print(before, '+', added, '=', before + added, 'rows')"
 ```
+
+**Bring shards together** (layout (c), or any run split over machines). Repeat the block above
+once per VM, each time with that VM's `$VM`:
+
+1. rsync the store and the cache with `rsync -a` and **never** `--delete`. A `--delete` would
+   remove every point, run record and leverage the other VMs brought back.
+2. Keep the per-point files and the run records: their names are distinct across shards.
+3. Copy each VM's `manifest.parquet` to its own temporary file and merge it with
+   `LeverageCache.merge_manifest`. Never copy it over the laptop's manifest: the last VM's copy
+   would drop the other VMs' rows.
+4. After the last VM, rebuild the store's derived `results/manifest.json` with
+   `ResultsStore('outputs/store').refresh_manifest()` (§12).
 
 The rows added are the VM's *new* keys, not the VM manifest's row count: a key the laptop
 already had (a base leverage the VM reused) is not added again. On the laptop, merging the

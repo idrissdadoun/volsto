@@ -1045,3 +1045,28 @@ def test_study_d_min_variance_benchmark_2f(tmp_path: Path) -> None:
         best,
         b.std,
     )
+
+
+def test_discriminator_gate_reads_the_repaired_run_and_falls_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """World (ii)'s gate reads the discriminator run on the repaired eSSVI history (M10 Part 0);
+    the pre-repair M8b run is used only when the repaired file is absent, and the reason says so."""
+    import volsto.studies.m8b as m8b
+
+    repaired = tmp_path / "essvi_gate" / "discriminator" / "discriminator_verdict.json"
+    pre = tmp_path / "m8b" / "discriminator_verdict.json"
+    pre.parent.mkdir(parents=True)
+    pre.write_text(json.dumps({"verdict": "surface artefact", "reason": "pre"}), encoding="utf-8")
+    monkeypatch.setattr(m8b, "ROOT", tmp_path)
+    monkeypatch.setattr(m8b, "DISCRIMINATOR_VERDICT", repaired)
+    monkeypatch.setattr(m8b, "DISCRIMINATOR_VERDICT_PRE_REPAIR", pre)
+    g = m8b.discriminator_gate(repaired)
+    assert not g.enabled and g.verdict == "surface artefact"
+    assert g.reason.startswith("pre") and "pre-repair discriminator" in g.reason
+    repaired.parent.mkdir(parents=True)
+    repaired.write_text(json.dumps({"verdict": "real", "reason": "repaired"}), encoding="utf-8")
+    g = m8b.discriminator_gate(repaired)
+    assert g.enabled and g.reason == "repaired"
+    other = tmp_path / "elsewhere.json"
+    assert m8b.discriminator_gate(other).verdict == "missing"  # an explicit path never falls back

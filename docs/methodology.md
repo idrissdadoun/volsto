@@ -50,10 +50,10 @@ Each convention is stated once here; the rest of the page uses it without restat
 | Vol of vol | $\nu$ is the lognormal vol of a variance-swap vol of vanishing maturity, and $\omega = 2\nu$ is the lognormal vol of vol of the instantaneous variance. Configs store $\nu$. The earlier studies' $\omega = 3$ is $\nu = 1.5$. | §3.3, §16 |
 | Prices | A product's value is in units of its `notional`. With `notional=100` it reads in % of notional. The M6 headline notes use notional 1, i.e. fractions of notional. The results store's M6 cells are fractions stored under a "% notional" label, and study S4 converts them (§10.2). The backtest stores product units and a `scale` / `unit` column (× 100 gives % of notional, % of the inception spot, or vol points of vega notional). | §6.8, §10.2, §10.3 |
 | Hedging units | Autocall, Phoenix, cliquet and VKO in % of notional. The study-D vanilla in % of spot. The FVA in vol points × notional. The KO variance swap in vol points of vega notional: the variance P&L divided by $2K_{\text{vol}}$, with $K_{\text{vol}}$ the pricing model's fair strike. | §8.2 |
-| Desk P&L sign | The desk is **short** the note. The hedger prices the product long, and every "desk" number is its negative (`volsto.studies.m8b.to_desk_pnl`). For the shadow rotation, fee = P1 price − LV price, and the desk P&L per +1 rota = −(d fee). The backtest's P&L is $V(d) - V(d-1)$ + flows, i.e. the change in the product's value (section 10 of this page). | §8.2, §15 Part 3, §10.3 |
+| Desk P&L sign | The desk is **short** the note. The hedger prices the product long, and every "desk" number is its negative (`volsto.studies.m8b.to_desk_pnl`). For the shadow rotation, fee = P1 price − LV price, and the desk P&L per +1 rota = −(d fee). The backtest's stored per-date rows keep the holder's sign, $V(d) - V(d-1)$ + flows; every stage-2 table, figure and sentence shows the desk P&L, −(that) (`volsto.studies.backtest.DESK_SIGN`; section 10 of this page). | §8.2, §15 Part 3, §10.3 |
 | Rota | +1 rota is an ATM-skew move of $2/\sqrt{T}$ vol points per unit log-moneyness, with $T$ floored at 1 month. It is applied through the saturating profile $k_{\text{cap}}\tanh(k/k_{\text{cap}})$ with $k_{\text{cap}} = 0.5$. Positive means puts up (the skew steepens). At 6 months +1 rota is +0.56 vp of 90/110 skew (0.568 without the saturation). The code constant is `volsto.risk.shadow_rotation.ROTATION_CONVENTION`. | §15 Part 3 |
 | Bumps | Delta and gamma: 1 % of spot in log space, central. Vega: 1 vp. Forward-variance buckets: +1 vp of the bucket's forward variance-swap vol. Model parameters: 5 % relative for $\nu, k_1, k_2$ and 0.05 absolute for $\theta$ and the correlations. | §7.1 |
-| Errors | No Monte Carlo number without its standard error. A difference priced on common paths carries the paired error. A difference of two stored estimates carries the quadrature error, labelled an upper bound. | §5, §10.2, §11 |
+| Errors | No Monte Carlo number without its standard error. A difference priced on common paths carries the paired error. A difference of two stored estimates carries the quadrature error, labelled "not the exact error": the estimates share random numbers, and quadrature bounds the exact error only when their correlation is non-negative, which no study checks. The forward 90/110 skew of stored smiles (S4, S5) carries the sum of the two strikes' errors, a bound whatever the correlation. | §5, §10.2, §11 |
 | Particle counts | Production (headline tables, baselines, grid precompute): $8\cdot10^5$ particles, single seed. Development: $2\cdot10^5$. The test-suite toy grids use $2\cdot10^4$. | §11, §9.2 |
 | Seeds | Normals are addressed by (seed, path, step, Brownian), so bumps under common random numbers are exact. The M4/M6 baseline pricing seed is 2024. | §5, §9.2 |
 
@@ -735,14 +735,18 @@ $\nu, \theta, k_1$ 10 %, $\rho$ 0.05). On a three-year synthetic history:
 - On a one-year history the two-point fit gives $\nu$ 1.422 (−18 %) with every SpotVolCovar
   within 2 %. Five covariance targets do not pin $(k_1, \lambda)$ once the short-end skew is free.
 
-**11. The SSR < 1 finding** (2022 H2 SPX; §15 M7 implementation notes, §13.1). The historical SSR
-is:
+**11. The SSR < 1 finding** (2022 H2 SPX; §15 M7 implementation notes, §13.1). The M7 historical
+SSR, on the plain-SSVI snapshots before the calendar repair (§15 M7 implementation notes), is:
 
 - 0.81–0.84 ± 0.07–0.11 on 60 days at every pillar to 1y;
 - 0.86–0.92 on 100 days.
 
-Both are below the floor $R \ge 1$ of local vol and of the two-factor LSV. An `ssr_target` below 1
-cannot be met by the model class.
+On the M10 repaired eSSVI history (item 12; `outputs/essvi_gate/discriminator/discriminator.md`)
+the fitted SSR at 1m–1y is 0.80–0.87 ± 0.07–0.12 on 60 days and 0.85–0.97 ± 0.05–0.09 on 100
+days.
+
+Every one of these values is below the floor $R \ge 1$ of local vol and of the two-factor LSV.
+An `ssr_target` below 1 cannot be met by the model class.
 
 **12. The discriminator verdict: "surface artefact".** The M10 Part 0 re-run on the 127 repaired
 eSSVI days (§13.1) gives a fitted 60-day SSR of
@@ -795,9 +799,12 @@ recalibrated vega of a 1y study cliquet ladder is 4× the sticky one (§7.13, §
 **Backtest sample.** The 2022 H2 sample is one regime and 127 days. Studies on it are proofs of
 concept (§10.3).
 
-**Backtest P&L sign.** SPEC §10.3 defines the P&L of $(d-1, d]$ as $V(d) - V(d-1)$ + the flows
-dated $d$, i.e. the change in the trade's value. It does not apply the desk-short sign used by
-the hedging studies and the shadow rotation. Negate it for a desk that is short the book.
+**Backtest P&L sign.** SPEC §10.3 defines the holder P&L of $(d-1, d]$ as $V(d) - V(d-1)$ +
+the flows dated $d$. The stored per-date rows (`rows.parquet` of the date's current attempt,
+`dates/<d>/attempts/<id>/`) keep this holder sign.
+Every stage-2 table, figure and sentence of `study.md` shows the desk P&L, −(that): the desk is
+short the book, as in the hedging studies and the shadow rotation
+(`volsto.studies.backtest.DESK_SIGN` = −1). Negate only when you read the raw per-date rows.
 
 ---
 
