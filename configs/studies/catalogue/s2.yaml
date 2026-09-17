@@ -1,0 +1,34 @@
+# S2 - the vol knock-out put (runner volsto/studies/catalogue/s2_vko.py) on the placeholder
+# surface's cached headline models (LV, 1F omega 1 / 2 / 3, 2F Table 8.2; 8e5 particles): the
+# 12m 100% put priced here from the cached leverage on one path set per model (the store keeps
+# neither the ITM-conditional realised-vol distribution nor its errors), the store's headline VKO
+# as a cross-check, and the 2022 H2 realised-outcome case from the repaired surface history.
+name: s2_vko
+runner: volsto.studies.catalogue.s2_vko
+grid: configs/grids/placeholder_cached.yaml
+store: outputs/store
+cache: cache
+outputs: outputs
+mode: full
+seeds:
+  pricing: 2024       # the M4 / M6 baseline seed
+  bootstrap: 20260916 # pair bootstrap of the ITM-conditional percentiles
+params:
+  models:
+    surface: placeholder
+    lv: true
+    one_factor: {nu: all, rho: all, kappa: all}
+    two_factor: all
+  vko:
+    strike: 1.0                  # fraction of spot (the owner's reference 100%)
+    maturity: 1.0                # 12m
+    per_year: 252                # daily fixings (SPEC 6.1, A = 252)
+    vol_ko: [0.20, 0.25, 0.30, 0.35, 0.40]
+  n_paths: 400000                # the M4c headline budget
+  bootstrap: {replicates: 200}
+  store_check: true
+  realised:
+    history: essvi_gate/hdn_history_repaired.csv   # under the outputs root (M10 Part 0)
+    command: ".venv/bin/python scripts/m7_hdn_history.py --tag _repaired --out outputs/essvi_gate"
+    start: "2022-07-01"          # the first close of the 2022 H2 sample (quoted: a string)
+    pillar: 1.0                  # the 12m marks of the start date

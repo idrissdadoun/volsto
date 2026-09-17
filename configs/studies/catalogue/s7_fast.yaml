@@ -1,0 +1,14 @@
+# S7 CI-fast variant: the same study on the synthetic M8b outputs of
+# tests/_synthetic_store.py::make_synthetic_outputs (the tests pass --outputs to the toy build's
+# outputs root).  Fast mode is plumbing, not numbers.
+name: s7_hedging_fast
+runner: volsto.studies.catalogue.s7_hedging
+grid: null
+store: outputs/store
+cache: cache
+outputs: outputs
+mode: fast
+seeds: {}
+params:
+  tables: [A, B, D]
+  headline_regimes: [sticky_strike, sticky_skew]

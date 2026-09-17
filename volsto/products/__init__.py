@@ -53,6 +53,15 @@ from volsto.products.gap import (
     conservative_shift,
     month_grid,
 )
+from volsto.products.seasoning import (
+    RealisedCashFlow,
+    RealisedHistory,
+    Replay,
+    Settled,
+    SettledCash,
+    replay,
+    season,
+)
 from volsto.products.vanilla import DigitalOption, EuropeanOption
 from volsto.products.variance import FVA, ForwardVarianceSwap, VarianceSwap, VolSwap
 from volsto.products.vko import VolKnockOutPut
@@ -90,7 +99,12 @@ __all__ = [
     "Phoenix",
     "Portfolio",
     "Product",
+    "RealisedCashFlow",
+    "RealisedHistory",
+    "Replay",
     "ReverseCliquet",
+    "Settled",
+    "SettledCash",
     "StatisticLeg",
     "UpVar",
     "VarianceSwap",
@@ -105,6 +119,8 @@ __all__ = [
     "forward_start_strip",
     "month_grid",
     "parse_cp",
+    "replay",
+    "season",
     "shift_times",
     "uniform_schedule",
 ]

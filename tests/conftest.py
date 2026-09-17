@@ -12,6 +12,17 @@ on a private copy) and ``tests/test_viewers_app.py`` (every page rendered headle
 stderr schema, relocatability, the two CLIs) consume it; the fixture directory stays intact.
 Under ``pytest -n auto`` the workers share one build (controller base temp + ``os.mkdir`` lock
 + ``done.json`` marker, stdlib only).  Wall clocks are recorded, never asserted.
+
+**The toy marking build** (M10 Part 2, for the S5 marking study): :func:`toy_marking_build` runs
+``volsto-precompute`` on ``configs/grids/toy_marking.yaml`` (the P1 marking fits at
+``ssr_target {1.0, 1.5} × skew_eps {0.05, 0.10}`` on the placeholder surface, at most 4 leverage
+calibrations at 2·10⁴ particles over a 1y horizon — an infeasible fit is stored without one — the
+LV point, M4 products at 4000 paths, no risk) as the single shard ``1/1`` into its own temporary
+directory, once per pytest run, with the same sharing, recording and skip rules and the same
+interface as :func:`toy_build` (``.require()``, ``.store_root``, ``.cache_root``,
+``.outputs_root``, ``.grid_path``; the synthetic M7 / M8b outputs beside it).  It is the second
+sanctioned calibrating site of the suite, and like the first it calibrates only when a test asks
+for it (``tests/test_catalogue_s1_s4.py::test_toy_marking_build`` and the S5 tests).
 """
 
 from __future__ import annotations
@@ -74,6 +85,9 @@ def rng() -> np.random.Generator:
 TOY_GRID = ROOT / "configs" / "grids" / "toy.yaml"
 #: The shards the fixture runs, in order (``volsto-precompute --shard``).
 TOY_SHARDS: tuple[str, ...] = ("1/2", "2/2")
+#: The toy marking grid (M10 Part 2) and its single shard.
+TOY_MARKING_GRID = ROOT / "configs" / "grids" / "toy_marking.yaml"
+TOY_MARKING_SHARDS: tuple[str, ...] = ("1/1",)
 #: Budget of the toy build (the owner's M9 brief: the toy half of a test skips with a reason
 #: when the build takes more than 3 min); reported, never asserted.
 TOY_BUDGET_S = 180.0
@@ -100,6 +114,8 @@ class ToyBuild:
     manifests: dict[str, list[dict[str, Any]]]
     built_by: str
     error: str = ""
+    #: the ``--shard`` values the build ran, in order
+    shards: tuple[str, ...] = TOY_SHARDS
 
     @property
     def store_root(self) -> Path:
@@ -121,7 +137,7 @@ class ToyBuild:
     def skip_reason(self) -> str:
         if self.error:
             return f"toy build failed: {self.error}"
-        if tuple(self.return_codes) != (0,) * len(TOY_SHARDS):
+        if tuple(self.return_codes) != (0,) * len(self.shards):
             return f"toy precompute returned {list(self.return_codes)}"
         if self.total_wall_s > TOY_BUDGET_S:
             return f"toy build took {self.total_wall_s:.0f} s > {TOY_BUDGET_S:.0f} s budget"
@@ -139,7 +155,7 @@ class ToyBuild:
         """The ``"calibrating"`` log records of ``logger`` (default: the precompute's own
         "leverage cache miss … calibrating at N particles" line, one per miss; the cache logs a
         second one under ``volsto.calibration.cache``) for ``shard`` or all shards."""
-        shards = TOY_SHARDS if shard is None else (shard,)
+        shards = self.shards if shard is None else (shard,)
         return [
             m
             for s in shards
@@ -167,11 +183,14 @@ def _shared_root(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return base.parent if os.environ.get("PYTEST_XDIST_WORKER") else base
 
 
-def _run_toy_precompute(root: Path) -> dict[str, Any]:
-    """The sanctioned toy calibration: ``volsto.viewers.precompute.main`` on the toy grid as
-    shards 1/2 then 2/2 into ``root/A/{store,cache}`` (in process, so the log records are
-    captured), then the synthetic M7 / M8b outputs beside them (``tests/_synthetic_store.py``,
-    no computation) — everything the pages read."""
+def _run_toy_precompute(
+    root: Path, grid: Path = TOY_GRID, shards: tuple[str, ...] = TOY_SHARDS
+) -> dict[str, Any]:
+    """The sanctioned toy calibration: ``volsto.viewers.precompute.main`` on ``grid`` (the toy
+    grid by default) as the ``shards`` in order (1/2 then 2/2 by default) into
+    ``root/A/{store,cache}`` (in process, so the log records are captured), then the synthetic
+    M7 / M8b outputs beside them (``tests/_synthetic_store.py``, no computation) — everything the
+    pages read."""
     from _synthetic_store import make_synthetic_outputs
 
     from volsto.calibration.cache import LeverageCache
@@ -179,7 +198,7 @@ def _run_toy_precompute(root: Path) -> dict[str, Any]:
 
     base = root / "A"
     store, cache = base / "store", base / "cache"
-    argv = ["--grid", str(TOY_GRID), "--store", str(store), "--cache", str(cache)]
+    argv = ["--grid", str(grid), "--store", str(store), "--cache", str(cache)]
     info: dict[str, Any] = {
         "return_codes": [],
         "wall_s": {},
@@ -193,7 +212,7 @@ def _run_toy_precompute(root: Path) -> dict[str, Any]:
     root_logger.addHandler(handler)
     root_logger.setLevel(logging.INFO)  # the "calibrating" / "resume" records are INFO
     try:
-        for s in TOY_SHARDS:
+        for s in shards:
             handler.messages = []
             buf = io.StringIO()
             t0 = time.perf_counter()
@@ -212,16 +231,15 @@ def _run_toy_precompute(root: Path) -> dict[str, Any]:
     return info
 
 
-@pytest.fixture(scope="session")
-def toy_build(tmp_path_factory: pytest.TempPathFactory) -> ToyBuild:
-    """The toy store + cache + outputs, built **exactly once per pytest run** (module
-    docstring).  Under ``pytest -n auto`` the workers share the build under the controller's
-    base temporary directory: the first worker to ``os.mkdir`` the lock builds and writes
-    ``done.json`` (atomically), the others wait for it up to :data:`TOY_WAIT_S`.  The fixture
-    never skips by itself — a failed or slow build is returned with its reason so every consumer
-    skips uniformly through :meth:`ToyBuild.require`.  Consumers must leave the directory
-    intact (copy it before writing anything)."""
-    root = _shared_root(tmp_path_factory) / "toy_precompute"
+def _session_build(
+    tmp_path_factory: pytest.TempPathFactory,
+    dirname: str,
+    grid: Path,
+    shards: tuple[str, ...],
+) -> ToyBuild:
+    """One shared build of ``grid`` under ``<controller base temp>/<dirname>`` (the sharing,
+    locking and recording of :func:`toy_build`)."""
+    root = _shared_root(tmp_path_factory) / dirname
     root.mkdir(exist_ok=True)
     done, lock = root / "done.json", root / "lock"
     if not done.exists():
@@ -234,7 +252,7 @@ def toy_build(tmp_path_factory: pytest.TempPathFactory) -> ToyBuild:
         else:
             info: dict[str, Any] = {"error": "toy build interrupted"}
             try:
-                info = _run_toy_precompute(root)
+                info = _run_toy_precompute(root, grid, shards)
             except Exception as exc:  # the toy half skips with the reason, the rest runs
                 info = {"error": f"{type(exc).__name__}: {exc}"}
             finally:
@@ -252,7 +270,7 @@ def toy_build(tmp_path_factory: pytest.TempPathFactory) -> ToyBuild:
     return ToyBuild(
         root=root,
         base=root / "A",
-        grid_path=TOY_GRID,
+        grid_path=grid,
         return_codes=tuple(int(rc) for rc in info.get("return_codes", [])),
         wall_s={str(k): float(v) for k, v in info.get("wall_s", {}).items()},
         stdout={str(k): str(v) for k, v in info.get("stdout", {}).items()},
@@ -260,4 +278,29 @@ def toy_build(tmp_path_factory: pytest.TempPathFactory) -> ToyBuild:
         manifests={str(k): list(v) for k, v in info.get("manifests", {}).items()},
         built_by=str(info.get("built_by", "")),
         error=str(info.get("error", "")),
+        shards=shards,
+    )
+
+
+@pytest.fixture(scope="session")
+def toy_build(tmp_path_factory: pytest.TempPathFactory) -> ToyBuild:
+    """The toy store + cache + outputs, built **exactly once per pytest run** (module
+    docstring).  Under ``pytest -n auto`` the workers share the build under the controller's
+    base temporary directory: the first worker to ``os.mkdir`` the lock builds and writes
+    ``done.json`` (atomically), the others wait for it up to :data:`TOY_WAIT_S`.  The fixture
+    never skips by itself — a failed or slow build is returned with its reason so every consumer
+    skips uniformly through :meth:`ToyBuild.require`.  Consumers must leave the directory
+    intact (copy it before writing anything)."""
+    return _session_build(tmp_path_factory, "toy_precompute", TOY_GRID, TOY_SHARDS)
+
+
+@pytest.fixture(scope="session")
+def toy_marking_build(tmp_path_factory: pytest.TempPathFactory) -> ToyBuild:
+    """The toy **marking** store + cache + outputs (module docstring): ``configs/grids/
+    toy_marking.yaml`` built once per pytest run as shard ``1/1``, shared across xdist workers
+    like :func:`toy_build`, with the same :class:`ToyBuild` interface (``.require()``,
+    ``.store_root``, ``.cache_root``, ``.outputs_root``, ``.grid_path``).  Consumers must leave
+    the directory intact."""
+    return _session_build(
+        tmp_path_factory, "toy_marking_precompute", TOY_MARKING_GRID, TOY_MARKING_SHARDS
     )

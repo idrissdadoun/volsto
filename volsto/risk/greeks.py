@@ -186,6 +186,8 @@ def theta(
     product: Product,
     state: RiskState,
     dt: float = BUSINESS_DAY,
+    *,
+    aged: Product | None = None,
 ) -> ThetaReport:
     """Theta per year from a one-business-day roll (SPEC v2 §7.3).
 
@@ -195,8 +197,14 @@ def theta(
     time decay), ``carry`` = the same difference with the actual curves minus ``decay`` (the
     rates/dividends part), ``roll_down = total − decay − carry``.  Aged products live on their own
     grid, so the errors of the two prices add in quadrature (no CRN).
+
+    ``aged`` (M10 Part 3) is the product seen ``dt`` later with the state held, default
+    ``product.aged(dt)`` — which raises for a fixing inside the roll window; a daily-fixed
+    product passes its seasoned form with the window's fixings at the held spot
+    (:func:`volsto.products.seasoning.season` on the history extended by the held close).
     """
-    aged = product.aged(dt)
+    if aged is None:
+        aged = product.aged(dt)
     rolled = state.with_perturbation(SurfacePerturbation("roll", {"dt": dt}), label="rolled")
     zero = state.with_zero_rates()
     total = engine.paired(
@@ -241,6 +249,39 @@ def theta(
         engine.sim.n_paths,
     )
     return ThetaReport(total, decay, carry, roll_down, dt)
+
+
+def rate_sensitivities(
+    engine: RiskEngine, product: Product, state: RiskState, rate_bp: float = 1e-4
+) -> dict[str, Sensitivity]:
+    """``rho`` and ``repo_delta``: forward differences for a parallel ``+rate_bp`` shift of the
+    rate and of the dividend curve (per 1 bp by default), recalibrated states — the rate items of
+    :func:`cross_greeks`, on their own for the P&L attribution (the rates step needs nothing
+    else)."""
+    out: dict[str, Sensitivity] = {}
+    out["rho"] = engine.combination(
+        "rho",
+        product,
+        [
+            (state.with_rate_shift(dr=rate_bp, label="r+1bp"), "recalibrate", 1.0),
+            (state, "recalibrate", -1.0),
+        ],
+        unit="per bp of rates",
+        size=rate_bp,
+        scheme="forward",
+    )
+    out["repo_delta"] = engine.combination(
+        "repo_delta",
+        product,
+        [
+            (state.with_rate_shift(dq=rate_bp, label="q+1bp"), "recalibrate", 1.0),
+            (state, "recalibrate", -1.0),
+        ],
+        unit="per bp of repo",
+        size=rate_bp,
+        scheme="forward",
+    )
+    return out
 
 
 def cross_greeks(
@@ -373,28 +414,7 @@ def cross_greeks(
         engine.sim.n_paths,
     )
     # rho and repo delta (per 1 bp)
-    out["rho"] = engine.combination(
-        "rho",
-        product,
-        [
-            (state.with_rate_shift(dr=rate_bp, label="r+1bp"), "recalibrate", 1.0),
-            (state, "recalibrate", -1.0),
-        ],
-        unit="per bp of rates",
-        size=rate_bp,
-        scheme="forward",
-    )
-    out["repo_delta"] = engine.combination(
-        "repo_delta",
-        product,
-        [
-            (state.with_rate_shift(dq=rate_bp, label="q+1bp"), "recalibrate", 1.0),
-            (state, "recalibrate", -1.0),
-        ],
-        unit="per bp of repo",
-        size=rate_bp,
-        scheme="forward",
-    )
+    out.update(rate_sensitivities(engine, product, state, rate_bp))
     # cross terms: model delta as a function of the vol-sto parameters (recalibrated)
     for name in params:
         h = default_params_bump(name, state.spec.model)

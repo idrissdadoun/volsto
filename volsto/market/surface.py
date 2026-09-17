@@ -142,18 +142,11 @@ class SSVISurface(ImpliedSurface):
     def from_config(
         cls, cfg: SSVIConfig, forward_curve: ForwardCurve, discount: DiscountCurve
     ) -> SSVISurface:
-        t = np.asarray(cfg.atm_maturities)
-        v = np.asarray(cfg.atm_vols)
-        return cls(
-            t,
-            v * v * t,
-            cfg.rho,
-            cfg.eta,
-            cfg.gamma,
-            forward_curve,
-            discount,
-            max_maturity=cfg.max_maturity,
-        )
+        """Alias of :func:`surface_from_config` (the one construction site of a surface from a
+        config): an eSSVI config gives an :class:`ESSVISurface`, never its flattened SSVI.
+        Library code calls the factory directly (``tests/test_surface_config.py`` walks the
+        package)."""
+        return surface_from_config(cfg, forward_curve, discount)
 
     @classmethod
     def flat_atm(
@@ -1052,6 +1045,48 @@ class ESSVISurface(SSVISurface):
             f"ESSVISurface(atm_maturities={self._t[1:].tolist()}, "
             f"rhos={np.round(self._rhos, 4).tolist()}, eta={self.eta}, gamma={self.gamma})"
         )
+
+
+def surface_from_config(
+    cfg: SSVIConfig, forward_curve: ForwardCurve, discount: DiscountCurve
+) -> SSVISurface:
+    """The implied surface of a surface config — **the one place a surface is built from a
+    config** (M10 Part 3, SPEC §13.2).
+
+    ``θ_i = σ_ATM,i² T_i`` at the pillars of ``cfg``; with ``cfg.rhos`` set the result is the
+    :class:`ESSVISurface` with ``ρ_T`` through the pillar correlations (its constructor re-runs
+    the calendar check on the exact ``∂_T w``), otherwise the plain :class:`SSVISurface` with the
+    scalar ``cfg.rho``.  The leverage cache's market (:func:`volsto.calibration.cache.
+    build_market`), the risk engine's states (:func:`volsto.risk.engine.surface_of`) and the
+    snapshot loader (:func:`volsto.market.loaders.load_ssvi_surface`) all build through here, so
+    an eSSVI snapshot is never flattened to one ``ρ`` on the way to a leverage calibration or a
+    risk bump.  ``tests/test_surface_config.py::test_every_surface_is_built_by_the_factory``
+    walks ``volsto/`` and ``scripts/`` for any other construction from a config;
+    ``test_calendar_certificate_survives_the_config_path`` re-proves the importer's calendar
+    certificate (SPEC §13.1) on the surface rebuilt here."""
+    t = np.asarray(cfg.atm_maturities)
+    v = np.asarray(cfg.atm_vols)
+    if cfg.rhos is None:
+        return SSVISurface(
+            t,
+            v * v * t,
+            cfg.rho,
+            cfg.eta,
+            cfg.gamma,
+            forward_curve,
+            discount,
+            max_maturity=cfg.max_maturity,
+        )
+    return ESSVISurface(
+        t,
+        v * v * t,
+        cfg.rhos,
+        cfg.eta,
+        cfg.gamma,
+        forward_curve,
+        discount,
+        max_maturity=cfg.max_maturity,
+    )
 
 
 # --------------------------------------------------------------------------------------------

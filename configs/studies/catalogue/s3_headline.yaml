@@ -1,0 +1,31 @@
+# S3 on the cached headline models only (runner volsto/studies/catalogue/s3_conditional_variance.py):
+# LV, 1F omega 1 / 2 / 3 at rho -0.7, kappa 1.5, and 2F Table 8.2 - runnable today (every
+# leverage is cached).  The rho and theta sweeps need configs/studies/catalogue/s3.yaml.
+name: s3_conditional_variance_headline
+runner: volsto.studies.catalogue.s3_conditional_variance
+grid: configs/grids/placeholder_cached.yaml
+store: outputs/store
+cache: cache
+outputs: outputs
+mode: full
+seeds: {pricing: 2024}
+params:
+  models:
+    surface: placeholder
+    lv: true
+    one_factor: {nu: all, rho: all, kappa: all}
+    two_factor: all
+  maturity: 1.0
+  per_year: 252
+  conditional_barriers: [0.9, 1.0, 1.1]
+  ko_barriers: [1.05, 1.10, 1.20]
+  n_paths: 400000
+  sweeps:
+    nu: {rho: -0.7, kappa: 1.5}
+    rho: {nu: 1.0, kappa: 1.5}
+  store_check: true
+  monitoring_order:                       # the O(dt) order of the current-close term, measured
+    barrier: 0.9                          # the down corridor's barrier
+    per_year: [63, 126, 252, 504]         # each frequency doubles the previous
+    n_paths: 100000
+    model: {nu: 1.5, rho: -0.7, kappa: 1.5}   # the 1F point measured beside the LV (omega 3)

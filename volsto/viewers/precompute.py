@@ -198,6 +198,7 @@ from volsto.viewers.grid import (
     parse_shard,
     resolve_marking,
     shard,
+    surface_digest,
 )
 from volsto.viewers.store import PointResult, ResultsStore, utc_now
 
@@ -891,6 +892,9 @@ def compute_point(
     row["cache_key"] = point.cache_key or ""
     row["n_particles"] = grid.particle.n_particles
     row["horizon"] = grid.particle.horizon
+    if point.mode == "marking":
+        # the id names the surface, not its content: --resume compares this digest
+        manifest["surface_digest"] = surface_digest(point.spec)
     if point.marking is not None:
         m = point.marking
         row["fit_status"] = m.status
@@ -1150,6 +1154,15 @@ def _stored_row(store: ResultsStore, point_id: str) -> pd.Series:
     return pd.read_parquet(store.point_dir(point_id) / "points.parquet").iloc[0]
 
 
+def _stored_manifest(store: ResultsStore, point_id: str) -> dict[str, Any]:
+    """A stored point's manifest entry (empty when the point has none)."""
+    path = store.point_dir(point_id) / "manifest.json"
+    if not path.exists():
+        return {}
+    entry = json.loads(path.read_text(encoding="utf-8"))
+    return dict(entry) if isinstance(entry, dict) else {}
+
+
 def pending_steps(
     point: GridPoint,
     store: ResultsStore,
@@ -1163,9 +1176,24 @@ def pending_steps(
     done; otherwise the refresh steps: ``"risk"`` when the stored ``risk_tier`` is below
     ``tier`` (LV / LSV points with a model), ``"diagnostics"`` when ``diagnostics`` is requested
     and the LSV point's cache entry has no ``diagnostics.json``.  Infeasible marking points are
-    done once stored (no model)."""
+    done once stored (no model).  A stored marking point whose manifest's ``surface_digest``
+    (:func:`~volsto.viewers.grid.surface_digest`; absent before M10 Part 3) differs from the
+    grid surface's is stale — its id names the surface, not its content — and is recomputed
+    (``("all",)``, logged)."""
     if not store.has_point(point.id):
         return ("all",)
+    if point.mode == "marking":
+        stored_digest = _stored_manifest(store, point.id).get("surface_digest")
+        current = surface_digest(point.spec)
+        if stored_digest != current:
+            log.info(
+                "resume: %s is stale — its stored surface digest %s differs from the grid "
+                "surface's %s; recomputing",
+                point.label,
+                str(stored_digest)[:12] if stored_digest else "(none recorded)",
+                current[:12],
+            )
+            return ("all",)
     row = _stored_row(store, point.id)
     status = str(row.get("status", "") or "")
     has_model = point.mode == "lv" or status != "infeasible"

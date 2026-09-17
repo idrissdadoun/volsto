@@ -1,0 +1,43 @@
+# S5 — marking: prices, Greeks and the implied dynamics across (ssr_target, skew_eps) on the SPX
+# snapshots (SPEC §10.2).  The binding map is fitted inline (the P1 marking fit without stage 3:
+# a parameter fit of seconds, not a leverage calibration); everything that needs a calibrated
+# leverage is read from the results store's marking points of the default grid
+# (marking:<surface>:ssr<s>:eps<e>) — until the grid run lands, the run prints the
+# volsto-precompute command and exits 2.
+name: s5_marking
+runner: volsto.studies.catalogue.s5_marking
+grid: configs/grids/default.yaml
+store: outputs/store
+cache: cache
+outputs: outputs
+mode: full
+seeds: {}                        # nothing is simulated here (the store priced at seed 2024)
+params:
+  surfaces: [spx_2022-12-30, spx_2022-09-15, spx_2022-12-02]
+  # the inline binding map: the grid's marks and the M7 report's map (ssr {1..2} x eps
+  # {0.05..0.3}, §15 Part 3) — 24 fits per snapshot, about 2 s each
+  binding_map:
+    ssr_target: [0.75, 1.0, 1.25, 1.5, 1.75, 2.0]
+    skew_eps: [0.05, 0.10, 0.20, 0.30]
+  # the mark every cost is measured against: the M8b marking (SPX ssr 1, eps 0.10)
+  reference_mark: {ssr_target: 1.0, skew_eps: 0.10}
+  # store product keys: M4 headline columns and '<product>:<column>' M6 cells
+  products:
+    - "autocall 3y:price"
+    - "phoenix 3y:price"
+    - cliquet_1y
+    - cliquet_2y
+    - vko_30
+    - kovar_110
+    - upvar_100
+    - downvar_100
+    - atm_vol
+    - vs_vol
+    - volswap_vol
+  ssr_pillars: [0.25, 1.0, 3.0]  # pillars of the store's ssr table shown (it holds 0.25-3y)
+  forward_windows: [[1.0, 2.0], [2.0, 3.0]]   # the store's two forward-smile windows
+  greeks:                        # the store's light-tier risk rows (volsto.risk.report names)
+    products: [autocall 3y, cliquet 1y]
+    names: ["delta[model]", "delta[sticky_strike]", "gamma[model]", "skew_tent[1y]",
+            "skew_tent[3y]", "fwd_var[1-3y]"]
+  recorded_m7_fits: true         # show m7/p1_marking_fits.csv, labelled as recorded

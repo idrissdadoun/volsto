@@ -18,6 +18,12 @@ sits relative to the ITM-conditional realised-vol distribution (owner, M4c revie
 ``vol_ko`` sweep of the ratio to the vanilla put and the distribution of ``σ_real`` conditional on
 ``S_T < K`` (10/50/90 percentiles and ``P(σ_real > vol_ko | ITM)``).  Checked by
 ``tests/test_conditional_variance.py``.
+
+Seasoned puts (M10 Part 3, SPEC §6.10): the realised state of
+:class:`~volsto.products.conditional_variance.RealisedVarianceSchedule` enters the budget test as
+``realised_sum_sq + Σ_future r_i² < vol_ko² N/A`` (``N`` the life's returns); a realised sum at or
+above the budget is a certain knock-out, which :func:`volsto.products.seasoning.season` settles
+at zero.  Checked by ``tests/test_seasoning.py``.
 """
 
 from __future__ import annotations
@@ -54,8 +60,22 @@ class VolKnockOutPut(RealisedVarianceSchedule):
         annualisation: float = 252.0,
         notional: float = 1.0,
         knock_in: bool = False,
+        reference_fixing: float | None = None,
+        realised_sum_sq: float = 0.0,
+        realised_count: int = 0,
+        seasoned: bool = False,
     ) -> None:
-        super().__init__(fixing_times, discount, notional, annualisation, daily_cap)
+        super().__init__(
+            fixing_times,
+            discount,
+            notional,
+            annualisation,
+            daily_cap,
+            reference_fixing=reference_fixing,
+            realised_sum_sq=realised_sum_sq,
+            realised_count=realised_count,
+            seasoned=seasoned,
+        )
         if strike <= 0 or vol_ko < 0:
             raise ValueError("strike must be positive and vol_ko non-negative")
         if abs(self._fixings[-1] - maturity) > 1e-9:
@@ -65,15 +85,21 @@ class VolKnockOutPut(RealisedVarianceSchedule):
         self.vol_ko = float(vol_ko)
         self.knock_in = bool(knock_in)
 
+    @property
+    def variance_budget(self) -> float:
+        """``vol_ko² N / A``: the sum of squared returns over the life that knocks the put out."""
+        return self.vol_ko**2 * self.n_returns / self.annualisation
+
     def statistics(self, paths: PathSet, idx: FixingIndex) -> dict[str, FloatArray]:
         ls = self.log_spots(paths, idx)
         r2 = self.squared_returns(ls)
         n = self.n_returns
-        budget = self.vol_ko**2 * n / self.annualisation
-        cum = np.cumsum(r2, axis=1)
+        budget = self.variance_budget
+        cum = self.realised_sum_sq + np.cumsum(r2, axis=1)
         alive = cum[:, -1] < budget
         breach = cum > budget
-        ko_time = np.where(alive, n + 1, np.argmax(breach, axis=1) + 1).astype(np.float64)
+        first = self.realised_count + np.argmax(breach, axis=1) + 1
+        ko_time = np.where(alive, n + 1, first).astype(np.float64)
         alive_f = alive.astype(np.float64)
         s_t = np.exp(ls[:, -1])
         return {
@@ -110,6 +136,7 @@ class VolKnockOutPut(RealisedVarianceSchedule):
                 annualisation=self.annualisation,
                 notional=-self.notional,
                 knock_in=True,
+                **self.state_kwargs(),
             ),
         ]
 
@@ -125,6 +152,7 @@ class VolKnockOutPut(RealisedVarianceSchedule):
             annualisation=self.annualisation,
             notional=self.notional,
             knock_in=self.knock_in,
+            **self.state_kwargs(),
         )
 
     def __repr__(self) -> str:
@@ -134,4 +162,5 @@ class VolKnockOutPut(RealisedVarianceSchedule):
             f"Vol {kind} put: strike {self.strike:g}, expiry {self.T:g}y, vol barrier "
             f"{self.vol_ko * 100:.4g}% checked at maturity ({self.n_returns} fixings, "
             f"A = {self.annualisation:g}{cap}), notional {self.notional:g}"
+            f"{self._seasoned_repr()}"
         )

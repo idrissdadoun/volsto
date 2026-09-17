@@ -54,6 +54,14 @@ the European knock-in the put leg is the interview-thread identity ``(K − S_T)
 ``decompose()`` returns the two components; the American knock-in has no static decomposition
 and :meth:`KIPutLeg.european_counterpart` is the leg it is reported against.  All legs sum to the
 payoff path by path.  Checked by ``tests/test_autocall.py``.
+
+Seasoned notes (M10 Part 3, SPEC §6.10; :func:`volsto.products.seasoning.season` re-indexes the
+remaining observation dates, coupons, non-call periods and monitoring dates): ``knocked_in``
+records a knock-in observed in the history (American type only: ``ki_breach = 1`` on every path,
+so the put leg is live whatever the remaining path does) and ``memory_coupons`` the Phoenix
+coupons missed since the last payment (added to the memory catch-up of the next paid coupon:
+``amount_j = memory_coupons 1{no payment before j} + Σ_{prev < m ≤ j} c_m``).  The defaults
+(``False``, 0) are the fresh note bit for bit (``tests/test_seasoning.py``).
 """
 
 from __future__ import annotations
@@ -143,6 +151,11 @@ class Autocall(Product):
             knock-in redemption independent) or ``"coupon_barrier"`` (the put loss only when
             ``S_{T_N} < CB S_ref``, the literal SPEC §6.6 sentence); see the module docstring.
             Must be ``"knock_in"`` without a coupon barrier.
+        knocked_in: a knock-in already observed (seasoned American note; module docstring).
+        memory_coupons: Phoenix coupons in memory (seasoned memory note; module docstring).
+        seasoned: the marker :func:`volsto.products.seasoning.season` sets on the notes it
+            returns (their dates count from the as-of date; a seasoned note is not seasoned
+            again).
         notional: scales every cash flow.
     """
 
@@ -165,6 +178,9 @@ class Autocall(Product):
         final_redemption: str = "knock_in",
         gap: GapSpec | None = None,
         notional: float = 1.0,
+        knocked_in: bool = False,
+        memory_coupons: float = 0.0,
+        seasoned: bool = False,
     ) -> None:
         super().__init__(discount, notional)
         obs = np.atleast_1d(np.asarray(observation_times, dtype=np.float64)).ravel()
@@ -272,6 +288,20 @@ class Autocall(Product):
                 "European knock-in); use ki_monitoring='discrete'"
             )
         self.gap = gap
+        if knocked_in and ki_type != "american":
+            raise ValueError(
+                "a European knock-in is observed at maturity only: knocked_in needs an American "
+                "knock-in"
+            )
+        if not (np.isfinite(memory_coupons) and memory_coupons >= 0.0):
+            raise ValueError("memory_coupons must be finite and non-negative")
+        if memory_coupons > 0.0 and not memory:
+            raise ValueError("memory_coupons need a memory Phoenix")
+        if gap is not None and gap.smart and (knocked_in or memory_coupons > 0.0):
+            raise NotImplementedError("the smart gap of a seasoned note (knock-in / memory state)")
+        self.knocked_in = bool(knocked_in)
+        self.memory_coupons = float(memory_coupons)
+        self.seasoned = bool(seasoned)
         self.ki_level = float(ki_level)
         self.ki_type = ki_type
         self.ki_monitoring = ki_monitoring
@@ -305,6 +335,9 @@ class Autocall(Product):
             "non_call_periods": self.non_call_periods,
             "final_redemption": self.final_redemption,
             "notional": self.notional,
+            "knocked_in": self.knocked_in,
+            "memory_coupons": self.memory_coupons,
+            "seasoned": self.seasoned,
         }
 
     def replace(self, **changes: Any) -> Autocall:
@@ -312,6 +345,13 @@ class Autocall(Product):
         ``ki_type="european", ki_monitoring=None, ki_fixing_times=None`` for the European
         counterpart of an American knock-in)."""
         return Autocall(**{**self._kwargs(), **changes})
+
+    @property
+    def is_seasoned(self) -> bool:
+        """Whether the note was seasoned (``seasoned``, set by
+        :func:`volsto.products.seasoning.season` — its dates then count from the as-of date) or
+        carries a knock-in / memory state."""
+        return self.seasoned or self.knocked_in or self.memory_coupons > 0.0
 
     @property
     def is_phoenix(self) -> bool:
@@ -358,7 +398,10 @@ class Autocall(Product):
     ) -> FloatArray:
         """``ki_breach``: the knock-in level breached at a monitoring date ``≤ life`` (0/1; a
         weight in ``[0, 1]`` for the continuous variant).  Discrete comparisons are strict and in
-        spot space (module docstring); ``s_t`` is the terminal spot column of the caller."""
+        spot space (module docstring); ``s_t`` is the terminal spot column of the caller.  A
+        knock-in observed in the history (``knocked_in``) is a breach on every path."""
+        if self.knocked_in:
+            return np.ones(paths.n_paths)
         b = self.ki_barrier
         if self.ki_type == "european":
             # the only monitoring date is T_N: an autocalled path never observes it
@@ -460,6 +503,7 @@ class Autocall(Product):
                 pay = alive & (spots >= self.coupon_barrier * s_ref)
             if self.memory:
                 cum = np.concatenate(([0.0], np.cumsum(c)))  # cum[j] = Σ_{m ≤ j} c_m, 1-based
+                cum[1:] += self.memory_coupons  # the coupons in memory at the time origin
                 pos = np.where(pay, dates[None, :], 0)
                 last = np.maximum.accumulate(pos, axis=1)  # last payment date ≤ i (0: none)
                 prev = np.concatenate(
@@ -666,9 +710,12 @@ class Autocall(Product):
 
     def _ki_state_by_date(self, paths: PathSet, idx: FixingIndex) -> FloatArray:
         """Knock-in level breached at a monitoring date ``≤ T_i`` (0/1 per path and date; the
-        European type has no status before its single date)."""
+        European type has no status before its single date; a knock-in in the history is a
+        breach at every date)."""
         obs = self.observation_times
         n = self.n_dates
+        if self.knocked_in:
+            return np.ones((paths.n_paths, n))
         out = np.zeros((paths.n_paths, n))
         if self.ki_type == "european":
             return out
@@ -682,7 +729,9 @@ class Autocall(Product):
 
     def _breached_by(self, paths: PathSet, idx: FixingIndex, t: float) -> BoolArray:
         """Knock-in status at ``t``: a fixing ``≤ t`` below the level (European: ``S_T < B``
-        when ``t`` is the maturity)."""
+        when ``t`` is the maturity); always once the history knocked in (``knocked_in``)."""
+        if self.knocked_in:
+            return np.ones(paths.n_paths, dtype=bool)
         if self.ki_type == "european":
             if t < self.maturity_date - _TOL:
                 return np.zeros(paths.n_paths, dtype=bool)
@@ -696,22 +745,37 @@ class Autocall(Product):
 
     def _memory_state_by_date(self, coupons: FloatArray) -> FloatArray:
         """Coupons missed and still recoverable just after each observation date (Phoenix with
-        memory; zeros otherwise): the scheduled coupons to date less the coupons paid to date
+        memory; zeros otherwise): the coupons in memory at the time origin
+        (``memory_coupons``) plus the scheduled coupons to date less the coupons paid to date
         (``coupons``: the per-date coupon amounts of the evaluation, ``(n_paths, N)``)."""
         n_paths, n = coupons.shape
         if not (self.is_phoenix and self.memory):
             return np.zeros((n_paths, n))
         cum_sched = np.cumsum(self.coupon_schedule)
-        state = cum_sched[None, :] - np.cumsum(coupons, axis=1)
+        state = self.memory_coupons + cum_sched[None, :] - np.cumsum(coupons, axis=1)
         return np.asarray(np.maximum(state, 0.0), dtype=np.float64)
 
     @staticmethod
     def _memory_at(memory_state: FloatArray, obs: FloatArray, t: float) -> FloatArray:
-        """Memory state at ``t``: the state after the last observation date ``≤ t``."""
+        """Memory state at ``t``: the state after the last observation date ``≤ t`` (zeros
+        before the first; :meth:`memory_at` adds a seasoned note's carried coupons)."""
         before = np.flatnonzero(obs <= t + _TOL)
         if before.size == 0:
             return np.zeros(memory_state.shape[0])
         return np.asarray(memory_state[:, before[-1]], dtype=np.float64)
+
+    def memory_at(self, paths: PathSet, idx: FixingIndex, t: float) -> FloatArray:
+        """Phoenix coupons in memory just after ``t`` per path (zeros without the memory
+        feature): ``memory_coupons`` before the first observation date, then the state of
+        :meth:`_memory_state_by_date` after the last date ``≤ t`` — the hedge state's memory
+        feature (:func:`volsto.hedging.state.hedge_state`)."""
+        if not (self.is_phoenix and self.memory):
+            return np.zeros(paths.n_paths)
+        obs = self.observation_times
+        if not np.any(obs <= t + _TOL):
+            return np.full(paths.n_paths, self.memory_coupons)
+        state = self._memory_state_by_date(self.coupon_amounts(paths, idx))
+        return self._memory_at(state, obs, t)
 
     def statistics(self, paths: PathSet, idx: FixingIndex) -> dict[str, FloatArray]:
         """Per-path undiscounted statistics: ``ac_index`` (first autocall date, 1-based, ``N + 1``
@@ -831,6 +895,10 @@ class Autocall(Product):
         else:
             ki = f"American KI {self.ki_level:.4g} continuous (Brownian bridge)"
         ncp = f", first {self.non_call_periods} dates non-call" if self.non_call_periods else ""
+        if self.knocked_in:
+            ki += " (knocked in: observed in the history)"
+        if self.memory_coupons:
+            kind += f", {self.memory_coupons:.4g} of coupons in memory"
         text = (
             f"{kind}; observation dates [{dates}]y, autocall barriers [{ac}]{ncp}; {ki}; "
             f"put strike 100% geared 1:1; levels x spot_reference {self.spot_reference:g}; "
@@ -1028,7 +1096,9 @@ class KIPutLeg(_AutocallLeg):
         if self.parent.ki_type == "european":
             return self
         return KIPutLeg(
-            self.parent.replace(ki_type="european", ki_monitoring=None, ki_fixing_times=None),
+            self.parent.replace(
+                ki_type="european", ki_monitoring=None, ki_fixing_times=None, knocked_in=False
+            ),
             self.component,
         )
 

@@ -18,17 +18,24 @@ The identity holds path by path (``tests/test_cliquet.py``), which is what
 
 The original study's structure is :meth:`AdditiveCliquet.study`: monthly fixings, local cap 2%,
 no local floor, global floor 0, maturities 1y and 2y.
+
+Seasoned cliquets (M10 Part 3, SPEC §6.10; :func:`volsto.products.seasoning.season`): the state
+inputs ``reference_fixing`` (the realised close that starts the running period: its return is
+``S_{t_1}/S_ref − 1``, a spot bump never moves it) and ``accrued`` (``Σ clip(r_i, LF, LC)`` over
+the realised periods) give ``clip(accrued + Σ_future clip(r_i, LF, LC), GF, GC)``; the defaults
+(``None``, 0) are the fresh cliquet bit for bit (``tests/test_seasoning.py``).
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypedDict
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 from volsto.products.base import CashFlow, Product, parse_cp, shift_times, uniform_schedule
 from volsto.products.forward_start import ForwardStartOption
+from volsto.products.variance import with_reference
 
 if TYPE_CHECKING:
     from volsto.engine.grid import FixingIndex
@@ -46,6 +53,15 @@ def _bound(x: float | None, default: float) -> float:
     return float(x)
 
 
+class CliquetBounds(TypedDict):
+    """The local and global bounds of an :class:`AdditiveCliquet` as constructor arguments."""
+
+    local_floor: float | None
+    local_cap: float | None
+    global_floor: float | None
+    global_cap: float | None
+
+
 def _fmt(x: float) -> str:
     return "none" if not np.isfinite(x) else f"{x * 100:g}%"
 
@@ -53,12 +69,26 @@ def _fmt(x: float) -> str:
 class _PeriodReturnProduct(Product):
     """Common schedule handling: ``n`` period returns over ``n + 1`` fixings (first may be 0)."""
 
-    def __init__(self, fixing_times: ArrayLike, discount: DiscountCurve, notional: float) -> None:
+    def __init__(
+        self,
+        fixing_times: ArrayLike,
+        discount: DiscountCurve,
+        notional: float,
+        *,
+        reference_fixing: float | None = None,
+    ) -> None:
         super().__init__(discount, notional)
         ft = np.unique(np.asarray(fixing_times, dtype=np.float64))
-        if ft.size < 2 or ft[0] < 0 or ft[-1] <= 0:
-            raise ValueError("need at least two non-negative fixing times ending after 0")
+        if reference_fixing is None:
+            if ft.size < 2 or ft[0] < 0 or ft[-1] <= 0:
+                raise ValueError("need at least two non-negative fixing times ending after 0")
+        else:
+            if ft.size < 1 or ft[0] <= 0:
+                raise ValueError("a seasoned cliquet needs its remaining fixings after the origin")
+            if not (np.isfinite(reference_fixing) and reference_fixing > 0):
+                raise ValueError("reference_fixing must be a positive close")
         self._fixings = ft
+        self.reference_fixing = None if reference_fixing is None else float(reference_fixing)
 
     @property
     def fixing_times(self) -> FloatArray:
@@ -66,11 +96,14 @@ class _PeriodReturnProduct(Product):
 
     @property
     def n_periods(self) -> int:
-        return int(self._fixings.size - 1)
+        """The periods still to fix (all of them when fresh)."""
+        return int(self._fixings.size - (1 if self.reference_fixing is None else 0))
 
     def period_returns(self, paths: PathSet, idx: FixingIndex) -> FloatArray:
-        """``(n_paths, n_periods)`` simple returns ``S_{t_i}/S_{t_{i-1}} − 1``."""
+        """``(n_paths, n_periods)`` simple returns ``S_{t_i}/S_{t_{i-1}} − 1`` (the first from
+        the realised reference close when seasoned)."""
         ls = paths.log_spot_at(idx.indices(self._fixings))
+        ls = with_reference(ls, self.reference_fixing)
         return np.asarray(np.exp(np.diff(ls, axis=1)) - 1.0, dtype=np.float64)
 
 
@@ -91,14 +124,25 @@ class AdditiveCliquet(_PeriodReturnProduct):
         global_floor: float | None = None,
         global_cap: float | None = None,
         notional: float = 1.0,
+        reference_fixing: float | None = None,
+        accrued: float = 0.0,
+        seasoned: bool = False,
     ) -> None:
-        super().__init__(fixing_times, discount, notional)
+        super().__init__(fixing_times, discount, notional, reference_fixing=reference_fixing)
         self.local_floor = _bound(local_floor, -np.inf)
         self.local_cap = _bound(local_cap, np.inf)
         self.global_floor = _bound(global_floor, -np.inf)
         self.global_cap = _bound(global_cap, np.inf)
         if self.local_floor > self.local_cap or self.global_floor > self.global_cap:
             raise ValueError("floors must not exceed caps")
+        if not np.isfinite(accrued):
+            raise ValueError("accrued must be finite")
+        if accrued != 0.0 and reference_fixing is None:
+            raise ValueError(
+                "realised periods need the reference fixing the running period starts on"
+            )
+        self.accrued = float(accrued)
+        self.seasoned = bool(seasoned)
 
     @classmethod
     def study(
@@ -131,28 +175,58 @@ class AdditiveCliquet(_PeriodReturnProduct):
     def has_global(self) -> bool:
         return bool(np.isfinite(self.global_floor) or np.isfinite(self.global_cap))
 
+    @property
+    def is_seasoned(self) -> bool:
+        """Whether the cliquet was seasoned (``seasoned``, set by
+        :func:`volsto.products.seasoning.season`, or a realised state; the defaults are the
+        fresh cliquet)."""
+        return self.seasoned or self.reference_fixing is not None
+
+    def terms(self, *, with_global: bool = True) -> CliquetBounds:
+        """The bounds as constructor arguments (``None`` for an absent bound; the global ones
+        ``None`` too without ``with_global``)."""
+
+        def b(x: float) -> float | None:
+            return None if not np.isfinite(x) else x
+
+        return CliquetBounds(
+            local_floor=b(self.local_floor),
+            local_cap=b(self.local_cap),
+            global_floor=b(self.global_floor) if with_global else None,
+            global_cap=b(self.global_cap) if with_global else None,
+        )
+
     def without_global(self) -> AdditiveCliquet:
         """Same local structure without the global floor/cap (the accumulated sum itself)."""
         return AdditiveCliquet(
             self._fixings,
             self.discount,
-            local_floor=None if not np.isfinite(self.local_floor) else self.local_floor,
-            local_cap=None if not np.isfinite(self.local_cap) else self.local_cap,
+            **self.terms(with_global=False),
             notional=self.notional,
+            reference_fixing=self.reference_fixing,
+            accrued=self.accrued,
+            seasoned=self.seasoned,
         )
 
     def local_returns(self, paths: PathSet, idx: FixingIndex) -> FloatArray:
         return np.clip(self.period_returns(paths, idx), self.local_floor, self.local_cap)
 
     def accumulated(self, paths: PathSet, idx: FixingIndex) -> FloatArray:
-        """``Σ_i clip(r_i, LF, LC)`` per path (before the global floor/cap)."""
-        return np.asarray(np.sum(self.local_returns(paths, idx), axis=1), dtype=np.float64)
+        """``Σ_i clip(r_i, LF, LC)`` per path (before the global floor/cap), the realised
+        ``accrued`` included."""
+        return np.asarray(
+            self.accrued + np.sum(self.local_returns(paths, idx), axis=1), dtype=np.float64
+        )
 
     def payoff(self, paths: PathSet, idx: FixingIndex) -> FloatArray:
         total = np.clip(self.accumulated(paths, idx), self.global_floor, self.global_cap)
         return np.asarray(self.notional * float(self.df(self.maturity)) * total, dtype=np.float64)
 
     def decompose(self) -> list[Product]:
+        if self.is_seasoned:
+            raise NotImplementedError(
+                "decompose() of a seasoned cliquet (its running period starts on a realised close)"
+            )
         T = self.maturity
         parts: list[Product] = []
         cash = 0.0
@@ -185,19 +259,25 @@ class AdditiveCliquet(_PeriodReturnProduct):
         return AdditiveCliquet(
             shift_times(self._fixings, dt),
             self.discount,
-            local_floor=None if not np.isfinite(self.local_floor) else self.local_floor,
-            local_cap=None if not np.isfinite(self.local_cap) else self.local_cap,
-            global_floor=None if not np.isfinite(self.global_floor) else self.global_floor,
-            global_cap=None if not np.isfinite(self.global_cap) else self.global_cap,
+            **self.terms(),
             notional=self.notional,
+            reference_fixing=self.reference_fixing,
+            accrued=self.accrued,
+            seasoned=self.seasoned,
         )
 
     def __repr__(self) -> str:
+        seasoned = (
+            ""
+            if self.reference_fixing is None
+            else f"; seasoned: running period from the realised close {self.reference_fixing:g}, "
+            f"accrued capped returns {self.accrued:.6g}"
+        )
         return (
             f"Additive cliquet: {self.n_periods} periods to {self.maturity:g}y, local floor "
             f"{_fmt(self.local_floor)}, local cap {_fmt(self.local_cap)}, global floor "
             f"{_fmt(self.global_floor)}, global cap {_fmt(self.global_cap)}, "
-            f"notional {self.notional:g}"
+            f"notional {self.notional:g}{seasoned}"
         )
 
 

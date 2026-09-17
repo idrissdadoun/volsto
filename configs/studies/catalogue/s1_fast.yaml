@@ -1,0 +1,25 @@
+# S1 CI-fast variant (runner volsto/studies/catalogue/s1_forward_vol.py): the toy store of
+# tests/conftest.py::toy_build (toy grid: LV + 1F nu 0.25 / 0.5 at rho -0.7, kappa 1.5 + 2F
+# Table 8.2; 2e4 particles, 1y horizon, 4000 paths, cliquet 1y only).  The tests pass
+# --grid/--store/--cache/--outputs.  Plumbing, not numbers: the 2y -> 3y window lies beyond the
+# toy horizon, and the baseline comparison is run to exercise the code (the budgets differ from
+# the baseline's, which the study says).
+name: s1_forward_vol_fast
+runner: volsto.studies.catalogue.s1_forward_vol
+grid: configs/grids/toy.yaml
+store: outputs/store
+cache: cache
+outputs: outputs
+mode: fast
+seeds: {pricing: 2024}
+params:
+  models:
+    surface: placeholder
+    lv: true
+    one_factor: {nu: all, rho: all, kappa: all}
+    two_factor: all
+  headline: {rho: -0.7, kappa: 1.5}
+  cliquet_maturities: [1.0]
+  price_missing: true
+  pricing: {n_paths: 4000}
+  baseline: {file: tests/test_m4_regression.py, variable: PLACEHOLDER_BASELINES}

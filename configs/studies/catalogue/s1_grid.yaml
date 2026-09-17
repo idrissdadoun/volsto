@@ -1,0 +1,25 @@
+# S1 over the default grid (runner volsto/studies/catalogue/s1_forward_vol.py): the whole 1F nu
+# grid on the placeholder surface (nu 0.25..1.5 x rho -0.9..0 x kappa 0.5 / 1.5 / 4, 90 LSV
+# points), the LV point and the 2F preset.  Only the 4 headline leverages are cached today: the
+# run prints the volsto-precompute line for the rest (the VM grid run, docs/vm_grid_run.md) and
+# exits 2.  Points in the store are read; a point absent from the store whose leverage is cached
+# is priced here (price_missing).
+name: s1_forward_vol_grid
+runner: volsto.studies.catalogue.s1_forward_vol
+grid: configs/grids/default.yaml
+store: outputs/store
+cache: cache
+outputs: outputs
+mode: full
+seeds: {pricing: 2024}
+params:
+  models:
+    surface: placeholder
+    lv: true
+    one_factor: {nu: all, rho: all, kappa: all}
+    two_factor: all
+  headline: {rho: -0.7, kappa: 1.5}
+  cliquet_maturities: [1.0, 2.0]
+  price_missing: true
+  pricing: {n_paths: 400000}
+  baseline: {file: tests/test_m4_regression.py, variable: PLACEHOLDER_BASELINES}

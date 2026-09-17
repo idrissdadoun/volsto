@@ -117,6 +117,24 @@ class DiscountCurve:
         idx = np.clip(idx, 0, self._fwd.size - 1)
         return self._fwd[idx]
 
+    def rolled(self, t0: float) -> DiscountCurve:
+        """The curve seen ``t0`` years later on today's forwards:
+        ``DF_{t0}(τ) = DF(t0 + τ) / DF(t0)`` (the pillars after ``t0`` shifted by ``−t0``, the
+        forward of the segment holding ``t0`` down to the first of them, the last forward beyond;
+        ``self`` when ``t0 = 0``).  The default as-of curve of a seasoned trade
+        (:mod:`volsto.products.seasoning`).  Checked by
+        ``tests/test_seasoning.py::test_settled_value_uses_the_as_of_curve``."""
+        t0 = float(t0)
+        if not np.isfinite(t0) or t0 < 0:
+            raise ValueError("t0 must be finite and non-negative")
+        if t0 == 0.0:
+            return self
+        knots = self._times[self._times > t0] - t0
+        if knots.size == 0:
+            return DiscountCurve([1.0], [float(self._fwd[-1])])
+        log_df = self.log_df(knots + t0) - self.log_df(t0)
+        return DiscountCurve(knots, -log_df / knots)
+
     def __repr__(self) -> str:
         return f"DiscountCurve(times={self.times.tolist()}, rates={self.zero_rates.tolist()})"
 

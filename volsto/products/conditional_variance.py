@@ -21,6 +21,13 @@ simulation grid.
   K² τ/N ]`` where the knock-out day's own return accrues.  Continuous monitoring and variants
   (a)/(c) raise ``NotImplementedError``.
 
+Seasoned products (M10 Part 3, SPEC §6.10; :func:`volsto.products.seasoning.season`): the
+schedule carries ``reference_fixing`` (the last realised close, prepended to the path's fixings
+as a constant column), ``realised_sum_sq`` (``Σ r_i²``, capped, over the realised returns) and
+``realised_count``; ``N`` counts every return of the life.  The knock-out swap's ``τ`` is then
+``realised_count`` plus the stopping index of the remaining returns (a realised knock-out is a
+settled trade, never a live seasoned one).  The defaults are the fresh products bit for bit.
+
 Fair strikes are ratios of expectations (``K² = A E[Σ r_i² I_i] / E[D]`` for the conditional
 convention, ``A E[Σ_{i≤τ} r_i²] / E[τ]`` for the knock-out swap, ``(A/N) E[Σ r_i² I_i]`` for the
 corridor); :func:`volsto.analytics.conditional_variance.fair_strike` estimates them with a
@@ -37,7 +44,7 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 from volsto.products.base import Product, shift_times
-from volsto.products.variance import VarianceSwap
+from volsto.products.variance import VarianceSwap, realised_state, with_reference
 
 if TYPE_CHECKING:
     from volsto.config import SimConfig
@@ -63,11 +70,19 @@ class RealisedVarianceSchedule(Product):
         notional: float,
         annualisation: float,
         daily_cap: float | None,
+        *,
+        reference_fixing: float | None = None,
+        realised_sum_sq: float = 0.0,
+        realised_count: int = 0,
+        seasoned: bool = False,
     ) -> None:
         super().__init__(discount, notional)
         ft = np.unique(np.asarray(fixing_times, dtype=np.float64))
-        if ft.size < 2 or ft[0] < 0 or ft[-1] <= 0:
-            raise ValueError("need at least two non-negative fixing times ending after 0")
+        if reference_fixing is None:
+            if ft.size < 2 or ft[0] < 0 or ft[-1] <= 0:
+                raise ValueError("need at least two non-negative fixing times ending after 0")
+        elif ft.size < 1 or ft[0] <= 0:
+            raise ValueError("a seasoned product needs its remaining fixings after the time origin")
         if annualisation <= 0:
             raise ValueError("annualisation must be positive")
         if daily_cap is not None and daily_cap <= 0:
@@ -75,18 +90,49 @@ class RealisedVarianceSchedule(Product):
         self._fixings = ft
         self.annualisation = float(annualisation)
         self.daily_cap = None if daily_cap is None else float(daily_cap)
+        self.reference_fixing, self.realised_sum_sq, self.realised_count = realised_state(
+            reference_fixing, realised_sum_sq, realised_count
+        )
+        self.seasoned = bool(seasoned)
 
     @property
     def fixing_times(self) -> FloatArray:
         return self._fixings
 
     @property
+    def is_seasoned(self) -> bool:
+        """Whether the product was seasoned (``seasoned``, set by
+        :func:`volsto.products.seasoning.season`, or a realised state; the defaults are the
+        fresh product)."""
+        return self.seasoned or self.reference_fixing is not None
+
+    @property
     def n_returns(self) -> int:
-        return int(self._fixings.size - 1)
+        """``N``: returns over the life, the realised ones included."""
+        future = self._fixings.size - (1 if self.reference_fixing is None else 0)
+        return int(self.realised_count + future)
+
+    def state_kwargs(self) -> dict[str, Any]:
+        """The realised-state constructor arguments."""
+        return {
+            "reference_fixing": self.reference_fixing,
+            "realised_sum_sq": self.realised_sum_sq,
+            "realised_count": self.realised_count,
+            "seasoned": self.seasoned,
+        }
+
+    def _seasoned_repr(self) -> str:
+        if self.reference_fixing is None:
+            return ""
+        return (
+            f"; seasoned: {self.realised_count} of {self.n_returns} returns realised (sum of "
+            f"squares {self.realised_sum_sq:.6g}, reference fixing {self.reference_fixing:g})"
+        )
 
     def log_spots(self, paths: PathSet, idx: FixingIndex) -> FloatArray:
-        """``ln S`` at the fixings, ``(n_paths, N + 1)``."""
-        return paths.log_spot_at(idx.indices(self._fixings))
+        """``ln S`` at the fixings, ``(n_paths, N + 1)``; for a seasoned product the realised
+        reference close followed by the remaining fixings, ``(n_paths, m + 1)``."""
+        return with_reference(paths.log_spot_at(idx.indices(self._fixings)), self.reference_fixing)
 
     def squared_returns(self, ls: FloatArray) -> FloatArray:
         """``r_i²`` (capped at ``daily_cap²`` when set), ``(n_paths, N)``."""
@@ -341,8 +387,22 @@ class KnockOutVarianceSwap(RealisedVarianceSchedule):
         daily_cap: float | None = None,
         annualisation: float = 252.0,
         notional: float = 1.0,
+        reference_fixing: float | None = None,
+        realised_sum_sq: float = 0.0,
+        realised_count: int = 0,
+        seasoned: bool = False,
     ) -> None:
-        super().__init__(fixing_times, discount, notional, annualisation, daily_cap)
+        super().__init__(
+            fixing_times,
+            discount,
+            notional,
+            annualisation,
+            daily_cap,
+            reference_fixing=reference_fixing,
+            realised_sum_sq=realised_sum_sq,
+            realised_count=realised_count,
+            seasoned=seasoned,
+        )
         if barrier <= 0 or strike_vol < 0:
             raise ValueError("barrier must be positive and strike_vol non-negative")
         if direction not in SIDES:
@@ -357,11 +417,24 @@ class KnockOutVarianceSwap(RealisedVarianceSchedule):
         self.strict = bool(strict)
         self.monitoring = monitoring
         self.variant = variant
+        if self.reference_fixing is not None and bool(
+            self.beyond_barrier(np.array([np.log(self.reference_fixing)]))[0]
+        ):
+            raise ValueError(
+                "the reference fixing lies beyond the barrier: the swap has knocked out "
+                "(a settled trade, volsto.products.seasoning.season)"
+            )
+
+    def beyond_barrier(self, ls: FloatArray) -> NDArray[np.bool_]:
+        """Whether each log close lies in the knock-out region (the monitoring comparison)."""
+        return _in_region(ls, np.log(self.barrier), self.direction, self.strict)
 
     def stopping_index(self, ls: FloatArray) -> NDArray[np.int64]:
-        """``τ = min(j, N)`` with ``j`` the first close (including ``S_0``) beyond the barrier."""
-        hit = _in_region(ls, np.log(self.barrier), self.direction, self.strict)
-        n = self.n_returns
+        """``τ = min(j, m)`` with ``j`` the first close of ``ls`` (including its first column,
+        ``S_0`` or the realised reference) beyond the barrier and ``m = ls.shape[1] − 1`` the
+        returns it spans."""
+        hit = self.beyond_barrier(ls)
+        n = int(ls.shape[1]) - 1
         any_hit = hit.any(axis=1)
         first = np.argmax(hit, axis=1)
         return np.where(any_hit, np.minimum(first, n), n).astype(np.int64)
@@ -369,15 +442,17 @@ class KnockOutVarianceSwap(RealisedVarianceSchedule):
     def statistics(self, paths: PathSet, idx: FixingIndex) -> dict[str, FloatArray]:
         ls = self.log_spots(paths, idx)
         n = self.n_returns
+        m = ls.shape[1] - 1  # the remaining returns (all of them when fresh)
         tau = self.stopping_index(ls)
         r2 = self.squared_returns(ls)
-        alive = (np.arange(1, n + 1)[None, :] <= tau[:, None]).astype(np.float64)
-        accrued = self.annualisation / n * np.sum(r2 * alive, axis=1)
+        alive = (np.arange(1, m + 1)[None, :] <= tau[:, None]).astype(np.float64)
+        accrued = self.annualisation / n * (self.realised_sum_sq + np.sum(r2 * alive, axis=1))
+        tau_life = self.realised_count + tau
         return {
             "accrued": accrued,
-            "count": tau / n,
-            "ko": (tau < n).astype(np.float64),
-            "tau": tau.astype(np.float64),
+            "count": tau_life / n,
+            "ko": (tau < m).astype(np.float64),
+            "tau": tau_life.astype(np.float64),
         }
 
     def payoff(self, paths: PathSet, idx: FixingIndex) -> FloatArray:
@@ -396,6 +471,7 @@ class KnockOutVarianceSwap(RealisedVarianceSchedule):
             daily_cap=self.daily_cap,
             annualisation=self.annualisation,
             notional=self.notional,
+            **self.state_kwargs(),
         )
 
     def __repr__(self) -> str:
@@ -406,5 +482,5 @@ class KnockOutVarianceSwap(RealisedVarianceSchedule):
             f"Knock-out variance swap (close-to-close, variant b): out when S {op} "
             f"{self.barrier:g}, {self.n_returns} returns to {self.maturity:g}y, strike "
             f"{self.strike_vol * 100:.4g}% vol, A = {self.annualisation:g}, "
-            f"variance notional {self.notional:g}"
+            f"variance notional {self.notional:g}{self._seasoned_repr()}"
         )

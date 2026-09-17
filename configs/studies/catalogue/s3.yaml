@@ -1,0 +1,33 @@
+# S3 - conditional and knock-out variance (runner volsto/studies/catalogue/s3_conditional_variance.py)
+# on configs/grids/s3_ko_var.yaml: LV, the 1F nu x rho grid at kappa 1.5 and the Table 8.2 theta
+# sweep, priced here from the cached leverage on one path set per model.  Only the three
+# degenerate 1F leverages and Table 8.2 are cached today: the run prints the volsto-precompute
+# line for the other 31 points and exits 2.
+name: s3_conditional_variance
+runner: volsto.studies.catalogue.s3_conditional_variance
+grid: configs/grids/s3_ko_var.yaml
+store: outputs/store
+cache: cache
+outputs: outputs
+mode: full
+seeds: {pricing: 2024}
+params:
+  models:
+    surface: placeholder
+    lv: true
+    one_factor: {nu: all, rho: all, kappa: [1.5]}
+    two_factor: all
+  maturity: 1.0
+  per_year: 252
+  conditional_barriers: [0.9, 1.0, 1.1]   # SPEC 6.1 ordering test barriers
+  ko_barriers: [1.05, 1.10, 1.20]         # SPEC 6.1 KO test barriers
+  n_paths: 400000
+  sweeps:
+    nu: {rho: -0.7, kappa: 1.5}           # the headline slice
+    rho: {nu: 1.0, kappa: 1.5}            # omega = 2
+  store_check: true
+  monitoring_order:                       # the O(dt) order of the current-close term, measured
+    barrier: 0.9                          # the down corridor's barrier
+    per_year: [63, 126, 252, 504]         # each frequency doubles the previous
+    n_paths: 100000
+    model: {nu: 1.5, rho: -0.7, kappa: 1.5}   # the 1F point measured beside the LV (omega 3)

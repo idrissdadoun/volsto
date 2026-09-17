@@ -593,8 +593,8 @@ class CalendarRepairConfig:
     ``tests/test_calendar_repair.py``.
 
     Not part of :class:`volsto.config.SSVIConfig` on purpose: the repair changes the fitted
-    parameters, not the surface definition, and a new ``SSVIConfig`` field would change every
-    leverage cache key."""
+    parameters, not the surface definition (a surface config carries what the fit returned — its
+    pillar ``rhos`` included, SPEC §13.2 — never how it was repaired)."""
 
     k_max: float = 3.0
     """Half-width in ``k`` of the invariant: the Dupire range (``LocalVolConfig.k_min`` /

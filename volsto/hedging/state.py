@@ -41,6 +41,15 @@ product                                 extra features / termination
 ``CashFlow``                            none
 ======================================  ================================================
 
+**Seasoned products** (:func:`volsto.products.seasoning.season`, SPEC §6.10) are handled with
+their realised state: the variance products' and the cliquet's realised reference close is the
+start of the first period (``u``, the accrued sums) and their realised sums are added
+(``realised_sum_sq``, ``accrued``); the VKO's budget is the whole life's; a seasoned note's
+knock-in (``knocked_in``) is a breach at every date and its carried memory coupons enter the
+memory feature.  The features equal those of the fresh product on the full path (the realised
+closes followed by the simulated future), checked by
+``tests/test_seasoning.py::test_hedge_state_of_seasoned_products``.
+
 Any other product gets no extra feature and a note (``HedgeState.notes``): its conditional value
 is then regressed on the spot and factor state only, which is exact for state-independent
 payoffs and an approximation otherwise — reported, never silent.  **Why the period start
@@ -64,6 +73,7 @@ from numpy.typing import NDArray
 from volsto.engine.grid import FixingIndex
 from volsto.engine.paths import PathSet
 from volsto.products.base import CashFlow, Portfolio, Product
+from volsto.products.variance import with_reference
 
 FloatArray = NDArray[np.float64]
 BoolArray = NDArray[np.bool_]
@@ -100,25 +110,51 @@ def _fixings_up_to(fixings: FloatArray, t: float) -> FloatArray:
     return np.asarray(fixings[fixings <= t + _TOL], dtype=np.float64)
 
 
-def _u_period(paths: PathSet, idx: FixingIndex, fixings: FloatArray, t: float) -> FloatArray:
+def _u_period(
+    paths: PathSet,
+    idx: FixingIndex,
+    fixings: FloatArray,
+    t: float,
+    reference: float | None = None,
+) -> FloatArray:
     """``ln S_t − ln S_start``, the log return of the period in progress (``S_start`` the last
-    fixing ``≤ t``; 0 at a fixing date and before the first fixing) — a feature that moves one
-    for one with ``ln S_t`` when the history is held, hence its ``u_`` prefix."""
+    fixing ``≤ t``, or a seasoned product's realised ``reference`` close before its first
+    remaining fixing; 0 at a fixing date and before the first fixing of a fresh product) — a
+    feature that moves one for one with ``ln S_t`` when the history is held, hence its ``u_``
+    prefix."""
     done = _fixings_up_to(fixings, t)
     col_t = idx[float(t)]
     if done.size == 0:
-        return np.zeros(paths.n_paths)
+        if reference is None:
+            return np.zeros(paths.n_paths)
+        return np.asarray(paths.log_spot_at(col_t) - np.log(reference), dtype=np.float64)
     start = paths.log_spot_at(idx[float(done[-1])])
     return np.asarray(paths.log_spot_at(col_t) - start, dtype=np.float64)
 
 
-def _accrued_sq(paths: PathSet, idx: FixingIndex, fixings: FloatArray, t: float) -> FloatArray:
-    """Sum of squared log returns over the fixings ``≤ t`` (0 with fewer than two)."""
+def _done_log_spots(
+    paths: PathSet, idx: FixingIndex, fixings: FloatArray, t: float, reference: float | None
+) -> FloatArray:
+    """``ln S`` at the fixings ``≤ t``, a seasoned product's realised reference close first."""
     done = _fixings_up_to(fixings, t)
-    if done.size < 2:
-        return np.zeros(paths.n_paths)
-    ls = paths.log_spot_at(idx.indices(done))
-    return np.asarray(np.sum(np.diff(ls, axis=1) ** 2, axis=1), dtype=np.float64)
+    ls = paths.log_spot_at(idx.indices(done)) if done.size else np.zeros((paths.n_paths, 0))
+    return with_reference(np.asarray(ls, dtype=np.float64), reference)
+
+
+def _accrued_sq(
+    paths: PathSet,
+    idx: FixingIndex,
+    fixings: FloatArray,
+    t: float,
+    reference: float | None = None,
+    realised: float = 0.0,
+) -> FloatArray:
+    """Sum of squared log returns over the fixings ``≤ t`` (0 with fewer than two), plus a
+    seasoned product's ``realised`` sum, its returns starting from the ``reference`` close."""
+    ls = _done_log_spots(paths, idx, fixings, t, reference)
+    if ls.shape[1] < 2:
+        return np.full(paths.n_paths, realised)
+    return np.asarray(realised + np.sum(np.diff(ls, axis=1) ** 2, axis=1), dtype=np.float64)
 
 
 def _terminated(
@@ -166,8 +202,9 @@ def hedge_state(product: Product, paths: PathSet, idx: FixingIndex, t: float) ->
             t, feats, np.ones(n, dtype=bool), np.full(n, np.nan), ("started", "u_start")
         )
     if isinstance(product, VarianceSwap | VolSwap):
-        acc = _accrued_sq(paths, idx, product.fixing_times, t)
-        start = _u_period(paths, idx, product.fixing_times, t)
+        ref = product.reference_fixing
+        acc = _accrued_sq(paths, idx, product.fixing_times, t, ref, product.realised_sum_sq)
+        start = _u_period(paths, idx, product.fixing_times, t, ref)
         return HedgeState(
             t,
             np.column_stack([acc, start]),
@@ -180,14 +217,14 @@ def hedge_state(product: Product, paths: PathSet, idx: FixingIndex, t: float) ->
     if isinstance(product, AdditiveCliquet | ReverseCliquet):
         inner = product if isinstance(product, AdditiveCliquet) else product._inner()
         fx = inner.fixing_times
-        done = _fixings_up_to(fx, t)
-        if done.size < 2:
-            acc = np.zeros(n)
+        ref = inner.reference_fixing
+        ls = _done_log_spots(paths, idx, fx, t, ref)
+        if ls.shape[1] < 2:
+            acc = np.full(n, inner.accrued)
         else:
-            ls = paths.log_spot_at(idx.indices(done))
             r = np.exp(np.diff(ls, axis=1)) - 1.0
-            acc = np.sum(np.clip(r, inner.local_floor, inner.local_cap), axis=1)
-        start = _u_period(paths, idx, fx, t)
+            acc = inner.accrued + np.sum(np.clip(r, inner.local_floor, inner.local_cap), axis=1)
+        start = _u_period(paths, idx, fx, t, ref)
         return HedgeState(
             t,
             np.column_stack([acc, start]),
@@ -215,33 +252,34 @@ def hedge_state(product: Product, paths: PathSet, idx: FixingIndex, t: float) ->
     if isinstance(product, KnockOutVarianceSwap):
         from volsto.products.conditional_variance import _in_region
 
-        done = _fixings_up_to(product.fixing_times, t)
+        ref = product.reference_fixing
+        ls = _done_log_spots(paths, idx, product.fixing_times, t, ref)
         alive = np.ones(n, dtype=bool)
-        acc = np.zeros(n)
-        if done.size >= 1:
-            ls = paths.log_spot_at(idx.indices(done))
+        acc = np.full(n, product.realised_sum_sq)
+        if ls.shape[1] >= 1:
+            # a close beyond the barrier at a done fixing stops it (the realised reference of a
+            # seasoned swap never is: a realised knock-out is a settled trade)
             hit = _in_region(ls, np.log(product.barrier), product.direction, product.strict)
-            alive = ~hit.any(axis=1)  # a close beyond the barrier at a done fixing stops it
-            if done.size >= 2:
-                acc = np.sum(product.squared_returns(ls), axis=1)
+            alive = ~hit.any(axis=1)
+            if ls.shape[1] >= 2:
+                acc = product.realised_sum_sq + np.sum(product.squared_returns(ls), axis=1)
         settled = _terminated(paths, idx, product, alive, t)
-        start = _u_period(paths, idx, product.fixing_times, t)
+        start = _u_period(paths, idx, product.fixing_times, t, ref)
         return HedgeState(
             t, np.column_stack([acc, start]), alive, settled, ("accrued_sq", "u_period")
         )
     if isinstance(product, VolKnockOutPut):
-        acc = _accrued_sq(paths, idx, product.fixing_times, t)
-        if product.daily_cap is not None:
-            done = _fixings_up_to(product.fixing_times, t)
-            if done.size >= 2:
-                ls = paths.log_spot_at(idx.indices(done))
-                acc = np.sum(product.squared_returns(ls), axis=1)
-        budget = product.vol_ko**2 * product.n_returns / product.annualisation
+        ref = product.reference_fixing
+        ls = _done_log_spots(paths, idx, product.fixing_times, t, ref)
+        acc = np.full(n, product.realised_sum_sq)
+        if ls.shape[1] >= 2:
+            acc = product.realised_sum_sq + np.sum(product.squared_returns(ls), axis=1)
+        budget = product.variance_budget  # the whole life's (realised returns included)
         alive = np.ones(n, dtype=bool)
         if not product.knock_in:
             alive = acc < budget
         settled = _terminated(paths, idx, product, alive, t)
-        start = _u_period(paths, idx, product.fixing_times, t)
+        start = _u_period(paths, idx, product.fixing_times, t, ref)
         return HedgeState(
             t, np.column_stack([acc, start]), alive, settled, ("accrued_sq", "u_period")
         )
@@ -254,10 +292,7 @@ def hedge_state(product: Product, paths: PathSet, idx: FixingIndex, t: float) ->
             levels = product.autocall_levels[: past.size]
             alive = ~(spots >= levels[None, :]).any(axis=1)
         ki = product._breached_by(paths, idx, t).astype(np.float64)
-        memory = np.zeros(n)
-        if product.is_phoenix and product.memory and past.size:
-            coupons = product.coupon_amounts(paths, idx)
-            memory = product._memory_at(product._memory_state_by_date(coupons), obs, t)
+        memory = product.memory_at(paths, idx, t)
         feats = np.column_stack([ki, memory])
         settled = _terminated(paths, idx, product, alive, t)
         return HedgeState(t, feats, alive, settled, ("ki", "memory"))

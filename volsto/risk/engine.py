@@ -4,13 +4,22 @@
   additive perturbation layer, model parameters, particle and simulation settings) plus an
   initial factor state.  Every state that changes the surface or a model parameter is a
   distinct leverage-cache entry, so the second run of a ladder is free.
-* :class:`ModelBuilder` turns a state into a priced model under one of three *modes*:
+* :class:`ModelBuilder` turns a state into a priced model under one of four *modes*:
   ``"recalibrate"`` (leverage refit to the state's surface through
   :meth:`~volsto.calibration.cache.LeverageCache.get_or_calibrate`), ``"sticky_leverage"``
-  (the base leverage held, ``ξ₀`` and parameters from the state) and ``"model"`` (spot and factor
-  state bumped only, leverage held fixed in spot, factors as given).  :class:`LSVBuilder`,
-  :class:`LVBuilder` and :class:`BSBuilder` cover the three model families; the LV and BS
-  builders accept every mode so the same tests run on all of them.
+  (the base leverage held **fixed in spot** — re-anchored on the state's forward curve — with
+  ``ξ₀`` and parameters from the state), ``"model"`` (spot and factor state bumped only, leverage
+  held fixed in spot, factors as given) and ``"frozen_leverage"`` (M10 Part 3: the base leverage
+  ``L(t, k)`` held **fixed in forward log-moneyness** ``k = ln(S/F(t))``, ``ξ₀`` and parameters
+  from the state; the base state itself is the recalibrated base model).  The last is the
+  leverage a recalibration reproduces after a sticky-moneyness spot move or a rate move: the
+  particle method is homogeneous in ``k``, measured on the cached pairs of the delta regimes
+  (2026-09-16: the recalibrated ``L`` at ``S₀ e^{±0.01}`` equals the base ``L`` in ``k`` to
+  3·10⁻¹¹ relative, while the spot-fixed re-anchoring moves grid values by up to 0.95–2.0).  It
+  is the mode of the sticky-leverage P&L attribution (:func:`volsto.risk.attribution.explain`).
+  :class:`LSVBuilder`, :class:`LVBuilder` and :class:`BSBuilder` cover the three model
+  families; the LV and BS builders accept every mode so the same tests run on all of them (pure
+  local vol has no leverage to hold: its non-``"model"`` modes rebuild the Dupire surface).
 * :class:`RiskEngine` prices ``(product, state, mode)`` under common random numbers (same seed,
   same grid) keeping the per-path payoffs, and returns :class:`Sensitivity` objects whose
   standard error is that of the *difference* estimated path by path.  Surface bumps that fail
@@ -50,10 +59,16 @@ from volsto.config import (
 from volsto.engine.mc import MonteCarlo, PriceResult
 from volsto.market.curves import ForwardCurve
 from volsto.market.dupire import LocalVolSurface
-from volsto.market.surface import ArbitrageError, ImpliedSurface, SSVISurface, perturbed_surface
+from volsto.market.surface import (
+    ArbitrageError,
+    ImpliedSurface,
+    perturbed_surface,
+    surface_from_config,
+)
 from volsto.models.base import Model
 from volsto.models.bergomi import BergomiSV
 from volsto.models.bs import BlackScholes
+from volsto.models.leverage import LeverageFunction
 from volsto.models.localvol import LocalVol
 from volsto.models.lsv import LSV
 from volsto.products.base import Product
@@ -61,7 +76,7 @@ from volsto.products.base import Product
 FloatArray = NDArray[np.float64]
 log = logging.getLogger(__name__)
 
-MODES = ("recalibrate", "sticky_leverage", "model")
+MODES = ("recalibrate", "sticky_leverage", "model", "frozen_leverage")
 
 
 # --------------------------------------------------------------------------------------------
@@ -158,9 +173,10 @@ def _as_mapping(p: SurfacePerturbation) -> dict[str, Any]:
 
 
 def surface_of(state: RiskState) -> ImpliedSurface:
-    """The (perturbed) SSVI surface of a state, arbitrage-checked."""
+    """The (perturbed) SSVI or eSSVI surface of a state, arbitrage-checked
+    (:func:`~volsto.market.surface.surface_from_config`)."""
     fc = ForwardCurve.from_config(state.spec.market)
-    base = SSVISurface.from_config(state.spec.surface, fc, fc.rate_curve)
+    base = surface_from_config(state.spec.surface, fc, fc.rate_curve)
     return perturbed_surface(state.spec.perturbation, base)
 
 
@@ -194,6 +210,22 @@ class _Counter:
             self.keys.append(key)
             if miss:
                 self.misses += 1
+
+
+def held_in_moneyness(leverage: LeverageFunction, forward_curve: ForwardCurve) -> LeverageFunction:
+    """``leverage``'s grid values re-labelled on ``forward_curve``: the same ``L(t, k)`` in
+    forward log-moneyness (the ``"frozen_leverage"`` mode).  The kernels look ``L`` up at
+    ``k = ln S − ln F_kernel(t)``, so the values need no shift; the new curve makes the
+    initial-variance lookup (``L(0, S₀)``) consistent with them.  Contrast
+    :meth:`~volsto.models.leverage.LeverageFunction.reanchored`, which holds ``L`` fixed in spot.
+    """
+    return LeverageFunction(
+        leverage.times,
+        leverage.k_grid,
+        leverage.values,
+        forward_curve,
+        {**leverage.metadata, "held_in": "moneyness"},
+    )
 
 
 def model_regime_spot_bump(model: Model, spot: float) -> Model:
@@ -251,6 +283,12 @@ class LSVBuilder:
         assert isinstance(base, LSV)
         if mode == "recalibrate":
             lsv = self._recalibrated(state)
+        elif mode == "frozen_leverage":
+            if state.key == self.base.key:
+                lsv = base  # the base state: exactly the recalibrated base model
+            else:
+                _, _, frozen = build_market(state.spec)  # ξ₀ and parameters from the state
+                lsv = LSV(frozen, held_in_moneyness(base.leverage, frozen.forward_curve))
         else:
             if mode == "model":
                 # the recalibrated model of this surface / parameter state at the BASE spot,

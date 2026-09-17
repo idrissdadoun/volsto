@@ -1,0 +1,18 @@
+# S6 CI-fast variant on the synthetic M7 / M8b outputs of
+# tests/_synthetic_store.py::make_synthetic_outputs (two products; one configured study-C row is
+# deliberately absent there so the missing-row path runs).  Fast mode is plumbing, not numbers.
+name: s6_shadow_rotation_fast
+runner: volsto.studies.catalogue.s6_shadow_rotation
+grid: null
+store: outputs/store
+cache: cache
+outputs: outputs
+mode: fast
+seeds: {}
+params:
+  products: [autocall 3y, cliquet 1y]
+  rotas: [1.0, 2.0, 3.0]
+  recalibrations: [none, sabr_linked, sticky_breakeven]
+  first_order_tolerance: 0.30
+  m7_surface: spx
+  m7_product: autocall 3y

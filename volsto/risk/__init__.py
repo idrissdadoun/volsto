@@ -4,7 +4,16 @@ attribution and the RiskReport."""
 
 from __future__ import annotations
 
-from volsto.risk.attribution import Explain, Step, explain
+from volsto.risk.attribution import (
+    AttributionCost,
+    DryRunBuilder,
+    DryRunEngine,
+    Explain,
+    FrozenLeverageEngine,
+    Step,
+    attribution_cost,
+    explain,
+)
 from volsto.risk.digital_risk import (
     BARRIER_SHIFT_SCOPES,
     CERTAIN_AUTOCALL,
@@ -29,6 +38,7 @@ from volsto.risk.engine import (
     RiskEngine,
     RiskState,
     Sensitivity,
+    held_in_moneyness,
     surface_of,
 )
 from volsto.risk.estimators import (
@@ -46,6 +56,7 @@ from volsto.risk.greeks import (
     cross_greeks,
     delta_gamma,
     delta_table,
+    rate_sensitivities,
     theta,
     vega,
 )
@@ -87,11 +98,15 @@ __all__ = [
     "REGIMES",
     "SECTIONS",
     "SKEW_BUMP",
+    "AttributionCost",
     "BSBuilder",
     "CliquetGammaProfile",
     "ConditionalGreeks",
     "ControlledSensitivity",
+    "DryRunBuilder",
+    "DryRunEngine",
     "Explain",
+    "FrozenLeverageEngine",
     "LSVBuilder",
     "LVBuilder",
     "Ladder",
@@ -104,7 +119,7 @@ __all__ = [
     "Step",
     "ThetaReport",
     "VegaTermStructure",
-    "[",
+    "attribution_cost",
     "autocall_spot_profiles",
     "bachelier_cliquet_value",
     "barrier_profile",
@@ -127,6 +142,7 @@ __all__ = [
     "fixing_risk",
     "fwd_var_convexity",
     "fwd_var_ladder",
+    "held_in_moneyness",
     "ki_barrier_profile",
     "ki_put_barrier_risk",
     "ko_probability_delta",
@@ -135,6 +151,7 @@ __all__ = [
     "lr_vega",
     "parameter_sensitivities",
     "parameter_sensitivity",
+    "rate_sensitivities",
     "realised_variance_exposure",
     "residual_note",
     "risk_report",

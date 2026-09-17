@@ -1,0 +1,16 @@
+# S7 — hedging: the M8b model-mismatch reserve (tables A, B) and the delta-regime ranking
+# (table D), with the discriminator verdict that gates world (ii) of study B (SPEC §10.2).
+# Artefacts only (outputs/m8b); no grid, no leverage, no store point is read.
+name: s7_hedging
+runner: volsto.studies.catalogue.s7_hedging
+grid: null
+store: outputs/store
+cache: cache
+outputs: outputs
+mode: full
+seeds: {}                     # nothing is simulated: the M8b runs used seed 2024 (their tables)
+params:
+  tables: [A, B, D]           # the M8b summary tables shown (m8b/m8b_table_<X>.csv)
+  # the owner's study-D headline (2026-09-16) names these as the regimes closest to the common
+  # minimum-variance delta; the study checks the ranking against them product by product
+  headline_regimes: [sticky_strike, sticky_skew]

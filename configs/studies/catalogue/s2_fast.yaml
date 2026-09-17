@@ -1,0 +1,33 @@
+# S2 CI-fast variant (runner volsto/studies/catalogue/s2_vko.py): the toy build of
+# tests/conftest.py::toy_build (LV + 1F nu 0.25 / 0.5 + 2F Table 8.2 at 2e4 particles, 1y
+# horizon); 4000 paths, 20 bootstrap replicates.  The tests pass --grid/--store/--cache/--outputs
+# (an outputs copy holding a synthetic surface history).  Plumbing, not numbers.
+name: s2_vko_fast
+runner: volsto.studies.catalogue.s2_vko
+grid: configs/grids/toy.yaml
+store: outputs/store
+cache: cache
+outputs: outputs
+mode: fast
+seeds:
+  pricing: 2024
+  bootstrap: 20260916
+params:
+  models:
+    surface: placeholder
+    lv: true
+    one_factor: {nu: all, rho: all, kappa: all}
+    two_factor: all
+  vko:
+    strike: 1.0
+    maturity: 1.0
+    per_year: 252
+    vol_ko: [0.20, 0.30, 0.40]
+  n_paths: 4000
+  bootstrap: {replicates: 20}
+  store_check: true
+  realised:
+    history: essvi_gate/hdn_history_repaired.csv
+    command: ".venv/bin/python scripts/m7_hdn_history.py --tag _repaired --out outputs/essvi_gate"
+    start: "2022-07-01"
+    pillar: 1.0

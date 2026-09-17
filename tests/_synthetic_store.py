@@ -11,7 +11,8 @@ path :data:`GRID_PATH` (so the read API recovers the surface catalogue and names
 store was built with).  The ``risk`` rows carry the naming the precompute stores — the
 :class:`~volsto.risk.report.RiskReport` groups ``delta`` / ``gamma`` / ``fwd_var`` / ``skew``
 with the names ``delta[<regime>]``, ``gamma[<regime>]``, ``fwd_var[<lo>-<hi>y]``,
-``skew_T[<T>y]`` (:func:`volsto.viewers.precompute._risk_rows`), and ``forward_smile`` /
+``skew_tent[<T>y]`` (:func:`volsto.viewers.precompute._risk_rows`; the skew ladder's kind is
+``skew_tent``), and ``forward_smile`` /
 ``forward_vols`` carry the ``beyond_horizon`` flag of the store (``t2`` beyond the calibration
 horizon — false on this grid's 3y horizon, true on the toy grid's 1y one).  Point ids are the
 real ids the
@@ -21,7 +22,13 @@ label); nothing is written to any leverage cache by :func:`make_synthetic_store`
 from arrays for the tests that need the read API's leverage path.  Beside the store,
 :func:`make_synthetic_outputs` writes an M8b task result (``m8b/A/<key>.json``, a summary table)
 and the M7 marking tables (``m7/*.csv``) with the real headers, so the marking and hedging API
-paths render against them.
+paths render against them; since M10 Part 2 (the S6 / S7 catalogue studies) also the M8b summary
+tables B, C and D built by the real builders (:func:`volsto.studies.m8b.table_B` / ``table_C`` /
+``table_D``) from synthetic task results, the study-C static greeks ``m8b/C/static_*.json`` and
+the discriminator verdict ``m8b/discriminator_verdict.json`` (:func:`make_synthetic_m8b_tables`;
+two products per study, one configured study-C row deliberately absent, the ``sabr_linked`` rows
+contaminated, the ``sticky_breakeven`` rows clean, every recalibration row recording its guarded
+fallbacks — all refits but one — and ``sabr_linked`` one capped correlation target from +2 on).
 
 Used by ``tests/test_viewers_api.py`` and the page tests; wall clock of the writer is a few
 hundred milliseconds.
@@ -42,10 +49,20 @@ import pandas as pd
 from volsto.calibration.cache import spec_key
 from volsto.calibration.diagnostics import CalibrationReport
 from volsto.config import BergomiParams
+from volsto.hedging.strategies import MIN_VARIANCE_REGIME
 from volsto.market.curves import ForwardCurve
 from volsto.models.leverage import LeverageFunction
+from volsto.risk.shadow_rotation import ROTATION_CONVENTION
 from volsto.studies.m4 import HEADLINE_STRIKES
-from volsto.studies.m8b import TaskResult
+from volsto.studies.m8b import (
+    MV_RAW_GRADIENT_NOTE,
+    REGIMES_D,
+    TaskResult,
+    slug,
+    table_B,
+    table_C,
+    table_D,
+)
 from volsto.viewers.grid import (
     GridSpec,
     MarkingAxes,
@@ -283,7 +300,15 @@ def _risk(rng: np.random.Generator) -> pd.DataFrame:
                 bucket=f"{lo:g}-{hi:g}y",
             )
         for T in (0.25, 1.0, 3.0):
-            add(product, "skew", f"skew_T[{T:g}y]", float(rng.normal(-0.05, 0.01)), "per vp", T=T)
+            # the risk report's name and unit (volsto.risk.ladders.skew_T: the "skew_tent" kind)
+            add(
+                product,
+                "skew",
+                f"skew_tent[{T:g}y]",
+                float(rng.normal(-0.05, 0.01)),
+                "per vol point of 90/110 skew",
+                T=T,
+            )
     return pd.DataFrame(rows)
 
 
@@ -690,4 +715,263 @@ def make_synthetic_outputs(root: str | Path) -> dict[str, Path]:
         pb = m7 / name
         binding.to_csv(pb, index=False)
         out[name] = pb
+    out.update(make_synthetic_m8b_tables(root))
+    return out
+
+
+#: The synthetic study-B / C / D products (two per study) and the study-C row left out on purpose.
+SYNTHETIC_C_PRODUCTS = ("autocall 3y", "cliquet 1y")
+SYNTHETIC_C_MISSING = ("cliquet 1y", 3.0, "sabr_linked")
+SYNTHETIC_B_PRODUCTS = ("autocall 3y", "cliquet 1y")
+SYNTHETIC_D_PRODUCTS = ("vanilla 1y atm", "autocall 3y")
+SYNTHETIC_VERDICT = {
+    "verdict": "surface artefact",
+    "reason": "T=0.0833333: raw SSR 0.942 + 2 x 0.153 = 1.249 is not below 1",
+}
+#: The static desk shadow per (product, policy), per +1 rota (% of notional).
+_STATIC_SHADOW = {
+    ("autocall 3y", "sabr_linked"): (-0.054, 0.0066),
+    ("autocall 3y", "sticky_breakeven"): (-0.074, 0.0072),
+    ("cliquet 1y", "sabr_linked"): (-0.079, 0.0004),
+    ("cliquet 1y", "sticky_breakeven"): (-0.102, 0.0005),
+}
+_STATIC_USUAL = {"autocall 3y": (0.0055, 0.0066), "cliquet 1y": (-0.0047, 0.0003)}
+#: The simulated desk recalibration P&L over the static prediction at +1 per policy (the clean
+#: column larger than the greek, as measured; the contaminated one of the opposite sign).
+_SIM_OVER_STATIC = {"sabr_linked": -1.5, "sticky_breakeven": 2.0}
+
+
+def _static_doc(product: str, policy: str) -> dict[str, Any]:
+    shadow, se = _STATIC_SHADOW[(product, policy)]
+    usual, use = _STATIC_USUAL[product]
+    doc: dict[str, Any] = {
+        "product": product,
+        "policy": policy,
+        "convention": ROTATION_CONVENTION,
+        "unit": "% of notional",
+        "n_paths": 200_000,
+        "n_particles": 200_000,
+        "seed": 2024,
+        "size": 1.0,
+        "base_fit_equals_marking_fit": True,
+        "n_calibrations": 5,
+        "n_cache_misses": 0,
+        "manifest_growth": 0,
+        "wall_seconds": 87.3,
+        "p1_level": [92.8, 0.045],
+        "lv_level": [92.1, 0.047],
+        "fee": [0.73, 0.027],
+        "lv_rotation": [-0.092, 0.0048],
+        "usual": [-0.097, 0.005],
+        # the runner writes the P1 recalibrated rotation under the same name as its flag
+        "recalibrated": [-0.097 - shadow, 0.0068],
+        "fee_shadow": [-shadow, se],
+        "desk_pnl_usual": [usual, use],
+        "desk_pnl_recalibrated": [usual + shadow, 0.0081],
+        "desk_pnl_shadow": [shadow, se],
+    }
+    return doc
+
+
+def _c_result(product: str, rota: float, policy: str, seed: int) -> TaskResult:
+    rng = np.random.default_rng(seed)
+    refits = {1.0: 2, 2.0: 7, 3.0: 13}[rota]
+    if policy == "none":
+        recal = (0.0, 0.0)
+        by_date: list[dict[str, float]] = []
+        refits, at_bound, fallback, capped = 0, 0, -1, -1
+    else:
+        shadow = _STATIC_SHADOW[(product, policy)][0]
+        desk = _SIM_OVER_STATIC[policy] * shadow * rota * (1.0 - 0.2 * (rota - 1.0))
+        recal = (-desk + float(rng.normal(0.0, 0.002)), 0.004 * rota)
+        by_date = [
+            {"t": 0.5 + 0.1 * i, "mean": recal[0] / refits, "stderr": 0.002, "alive_fraction": 1.0}
+            for i in range(refits)
+        ]
+        contaminated = policy == "sabr_linked"
+        at_bound = 1 + int(rota) if contaminated else 0
+        # every refit but one took the guarded fallback; sabr_linked had one capped correlation
+        # target from +2 on (the counts the rebuilt refit records)
+        fallback = refits - 1
+        capped = 1 if contaminated and rota >= 2.0 else 0
+    return TaskResult(
+        key=f"C__{slug(product)}__skew_shock__preset__rota+{rota:g}__recal_{policy}",
+        study="C",
+        product=product,
+        world="skew_shock",
+        strategy="preset",
+        rota=rota,
+        policy=policy,
+        frequency="weekly" if product.endswith("3y") else "daily",
+        n_paths_pricing=20_000,
+        n_paths_world=20_000,
+        n_particles=800_000,
+        n_dates=156,
+        value_0=(92.8, 0.05),
+        mean=(-0.30 + float(rng.normal(0.0, 0.01)), 0.06),
+        std=(9.0, 0.16),
+        quantiles={"q05": (-14.0, 0.26), "q95": (11.5, 0.25)},
+        zero_cost_mean=(-0.30, 0.06),
+        recal_total=recal,
+        recal_by_date=by_date,
+        n_refits=refits,
+        n_refits_at_bound=at_bound,
+        n_refits_fallback=fallback,
+        n_refits_capped=capped,
+        wall_seconds=100.0 * rota,
+        world_meta={
+            "skew_90_110_6m_base_vp": 6.30,
+            "skew_90_110_6m_rotated_vp": 6.30 + 0.56 * rota,
+        },
+    )
+
+
+def _b_result(world: str, product: str, seed: int) -> TaskResult:
+    rng = np.random.default_rng(seed)
+    base = {"autocall 3y": -0.31, "cliquet 1y": -0.56}[product]
+    shift = {"same": 0.0, "pure LV": 1.9, "nu x1.5": -0.05}[world]
+    return TaskResult(
+        key=f"B__{slug(product)}__{slug(world)}__preset",
+        study="B",
+        product=product,
+        world=world,
+        strategy="preset",
+        n_paths_world=20_000,
+        n_dates=156,
+        value_0=(92.8 if product == "autocall 3y" else 1.53, 0.2),
+        mean=(base + shift + float(rng.normal(0.0, 0.01)), 0.06),
+        std=(9.0 + 10.0 * shift, 0.16),
+        quantiles={"q05": (-14.0, 0.26), "q95": (11.5, 0.25)},
+        zero_cost_mean=(base + shift, 0.06),
+        world_value_0=(92.8, 0.2),
+        static_spread=(0.4 * shift, 0.2),
+        wall_seconds=195.0,
+    )
+
+
+def _d_result(product: str, regime: str) -> TaskResult:
+    call = product == "vanilla 1y atm"
+    mv = 0.536 if call else 0.299
+    offset = {
+        "model": 0.113 if call else -0.056,
+        "sticky_strike": 0.062 if call else -0.031,
+        "sticky_skew": 0.063 if call else -0.027,
+        "sticky_moneyness": 0.108 if call else -0.061,
+        MIN_VARIANCE_REGIME: 0.0 if call else 0.019,
+    }[regime]
+    mean_delta = mv + offset
+    implied = mv + (0.001 if regime == "sticky_strike" else -0.001)
+    notes = [MV_RAW_GRADIENT_NOTE] if regime == MIN_VARIANCE_REGIME and not call else []
+    return TaskResult(
+        key=f"D__{slug(product)}__pricing__delta_{regime}",
+        study="D",
+        product=product,
+        world="pricing",
+        strategy=f"delta only ({regime})",
+        regime=regime,
+        unit="% of spot" if call else "% of notional",
+        n_paths_world=20_000,
+        n_dates=252 if call else 156,
+        value_0=(8.9, 0.02),
+        mean=(0.01, 0.01),
+        std=((3.1 if call else 7.7) * (1.0 + abs(offset)), 0.011),
+        quantiles={"q05": (-5.0, 0.1), "q95": (5.0, 0.1)},
+        zero_cost_mean=(0.01, 0.01),
+        wall_seconds=22.0,
+        notes=notes,
+        delta_diag={
+            "mean_delta": (mean_delta, 0.0008),
+            "lambda_star": (implied / mean_delta, 0.001),
+            "std_at_lambda": (1.7, 0.013),
+            "mv_delta_implied": (implied, 0.0009),
+        },
+    )
+
+
+def make_synthetic_m8b_tables(root: str | Path) -> dict[str, Path]:
+    """Write the M8b tables B, C and D, the study-C static greeks and the discriminator verdict
+    under ``<root>/m8b`` from synthetic task results through the real table builders (module
+    docstring) — no calibration, no Monte Carlo; returns the paths."""
+    m8b = Path(root) / "m8b"
+    (m8b / "C").mkdir(parents=True, exist_ok=True)
+    out: dict[str, Path] = {}
+    static: dict[tuple[str, str], dict[str, Any]] = {}
+    for product, policy in _STATIC_SHADOW:
+        doc = _static_doc(product, policy)
+        static[(product, policy)] = doc
+        path = m8b / "C" / f"static_{slug(product)}__{slug(policy)}.json"
+        path.write_text(json.dumps(doc, indent=1))
+        out[f"static_{slug(product)}__{slug(policy)}"] = path
+    c_results = [
+        _c_result(product, rota, policy, 100 + i)
+        for i, (product, rota, policy) in enumerate(
+            (p, r, q)
+            for p in SYNTHETIC_C_PRODUCTS
+            for r in (1.0, 2.0, 3.0)
+            for q in ("none", "sabr_linked", "sticky_breakeven")
+        )
+        if (product, rota, policy) != SYNTHETIC_C_MISSING
+    ]
+    pc = m8b / "m8b_table_C.csv"
+    table_C(c_results, static).to_csv(pc, index=False)
+    out["hedging_table_C"] = pc
+    b_results = [
+        _b_result(world, product, 200 + i)
+        for i, (world, product) in enumerate(
+            (w, p) for w in ("same", "pure LV", "nu x1.5") for p in SYNTHETIC_B_PRODUCTS
+        )
+    ]
+    reason = (
+        f"discriminator verdict '{SYNTHETIC_VERDICT['verdict']}': {SYNTHETIC_VERDICT['reason']}"
+    )
+    skipped = [
+        {
+            "world": "historical",
+            "product": product,
+            "status": "surface artefact, skipped",
+            "reason": reason,
+        }
+        for product in SYNTHETIC_B_PRODUCTS
+    ]
+    pb = m8b / "m8b_table_B.csv"
+    table_B(b_results, skipped).to_csv(pb, index=False)
+    out["hedging_table_B"] = pb
+    d_results = [_d_result(p, r) for p in SYNTHETIC_D_PRODUCTS for r in REGIMES_D]
+    pd_ = m8b / "m8b_table_D.csv"
+    table_D(d_results).to_csv(pd_, index=False)
+    out["hedging_table_D"] = pd_
+    verdict = {
+        **SYNTHETIC_VERDICT,
+        "n_dates_used": 127,
+        "n_dates_dropped": 0,
+        "wall_seconds": 271.8,
+        "recalibrated": False,
+        "table": [
+            {
+                "T": T,
+                "window": 60,
+                "ssr_raw": raw,
+                "se_raw": se_raw,
+                "ssr_ssvi": ssvi,
+                "se_ssvi": se_ssvi,
+                "diff": raw - ssvi,
+                "se_diff": math.hypot(se_raw, se_ssvi),
+                "z": (raw - ssvi) / math.hypot(se_raw, se_ssvi),
+                "slope_raw": -0.4,
+                "slope_ssvi": -0.42,
+                "mean_skew_raw": -0.43,
+                "mean_skew_ssvi": -0.52,
+                "r2_raw": 0.35,
+                "r2_ssvi": 0.39,
+                "n": 60,
+            }
+            for T, raw, se_raw, ssvi, se_ssvi in (
+                (1.0 / 12.0, 0.942, 0.153, 0.808, 0.112),
+                (1.0, 0.770, 0.060, 0.840, 0.070),
+            )
+        ],
+    }
+    pv = m8b / "discriminator_verdict.json"
+    pv.write_text(json.dumps(verdict, indent=1))
+    out["discriminator_verdict"] = pv
     return out

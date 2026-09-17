@@ -19,9 +19,14 @@ work is done. Every rule here was set by the owner and each has a reason recorde
 ## Calibration and the cache
 
 - **Tests read the leverage cache and never calibrate** (`allow_calibrate=False`; a cache miss
-  skips with the reason). The one sanctioned exception is the toy-grid session fixture in
-  `tests/conftest.py`, which calibrates three leverages at 2·10⁴ particles into a temporary
-  directory, once per pytest run.
+  skips with the reason). The sanctioned exceptions are the session fixtures that build toy
+  stores into temporary directories, once per pytest run, at 2·10⁴ particles: `toy_build` and
+  `toy_marking_build` in `tests/conftest.py`, and `toy_backtest_build` in
+  `tests/_backtest_build.py` (imported by `tests/test_backtest.py`; it runs `volsto-backtest run`,
+  the one M10 path that calibrates).
+- **Studies never calibrate.** `volsto-study run` and `render` forbid calibration at the entry of
+  `calibrate_leverage` (`volsto/calibration/guard.py`, inherited by child processes) and record
+  whether one started; `volsto-backtest run` is the only M10 command that calibrates.
 - **Viewers and the read API never calibrate and never simulate.** A missing point prints the
   exact `volsto-precompute` command that produces it. `volsto-precompute` is the only place in
   the viewers layer that calibrates, and it says so in its log and manifest.

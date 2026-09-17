@@ -24,6 +24,7 @@ leaves a complete entry whose row is missing (:meth:`LeverageCache.unlisted_keys
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as _dt
 import fcntl
 import hashlib
@@ -32,20 +33,23 @@ import logging
 import os
 import secrets
 import subprocess
+import threading
 import zipfile
-from collections.abc import Callable
+from collections import OrderedDict
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 import volsto
 from volsto.calibration.diagnostics import CalibrationReport, reprice_surface
 from volsto.calibration.particle import CALIBRATION_CODE_TAG, calibrate_leverage
-from volsto.config import CalibrationSpec, SimConfig, to_mapping
+from volsto.config import CalibrationSpec, CurveConfig, MarketConfig, SimConfig, to_mapping
 from volsto.market.curves import ForwardCurve
-from volsto.market.surface import ImpliedSurface, SSVISurface, perturbed_surface
-from volsto.market.varswap import xi0_curve
+from volsto.market.surface import ImpliedSurface, perturbed_surface, surface_from_config
+from volsto.market.varswap import ForwardVarianceCurve, xi0_curve
 from volsto.models.bergomi import BergomiSV
 from volsto.models.leverage import LeverageFunction
 from volsto.models.lsv import LSV
@@ -173,14 +177,187 @@ def spec_key(spec: CalibrationSpec, code_tag: str = CALIBRATION_CODE_TAG) -> str
     return hashlib.sha256(blob).hexdigest()
 
 
+#: Largest number of ξ₀ curves :func:`build_market` keeps (least recently used evicted first).
+#: A ladders attribution date touches about 62 states, a backtest keeps two dates alive.
+XI0_MEMO_SIZE = 256
+
+
+class _Xi0Memo:
+    """The process-local, size-bounded, exact memo of the ξ₀ strip of :func:`build_market`.
+
+    **What it keys on.**  The strip ``xi0_curve(surface, t_max)`` is a deterministic function of
+    the surface object, which :func:`build_market` builds from ``spec.market`` (spot and the
+    two curves: the forward and the discount curve), ``spec.surface`` and
+    ``spec.perturbation`` alone, and of ``t_max`` (from the surface's ``max_maturity`` and
+    ``spec.particle.horizon``).  The key is the SHA-256 of the canonical JSON of exactly those
+    four items (:func:`volsto.config.to_mapping`; floats by ``repr``, which round-trips), so a
+    hit returns the curve the same computation would return, bit for bit.  The model
+    parameters, the simulation schedule and scheme, the particle settings other than the
+    horizon and the local-vol grid do not enter the strip and are not in the key: a parameter
+    or particle-count bump reuses its state's strip.  A payload that is not plain JSON data is
+    not memoised (computed every time), and an ``int`` against a ``float`` spelling of the same
+    number is a miss, never a wrong hit.  The market and surface numbers are made Python floats
+    first (:func:`canonical_market_surface`, also applied by :func:`build_market` before it
+    computes anything), so a ``numpy.float32`` config and its float64 twin — equal under
+    :func:`spec_key` — are one computation and one entry; a perturbation payload with a
+    non-string mapping key or a non-float64 float is not memoised.
+
+    **Why it is safe to share.**  :class:`~volsto.market.varswap.ForwardVarianceCurve` has no
+    mutator and nothing in ``volsto`` writes its arrays (``BergomiSV.bump`` builds a new curve).
+    Cache keys are untouched (:func:`spec_key` does not read the memo).  Checked by
+    ``tests/test_backtest.py::test_xi0_memo_is_exact_and_keys_are_unchanged`` (memo on / off on
+    a perturbed eSSVI state, bit for bit; recorded keys unchanged; LRU bound)."""
+
+    def __init__(self, size: int) -> None:
+        self.size = int(size)
+        self.enabled = True
+        self.hits = 0
+        self.misses = 0
+        self._curves: OrderedDict[str, ForwardVarianceCurve] = OrderedDict()
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def key(spec: CalibrationSpec, t_max: float) -> str | None:
+        """The memo key of ``spec``'s strip, or ``None`` (not memoised) when the perturbation
+        payload is not strict plain data (:func:`_plain_payload`).  The market and the surface
+        enter through :func:`canonical_market_surface` (Python floats), which is also what
+        :func:`build_market` computes from, so equal keys mean equal computations."""
+        spec = canonical_market_surface(spec)
+        pert = None if spec.perturbation is None else _plain_payload(spec.perturbation)
+        if spec.perturbation is not None and pert is _NOT_PLAIN:
+            return None
+        payload = {
+            "market": to_mapping(spec.market),
+            "surface": to_mapping(spec.surface),
+            "perturbation": pert,
+            "t_max": float(t_max),
+        }
+        try:
+            blob = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        except (TypeError, ValueError):
+            return None
+        return hashlib.sha256(blob.encode()).hexdigest()
+
+    def get(
+        self, spec: CalibrationSpec, surface: ImpliedSurface, t_max: float
+    ) -> ForwardVarianceCurve:
+        key = self.key(spec, t_max) if self.enabled and self.size > 0 else None
+        if key is not None:
+            with self._lock:
+                hit = self._curves.get(key)
+                if hit is not None:
+                    self._curves.move_to_end(key)
+                    self.hits += 1
+                    return hit
+        curve = xi0_curve(surface, t_max)
+        if key is not None:
+            with self._lock:
+                self.misses += 1
+                self._curves[key] = curve
+                self._curves.move_to_end(key)
+                while len(self._curves) > self.size:
+                    self._curves.popitem(last=False)
+        return curve
+
+    def clear(self) -> None:
+        with self._lock:
+            self._curves.clear()
+            self.hits = self.misses = 0
+
+    def info(self) -> dict[str, int | bool]:
+        with self._lock:
+            return {
+                "enabled": self.enabled,
+                "size": self.size,
+                "entries": len(self._curves),
+                "hits": self.hits,
+                "misses": self.misses,
+            }
+
+
+_NOT_PLAIN: Any = object()
+
+
+def _plain_payload(obj: Any) -> Any:
+    """``obj`` as strict plain data for a memo key, or :data:`_NOT_PLAIN`: dataclasses by their
+    fields, mappings with **string** keys only (``{1: …}`` and ``{"1": …}`` would otherwise hash
+    alike), lists and tuples, ``str`` / ``bool`` / ``int`` / ``None``, and floats that are
+    float64 (a Python ``float`` or ``numpy.float64``) — any other number type (``numpy.float32``
+    and friends, whose arithmetic differs) is not plain."""
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        out: dict[str, Any] = {}
+        for f in dataclasses.fields(obj):
+            v = _plain_payload(getattr(obj, f.name))
+            if v is _NOT_PLAIN:
+                return _NOT_PLAIN
+            out[f.name] = v
+        return out
+    if isinstance(obj, Mapping):
+        items: dict[str, Any] = {}
+        for k, v in obj.items():
+            if not isinstance(k, str):
+                return _NOT_PLAIN
+            pv = _plain_payload(v)
+            if pv is _NOT_PLAIN:
+                return _NOT_PLAIN
+            items[k] = pv
+        return items
+    if isinstance(obj, (list, tuple)):
+        seq = [_plain_payload(v) for v in obj]
+        return _NOT_PLAIN if any(v is _NOT_PLAIN for v in seq) else seq
+    if obj is None or isinstance(obj, (str, bool)):
+        return obj
+    if isinstance(obj, (float, np.float64)):
+        return float(obj)
+    if type(obj) is int:  # a Python int (numpy integers are not plain)
+        return int(obj)
+    return _NOT_PLAIN
+
+
+def canonical_market_surface(spec: CalibrationSpec) -> CalibrationSpec:
+    """``spec`` with every number of its market and surface configs as a Python float (a
+    ``numpy.float32`` or an ``int`` would otherwise change the surface's arithmetic while
+    :func:`spec_key` — which reads them through ``to_mapping`` — does not see the difference).
+    Configs read from YAML are unchanged value for value, so their computations are unchanged."""
+    s, m = spec.surface, spec.market
+
+    def floats(xs: Any) -> tuple[float, ...]:
+        return tuple(float(x) for x in xs)
+
+    surface = dataclasses.replace(
+        s,
+        atm_maturities=floats(s.atm_maturities),
+        atm_vols=floats(s.atm_vols),
+        rho=float(s.rho),
+        eta=float(s.eta),
+        gamma=float(s.gamma),
+        max_maturity=float(s.max_maturity),
+        rhos=None if s.rhos is None else floats(s.rhos),
+    )
+    market = MarketConfig(
+        float(m.spot),
+        CurveConfig(floats(m.rate_curve.times), floats(m.rate_curve.rates)),
+        CurveConfig(floats(m.dividend_curve.times), floats(m.dividend_curve.rates)),
+    )
+    return dataclasses.replace(spec, surface=surface, market=market)
+
+
+XI0_MEMO = _Xi0Memo(XI0_MEMO_SIZE)
+"""The ξ₀ memo of :func:`build_market` (``XI0_MEMO.enabled = False`` switches it off;
+``XI0_MEMO.info()`` / ``clear()``)."""
+
+
 def build_market(spec: CalibrationSpec) -> tuple[ForwardCurve, ImpliedSurface, BergomiSV]:
-    """Forward curve, (possibly perturbed) SSVI surface and pure SV kernel (ξ₀ from the
-    variance-swap strip of that surface)."""
+    """Forward curve, (possibly perturbed) SSVI or eSSVI surface
+    (:func:`~volsto.market.surface.surface_from_config`) and pure SV kernel (ξ₀ from the
+    variance-swap strip of that surface, reused from :data:`XI0_MEMO` when the same market,
+    surface, perturbation and strip horizon were stripped before in this process)."""
+    spec = canonical_market_surface(spec)
     fc = ForwardCurve.from_config(spec.market)
-    base = SSVISurface.from_config(spec.surface, fc, fc.rate_curve)
+    base = surface_from_config(spec.surface, fc, fc.rate_curve)
     surface = perturbed_surface(spec.perturbation, base)
     t_max = min(surface.max_maturity, max(spec.particle.horizon + 1.0, 5.0))
-    xi0 = xi0_curve(surface, t_max)
+    xi0 = XI0_MEMO.get(spec, surface, t_max)
     return fc, surface, BergomiSV(spec.model, xi0, fc)
 
 

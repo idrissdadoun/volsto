@@ -70,12 +70,11 @@ from volsto.calibration.fit_2f import (
 )
 from volsto.config import (
     CalibrationSpec,
-    MarketConfig,
     SimConfig,
-    SSVIConfig,
     load_yaml,
     to_mapping,
 )
+from volsto.market.loaders import snapshot_spec
 from volsto.risk.shadow_rotation import (
     RECALIBRATION_POLICIES,
     ROTATION_CONVENTION,
@@ -100,11 +99,7 @@ def base_spec(surface: str, n_particles: int) -> CalibrationSpec:
     """The calibration spec of a surface (reference study particle / simulation settings)."""
     ref = load_yaml(REF_SPEC, CalibrationSpec)
     if surface == "spx":
-        ref = dataclasses.replace(
-            ref,
-            market=load_yaml(SPX_SNAPSHOT, MarketConfig, section="market"),
-            surface=load_yaml(SPX_SNAPSHOT, SSVIConfig, section="ssvi"),
-        )
+        ref = snapshot_spec(ref, SPX_SNAPSHOT)
     elif surface != "reference":
         raise ValueError(f"unknown surface {surface!r}")
     return dataclasses.replace(

@@ -1,0 +1,74 @@
+# M10 Part 3 — the toy backtest of the test suite (tests/_backtest_build.py::toy_backtest_build,
+# the sanctioned calibrating fixture): 5 consecutive HDN dates across a month end (so the rolling
+# book strikes twice), 2e4 particles over a 1y horizon, half-year term sheets, 2000 pricing paths,
+# parallel attribution detail (the ladders path is unit-tested on a Black-Scholes builder).  The
+# fixture overrides paths.out / cache / snapshots with a pytest temporary directory.
+# Fast mode checks the plumbing, not the models.  Variance products: struck at the inception
+# strip (strike: vs_strip), variance notional 1/(2 K_vol), vega notional 1, as in hdn_2022h2.yaml.
+# Loaded by volsto.studies.backtest.
+# P&L sign: the stored per-date rows keep the holder's sign, V(d) - V(d-1) + flows; the study
+# (stage 2) presents the desk P&L, -(that), the desk being short the book (M7 / M8b convention).
+name: hdn_2022h2_toy
+data:
+  vendor: hdn
+  root: data/hdn_sample/options_sample_2022H2
+  underlying: SPX
+  missing_close: fail
+dates:
+  start: "2022-07-27"
+  end: "2022-08-02"
+surface:
+  essvi: true
+  calendar_repair: true
+marking:
+  ssr_target: 1.0
+  skew_eps: 0.10
+  stage3: false
+calibration:
+  base_spec: configs/studies/lsv_reference_2f.yaml
+  n_particles: 20000
+  horizon: 1.0
+pricing:
+  n_paths: 2000
+  chunk_size: 2000
+  seed: 2024
+book:
+  fixed:
+    - {id: autocall_6m, kind: autocall, maturity: 0.5, observations: 2}
+    - {id: phoenix_6m, kind: phoenix, maturity: 0.5, observations: 2}
+    - {id: cliquet_6m, kind: cliquet, maturity: 0.5}
+    - {id: vko_put_6m, kind: vko_put, maturity: 0.5, vol_ko: 0.30, moneyness: 1.0}
+    - {id: ko_var_6m, kind: ko_var, maturity: 0.5, barrier: 1.10, strike: vs_strip}
+    - {id: var_swap_6m, kind: var_swap, maturity: 0.5, strike: vs_strip}
+  rolling:
+    every: month
+    mark: daily
+    products:
+      - {id: var_swap_6m, kind: var_swap, maturity: 0.5, strike: vs_strip}
+attribution:
+  mode: sticky_leverage
+  detail: parallel
+  trades: fixed
+  pillars: [0.0833333333333333, 0.25, 0.5, 1.0]
+  bump: 0.01
+  max_halvings: 6
+ssr:
+  window: 20
+  pillars: [0.25, 1.0]
+stability:
+  window_vol: 20
+  window_ssr: 20
+  share: 0.5
+  band: 1.0
+  fit:                     # the historical-mode rolling fit (BreakEvenFitConfig; the
+                           # other settings at their library defaults, hashed)
+    pillars: [0.25, 0.5, 1.0, 2.0, 3.0]
+    mat_min: 0.25
+    k2: 0.2
+    skew_mode: soft        # the historical fit's mode (auto resolves to soft)
+    skew_eps: 0.10
+    nu_cap: 3.5
+paths:
+  out: outputs/backtest/hdn_2022h2_toy
+  cache: outputs/backtest/hdn_2022h2_toy/cache
+  snapshots: outputs/backtest/hdn_2022h2_toy/snapshots

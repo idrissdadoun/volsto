@@ -35,6 +35,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from volsto._numba import njit, prange
+from volsto.calibration.guard import check_calibration_allowed
 from volsto.config import LocalVolConfig, ParticleConfig, SimConfig
 from volsto.engine.grid import TimeGrid
 from volsto.engine.rng import GaussianDraws
@@ -281,7 +282,12 @@ def calibrate_leverage(
     ``sim`` supplies the step schedule and scheme shared with pricing; ``cfg`` the particle
     settings.  ``local_vol`` may be passed to reuse a Dupire surface (its ``k`` grid becomes the
     leverage grid).
+
+    Refused with :class:`~volsto.calibration.guard.CalibrationForbiddenError` while calibration
+    is forbidden (a running study, ``VOLSTO_FORBID_CALIBRATION``): the check below is the single
+    enforcement point of :mod:`volsto.calibration.guard` and must stay the first statement.
     """
+    check_calibration_allowed()
     t_start = time.perf_counter()
     if kernel.forward_curve is not surface.forward_curve and not np.isclose(
         kernel.forward_curve.spot, surface.forward_curve.spot

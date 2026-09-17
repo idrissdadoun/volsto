@@ -241,8 +241,15 @@ def main() -> None:
                 print(
                     f"[m8b]   static greek {product} / {policy}: desk_pnl_shadow "
                     f"{doc['desk_pnl_shadow'][0]:+.4f} +/- {doc['desk_pnl_shadow'][1]:.4f} "
-                    f"{doc['unit']} per rota ({doc['wall_seconds']:.0f} s, recalibrated: "
-                    f"{'yes' if doc['recalibrated'] else 'no'})",
+                    f"{doc['unit']} per rota ("
+                    + (
+                        "read from its cached file"
+                        if doc.get("from_cache")
+                        else f"{doc['wall_seconds']:.0f} s"
+                    )
+                    # `doc["recalibrated"]` is the recalibrated PRICE (a value/se pair, always
+                    # truthy); whether leverage was calibrated is the recorded cache-miss count
+                    + f", recalibrated: {'yes' if int(doc.get('n_cache_misses', 0)) else 'no'})",
                     flush=True,
                 )
 

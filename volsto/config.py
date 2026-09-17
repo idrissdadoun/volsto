@@ -16,7 +16,7 @@ import typing
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
-from typing import Any, get_args, get_origin, get_type_hints
+from typing import Any, ClassVar, get_args, get_origin, get_type_hints
 
 import numpy as np
 import yaml
@@ -148,10 +148,32 @@ def load_yaml[T](path: str | Path, cls: type[T], *, section: str | None = None) 
     return from_mapping(cls, raw, path=str(p))
 
 
+def omitted_when_none(obj: Any) -> frozenset[str]:
+    """The fields of a config dataclass that :func:`to_mapping` leaves out while they hold
+    ``None``: its ``OMIT_WHEN_NONE`` class attribute (empty by default).
+
+    The invariant it enforces, in this one place: **a field added to a config after cache keys
+    were computed is absent from every mapping of a config that does not use it**, so the
+    leverage-cache key (:meth:`CalibrationSpec.key_payload`), the viewers' LV id, ``spec.json``
+    and every YAML dump of such a config are byte-identical to what they were before the field
+    existed.  The field must default to ``None``.  Checked by
+    ``tests/test_surface_config.py::test_keys_of_committed_specs_unchanged``."""
+    omit: frozenset[str] = frozenset(getattr(type(obj), "OMIT_WHEN_NONE", frozenset()))
+    return omit
+
+
 def to_mapping(obj: Any) -> Any:
-    """Recursively convert a dataclass (with numpy scalars/arrays) to plain YAML-safe types."""
+    """Recursively convert a dataclass (with numpy scalars/arrays) to plain YAML-safe types.
+
+    A field named in the class's ``OMIT_WHEN_NONE`` is left out while it is ``None``
+    (:func:`omitted_when_none`)."""
     if is_dataclass(obj) and not isinstance(obj, type):
-        return {f.name: to_mapping(getattr(obj, f.name)) for f in fields(obj)}
+        omit = omitted_when_none(obj)
+        return {
+            f.name: to_mapping(getattr(obj, f.name))
+            for f in fields(obj)
+            if not (f.name in omit and getattr(obj, f.name) is None)
+        }
     if isinstance(obj, np.ndarray):
         return [to_mapping(v) for v in obj.tolist()]
     if isinstance(obj, np.generic):
@@ -399,10 +421,21 @@ class MarketConfig:
 
 @dataclass(frozen=True)
 class SSVIConfig:
-    """Gatheral–Jacquier power-law SSVI (SPEC §2.2).
+    """Gatheral–Jacquier power-law SSVI (SPEC §2.2), or its eSSVI extension (SPEC §13.2).
 
     ``atm_maturities`` / ``atm_vols`` give the ATM implied-vol term structure; θ_T = σ_ATM(T)² T
     is interpolated linearly in T (flat forward variance) between pillars.
+
+    ``rhos`` (M10 Part 3): one correlation per ATM pillar, ``|ρ_i| < 1`` — the eSSVI surface the
+    importer fits by default (``ρ_T`` piecewise linear between the pillars, flat outside;
+    :class:`volsto.market.surface.ESSVISurface`).  ``None`` is the plain SSVI with the scalar
+    ``rho``.  With ``rhos`` set the scalar ``rho`` stays in the config (the importer writes the
+    mean of the pillar values there) and the surface ignores it.  ``rhos`` is in
+    :data:`OMIT_WHEN_NONE`: a plain SSVI config maps — and hashes into the leverage-cache key —
+    exactly as before the field existed.  Surfaces are built from a config only by
+    :func:`volsto.market.surface.surface_from_config`; a snapshot's ``essvi`` section is read
+    only by :func:`volsto.market.loaders.load_surface_config`.  Checked by
+    ``tests/test_surface_config.py``.
     """
 
     atm_maturities: tuple[float, ...]
@@ -411,8 +444,22 @@ class SSVIConfig:
     eta: float
     gamma: float
     max_maturity: float = 10.0
+    rhos: tuple[float, ...] | None = None
+
+    OMIT_WHEN_NONE: ClassVar[frozenset[str]] = frozenset({"rhos"})
+    """Fields left out of every mapping while ``None`` (:func:`omitted_when_none`)."""
 
     def __post_init__(self) -> None:
+        if self.rhos is not None:
+            rhos = tuple(float(r) for r in self.rhos)
+            object.__setattr__(self, "rhos", rhos)
+            if len(rhos) != len(self.atm_maturities):
+                raise ValueError(
+                    f"rhos needs one correlation per ATM pillar: {len(rhos)} given for "
+                    f"{len(self.atm_maturities)} pillars"
+                )
+            if not all(math.isfinite(r) and -1.0 < r < 1.0 for r in rhos):
+                raise ValueError("rhos must be finite and lie in (-1, 1)")
         if len(self.atm_maturities) != len(self.atm_vols) or not self.atm_maturities:
             raise ValueError("atm_maturities and atm_vols must be non-empty and of equal length")
         if any(t <= 0 for t in self.atm_maturities) or any(np.diff(self.atm_maturities) <= 0):
@@ -755,7 +802,9 @@ class CalibrationSpec:
     The cache key hashes ``key_payload()``: market, surface, its perturbation layer (M5), model
     parameters, particle settings, the local-vol grid, and the parts of :class:`SimConfig` the
     kernel depends on (step schedule and scheme).  Pricing-only settings (``n_paths``, pricing
-    seed, chunking) are excluded.
+    seed, chunking) are excluded.  An eSSVI surface (``surface.rhos``, SPEC §13.2) enters the
+    key through its pillar correlations; a plain SSVI surface hashes as it did before eSSVI
+    configs existed (:func:`omitted_when_none`).
     """
 
     market: MarketConfig

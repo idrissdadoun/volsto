@@ -5,7 +5,7 @@ studies: Black–Scholes, Dupire local vol, two-factor lognormal Bergomi forward
 LSV with particle-calibrated leverage, Monte Carlo with common random numbers, and viewers over a
 precomputed parameter cache.  The full design is in [SPEC.md](SPEC.md).
 
-Status: **M6 (in progress)** — market layer, BS, local vol, MC engine, vanilla / variance products (M1); the
+Status: **M10 built (pending review); M1–M9 accepted** — market layer, BS, local vol, MC engine, vanilla / variance products (M1); the
 two-factor lognormal Bergomi forward-variance model with exact factor stepping, its closed forms
 and the mixing-solution smile (M2); particle-method leverage calibration, the LSV model, §4.2
 repricing diagnostics and the content-addressed leverage cache (M3); the HistoricalData.net
@@ -19,8 +19,12 @@ skew / curvature ladders, spot and cliquet gamma profiles, parameter sensitiviti
 likelihood-ratio / conditional / control-variate estimators, P&L attribution and `RiskReport`.
 M6: barrier machinery (discrete and Brownian-bridge continuous monitoring, barrier shift,
 Reiner–Rubinstein closed forms), autocall / Phoenix notes with exact leg decompositions and
-analytics, and a 1F LSV ADI PDE cross-check; the calibration-side pass (Part 0) is measured and
-stopped for the owner's decision (SPEC §4.2 M6 Part 0 notes).
+analytics, and a 1F LSV ADI PDE cross-check (M6). Smile dynamics, SSR estimators and the P1
+marking calibration by SABR break-evens (M7); the hedging framework and the M8b hedging studies
+(M8); the sharded precompute, results store and Streamlit viewers (M9); the certified eSSVI
+calendar repair, the study runner with LaTeX output, the study catalogue S1–S7 and the rolling
+backtest (M10). Methodology: [docs/methodology.md](docs/methodology.md); studies:
+[docs/studies.md](docs/studies.md).
 
 ## Install
 
@@ -31,6 +35,95 @@ uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python -e ".[de
 ```
 
 ## Quickstart
+
+### Command line: precompute a toy grid, run study S1, open the viewer
+
+Run the commands below from the repository root. They install the optional extras, precompute a
+small grid, run study S1 on it, and check the viewer.
+
+The walk-through writes everything under a scratch root, `$QS`. This keeps the toy grid
+(2·10⁴ particles, 1y horizon) away from the production store: the toy grid's local-vol
+point has the same id as the one in `outputs/store`, so writing the toy there would replace that
+point.
+
+```bash
+uv pip install --python .venv/bin/python -e ".[viewers,studies]"   # streamlit + plotly, matplotlib
+source .venv/bin/activate
+export QS=/tmp/volsto-quickstart
+
+# 1. Precompute the toy grid (configs/grids/toy.yaml): the placeholder surface's LV point,
+#    1F nu in {0.25, 0.5} (rho -0.7, kappa 1.5) and 2F Table 8.2 -- 3 leverage calibrations
+#    at 2e4 particles, 4000 pricing paths, no risk tier
+volsto-precompute --grid configs/grids/toy.yaml --store $QS/store --cache $QS/cache --dry-run
+volsto-precompute --grid configs/grids/toy.yaml --store $QS/store --cache $QS/cache
+
+# 2. Study S1 (forward vol and cliquets vs vol-of-vol) in fast mode on that store.
+#    It reads the store and the cache and never calibrates.
+volsto-study run configs/studies/catalogue/s1_fast.yaml \
+    --grid configs/grids/toy.yaml --store $QS/store --cache $QS/cache \
+    --outputs $QS/outputs --out $QS/studies/s1_forward_vol_fast
+
+# 3. The viewer: render the eight pages headless (nothing served), then serve them
+volsto-viewer --grid configs/grids/toy.yaml --store $QS/store --cache $QS/cache --outputs $QS/outputs --check
+volsto-viewer --grid configs/grids/toy.yaml --store $QS/store --cache $QS/cache --outputs $QS/outputs
+```
+
+The last command starts Streamlit on port 8501 (`--port`, `--headless`); stop it with Ctrl-C.
+
+**Where the study lands.** Everything is in `$QS/studies/s1_forward_vol_fast/`:
+
+| File | Contents |
+|---|---|
+| `study.md` | the question, the narrative with the tables inlined, provenance |
+| `study.pdf`, `study.tex` | compiled by Tectonic (see below) |
+| `tables/*.tex` | the LaTeX tables |
+| `figures/*.pdf`, `figures/*.png` | the figures |
+| `results.parquet` | every number with its standard error |
+| `manifest.json` | commit, cache keys, seeds, wall clock, `recalibrated: false` |
+
+A fast-mode study carries a "FAST MODE" banner: the toy numbers check the plumbing, not the
+models. `study.pdf` needs Tectonic (`brew install tectonic`); without it the LaTeX check is
+skipped and the install line is printed, and `--no-latex-check` skips it on purpose.
+
+To rebuild the documents from the stored numbers, or to re-execute the study and diff the numbers
+at 2 standard errors:
+
+```bash
+volsto-study render $QS/studies/s1_forward_vol_fast
+volsto-study rerun  $QS/studies/s1_forward_vol_fast
+```
+
+**Default paths**, used when a flag is omitted (all relative to the repository root):
+
+| Command | Defaults |
+|---|---|
+| `volsto-precompute` | `--grid configs/grids/default.yaml --store outputs/store --cache cache` |
+| `volsto-study run` | the config's `store: outputs/store`, `cache: cache`, `outputs: outputs`; output in `outputs/studies/<name>` |
+| `volsto-viewer` | `--cache cache --store outputs/store --outputs outputs --snapshots configs/surfaces/snapshots --grid configs/grids/default.yaml`; also settable through `VOLSTO_CACHE` / `VOLSTO_STORE` / `VOLSTO_OUTPUTS` / `VOLSTO_SNAPSHOTS` / `VOLSTO_GRID` or `configs/viewer.yaml` |
+
+The production S1 reads the repository store directly:
+`volsto-study run configs/studies/catalogue/s1.yaml`.
+
+**Measured** on 2026-09-16, with `NUMBA_NUM_THREADS=2` on a laptop shared with a Monte Carlo job:
+
+| Step | Wall clock |
+|---|---|
+| Install (resolved with `--dry-run`: every extra already satisfied) | 0.3 s |
+| Precompute dry run | 1.1 s |
+| Precompute | 20.2 s (3 calibrations of 2.8–2.9 s each) |
+| S1 fast | 3.2 s |
+| Viewer `--check` | 8.1 s (8 pages ok) |
+| `render` | 2.9 s |
+| `rerun` | 2.6 s (351 numbers, nothing moved) |
+
+On an empty cache the dry run charges a 140 s fallback per calibration and projects 0.12 h. That
+figure overstates the toy run.
+
+What each catalogue study answers, and how to run it: [docs/studies.md](docs/studies.md). The
+model, calibration and conventions: [docs/methodology.md](docs/methodology.md). The production
+grid on a rented VM: [docs/vm_grid_run.md](docs/vm_grid_run.md).
+
+### Python API
 
 ```python
 from volsto.calibration import LeverageCache, reprice_surface

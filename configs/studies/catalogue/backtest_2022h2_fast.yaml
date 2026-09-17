@@ -1,0 +1,15 @@
+# M10 Part 3, stage 2 in CI-fast mode: the toy backtest (configs/backtest/hdn_2022h2_toy.yaml,
+# 5 dates, 2e4 particles, 1y horizon, half-year term sheets) built by the session fixture
+# tests/_backtest_build.py::toy_backtest_build; the tests pass --outputs <the fixture's outputs>.
+# Fast mode checks the plumbing, not the models.
+name: backtest_2022h2_fast
+runner: volsto.studies.backtest
+grid: null
+store: outputs/store
+cache: cache
+outputs: outputs
+mode: fast
+seeds: {pricing: 2024}          # must equal the backtest config's pricing seed (checked)
+params:
+  backtest: configs/backtest/hdn_2022h2_toy.yaml
+  store: backtest/hdn_2022h2_toy

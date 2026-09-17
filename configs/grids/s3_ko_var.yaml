@@ -1,0 +1,49 @@
+# Grid of study S3 (volsto/studies/catalogue/s3_conditional_variance.py): the knock-out variance
+# swap's LSV-minus-LV strike against nu, rho and theta on the placeholder surface.  Loaded as
+# volsto.viewers.grid.GridSpec.
+#
+# 1F: nu x rho at kappa 1.5 (30 points).  Their specs are the default grid's (same reference
+# spec, particles and horizon), so their ids and leverage keys are the default grid's: a
+# default-grid VM run fills them, and a run of this grid fills the default grid's.  The products
+# and pricing budget are the default grid's for the same reason (a stored point is skipped by a
+# later --resume of the other grid, so both must store the same tables); the risk tier is none
+# (a later default-grid --resume refreshes the risk step only).
+# 2F: Table 8.2 and four theta variants of it (the theta sweep no other grid holds; the other
+# six parameters as in Table 8.2; the correlation matrix is theta-independent and PSD).
+# Cached today: the three degenerate 1F points (nu 0.5 / 1 / 1.5 at rho -0.7) and Table 8.2.
+name: s3_ko_var
+reference_spec: configs/studies/lsv_reference_2f.yaml
+surfaces:
+  - {name: placeholder, kind: placeholder, one_factor: true, two_factor: true, marking: false}
+particle:
+  n_particles: 800000      # SPEC §11 production count
+  horizon: 3.0             # the default grid's horizon (shared leverage keys)
+one_factor:
+  nu: [0.25, 0.5, 0.75, 1.0, 1.25, 1.5]
+  rho: [-0.9, -0.7, -0.5, -0.3, 0.0]
+  kappa: [1.5]
+two_factor_presets:
+  - name: "Table 8.2"
+    model: {nu: 1.74, theta: 0.245, k1: 5.35, k2: 0.28, rho12: 0.0, rho_SX1: -0.759, rho_SX2: -0.487}
+  - name: "Table 8.2 theta=0.1"
+    model: {nu: 1.74, theta: 0.1, k1: 5.35, k2: 0.28, rho12: 0.0, rho_SX1: -0.759, rho_SX2: -0.487}
+  - name: "Table 8.2 theta=0.4"
+    model: {nu: 1.74, theta: 0.4, k1: 5.35, k2: 0.28, rho12: 0.0, rho_SX1: -0.759, rho_SX2: -0.487}
+  - name: "Table 8.2 theta=0.6"
+    model: {nu: 1.74, theta: 0.6, k1: 5.35, k2: 0.28, rho12: 0.0, rho_SX1: -0.759, rho_SX2: -0.487}
+  - name: "Table 8.2 theta=0.8"
+    model: {nu: 1.74, theta: 0.8, k1: 5.35, k2: 0.28, rho12: 0.0, rho_SX1: -0.759, rho_SX2: -0.487}
+include_degenerate: true
+products:                  # the default grid's (see above)
+  m4: true
+  m6: true
+  conditional: true
+  cliquet_maturities: [1.0, 2.0]
+pricing:
+  n_paths: 400000
+  seed: 2024
+risk:
+  tier: none
+  products: ["autocall 3y", "cliquet 1y"]
+  light_pillars: [0.25, 1.0, 3.0]
+  fwd_var_buckets: 3

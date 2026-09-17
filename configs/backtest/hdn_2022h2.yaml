@@ -1,0 +1,95 @@
+# M10 Part 3 — rolling date-by-date backtest, the proof of concept on the free
+# HistoricalData.net 2022 H2 SPX sample (127 trading days).
+# The cheapest configuration that delivers every output the owner listed: the P&L by delta,
+# gamma, vega waves, skew / curvature, model parameters, recalibration and residual; the fitted
+# parameters with the stability flags; realised vs marked SSR; the VKO outcome; the inception
+# pricing of a monthly rolling book.  Ladders on the five fitted pillars 3m / 6m / 1y / 2y / 3y;
+# the rolling book priced on its inception dates only (the fixed book carries the
+# mark-to-market drift); 2e4 paths with one seed.  The richer variant is hdn_2022h2_full.yaml.
+# Stage 1: `volsto-backtest run configs/backtest/hdn_2022h2.yaml [--shard i/n] [--resume]
+# [--only-dates 2022-07-01..2022-08-05]` (the only M10 path that calibrates);
+# `volsto-backtest dry-run ...` prints the projected wall clock; stage 2:
+# `volsto-study run configs/studies/catalogue/backtest_2022h2.yaml`.
+# One regime and too short for a conclusion; the multi-year run waits on the paid EOD archive and
+# is a one-line change: dates.start / dates.end and data.root.
+# Variance products (var_swap, ko_var) are struck at the inception surface's log-contract
+# variance-swap strike (strike: vs_strip) with variance notional 1/(2 K_vol): vega notional 1,
+# values in vol points x 100.  This differs from M8b, whose KO var had strike 0 in variance
+# units; the backtest strikes each trade as a desk would on its trade date (value ~ 0).
+# Loaded strictly by volsto.studies.backtest.load_backtest_config: every key is required.
+# P&L sign: the stored per-date rows keep the holder's sign, V(d) - V(d-1) + flows; the study
+# (stage 2) presents the desk P&L, -(that), the desk being short the book (M7 / M8b convention).
+name: hdn_2022h2
+data:
+  vendor: hdn                                     # the only importer (volsto.market.import_hdn)
+  root: data/hdn_sample/options_sample_2022H2     # a day_by_date/ directory; not hashed
+  underlying: SPX
+  missing_close: fail      # fail: an unreadable day file fails its date and leaves the
+                           # trades spanning it unpriced (the message names the fix);
+                           # skip_date: drop it from the calendar (every later fixing
+                           # of a trade spanning it moves one vendor date; stated)
+dates:
+  start: "2022-07-01"      # the fixed book's inception; hashed
+  end: "2022-12-30"        # not hashed: extending the range keeps the computed dates
+surface:
+  essvi: true              # eSSVI (per-pillar rho), the importer's default
+  calendar_repair: true    # SPEC §13.1: proven d_T w >= 1e-4 on 127/127 days
+marking:
+  ssr_target: 1.0          # the M8b reference mark (configs/studies/m7_p1_marking/spx_ssr1_eps0.1)
+  skew_eps: 0.10
+  stage3: false            # off: minutes per date, and its engine-bias assertion FAILS for the
+                           # SPX (1.0, 0.10) mark (SPEC §15); the marked SSR is first order
+calibration:
+  base_spec: configs/studies/lsv_reference_2f.yaml   # particle, scheme and step schedule
+  n_particles: 800000      # production (SPEC §11)
+  horizon: 3.0             # covers the 3y notes
+pricing:
+  n_paths: 20000           # the M8b budget; CRN: one seed on every date, so daily P&L and the
+  chunk_size: 20000        # attribution steps are paired differences
+  seed: 2024
+book:
+  fixed:                   # struck on dates.start
+    - {id: autocall_3y, kind: autocall, maturity: 3.0, observations: 3}   # = M6 headline
+    - {id: phoenix_3y, kind: phoenix, maturity: 3.0, observations: 3}    # = M6 headline
+    - {id: cliquet_1y, kind: cliquet, maturity: 1.0}                     # the study cliquet
+    - {id: vko_put_12m, kind: vko_put, maturity: 1.0, vol_ko: 0.30, moneyness: 1.0}
+    - {id: ko_var_1y, kind: ko_var, maturity: 1.0, barrier: 1.10, strike: vs_strip}
+    - {id: var_swap_1y, kind: var_swap, maturity: 1.0, strike: vs_strip}
+  rolling:                 # a new trade of each on the first trading date of each month
+    every: month
+    mark: inception        # inception: priced on its inception date only (the inception
+                           # pricing); daily: also marked after (paired P&L), +1.7 h
+    products:
+      - {id: autocall_3y, kind: autocall, maturity: 3.0, observations: 3}
+      - {id: phoenix_3y, kind: phoenix, maturity: 3.0, observations: 3}
+      - {id: cliquet_1y, kind: cliquet, maturity: 1.0}
+      - {id: vko_put_12m, kind: vko_put, maturity: 1.0, vol_ko: 0.30, moneyness: 1.0}
+      - {id: ko_var_1y, kind: ko_var, maturity: 1.0, barrier: 1.10, strike: vs_strip}
+      - {id: var_swap_1y, kind: var_swap, maturity: 1.0, strike: vs_strip}
+attribution:
+  mode: sticky_leverage    # SPEC §7.12.1: no calibration between the endpoints
+  detail: ladders          # vega waves (tents), skew and curvature buckets (owner's list)
+  trades: fixed            # the fixed book; rolling trades are priced at inception only
+  pillars: [0.25, 0.5, 1.0, 2.0, 3.0]   # the fitted pillars (46 states a date, not 62)
+  bump: 0.01
+  max_halvings: 6          # the curvature ladder on repaired eSSVI needs up to 6 (SPEC §7.12.1)
+ssr:
+  window: 20               # realised SSR: the minimum window (MIN_INCREMENTS), SPEC §15 Part 2
+  pillars: [0.25, 0.5, 1.0]
+stability:
+  window_vol: 60           # the §15 Part 4 historical-mode rolling fit on the stored history
+  window_ssr: 60
+  share: 0.5
+  band: 1.0
+  fit:                     # the historical-mode rolling fit (BreakEvenFitConfig; the
+                           # other settings at their library defaults, hashed)
+    pillars: [0.25, 0.5, 1.0, 2.0, 3.0]
+    mat_min: 0.25
+    k2: 0.2
+    skew_mode: soft        # the historical fit's mode (auto resolves to soft)
+    skew_eps: 0.10
+    nu_cap: 3.5
+paths:
+  out: outputs/backtest/hdn_2022h2
+  cache: cache
+  snapshots: outputs/backtest/hdn_2022h2/snapshots

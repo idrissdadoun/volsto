@@ -1,0 +1,16 @@
+# M10 Part 3, stage 2: the rolling backtest study, rendered from the per-date store written by
+# `volsto-backtest run configs/backtest/hdn_2022h2.yaml` (stage 1, the only M10 path that
+# calibrates).  This study reads that store and never calibrates; a missing date prints the exact
+# `volsto-backtest run ... --only-dates ...` line and exits 2.
+name: backtest_2022h2
+runner: volsto.studies.backtest
+question: "Day by day over 2022 H2, how does the marked book move, which risks explain its P&L, and how do the marked SSR and the fitted parameters compare with what was realised?"
+grid: null
+store: outputs/store
+cache: cache
+outputs: outputs
+mode: full
+seeds: {pricing: 2024}          # must equal the backtest config's pricing seed (checked)
+params:
+  backtest: configs/backtest/hdn_2022h2.yaml
+  store: backtest/hdn_2022h2      # relative to `outputs` (null: the backtest config's paths.out)

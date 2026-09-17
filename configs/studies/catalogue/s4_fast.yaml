@@ -1,0 +1,22 @@
+# S4 CI-fast variant (runner volsto/studies/catalogue/s4_autocall.py): the toy build of
+# tests/conftest.py::toy_build.  The toy store has no M6 cells, so every note is priced here
+# from the toy leverage (2e4 particles, 1y horizon: the 3y notes run on the last leverage slice
+# held beyond 1y - plumbing, not numbers), 4000 paths; local-vol exposure at 4000 paths.
+name: s4_autocall_fast
+runner: volsto.studies.catalogue.s4_autocall
+grid: configs/grids/toy.yaml
+store: outputs/store
+cache: cache
+outputs: outputs
+mode: fast
+seeds: {pricing: 2024}
+params:
+  models:
+    surface: placeholder
+    lv: true
+    one_factor: {nu: all, rho: all, kappa: all}
+    two_factor: all
+  price_missing: true
+  pricing: {n_paths: 4000}
+  lv_exposure: {n_paths: 4000, size: 0.01}
+  store_risk: true

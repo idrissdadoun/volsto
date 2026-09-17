@@ -181,7 +181,7 @@ def committed_snapshots() -> dict[str, Any]:
         except ValueError as exc:
             row["loads"] = False
             row["error"] = str(exc)
-        with mock.patch("volsto.market.loaders.ESSVISurface", _RecordingESSVI):
+        with mock.patch("volsto.market.surface.ESSVISurface", _RecordingESSVI):
             u = load_ssvi_surface(path)
         assert isinstance(u, ESSVISurface)
         row.update({k.removeprefix("s_"): v for k, v in _calendar_columns("s", u).items()})

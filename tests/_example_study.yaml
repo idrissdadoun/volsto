@@ -1,0 +1,18 @@
+# Example study of tests/test_study_runner.py (runner module tests/_example_study.py): European
+# calls under Black-Scholes by Monte Carlo beside the closed form.  The tests pass --store /
+# --cache / --outputs (the study reads none of them); grid null.  Loaded as
+# volsto.studies.runner.StudyConfig.
+name: example_bs_vanilla
+runner: _example_study
+grid: null
+store: outputs/store
+cache: cache
+outputs: outputs
+mode: fast
+seeds: {pricing: 2024}
+params:
+  vol: 0.2
+  maturity: 1.0
+  strikes: [80, 100, 120]
+  n_paths: 20000
+  requires: []

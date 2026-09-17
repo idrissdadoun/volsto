@@ -1,0 +1,23 @@
+# S4 - autocall and Phoenix model risk (runner volsto/studies/catalogue/s4_autocall.py) on the
+# placeholder surface's cached headline models (8e5 particles): the M6 cells read from the
+# repository store (400k paths, seed 2024), the local-vol forward-skew exposure priced here, the
+# forward-skew diagnostic from the stored smiles.  The store's risk tier is none: the LSV skew_T
+# is reported missing with its --risk light precompute line.
+name: s4_autocall
+runner: volsto.studies.catalogue.s4_autocall
+grid: configs/grids/placeholder_cached.yaml
+store: outputs/store
+cache: cache
+outputs: outputs
+mode: full
+seeds: {pricing: 2024}
+params:
+  models:
+    surface: placeholder
+    lv: true
+    one_factor: {nu: all, rho: all, kappa: all}
+    two_factor: all
+  price_missing: true              # a point without M6 cells is priced from its leverage
+  pricing: {n_paths: 400000}       # the M6 headline budget of that pricing
+  lv_exposure: {n_paths: 400000, size: 0.01}   # one vol point of 90/110 skew per tent
+  store_risk: true

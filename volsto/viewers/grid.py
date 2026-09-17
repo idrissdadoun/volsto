@@ -58,11 +58,10 @@ from volsto.config import (
     CalibrationSpec,
     ConfigError,
     LocalVolConfig,
-    MarketConfig,
-    SSVIConfig,
     load_yaml,
     to_mapping,
 )
+from volsto.market.loaders import snapshot_spec
 from volsto.market.surface import ImpliedSurface
 
 log = logging.getLogger(__name__)
@@ -332,19 +331,19 @@ def surface_spec(grid: GridSpec, surface: SurfaceSpec, ref: CalibrationSpec) -> 
         path = REPO_ROOT / surface.path
         if not path.exists():
             raise ConfigError(f"surface {surface.name!r}: snapshot {path} does not exist")
-        spec = dataclasses.replace(
-            spec,
-            market=load_yaml(path, MarketConfig, section="market"),
-            surface=load_yaml(path, SSVIConfig, section="ssvi"),
-        )
+        spec = snapshot_spec(spec, path)  # an essvi section keeps its pillar rhos
     if surface.local_vol is not None:
         spec = dataclasses.replace(spec, local_vol=surface.local_vol)
     return spec
 
 
-def lv_key(spec: CalibrationSpec) -> str:
-    """Id of a surface's LV point: ``lv:`` + SHA-256 of market, surface and local-vol config
-    (model, particle and scheme settings play no part in a Dupire local vol)."""
+def surface_digest(spec: CalibrationSpec) -> str:
+    """SHA-256 of a spec's surface content — market, surface config (an eSSVI's pillar ``rhos``
+    included), local-vol grid and perturbation layer; model, particle and scheme settings play no
+    part.  The LV point's id (:func:`lv_key`) and the marking points' stored
+    ``surface_digest`` (their id names the surface only: ``volsto-precompute --resume``
+    recomputes a stored marking point whose digest differs,
+    :func:`volsto.viewers.precompute.pending_steps`)."""
     payload = {
         "market": to_mapping(spec.market),
         "surface": to_mapping(spec.surface),
@@ -352,10 +351,18 @@ def lv_key(spec: CalibrationSpec) -> str:
         "perturbation": (to_mapping(spec.perturbation) if spec.perturbation is not None else None),
     }
     blob = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
-    return "lv:" + hashlib.sha256(blob).hexdigest()
+    return hashlib.sha256(blob).hexdigest()
+
+
+def lv_key(spec: CalibrationSpec) -> str:
+    """Id of a surface's LV point: ``lv:`` + :func:`surface_digest` (model, particle and scheme
+    settings play no part in a Dupire local vol)."""
+    return "lv:" + surface_digest(spec)
 
 
 def marking_id(surface: str, ssr_target: float, skew_eps: float) -> str:
+    """A marking point's id: the surface's grid name and the two dials — not its content, which
+    the stored manifest's ``surface_digest`` records (:func:`surface_digest`)."""
     return f"marking:{surface}:ssr{ssr_target:g}:eps{skew_eps:g}"
 
 

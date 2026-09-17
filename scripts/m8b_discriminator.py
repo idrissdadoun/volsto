@@ -53,7 +53,8 @@ from volsto.calibration.raw_history import (
     verdict_from_table,
     write_discriminator_report,
 )
-from volsto.config import CalibrationSpec, MarketConfig, SSVIConfig, load_yaml
+from volsto.config import CalibrationSpec, load_yaml
+from volsto.market.loaders import snapshot_spec
 
 ROOT = Path(__file__).resolve().parents[1]
 REF_SPEC = ROOT / "configs" / "studies" / "lsv_reference_2f.yaml"
@@ -137,12 +138,7 @@ def relabel_report(paths: dict[str, Path], label: str, history: str) -> None:
 def spx_base_spec(n_particles: int) -> CalibrationSpec:
     """``scripts/m7_p1_marking.py::base_spec('spx', n_particles)``: the reference 2F study spec
     with the SPX 2022-12-30 snapshot's market and surface."""
-    ref = load_yaml(REF_SPEC, CalibrationSpec)
-    ref = dataclasses.replace(
-        ref,
-        market=load_yaml(SPX_SNAPSHOT, MarketConfig, section="market"),
-        surface=load_yaml(SPX_SNAPSHOT, SSVIConfig, section="ssvi"),
-    )
+    ref = snapshot_spec(load_yaml(REF_SPEC, CalibrationSpec), SPX_SNAPSHOT)
     return dataclasses.replace(
         ref, particle=dataclasses.replace(ref.particle, n_particles=n_particles)
     )

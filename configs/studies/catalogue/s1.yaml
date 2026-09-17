@@ -1,0 +1,26 @@
+# S1 - forward vol and cliquets vs vol-of-vol (runner volsto/studies/catalogue/s1_forward_vol.py)
+# on the placeholder surface's cached headline models: LV + 1F omega in {1, 2, 3} (nu 0.5 / 1 /
+# 1.5, rho -0.7, kappa 1.5) + 2F Table 8.2, all five points in the repository store at 8e5
+# particles, 400k paths, seed 2024.  The M4 headline regeneration against
+# tests/test_m4_regression.py is part of the study.  Store-only run (no pricing at all):
+#   volsto-study run configs/studies/catalogue/s1.yaml --set price_missing=false
+name: s1_forward_vol
+runner: volsto.studies.catalogue.s1_forward_vol
+grid: configs/grids/placeholder_cached.yaml
+store: outputs/store
+cache: cache
+outputs: outputs
+mode: full
+seeds: {pricing: 2024}          # the M4 / M6 baseline seed (used only by inline pricing)
+params:
+  models:
+    surface: placeholder
+    lv: true
+    one_factor: {nu: all, rho: all, kappa: all}
+    two_factor: all
+  headline: {rho: -0.7, kappa: 1.5}      # the M4 headline slice
+  cliquet_maturities: [1.0, 2.0]         # the study cliquets (monthly, cap 2%, floor 0)
+  price_missing: true                    # a point absent from the store is priced from its
+                                         # cached leverage (none is absent on this grid)
+  pricing: {n_paths: 400000}             # the M4 baseline budget of that inline pricing
+  baseline: {file: tests/test_m4_regression.py, variable: PLACEHOLDER_BASELINES}

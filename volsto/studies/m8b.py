@@ -146,9 +146,7 @@ from volsto.calibration.cache import CacheMissError, LeverageCache
 from volsto.calibration.fit_2f import BreakEvenFitConfig, load_fit_spec
 from volsto.config import (
     CalibrationSpec,
-    MarketConfig,
     SimConfig,
-    SSVIConfig,
     SurfacePerturbation,
     load_yaml,
 )
@@ -184,6 +182,7 @@ from volsto.hedging.strategies import (
     default_strategy,
 )
 from volsto.hedging.worlds import SHOCK_DAYS, shock_state, skew_shock_world
+from volsto.market.loaders import snapshot_spec
 from volsto.models.base import Model
 from volsto.products.base import Product, daily_schedule
 from volsto.products.cliquet import AdditiveCliquet
@@ -735,12 +734,7 @@ def spx_base_spec(n_particles: int) -> CalibrationSpec:
     """``scripts/m7_p1_marking.py::base_spec("spx", n_particles)``: the reference 2F study spec
     with the SPX 2022-12-30 snapshot's market and surface — the base spec of the M7 rotation
     greek (its model field is replaced by the marking fit inside the greek)."""
-    ref = load_yaml(REF_SPEC, CalibrationSpec)
-    ref = dataclasses.replace(
-        ref,
-        market=load_yaml(SPX_SNAPSHOT, MarketConfig, section="market"),
-        surface=load_yaml(SPX_SNAPSHOT, SSVIConfig, section="ssvi"),
-    )
+    ref = snapshot_spec(load_yaml(REF_SPEC, CalibrationSpec), SPX_SNAPSHOT)
     return dataclasses.replace(
         ref, particle=dataclasses.replace(ref.particle, n_particles=int(n_particles))
     )
@@ -1927,7 +1921,7 @@ def static_prediction(
             int(cached.get("n_paths", -1)) == cfg.rotation_paths
             and int(cached.get("n_particles", -1)) == cfg.rotation_particles
         ):
-            return cached
+            return {**cached, "from_cache": True}
     t0 = time.perf_counter()
     product = env.product(product_name)
     unit, scale, _ = env.unit_of(product_name)
