@@ -20,8 +20,9 @@ fit), the DENSE check (:meth:`~volsto.market.surface.ESSVISurface.calendar_dense
 ``∂_T w`` on 1201 ``k`` on ``±3`` × 3000 ``T`` plus both limits at every knot, the secant and
 step metrics of the verifier, and the floor-0 certificate), the status of every committed eSSVI
 snapshot under ``configs/surfaces`` under the three constructor checks, RMS and
-max error inside ``|k| ≤ 0.20`` from 3m to 3y (the fit's reported convention, and on the surface
-actually returned — the ``θ`` clamp defect of ``fit_ssvi``), the 1y/2y/3y ATMF skew of each
+max error inside ``|k| ≤ 0.20`` from 3m to 3y (from the fit's points and on the surface
+returned; the two agree since the ``θ`` clamp of ``fit_ssvi`` was fixed on 2026-09-17, and the
+largest per-day difference is reported), the 1y/2y/3y ATMF skew of each
 variant, the anchor day 2022-12-30, and the pillar-count distribution (days whose 3y skew is
 extrapolation whatever the parametrisation).  Surface fitting only, single core: nothing
 calibrates, nothing simulates, nothing is written outside ``--out`` (refused under
@@ -111,8 +112,8 @@ def _unchecked_essvi() -> Iterator[None]:
 
 
 def _surface_errors(fit: ih.SSVIFit) -> tuple[float, float]:
-    """RMS / max error in the gate window on the surface ``fit`` returns (the fit's ``points``
-    clamp ``θ`` beyond the last pillar; the surface extrapolates it)."""
+    """RMS / max error in the gate window on the surface ``fit`` returns, evaluated
+    independently of the fit's ``points`` (which describe the same surface since 2026-09-17)."""
     p = fit.points
     m = (p["T"] >= ERR_T_MIN - 1e-9) & (p["T"] <= ERR_T_MAX + 1e-9) & (p["k"].abs() <= ERR_K_ABS)
     k = p.loc[m, "k"].to_numpy(float)
@@ -364,6 +365,12 @@ def summarise(df: pd.DataFrame, wall: float, with_ssvi: bool) -> dict[str, Any]:
             "median_max": _med(df[f"{v}_max"]),
             "median_rms_surface": _med(df[f"{v}_rms_surface"]),
             "median_max_surface": _med(df[f"{v}_max_surface"]),
+            "max_abs_diff_fit_vs_surface": float(
+                max(
+                    (df[f"{v}_rms"] - df[f"{v}_rms_surface"]).abs().max(),
+                    (df[f"{v}_max"] - df[f"{v}_max_surface"]).abs().max(),
+                )
+            ),
         }
         s["skew"][v] = {f"{T:g}y": _med(df[f"{v}_skew{T:g}"]) for T in SKEW_TENORS}
     if len(ch):
@@ -576,12 +583,19 @@ def write_report(out: Path, df: pd.DataFrame, s: dict[str, Any], args: argparse.
             f"max increase {c['worst_max_increase']['delta']:+.4f} "
             f"({c['worst_max_increase']['date']}); median repaired fit "
             f"{c['seconds_per_repaired_fit_median']:.2f} s.",
-            "",
-            "The 'fit's points' columns are the repository's reported convention (`fit_ssvi` "
-            "clamps θ beyond the last pillar); the 'surface returned' columns evaluate the "
-            "surface the importer hands back (θ extrapolated) — the defect is reported, not "
-            "fixed, in this change.",
         ]
+    lines += [
+        "",
+        "The 'fit's points' columns are what `fit_ssvi` reports; the 'surface returned' columns "
+        "evaluate the surface the importer hands back. They agree since the fit's θ clamp was "
+        "fixed (2026-09-17): largest per-day difference "
+        + ", ".join(
+            f"{v} {er[v]['max_abs_diff_fit_vs_surface']:.1e} vp"
+            for v in ("base", "rep", "ssvi")
+            if v in er
+        )
+        + ".",
+    ]
     lines += [
         "",
         "## ATMF skew (d sigma / dk at k = 0), medians over days",

@@ -64,7 +64,9 @@ from volsto.market.surface import (
     calendar_t_grid,
     certify_calendar,
     essvi_dw_dt,
+    pillar_rho,
     ssvi_theta,
+    ssvi_total_variance,
 )
 
 FloatArray = NDArray[np.float64]
@@ -106,6 +108,9 @@ HDN_COLUMNS: tuple[str, ...] = (
     "vega",
     "rho",
 )
+CONSTRUCTOR_MIN_MATURITY: float = 1.0 / 365.0
+"""``min_maturity`` of the surfaces the importer builds (the constructors' default): the short end
+of the butterfly check the ``η`` cap covers (:func:`_eta_theta_range`)."""
 RATE_TENORS: FloatArray = np.array([1.0 / 12.0, 0.25, 1.0, 2.0, 5.0, 10.0, 30.0])
 INDEX_ROOTS: dict[str, tuple[str, ...]] = {"SPX": ("SPX", "SPXW")}
 
@@ -687,7 +692,7 @@ def calendar_constraint_grid(
     pillars: FloatArray,
     max_maturity: float,
     cfg: CalendarRepairConfig,
-    min_maturity: float = 1.0 / 365.0,
+    min_maturity: float = CONSTRUCTOR_MIN_MATURITY,
     *,
     k_max: float | None = None,
     n_k: int | None = None,
@@ -705,17 +710,19 @@ def calendar_constraint_grid(
     return np.linspace(-km, km, nk), seg, ts
 
 
-def _eta_theta_range(theta_p: FloatArray) -> tuple[float, float]:
-    """``θ`` range on which :func:`fit_ssvi` caps ``η`` (half the smallest, 1.5× the largest
-    pillar variance)."""
-    return float(theta_p.min()) * 0.5, float(theta_p.max()) * 1.5
-
-
-def _surface_theta(pillars: FloatArray, theta_p: FloatArray, Tq: FloatArray) -> FloatArray:
-    """``θ_T`` exactly as :meth:`volsto.market.surface.SSVISurface.theta` evaluates it (linear
-    from 0, last forward variance extended beyond the last pillar) — the repair constrains the
-    surface the importer returns, not the fit's clamped ``θ`` (see :func:`fit_ssvi`)."""
-    return ssvi_theta(pillars, theta_p, Tq)
+def _eta_theta_range(
+    pillars: FloatArray, theta_p: FloatArray, min_maturity: float, max_maturity: float
+) -> tuple[float, float]:
+    """``θ`` range on which :func:`fit_ssvi` and :func:`repair_calendar` cap ``η``: half the
+    smallest to 1.5× the largest pillar variance, widened to the range the surface constructor
+    checks for butterfly arbitrage, ``[θ(min_maturity), θ(max_maturity)]`` (``θ`` as the
+    surface evaluates it, :func:`~volsto.market.surface.ssvi_theta`), so every ``η`` the fit or
+    the repair may return constructs.  The one place (since 2026-09-17; the unrepaired fit
+    capped on the pillar range only)."""
+    th_ends = ssvi_theta(pillars, theta_p, np.array([min_maturity, max_maturity]))
+    lo = min(float(theta_p.min()) * 0.5, float(th_ends[0]))
+    hi = max(float(theta_p.max()) * 1.5, float(th_ends[1]))
+    return lo, hi
 
 
 def repair_calendar(
@@ -729,7 +736,7 @@ def repair_calendar(
     gamma_bounds: tuple[float, float],
     cfg: CalendarRepairConfig,
     max_maturity: float | None = None,
-    min_maturity: float = 1.0 / 365.0,
+    min_maturity: float = CONSTRUCTOR_MIN_MATURITY,
 ) -> CalendarRepair:
     """Constrained refit of the eSSVI stage-2 parameters under the calendar INVARIANT
     ``∂_T w(k, T) ≥ margin`` for every ``|k| ≤ k_max`` and every ``T`` in
@@ -775,12 +782,8 @@ def repair_calendar(
     if not 0.0 <= cfg.tol < 0.5 * cfg.headroom:
         raise ValueError("need 0 <= tol < headroom / 2 (a cut must be a new point)")
     max_mat = max(float(pil[-1]), 3.0) if max_maturity is None else float(max_maturity)
-    # η cap on the fit's θ range AND on the constructor's butterfly range [θ(min), θ(max)], so
-    # the repaired surface constructs (the unconstrained fit caps on the former only)
-    theta_lo, theta_hi = _eta_theta_range(th_p)
-    th_ends = _surface_theta(pil, th_p, np.array([min_maturity, max_mat]))
-    theta_lo = min(theta_lo, float(th_ends[0]))
-    theta_hi = max(theta_hi, float(th_ends[1]))
+    # η cap on the same θ range as the fit (pillar range and constructor range)
+    theta_lo, theta_hi = _eta_theta_range(pil, th_p, min_maturity, max_mat)
     g_lo, g_hi = gamma_bounds
     lo = np.concatenate([np.full(n_p, -cfg.rho_bound), [g_lo, 0.0]])
     hi = np.concatenate([np.full(n_p, cfg.rho_bound), [g_hi, 1.0]])
@@ -972,12 +975,14 @@ def fit_ssvi(
     ``calendar_k_max`` and ``calendar_margin``.  ``calendar_repair=None`` restores the pre-M10
     behaviour (the constructor raises on a violation).
 
-    Known defect, kept on purpose (M10 Part 0, owner's decision pending): ``theta_of`` below
-    CLAMPS ``θ`` beyond the last pillar while the returned surface extrapolates it, so the
-    residuals and ``points`` beyond the last pillar describe a slightly different surface
-    (median over the 127 days of the 2022 H2 sample, ``|k| ≤ 0.2``, 3m-3y: RMS 0.1957 vp
-    reported vs 0.1384 vp on the surface returned, ``scripts/essvi_calendar_gate.py``).
-    Fixing it moves every snapshot.  Checked by ``tests/test_import_hdn.py``."""
+    The residuals, ``points`` and ``residuals`` describe the surface returned: the model is
+    evaluated by the surfaces' own functions — :func:`~volsto.market.surface.ssvi_theta` (linear
+    from 0, the last forward variance extended beyond the last pillar),
+    :func:`~volsto.market.surface.pillar_rho` and
+    :func:`~volsto.market.surface.ssvi_total_variance`.  Until 2026-09-17 the fit clamped
+    ``θ`` beyond the last pillar while the surface extrapolated it (owner's decision: fixed, every
+    fitted snapshot moved; SPEC §13.1).  Checked by
+    ``tests/test_import_hdn.py::test_fit_points_are_the_returned_surface``."""
     f = filters or HdnFilters()
     tbl = points.table
     mats_all = np.array(sorted(tbl["T"].unique()))
@@ -995,11 +1000,9 @@ def fit_ssvi(
     k = fit_tbl["k"].to_numpy(float)
     T = fit_tbl["T"].to_numpy(float)
     sig_mkt = fit_tbl["iv_mid"].to_numpy(float)
-    knots_t = np.concatenate(([0.0], pil))
-    knots_th = np.concatenate(([0.0], theta_p))
 
     def theta_of(Tq: FloatArray) -> FloatArray:
-        return np.asarray(np.interp(Tq, knots_t, knots_th), dtype=np.float64)
+        return ssvi_theta(pil, theta_p, Tq)
 
     if weights == "vega":
         F = fit_tbl["forward"].to_numpy(float)
@@ -1007,7 +1010,8 @@ def fit_ssvi(
         wts = np.sqrt(wts / wts.max())
     else:
         wts = np.ones_like(k)
-    theta_lo, theta_hi = float(theta_p.min()) * 0.5, float(theta_p.max()) * 1.5
+    max_mat = max(float(pil[-1]), 3.0)
+    theta_lo, theta_hi = _eta_theta_range(pil, theta_p, CONSTRUCTOR_MIN_MATURITY, max_mat)
     n_rho = pil.size if essvi else 1
 
     def unpack(x: FloatArray) -> tuple[FloatArray, float, float]:
@@ -1021,16 +1025,12 @@ def fit_ssvi(
     def rho_at(rho_p: FloatArray, Tq: FloatArray) -> FloatArray:
         if not essvi:
             return np.full_like(Tq, rho_p[0])
-        return np.asarray(np.interp(Tq, pil, rho_p), dtype=np.float64)
+        return pillar_rho(pil, rho_p, Tq)
 
     def model_vol_p(
         rho_p: FloatArray, gamma: float, eta: float, kq: FloatArray, Tq: FloatArray
     ) -> FloatArray:
-        th = theta_of(Tq)
-        r = rho_at(rho_p, Tq)
-        phi = eta / (th**gamma * (1.0 + th) ** (1.0 - gamma))
-        pk = phi * kq
-        w = 0.5 * th * (1.0 + r * pk + np.sqrt((pk + r) ** 2 + 1.0 - r * r))
+        w = ssvi_total_variance(kq, theta_of(Tq), rho_at(rho_p, Tq), eta, gamma)
         return np.asarray(np.sqrt(np.maximum(w, 1e-12) / Tq), dtype=np.float64)
 
     def resid_p(rho_p: FloatArray, gamma: float, eta: float) -> FloatArray:
@@ -1045,7 +1045,6 @@ def fit_ssvi(
     sol = least_squares(resid, x0, method="trf", max_nfev=2000)
     rho_p, gamma, eta = unpack(sol.x)
     fit_cost = float(sol.cost)
-    max_mat = max(float(pil[-1]), 3.0)
     calendar: dict[str, Any] = {}
     surface: SSVISurface | ESSVISurface
     if essvi and calendar_repair is not None:

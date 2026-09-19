@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from itertools import pairwise
 
 import numpy as np
@@ -452,3 +453,85 @@ def test_certify_calendar_outcomes(forward_curve: ForwardCurve, discount: Discou
     assert v.status == "violated" and 1 <= v.cut_k.size <= 7
     D = segs.dw_dt(v.cut_k, v.cut_seg, v.cut_T, bad.eta, bad.gamma)
     assert np.all(D < 0.0) and np.all(np.diff(D) >= 0.0) and D[0] == v.min_value
+
+
+SSVI_W_FORMULA = re.compile(
+    r"0\.5\s*\*\s*\w+\s*\*\s*\(\s*1\.0\s*\+\s*\w+\s*\*\s*\w+\s*\+\s*np\.sqrt\(\s*\(\s*\w+\s*\+\s*\w+"
+    r"\s*\)\s*\*\*\s*2\s*\+\s*1\.0\s*-\s*\w+\s*\*\s*\w+\s*\)"
+)
+"""The (e)SSVI total variance ``0.5 * th * (1.0 + r * pk + np.sqrt((pk + r) ** 2 + 1.0 - r * r))`` as it
+is written in source (any names)."""
+
+
+def test_ssvi_formula_has_one_implementation() -> None:
+    """The (e)SSVI total variance is written once, in
+    :func:`volsto.market.surface.ssvi_total_variance`, which the surfaces and the importer's fit
+    call (the third occurrence of "a fit or a check evaluates a different surface than the one
+    returned" — the repair's ``θ``, the flattened eSSVI of M10 Part 3, the fit's clamped ``θ``
+    until 2026-09-17 — so the invariant is enforced here).  Walks ``volsto/`` and ``scripts/``;
+    independent reference formulae in ``tests/`` are allowed."""
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    # the pattern sees the formula as the fit and the surfaces wrote it before 2026-09-17
+    for old in (
+        "w = 0.5 * th * (1.0 + r * pk + np.sqrt((pk + r) ** 2 + 1.0 - r * r))",
+        "w = 0.5 * th * (1.0 + rho * pk + np.sqrt((pk + rho) ** 2 + 1.0 - rho * rho))",
+    ):
+        assert SSVI_W_FORMULA.search(old), old
+    found: list[tuple[str, str]] = []
+    files = sorted((root / "volsto").rglob("*.py")) + sorted((root / "scripts").rglob("*.py"))
+    assert len(files) > 50
+    for path in files:
+        text = path.read_text(encoding="utf-8")
+        if not SSVI_W_FORMULA.search(text):
+            continue
+        rel = path.relative_to(root).as_posix()
+        tree = ast.parse(text, filename=rel)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                seg = ast.get_source_segment(text, node) or ""
+                inner = [
+                    n
+                    for n in ast.walk(node)
+                    if n is not node and isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)
+                ]
+                for n in inner:  # attribute a nested function's formula to the nested function
+                    seg = seg.replace(ast.get_source_segment(text, n) or "\0", "")
+                if SSVI_W_FORMULA.search(seg):
+                    found.append((rel, node.name))
+    assert found == [("volsto/market/surface.py", "ssvi_total_variance")], found
+
+
+def test_ssvi_surfaces_are_bit_identical_to_the_written_formula(
+    forward_curve: ForwardCurve, discount: DiscountCurve
+) -> None:
+    """Routing :class:`SSVISurface` and :class:`ESSVISurface` through the shared helpers
+    (2026-09-17) changed no number: exact equality with the formula as the classes wrote it
+    (``θ`` linear from 0, the last forward variance extended, ``ρ_T`` flat outside the pillars),
+    inside, between and beyond the pillars."""
+    pil = np.array(_PILLARS_7[:6])
+    th_p = np.array(_THETA_7[:6])
+    rhos = np.array([-0.8, -0.75, -0.7, -0.66, -0.62, -0.6])
+    eta, gamma = 0.9, 0.45
+    rng = np.random.default_rng(20260917)
+    k = rng.uniform(-3.0, 3.0, 4000)
+    T = np.concatenate((rng.uniform(1e-3, 6.0, 3990), pil, [0.0 + 1e-9, 10.0, 3.0, 2.0]))
+
+    def written(rho: NDArray[np.float64] | float) -> NDArray[np.float64]:
+        t = np.concatenate(([0.0], pil))
+        th_all = np.concatenate(([0.0], th_p))
+        slope = (th_all[-1] - th_all[-2]) / (t[-1] - t[-2])
+        th = np.where(t[-1] < T, th_all[-1] + slope * (T - t[-1]), np.interp(T, t, th_all))
+        ph = eta / (th**gamma * (1.0 + th) ** (1.0 - gamma))
+        pk = ph * k
+        return np.asarray(
+            0.5 * th * (1.0 + rho * pk + np.sqrt((pk + rho) ** 2 + 1.0 - rho * rho)),
+            dtype=np.float64,
+        )
+
+    s = SSVISurface(pil, th_p, -0.7, eta, gamma, forward_curve, discount, max_maturity=10.0)
+    assert np.array_equal(s.total_variance(k, T), written(-0.7))
+    e = ESSVISurface(pil, th_p, rhos, eta, gamma, forward_curve, discount, max_maturity=10.0)
+    assert np.array_equal(e.total_variance(k, T), written(np.interp(T, pil, rhos)))

@@ -27,7 +27,6 @@ from volsto.market.import_hdn import (
     SurfacePoints,
     _eta_max,
     _eta_theta_range,
-    _surface_theta,
     calendar_constraint_grid,
     implied_forwards,
     import_day,
@@ -319,11 +318,11 @@ def test_essvi_repair_on_failing_day(
     pil = np.asarray(plain.params["atm_maturities"])
     th = np.asarray(plain.params["atm_vols"]) ** 2 * pil
     np.testing.assert_array_equal(th, np.asarray(fit.params["atm_vols"]) ** 2 * pil)
-    lo, hi = _eta_theta_range(th)
-    ends = _surface_theta(pil, th, np.array([1.0 / 365.0, fit.surface.max_maturity]))
-    cap = 0.999 * _eta_max(
-        abs(plain.params["rho"]), plain.params["gamma"], min(lo, ends[0]), max(hi, ends[1])
-    )
+    lo, hi = _eta_theta_range(pil, th, 1.0 / 365.0, fit.surface.max_maturity)
+    ends = plain.surface.theta(np.array([plain.surface.min_maturity, fit.surface.max_maturity]))
+    # the cap covers the constructor's butterfly range (th is rebuilt from the rounded vols)
+    assert lo <= ends[0] * (1.0 + 1e-12) and ends[1] * (1.0 - 1e-12) <= hi
+    cap = 0.999 * _eta_max(abs(plain.params["rho"]), plain.params["gamma"], lo, hi)
     assert plain.params["eta"] <= cap
     as_essvi = ESSVISurface(
         pil,
@@ -451,8 +450,8 @@ def test_part0_gate_on_the_127_day_sample() -> None:
     assert (df["rep_certm_k3"] == "certified").all()
     assert (df["rep_certm_k3_lb"] >= gate.MARGIN).all()
     repaired = df[df["repaired"]]
-    assert len(repaired) == 25 and (repaired["rep_certm_k3"] == "certified").all()
-    assert passing["n_identity_bit_equal"] == 102  # the other days are returned bit-equal
+    assert len(repaired) == 30 and (repaired["rep_certm_k3"] == "certified").all()
+    assert passing["n_identity_bit_equal"] == 97  # the other days are returned bit-equal
     assert (df["rep_dense_min_dw_dt"] >= gate.MARGIN - 1e-12).all()
     # the second criterion: measured, not met (SPEC §13.1)
     last = df["last_pillar"]
@@ -460,7 +459,75 @@ def test_part0_gate_on_the_127_day_sample() -> None:
     assert pillars["P_distribution"] == {"5": 1, "6": 117, "7": 9}
     assert pillars["days_quote_at_or_beyond_3y"] == 1
     # what the repair delivers instead: the eSSVI rho_T's 2y/3y skew, not the SSVI fallback's
-    for tenor, rep, ssvi in (("2y", -0.1966, -0.2240), ("3y", -0.1626, -0.1910)):
+    for tenor, rep, ssvi in (("2y", -0.2059, -0.2240), ("3y", -0.1702, -0.1911)):
         assert skew["rep"][tenor] == pytest.approx(rep, abs=1e-4)
         assert skew["ssvi"][tenor] == pytest.approx(ssvi, abs=1e-4)
     assert skew["median_gap_vs_ssvi"]["rep_on_passing_days_n"] == len(df)
+
+
+@pytest.mark.parametrize(
+    ("day", "essvi", "repair"),
+    [
+        (DAY, True, DEFAULT_CALENDAR_REPAIR),  # eSSVI returned bit-equal by the repair
+        (FAILING_DAY, True, DEFAULT_CALENDAR_REPAIR),  # eSSVI repaired, 3y pillar
+        ("2022-09-09", True, DEFAULT_CALENDAR_REPAIR),  # eSSVI repaired, quotes beyond 2y
+        (DAY, True, None),  # eSSVI, no repair
+        (DAY, False, DEFAULT_CALENDAR_REPAIR),  # plain SSVI (also the repair's fallback fit)
+    ],
+)
+def test_fit_points_are_the_returned_surface(day: str, essvi: bool, repair: Any) -> None:
+    """The fit's reported model vols (``points``, hence ``residuals``, ``rms_error`` and
+    ``max_error``) are the returned surface's own implied vols at every retained quote: below
+    the first pillar, between pillars and beyond the last one (owner's decision 2026-09-17: until
+    then the fit clamped ``θ`` beyond the last pillar while the surface extrapolated it; median
+    RMS 0.1957 vp reported against 0.1384 vp on the surface returned, SPEC §13.1)."""
+    manifest = load_manifest(SAMPLE)
+    f = HdnFilters()
+    ch = load_day(SAMPLE / "day_by_date" / f"{day}_options.csv", "SPX", manifest=manifest)
+    grid, points = import_hdn.to_grid_surface(
+        ch, implied_forwards(ch, max_years=f.max_years, band=f.near_atm_band), f
+    )
+    fit = import_hdn.fit_ssvi(grid, points, filters=f, essvi=essvi, calendar_repair=repair)
+    assert isinstance(fit.surface, ESSVISurface) is essvi
+    if repair is not None and essvi:
+        assert fit.params["calendar_repaired"] is (day != DAY)
+    p = fit.points
+    k, T = p["k"].to_numpy(float), p["T"].to_numpy(float)
+    last = float(fit.params["atm_maturities"][-1])
+    in_fit = p["in_fit"].to_numpy(bool)
+    # the check bites: quotes the fit uses lie beyond the last pillar, and quotes below the
+    # first pillar are reported
+    assert int((in_fit & (last < T)).sum()) > 0 or day == FAILING_DAY
+    first = float(fit.params["atm_maturities"][0])
+    assert int((first > T).sum()) > 0
+    np.testing.assert_allclose(
+        p["model_vol"].to_numpy(float), fit.surface.implied_vol_k(k, T), rtol=0.0, atol=1e-12
+    )
+    m = (T >= 0.25 - 1e-9) & (T <= 3.0 + 1e-9) & (np.abs(k) <= 0.2 + 1e-9)  # SSVIFit._mask
+    e = 100.0 * (fit.surface.implied_vol_k(k[m], T[m]) - p["iv_mid"].to_numpy(float)[m])
+    assert fit.rms_error(3.0, 0.2, 0.25) == pytest.approx(float(np.sqrt(np.mean(e**2))), abs=1e-9)
+    assert fit.max_error(3.0, 0.2, 0.25) == pytest.approx(float(np.abs(e).max()), abs=1e-9)
+
+
+def test_fit_points_are_the_returned_surface_on_the_ssvi_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same invariant on the repair's fallback path (an eSSVI the constructor refuses is
+    refitted as plain SSVI): forced by a constructor that raises, on a day whose fit uses quotes
+    beyond its last pillar."""
+
+    class Refused(ESSVISurface):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            raise ValueError("refused for the test")
+
+    monkeypatch.setattr(import_hdn, "ESSVISurface", Refused)
+    _cfg, fit, _points, _chain = import_day(SAMPLE, "2022-09-09", "SPX")
+    assert type(fit.surface) is SSVISurface
+    assert fit.params["calendar_fallback"] == "ssvi"
+    assert "refused for the test" in fit.params["calendar_fallback_reason"]
+    p = fit.points
+    k, T = p["k"].to_numpy(float), p["T"].to_numpy(float)
+    assert int((p["in_fit"].to_numpy(bool) & (fit.params["atm_maturities"][-1] < T)).sum()) > 0
+    np.testing.assert_allclose(
+        p["model_vol"].to_numpy(float), fit.surface.implied_vol_k(k, T), rtol=0.0, atol=1e-12
+    )

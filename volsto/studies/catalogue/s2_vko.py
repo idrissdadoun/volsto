@@ -37,9 +37,10 @@ leverage-slice times added), so its store-check rows are not the store's computa
   1. ``−sign(dP)`` with ``dP`` the LSV-minus-LV difference of ``P(σ_real > vol_ko | ITM)``
      (more in-the-money paths above the barrier are knocked out, so the ratio falls), used
      where ``|dP|`` exceeds 2 stderr;
-  2. SPEC §6.2's reading ``sign(d width) × sign(p50_LV − vol_ko)`` with ``width = p90 − p10``
-     (a wider in-the-money distribution saves paths below its bulk and knocks more out above
-     it), used where both factors exceed 2 stderr.
+  2. the superseded reading of SPEC §6.2 (replaced by reading 1 on 2026-09-17)
+     ``sign(d width) × sign(p50_LV − vol_ko)`` with ``width = p90 − p10`` (a wider
+     in-the-money distribution saves paths below its bulk and knocks more out above it), used
+     where both factors exceed 2 stderr.
 
 **Realised outcome** (``realised``): the daily closes of the 2022 H2 surface history
 (``ln_spot`` of ``essvi_gate/hdn_history_repaired.csv``, an artefact under the outputs root) from
@@ -674,8 +675,8 @@ def _lsv_minus_lv(
         measured = float(np.sign(d.value)) if significant else 0.0
         # reading 1: more in-the-money paths above the barrier -> more knocked out -> lower ratio
         pred_p = -_sign_if(dk.value, dk.stderr)
-        # reading 2 (SPEC 6.2): a wider ITM distribution saves paths below its bulk and knocks
-        # more of them out above it
+        # reading 2 (superseded SPEC 6.2): a wider ITM distribution saves paths below its bulk and
+        # knocks more of them out above it
         pred_w = _sign_if(wd, wd_se) * _sign_if(p50_lv - h, p50_lv_se)
         for col, val, what in (
             ("significant", float(significant), f"|ratio_diff| > {SIGNIFICANCE:g} stderr"),
@@ -1010,7 +1011,8 @@ def tables(results: Results) -> list[TableSpec]:
         specs.append(
             TableSpec(
                 "mechanism_reading",
-                "Reading 2 (SPEC 6.2) of the same pairs: the width p90 - p10 of the ITM "
+                "Reading 2 (the superseded SPEC 6.2 reading) of the same pairs: the width "
+                "p90 - p10 of the ITM "
                 "distribution minus the local vol's, where the barrier sits against the local "
                 "vol's ITM median (vol points), the predicted sign (each factor beyond 2 stderr, "
                 "else 0) and whether it agrees with d.",
@@ -1323,10 +1325,11 @@ def narrative(results: Results) -> str:
             f"Of {len(piv)} (model, barrier) pairs, {sig} ratio differences exceed "
             f"{SIGNIFICANCE:g} stderr (paired).",
             "",
-            f"- Reading 1, the knock-out probability of the in-the-money paths: resolved on {n1} "
-            f"of them, the predicted sign is the measured one in **{a1} of {n1}**.",
-            f"- Reading 2, SPEC §6.2's width and median position: resolved on {n2}, right in "
-            f"**{a2} of {n2}**.",
+            f"- Reading 1 (SPEC §6.2), the knock-out probability of the in-the-money paths: "
+            f"resolved on {n1} of them, the predicted sign is the measured one in "
+            f"**{a1} of {n1}**.",
+            f"- Reading 2, the width and median position (the superseded SPEC §6.2 reading): "
+            f"resolved on {n2}, right in **{a2} of {n2}**.",
             "",
             "A reading resolved on few pairs says little either way; the tables list every "
             "pair.",

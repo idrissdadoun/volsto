@@ -8463,9 +8463,9 @@ def _repair_sentence(results: Results) -> str:
     if n == 0:
         return (
             "No marked date of this window is calendar-repaired, so the backtest does not "
-            "exercise the repaired-surface path of stage 1 here (in 2022 H2 the 25 repaired days "
-            "run from 2022-10-21 to 2022-12-30, M10 Part 0; a shard over 2022-10-21..2022-10-28 "
-            "would)."
+            "exercise the repaired-surface path of stage 1 here (in 2022 H2 the 30 repaired days "
+            "run from 2022-09-09 to 2022-12-30, SPEC §13.1 after the θ fix of 2026-09-17; a shard "
+            "over 2022-09-09..2022-09-13 would)."
         )
     return f"{int(n)} marked date(s) use a calendar-repaired surface."
 

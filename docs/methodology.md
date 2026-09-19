@@ -88,7 +88,8 @@ $\partial_T w(k,T) \ge 10^{-4}$ per year holds for every $|k| \le 3$ and every $
 to the surface's last maturity. This is proven by branch and bound on the closed-form
 $\partial_T w$ (`essvi_dw_dt`), not sampled. The repair refits only $\rho_T$ (with $\gamma$ in its
 box and $\eta$ capped) and freezes $\theta_T$. On the 127-day 2022 H2 SPX sample: 127/127 days
-certified, 25 of them repaired and 102 bit-equal, with no fallback (§13.1).
+certified, 30 of them repaired and 97 bit-equal, with no fallback (§13.1, after the fit's θ fix
+of 2026-09-17; 25 and 102 before it).
 
 **Local volatility** (`volsto.market.dupire.LocalVolSurface.from_implied`, §2.3). Dupire in total
 variance, derivatives by central differences on the analytic surface:
@@ -778,15 +779,17 @@ backtest's stability flags come from the historical-mode rolling fit instead (§
 
 **Surface fit.**
 
-- `fit_ssvi` clamps $\theta_T$ beyond the last pillar in its residuals, while the surface it
-  returns extrapolates. The reported fit errors therefore describe a slightly different surface:
-  median RMS 0.1957 vp reported against 0.1384 vp on the returned surface ($|k| \le 0.2$, 3m–3y).
-  The fix is deferred because it would change every fitted snapshot and cache key (§13.1).
+- Until 2026-09-17 `fit_ssvi` clamped $\theta_T$ beyond the last pillar in its residuals while
+  the surface it returned extrapolated, so the reported errors described a different surface
+  (median RMS 0.1957 vp reported against 0.1384 vp on the returned surface, $|k| \le 0.2$,
+  3m–3y). Fixed by the owner's decision: the fit evaluates the surfaces' own formula, and the
+  median RMS on the returned surface is now 0.1304 vp. Every fitted snapshot moved (§13.1).
 - The 1–2 month weeklies of high-volatility days are 1–7 vp off under a single power-law
   $\varphi$ (§13).
 
 **Ladders on eSSVI.** The curvature ladder's butterfly bump needs more than the default 4
-halvings on 62 of the 127 eSSVI days (5 on 51, 6 on 11). A ladders risk run on eSSVI surfaces
+halvings on 62 of the 127 eSSVI days (5 on 51, 6 on 11; measured before the θ fix of
+§13.1). A ladders risk run on eSSVI surfaces
 uses `max_halvings=6` (§13.2, §7.12.1).
 
 **Particle calibration.** The far-wing bias of section 5 applies. SPEC §4.2 also records, from

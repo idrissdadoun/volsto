@@ -129,7 +129,6 @@ class SSVISurface(ImpliedSurface):
             raise ValueError("need 0 < min_maturity < max_maturity")
         self._t = np.concatenate(([0.0], t))
         self._theta = np.concatenate(([0.0], th))
-        self._slope_last = (self._theta[-1] - self._theta[-2]) / (self._t[-1] - self._t[-2])
         self.rho = float(rho)
         self.eta = float(eta)
         self.gamma = float(gamma)
@@ -179,23 +178,14 @@ class SSVISurface(ImpliedSurface):
         T_ = np.asarray(T, dtype=np.float64)
         if np.any(T_ < 0):
             raise ValueError("maturity must be non-negative")
-        inside = np.interp(T_, self._t, self._theta)
-        beyond = self._theta[-1] + self._slope_last * (T_ - self._t[-1])
-        return np.where(self._t[-1] < T_, beyond, inside)
+        return ssvi_theta(self._t[1:], self._theta[1:], T_)
 
     def phi(self, theta: ArrayLike) -> FloatArray:
         """Power-law ``φ(θ) = η / (θ^γ (1+θ)^{1−γ})``."""
-        th = np.asarray(theta, dtype=np.float64)
-        return self.eta / (th**self.gamma * (1.0 + th) ** (1.0 - self.gamma))
+        return ssvi_phi(theta, self.eta, self.gamma)
 
     def total_variance(self, k: ArrayLike, T: ArrayLike) -> FloatArray:
-        k_ = np.asarray(k, dtype=np.float64)
-        th = self.theta(T)
-        ph = self.phi(th)
-        rho = self.rho
-        pk = ph * k_
-        w = 0.5 * th * (1.0 + rho * pk + np.sqrt((pk + rho) ** 2 + 1.0 - rho * rho))
-        return np.asarray(w, dtype=np.float64)
+        return ssvi_total_variance(k, self.theta(T), self.rho, self.eta, self.gamma)
 
     def atm_skew(self, T: ArrayLike) -> FloatArray:
         """ATMF skew ``∂σ̂/∂k |_{k=0} = ρ φ(θ) sqrt(θ) / (2 √T)`` (from ``∂_k w(0) = θρφ/2``)."""
@@ -460,6 +450,48 @@ def ssvi_theta(
     slope = (th[-1] - th[-2]) / (t[-1] - t[-2])
     beyond = th[-1] + slope * (T_ - t[-1])
     return np.asarray(np.where(t[-1] < T_, beyond, np.interp(T_, t, th)), dtype=np.float64)
+
+
+def pillar_rho(
+    pillars: Sequence[float] | FloatArray,
+    rhos: Sequence[float] | FloatArray,
+    T: ArrayLike,
+) -> FloatArray:
+    """eSSVI ``ρ_T``: linear between the pillars, flat outside them (as
+    :meth:`ESSVISurface.rho_T` evaluates it)."""
+    return np.asarray(
+        np.interp(
+            np.asarray(T, dtype=np.float64),
+            np.asarray(pillars, dtype=np.float64),
+            np.asarray(rhos, dtype=np.float64),
+        ),
+        dtype=np.float64,
+    )
+
+
+def ssvi_phi(theta: ArrayLike, eta: float, gamma: float) -> FloatArray:
+    """Power-law ``φ(θ) = η / (θ^γ (1+θ)^{1−γ})``."""
+    th = np.asarray(theta, dtype=np.float64)
+    phi: FloatArray = eta / (th**gamma * (1.0 + th) ** (1.0 - gamma))
+    return phi  # a numpy scalar for a scalar θ, as the surfaces returned it before
+
+
+def ssvi_total_variance(
+    k: ArrayLike, theta: ArrayLike, rho: ArrayLike, eta: float, gamma: float
+) -> FloatArray:
+    """``w = θ/2 (1 + ρφk + sqrt((φk + ρ)² + 1 − ρ²))`` with the power-law ``φ(θ)``: the one
+    implementation of the (e)SSVI total variance.  :class:`SSVISurface`,
+    :class:`ESSVISurface` and the importer's fit (:func:`volsto.market.import_hdn.fit_ssvi`)
+    all evaluate it, with ``θ_T`` from :func:`ssvi_theta` and ``ρ_T`` from
+    :func:`pillar_rho`, so a fit's residuals describe the surface it returns
+    (``tests/test_import_hdn.py::test_fit_points_are_the_returned_surface``; the formula is not
+    written anywhere else, ``tests/test_surface.py::test_ssvi_formula_has_one_implementation``)."""
+    k_ = np.asarray(k, dtype=np.float64)
+    th = np.asarray(theta, dtype=np.float64)
+    r = np.asarray(rho, dtype=np.float64)
+    pk = ssvi_phi(th, eta, gamma) * k_
+    w = 0.5 * th * (1.0 + r * pk + np.sqrt((pk + r) ** 2 + 1.0 - r * r))
+    return np.asarray(w, dtype=np.float64)
 
 
 def essvi_dw_dt(
@@ -899,19 +931,11 @@ class ESSVISurface(SSVISurface):
         self._check_calendar_numeric()
 
     def rho_T(self, T: ArrayLike) -> FloatArray:
-        return np.asarray(
-            np.interp(np.asarray(T, dtype=np.float64), self._rho_t, self._rhos), dtype=np.float64
-        )
+        return pillar_rho(self._rho_t, self._rhos, T)
 
     def total_variance(self, k: ArrayLike, T: ArrayLike) -> FloatArray:
-        k_ = np.asarray(k, dtype=np.float64)
         T_ = np.asarray(T, dtype=np.float64)
-        th = self.theta(T_)
-        ph = self.phi(th)
-        rho = self.rho_T(T_)
-        pk = ph * k_
-        w = 0.5 * th * (1.0 + rho * pk + np.sqrt((pk + rho) ** 2 + 1.0 - rho * rho))
-        return np.asarray(w, dtype=np.float64)
+        return ssvi_total_variance(k, self.theta(T_), self.rho_T(T_), self.eta, self.gamma)
 
     def atm_skew(self, T: ArrayLike) -> FloatArray:
         T_ = np.asarray(T, dtype=np.float64)
