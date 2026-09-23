@@ -3,9 +3,11 @@ spec of study B world (ii) (SPEC §15 Part 2, "Raw-slice discriminator (M8b)").
 
 Steps: (1) :func:`volsto.calibration.raw_history.raw_pillar_frame` on every sample day (the
 importer pipeline up to the retained quotes, a local quadratic per slice, no SSVI fit; about
-1 s per day); (2) :func:`~volsto.calibration.raw_history.discriminator` against the SSVI history
-(``outputs/m7/hdn_history_ssvi.csv``) on the common dates, written to ``<out>/discriminator.md``,
-``.csv`` and ``discriminator_verdict.json`` (plus ``raw_history.csv`` and
+1 s per day); (2) :func:`~volsto.calibration.raw_history.discriminator` against the fitted history
+(the repaired eSSVI history ``outputs/essvi_gate/hdn_history_repaired.csv`` since 2026-09-22;
+the plain-SSVI ``outputs/m7/hdn_history_ssvi.csv`` before) on the common dates, written to
+``<out>/discriminator.md``, ``.csv`` and ``discriminator_verdict.json`` (plus
+``raw_history.csv`` and
 ``raw_history_diagnostics.csv``); (3) unless ``--no-world-spec``, the FINAL historical fit
 (``fit_2f_historical`` with the owner's historical defaults: soft skew, weight 10, k2 0.2,
 pillars 3M–1Y, windows 100 / 60 — the same call ``scripts/m7_fit_2f_hdn.py --skew-mode soft
@@ -58,18 +60,21 @@ from volsto.market.loaders import snapshot_spec
 
 ROOT = Path(__file__).resolve().parents[1]
 REF_SPEC = ROOT / "configs" / "studies" / "lsv_reference_2f.yaml"
-SPX_SNAPSHOT = (
-    ROOT / "configs" / "surfaces" / "snapshots" / "hdn_2022H2_ssvi" / "spx_2022-12-30.yaml"
-)
+SPX_SNAPSHOT = ROOT / "configs" / "surfaces" / "snapshots" / "hdn_2022H2" / "spx_2022-12-30.yaml"
 HISTORICAL_PILLARS: tuple[float, ...] = (0.25, 0.5, 1.0)
 """``scripts/m7_fit_2f_hdn.py``: the history's pillars between MatMin 3M and ``--max-pillar`` 1y."""
 HISTORICAL_SKEW_WEIGHT = 10.0
 """Owner decision: soft skew with weight 10 is the historical-mode default (FINAL fitter)."""
 WORLD_N_PARTICLES = 800_000
 """Study B particle count (the owner's M8b spec)."""
-DEFAULT_FITTED_HISTORY = "outputs/m7/hdn_history_ssvi.csv"
-"""The committed M8b comparison history: plain SSVI (``scripts/m7_hdn_history.py --no-essvi``)."""
-DEFAULT_FITTED_LABEL = "SSVI"
+DEFAULT_FITTED_HISTORY = "outputs/essvi_gate/hdn_history_repaired.csv"
+"""The M8b comparison history: the repaired eSSVI history (``scripts/m7_hdn_history.py --tag
+_repaired --out outputs/essvi_gate``; owner's decision 2026-09-22 — plain SSVI,
+``outputs/m7/hdn_history_ssvi.csv``, until then)."""
+DEFAULT_FITTED_LABEL = "eSSVI repaired"
+PLAIN_SSVI_LABEL = "SSVI"
+"""The fitted-side name the verdict phrases and the report heading are written with
+(:data:`REASON_PHRASES`); any other label is substituted for it."""
 """Label of :data:`DEFAULT_FITTED_HISTORY`.  Any other ``--ssvi-history`` needs an explicit
 ``--fitted-label``: the history CSV does not record which parametrisation produced it."""
 REPORT_HEADING = "## SSR: raw slices vs SSVI snapshots (same estimator, common dates)"
@@ -102,7 +107,7 @@ REASON_PHRASES: tuple[str, ...] = (" vs SSVI ", "raw and SSVI SSR")
 
 def relabel(text: str, label: str) -> str:
     """Rename the fitted side in a verdict reason (only the phrases that name it)."""
-    if label == DEFAULT_FITTED_LABEL:
+    if label == PLAIN_SSVI_LABEL:
         return text
     for phrase in REASON_PHRASES:
         text = text.replace(phrase, phrase.replace("SSVI", label))
@@ -112,7 +117,7 @@ def relabel(text: str, label: str) -> str:
 def relabel_report(paths: dict[str, Path], label: str, history: str) -> None:
     """Name the fitted history in ``discriminator.md`` and ``discriminator_verdict.json``.  The
     CSV keeps its ``*_ssvi`` column names (the viewers' read API parses them)."""
-    if label == DEFAULT_FITTED_LABEL:
+    if label == PLAIN_SSVI_LABEL:
         return
     md = paths["md"].read_text(encoding="utf-8")
     if REPORT_HEADING not in md:
@@ -180,7 +185,7 @@ def world_spec_document(
     *,
     n_particles: int,
     checks: list[str],
-    history_path: str = "outputs/m7/hdn_history_ssvi.csv",
+    history_path: str = DEFAULT_FITTED_HISTORY,
     n_dates: int | None = None,
     window_long: int = WINDOW_LONG,
     window_ssr: int = WINDOW_SSR,

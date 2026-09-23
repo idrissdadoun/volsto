@@ -90,6 +90,7 @@ from volsto.calibration.stability import PARAM_COLUMNS, flag_unidentified
 from volsto.config import CalibrationSpec, ConfigError, CurveConfig, MarketConfig, SimConfig
 from volsto.config import load_yaml as load_config_yaml
 from volsto.market.curves import DiscountCurve
+from volsto.products.base import Product
 from volsto.products.seasoning import RealisedHistory, replay
 from volsto.products.variance import VarianceSwap
 from volsto.risk.attribution import explain
@@ -1228,12 +1229,18 @@ def test_incomplete_date_waits_for_its_dependencies_then_is_recomputed(
 
 
 def test_changed_inputs_make_dates_stale(
-    build_copy: BacktestBuild, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    build_copy: BacktestBuild,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """D4: R3 — a data root without 2022-07-28 (same config hash, same day files otherwise)
     makes that date's successors stale (their calendar prefix changed) and --resume would
     recompute exactly them; R3b — a manifest whose rates for 2022-07-29 moved by +50 bp makes
-    that date and its successors stale, and the snapshot is re-imported with the new rates."""
+    that date and its successors stale, and the snapshot is re-imported with the new rates;
+    R4 — a stored snapshot imported under another importer tag (its bytes intact) makes its
+    date stale with the reason naming both tags, is no longer bound, and every date after it
+    is stale through it (SPEC §13.1, 2026-09-22)."""
     b = build_copy
     toy = cfg_at(b)
     ledger0 = bt.Ledger.of(toy)
@@ -1271,15 +1278,20 @@ def test_changed_inputs_make_dates_stale(
     got = [run_r.ledger.verdict(d).status for d in b.dates]
     assert got == ["done", "done", "stale", "stale", "stale"]
     snap = run_r.snapshot_path("2022-07-29")
-    old_rates = yaml.safe_load(snap.read_text())["market"]["rate_curve"]["rates"]
+    old_snap = yaml.safe_load(snap.read_text())
+    old_rates = old_snap["provenance"]["rate_curve_percent"]["zeros"]
     assert not bt.snapshot_bound(
         cfg_r, snap, run_r.inputs.file_sha("2022-07-29"), run_r.inputs.manifest_sha("2022-07-29")
     )
     _, _, imported, _ = run_r.ensure_snapshot("2022-07-29")
     path = run_r.snapshot_path("2022-07-29")
-    new_rates = yaml.safe_load(path.read_text())["market"]["rate_curve"]["rates"]
+    new_snap = yaml.safe_load(path.read_text())
+    new_rates = new_snap["provenance"]["rate_curve_percent"]["zeros"]
     assert imported and new_rates[0] == pytest.approx(old_rates[0] + 0.005, abs=2e-3)
     assert new_rates != old_rates
+    # the market's rate curve is the option-implied funding curve: the manifest move reaches
+    # the provenance (and the digest), not the discounting (SPEC §13.1, 2026-09-22)
+    assert new_snap["market"]["rate_curve"] == old_snap["market"]["rate_curve"]
     assert bt.snapshot_bound(
         cfg_r, path, run_r.inputs.file_sha("2022-07-29"), run_r.inputs.manifest_sha("2022-07-29")
     )
@@ -1290,6 +1302,27 @@ def test_changed_inputs_make_dates_stale(
         run_r.inputs.file_sha("2022-07-28"),
         run_r.inputs.manifest_sha("2022-07-28"),
     )
+    # R4: the importer that wrote a stored snapshot is not the current one (R3b re-imported
+    # 2022-07-29 into the shared snapshots directory, so under ``toy`` that date and its
+    # successors are already stale; the first date is still done)
+    first = b.dates[0]
+    ledger1 = bt.Ledger.of(toy)
+    assert ledger1.verdict(first).status == "done"
+    snap = ledger1.snapshot_path(first)
+    assert ledger1.read_snapshot(first).importer_tag == bt.IMPORTER_TAG
+    monkeypatch.setattr(bt, "IMPORTER_TAG", "2099-01-01")
+    ledger2 = bt.Ledger.of(toy)
+    got = [ledger2.verdict(d).status for d in b.dates]
+    assert got == ["stale"] * len(b.dates), got
+    reason = ledger2.verdict(first).reason
+    assert reason == bt.importer_tag_reason(ledger2.read_snapshot(first).importer_tag)
+    assert "imported by importer 2026-" in reason and "(current 2099-01-01)" in reason
+    assert f"depends on stale {first}: {reason}" == ledger2.verdict(b.dates[1]).reason
+    inputs = ledger2.inputs
+    assert not bt.snapshot_bound(toy, snap, inputs.file_sha(first), inputs.manifest_sha(first))
+    monkeypatch.undo()
+    assert bt.snapshot_bound(toy, snap, inputs.file_sha(first), inputs.manifest_sha(first))
+    assert bt.Ledger.of(toy).verdict(first).status == "done"
 
 
 # --------------------------------------------------------------------------------------------
@@ -1936,8 +1969,16 @@ def test_storage_crash_matrix(
     assert code == 0, text
     left = bt.BacktestStore(b.store_root).leftovers()
     assert not left["pointer"]
-    # the in-process kills' staging directories belong to this (live) process: kept
-    assert left["staging"] and all(f"-{os.getpid()}-" in p.name for p in left["staging"])
+    # the in-process kills' staging directories belong to this (live) process: kept.  gc's
+    # ownership test is the pid in the name (os.kill(pid, 0)): a killed child's pid reused by
+    # another live process keeps that child's staging directory too (seen once under a
+    # saturated machine, 2026-09-22) — so what is asserted is gc's rule, dead owners removed and
+    # live owners kept, not that only this pid survives
+    assert left["staging"], left
+    for p in left["staging"]:
+        pid = int(p.name[len(bt.STAGING_PREFIX) :].split("-")[1])
+        assert pid == os.getpid() or bt._staging_owner_alive(p), p
+        assert bt._staging_owner_alive(p), p
     for d in b.dates:
         assert len(list((b.store_root / "dates" / d / "attempts").glob("[a-z]*"))) == 1
     assert set(all_done().values()) == {"done"}
@@ -2752,7 +2793,7 @@ def test_stage2_renders_from_the_stored_rows_without_calibrating(
     assert "marked on every date after inception" in text  # the toy marks its rolling book daily
     # D5: the window is described from the data, without a regime adjective
     assert "bear market" not in text and "2022 H2 sample" not in text
-    closes = [store_fits(b.store_root)[d]["spot"] for d in b.dates]
+    closes = [store_fits(b.store_root)[d]["close"] for d in b.dates]
     assert f"went from {closes[0]:.2f} to {closes[-1]:.2f}" in text
     assert "realised volatility of" in text and "SPX day files under" in text
     # (c) the stability fit is stated; (a) the desk sign is stated and used; D10 checks
@@ -2881,7 +2922,16 @@ def test_inception_value_is_the_fresh_price_under_the_same_seed(
                 spec = next(
                     t for t in (*toy.fixed, *toy.rolling) if r["trade_id"].endswith(f":{t.id}")
                 )
-                fresh = bt.build_product(spec, st.spot, st.surface, st.discount).product
+                # struck at the close and seasoned with the inception fixing (the close), as the
+                # run prices it; the model starts at the option-implied spot (SPEC §13.1)
+                built = bt.build_product(spec, st.close, st.surface, st.discount).product
+                fresh = replay(
+                    built,
+                    run.history(inception, inception),
+                    dt.date.fromisoformat(inception),
+                    discount=st.discount,
+                ).result
+                assert isinstance(fresh, Product)
                 price = engine.price(fresh, st.state)
                 assert float(price.mean) == r["value"], r["trade_id"]
                 assert float(price.stderr) == r["value_stderr"]
@@ -2899,7 +2949,7 @@ def test_vko_row_carries_the_realised_state(
     closes = []
     for d in b.dates:
         snap = yaml.safe_load((b.snapshots_root / f"spx_{d}.yaml").read_text())
-        closes.append(float(snap["market"]["spot"]))
+        closes.append(float(snap["market"]["close"]))  # the fixing level, not the implied spot
     r2 = np.diff(np.log(closes)) ** 2
     for i, (_, r) in enumerate(vko.iterrows()):
         state = json.loads(r["realised_json"])

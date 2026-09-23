@@ -1582,8 +1582,9 @@ class Hedger:
             if not mv_delta:
                 return
             col = idx[t]
-            n_f = int(pr.model.n_factors)
-            fac = world.factors_at(col) if world.n_factors == n_f else np.zeros((n_w, n_f))
+            # a world without the pricing model's factors: the pricer's imputed state
+            # E[X_t | ln S_t] (ConditionalPricer.pricing_factors), the one its fits are read at
+            fac = pr.pricing_factors(world, col)
             proj, _ = spot_factor_projection(pr.model, t, world.log_spot_at(col), fac)
             if proj.shape[1] == 0:
                 return

@@ -408,15 +408,27 @@ class CurveConfig:
 
 @dataclass(frozen=True)
 class MarketConfig:
-    """Spot plus rate and dividend-yield curves (SPEC §2.1)."""
+    """Spot plus rate and dividend-yield curves (SPEC §2.1).
+
+    ``close`` (2026-09-22, SPEC §13.1): the official close of the day — the level trades fix
+    on — when it differs from ``spot``, the level the option quotes imply (the importer's
+    snapshots: the HDN close is the 16:00 print, SPX options quote until 16:15).  Pricing never
+    reads it; the realised history, the backtest's fixings and its strikes do.  It is not a
+    pricing input, so :meth:`CalibrationSpec.key_payload` leaves it out of the cache key, and
+    a config without it maps and hashes exactly as before (``OMIT_WHEN_NONE``)."""
 
     spot: float
     rate_curve: CurveConfig
     dividend_curve: CurveConfig
+    close: float | None = None
+
+    OMIT_WHEN_NONE: ClassVar[frozenset[str]] = frozenset({"close"})
 
     def __post_init__(self) -> None:
         if self.spot <= 0:
             raise ValueError("spot must be positive")
+        if self.close is not None and self.close <= 0:
+            raise ValueError("close must be positive")
 
 
 @dataclass(frozen=True)
@@ -817,8 +829,10 @@ class CalibrationSpec:
 
     def key_payload(self) -> dict[str, Any]:
         sim = self.sim
+        market = to_mapping(self.market)
+        market.pop("close", None)  # a fixing level, not a pricing input (MarketConfig)
         payload = {
-            "market": to_mapping(self.market),
+            "market": market,
             "surface": to_mapping(self.surface),
             "model": to_mapping(self.model),
             "particle": to_mapping(self.particle),

@@ -16,7 +16,7 @@ surfaces:
   - {name: placeholder, kind: placeholder, one_factor: true, two_factor: true, marking: false}
   - name: spx_2022-12-30
     kind: snapshot
-    path: configs/surfaces/snapshots/hdn_2022H2_ssvi/spx_2022-12-30.yaml
+    path: configs/surfaces/snapshots/hdn_2022H2/spx_2022-12-30.yaml
     one_factor: false
     two_factor: false
     marking: true

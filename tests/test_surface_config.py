@@ -64,6 +64,14 @@ GRIDS = ROOT / "configs" / "grids"
 # keys recorded on 2026-09-16 with the code of commit 0ca0897 (before SSVIConfig.rhos existed)
 # --------------------------------------------------------------------------------------------
 
+# 2026-09-22: the two SPX marking specs the M7 P1 run rewrote on the repaired eSSVI anchor with
+# the new importer's market section carry re-recorded keys (spx_ssr1.5_eps0.05: was 6d5f…;
+# spx_ssr1_eps0.1: was 9b5e…); every other key is unchanged.
+ESSVI_SPECS: frozenset[str] = frozenset(
+    {"m7_p1_marking/spx_ssr1.5_eps0.05.yaml", "m7_p1_marking/spx_ssr1_eps0.1.yaml"}
+)
+"""The committed specs the M7 P1 run of 2026-09-22 wrote on the repaired eSSVI anchor: they
+carry the pillar rhos and their keys were re-recorded that day."""
 RECORDED_SPEC_KEYS: dict[str, str] = {
     "lsv_reference_1f.yaml": "831dd92b8b20dde68e314dae51b30c0df4d190f63479d623b0940e2113a6ae33",
     "lsv_reference_2f.yaml": "6a007884b6de9bd0b7dad2540e77ad5f647268783d76ea2586a2a426609d937c",
@@ -77,13 +85,13 @@ RECORDED_SPEC_KEYS: dict[str, str] = {
         "2f14cad8e868274de720d632fdbf7794111a388347c365a1d7994b7e4e68cdb9"
     ),
     "m7_p1_marking/spx_ssr1.5_eps0.05.yaml": (
-        "6bf536715bce6a86715c4e138399b2e6340312eade6f9d5aad3cde1e505ec52a"
+        "77b5f64ab3695d00e336a759c20acb23b97413540e1e32909b1965a488b657d1"
     ),
     "m7_p1_marking/spx_ssr1.75_eps0.2.yaml": (
         "1b76d7538370e4e9454b5f2d5f72c25d17e63cf5d89ee0b0036f3dff95dad20e"
     ),
     "m7_p1_marking/spx_ssr1_eps0.1.yaml": (
-        "6f6302bac31c7683dcc0a6fdaac59085f37aa5650ad0256afe4994564232b615"
+        "d4c3335fc372d7bc18de3a62f385da33e7dfd80c40c032e2111b0d2b4ee8ef60"
     ),
 }
 """``spec_key`` of the committed calibration specs (a whole-file spec, or the ``spec`` section of
@@ -95,8 +103,10 @@ RECORDED_M6_HEADLINE_KEYS: dict[str, str] = {
     "2F Table 8.2": "29719be67072c7d766af145cba91f2261bc9c4be4499f1a4787e2d2e0bfc76fa",
 }
 """The M6 headline calibrations (``lsv_reference_1f`` / ``_2f`` at 8·10⁵ particles)."""
-RECORDED_M8B_SPX_KEY = "b81b684f1bf1d578d9f522cd561e225f4f52551a872ee3ad37bf3dd6a2a1c0b1"
-"""``volsto.studies.m8b.spx_base_spec(800_000)`` (the plain-SSVI 2022-12-30 snapshot)."""
+RECORDED_M8B_SPX_KEY = "eb8e8e555784762b0e2c8088351a6f871a687ddcf9ab14cc81aeb070e4b64095"
+"""``volsto.studies.m8b.spx_base_spec(800_000)``: the repaired eSSVI 2022-12-30 snapshot with the
+2026-09-22 importer's market section (re-recorded that day; the plain-SSVI snapshot's key was
+b81b684f1bf1d578d9f522cd561e225f4f52551a872ee3ad37bf3dd6a2a1c0b1 until then)."""
 PLACEHOLDER_LV = "lv:9a912c0ffbc703a849ce2922eaa21badbb02c031d84bdba019a77dc22f37a501"
 RECORDED_GRID_KEYS: dict[str, dict[str, str | None]] = {
     "toy": {
@@ -118,23 +128,29 @@ RECORDED_GRID_KEYS: dict[str, dict[str, str | None]] = {
 }
 """Point id → leverage-cache key of the two small grids (the toy grid's keys are those the test
 suite's fixture calibrates)."""
+# 2026-09-22: the default grid's digest and the spx_2022-12-30 LV id are re-recorded — the anchor
+# moved to the repaired eSSVI snapshot with the new importer's market section (was
+# 95e0a5fa… and lv:… of the plain-SSVI anchor); toy and placeholder_cached grids are unchanged.
 RECORDED_DEFAULT_GRID_DIGEST = (
     105,
-    "95e0a5fa88c9a51eaa498513385c28a5c543068e3afb2a78f30db87351eea7ce",
+    "d46a18d38e97946bcc80d55a65ea2e698025ca6f02b826f1908c064f07019820",
 )
 """``(count, SHA-256)`` of ``"id=key"`` lines of the default grid's points on its plain-SSVI
 surfaces (``placeholder``, ``spx_2022-12-30``), sorted by id."""
 RECORDED_LV_IDS: dict[str, str] = {
     "placeholder": PLACEHOLDER_LV,
-    "spx_2022-12-30": "lv:738c9cc86ce4838a4d796445e7581b92a4ec443952d60e1538870e96e7996aed",
+    "spx_2022-12-30": "lv:6d8464a99e4188b68eb6b66d6ea7b0911a3828b1c7d787beb79c6f7088dacd59",
 }
 FLATTENED_LV_IDS: dict[str, str] = {
-    "spx_2022-09-15": "lv:c0e02417fd38ad176bdfa2695be6fdf35aae922400e938ab5ec77e3cfb41b74d",
-    "spx_2022-12-02": "lv:abe1f0eda308ae5211c59c7fa6615303ab2115cb851d8b3ab4f61a73bb7a105d",
+    "spx_2022-09-15": "lv:b25328ced1c0103b5b85efb9a181369571a9088275b4e1907ff9c5124623a315",
+    "spx_2022-12-02": "lv:6c3bce1e8453e635dbd5819ad9e361122d3590c4a96325bcc0b1eba535d9af7b",
 }
-"""The default grid's LV ids of its two eSSVI snapshots BEFORE the change, when the grid read
-them flattened to the mean rho: they change deliberately (the LV point of an eSSVI surface is
-now the eSSVI's Dupire); no store or cache held them (checked below when the store exists)."""
+"""The LV ids the default grid's two eSSVI snapshots would have if the grid still read them
+flattened to the mean rho (as it did before M10 Part 3): the grid's ids differ from them
+deliberately (the LV point of an eSSVI surface is the eSSVI's Dupire); no store or cache held
+them (checked below when the store exists).  Re-recorded 2026-09-22 for the snapshots the
+2026-09-22 importer writes (spot, close, funding curve); the 2026-09-16 recording
+(lv:c0e02417…, lv:abe1f0ed…) proved the pre-change ids on the files then committed."""
 IN_MANIFEST_AT_RECORDING: tuple[str, ...] = (
     RECORDED_SPEC_KEYS["m7_p1_marking/reference_ssr1.5_eps0.05.yaml"],
     RECORDED_SPEC_KEYS["m7_p1_marking/reference_ssr1_eps0.1.yaml"],
@@ -209,9 +225,12 @@ def test_keys_of_committed_specs_unchanged() -> None:
     key it had before the field existed (recorded literally above)."""
     for rel, key in RECORDED_SPEC_KEYS.items():
         spec = _committed_spec(rel)
-        assert spec.surface.rhos is None, rel
         assert spec_key(spec) == key, rel
-        assert "rhos" not in json.dumps(spec.key_payload()), rel
+        if rel in ESSVI_SPECS:  # written on the repaired eSSVI anchor: the pillar rhos are keyed
+            assert spec.surface.rhos is not None and "rhos" in json.dumps(spec.key_payload()), rel
+        else:
+            assert spec.surface.rhos is None, rel
+            assert "rhos" not in json.dumps(spec.key_payload()), rel
     assert _m6_headline_keys() == RECORDED_M6_HEADLINE_KEYS
     from volsto.studies.m8b import spx_base_spec
 

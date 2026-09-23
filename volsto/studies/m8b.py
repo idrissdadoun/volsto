@@ -223,9 +223,7 @@ DISCRIMINATOR_VERDICT_PRE_REPAIR = ROOT / "outputs" / "m8b" / "discriminator_ver
 #: the SPX snapshot and the reference study spec the marking fit was built from
 #: (``scripts/m7_p1_marking.py::base_spec``): the base spec of the M7 rotation greek
 REF_SPEC = ROOT / "configs" / "studies" / "lsv_reference_2f.yaml"
-SPX_SNAPSHOT = (
-    ROOT / "configs" / "surfaces" / "snapshots" / "hdn_2022H2_ssvi" / "spx_2022-12-30.yaml"
-)
+SPX_SNAPSHOT = ROOT / "configs" / "surfaces" / "snapshots" / "hdn_2022H2" / "spx_2022-12-30.yaml"
 DEFAULT_OUT = ROOT / "outputs" / "m8b"
 DEFAULT_CACHE = ROOT / "cache"
 

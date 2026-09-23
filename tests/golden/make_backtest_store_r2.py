@@ -13,7 +13,7 @@ Nothing is calibrated here.
 For each date the current attempt's files are written as round 2 wrote them, the previous
 golden being the schema: ``rows.parquet`` without the columns added since (the cumulative P&L
 and its stderr, the paired group stderrs, ``residual_paired`` — the migration test asserts a
-round-2 store carries no cumulative error), ``fit.json`` without the timing keys added since,
+round-2 store carries no cumulative error), ``fit.json`` without the keys added since (``close``, timing keys),
 ``done.json`` without the top-level keys added since (``previous_cache_key``,
 ``previous_date``, ``volsto_version``) and with a version-1 record (no leverage content
 digest; the file digests recomputed; version-1 state links from the library's own
@@ -93,7 +93,8 @@ def main(argv: list[str]) -> int:
         new[f"dates/{d}/rows.parquet"] = buf_rows.getvalue()
         # fit: the round-2 keys only
         old_fit = json.loads(old[f"dates/{d}/fit.json"])
-        assert sorted(fit) == sorted(old_fit), d
+        assert set(old_fit) <= set(fit), (d, sorted(set(old_fit) - set(fit)))
+        fit = {k: fit[k] for k in old_fit}  # the round-2 keys only (e.g. no ``close``)
         for k, v in fit.items():
             if isinstance(v, dict) and isinstance(old_fit[k], dict):
                 assert set(old_fit[k]) <= set(v), (d, k)

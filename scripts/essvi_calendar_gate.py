@@ -56,7 +56,8 @@ from volsto.market.surface import CALENDAR_GRID_N_T, ESSVISurface, SSVISurface
 
 ROOT = Path(__file__).resolve().parents[1]
 ANCHOR = "2022-12-30"
-"""The SPX anchor day of M7/M8b (``configs/surfaces/snapshots/hdn_2022H2_ssvi``)."""
+"""The SPX anchor day of M7/M8b (``configs/surfaces/snapshots/hdn_2022H2``, the repaired eSSVI
+set; ``hdn_2022H2_ssvi`` is the plain-SSVI set)."""
 GATE_PASS_FRACTION = 0.95
 """Owner's gate: eSSVI passes the calendar check on at least 95% of days."""
 ERR_T_MIN, ERR_T_MAX, ERR_K_ABS = 0.25, 3.0, 0.20

@@ -46,13 +46,12 @@ from volsto.calibration.fit_2f import BreakEvenFitConfig, fit_2f_marking
 from volsto.config import (
     BergomiParams,
     CalibrationSpec,
-    MarketConfig,
     SimConfig,
-    SSVIConfig,
     SurfacePerturbation,
     from_mapping,
     load_yaml,
 )
+from volsto.market.loaders import snapshot_spec
 from volsto.market.surface import atm_skew_numeric, perturbed_surface
 from volsto.risk.engine import RiskState, Sensitivity, surface_of
 from volsto.risk.shadow_rotation import (
@@ -74,7 +73,7 @@ from volsto.studies.m6 import AUTOCALL_NAME, headline_products
 
 ROOT = Path(__file__).resolve().parents[1]
 STUDY_DIR = ROOT / "configs" / "studies" / "m7_p1_marking"
-SPX = ROOT / "configs" / "surfaces" / "snapshots" / "hdn_2022H2_ssvi" / "spx_2022-12-30.yaml"
+SPX = ROOT / "configs" / "surfaces" / "snapshots" / "hdn_2022H2" / "spx_2022-12-30.yaml"
 OWNER_POLICIES = ("sabr_linked", "sticky_breakeven")
 
 
@@ -82,11 +81,9 @@ def _spec(surface: str) -> CalibrationSpec:
     """The study's base calibration spec (``scripts/m7_p1_marking.py::base_spec``)."""
     ref = load_yaml(ROOT / "configs" / "studies" / "lsv_reference_2f.yaml", CalibrationSpec)
     if surface == "spx":
-        ref = dataclasses.replace(
-            ref,
-            market=load_yaml(SPX, MarketConfig, section="market"),
-            surface=load_yaml(SPX, SSVIConfig, section="ssvi"),
-        )
+        # the one reader of a snapshot's surface (SPEC §13.2): reading the ``ssvi`` section
+        # alone flattened the eSSVI anchor to its mean rho and fitted another surface
+        ref = snapshot_spec(ref, SPX)
     return dataclasses.replace(ref, particle=dataclasses.replace(ref.particle, n_particles=200_000))
 
 
@@ -150,7 +147,11 @@ def test_rotated_refit_under_the_policies() -> None:
     slope = np.array([rota_slope(t) for t in T])
     assert np.allclose(up.targets.skew_target - base.targets.skew_target, -slope, rtol=1e-4)
     assert np.allclose(dn.targets.skew_target - base.targets.skew_target, slope, rtol=1e-4)
-    assert np.all(np.abs(up.targets.correl_target - base.targets.correl_target) > 1e-4)
+    # every correlation target moves with the rota except where it sits on the -1 bound (the
+    # 1y pillar of the repaired eSSVI anchor: Corr_BE is clipped there before and after)
+    d_corr = up.targets.correl_target - base.targets.correl_target
+    at_bound = np.isclose(np.abs(base.targets.correl_target), 1.0)
+    assert np.all(np.abs(d_corr[~at_bound]) > 1e-4) and np.all(d_corr[at_bound] == 0.0)
     assert dn.params.nu < base.params.nu < up.params.nu
     print("sabr_linked nu:", dn.params.nu, base.params.nu, up.params.nu)
     rot_up = surface_of(states["up"])

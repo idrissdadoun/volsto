@@ -2110,3 +2110,147 @@ def test_curvature_stencil_wiring_and_base_fit_consistency(
         hr.run(opt, GreekTargetStrategy((Target("delta"),), [Spot()], name="delta"))
     assert captured["surface"] is lv.surface
     assert captured["h"] == 0.10 and captured["skew_h"] == 0.05 and captured["ssr_target"] == 1.0
+
+
+def test_foreign_world_factors_imputed_by_their_conditional_mean(fc: ForwardCurve) -> None:
+    """A world without the pricing model's factors (Black–Scholes under a two-factor Bergomi
+    pricer) has the pricing factors imputed as ``E[X_t | ln S_t]`` under the pricing model
+    (:meth:`ConditionalPricer.pricing_factors`): each factor regressed on the pricer's cubic
+    spline in ``ln S_t`` (standardised, clipped to the pricing paths' 0.1–99.9 % range, 8
+    quantile knots) over the pricing paths — not held at 0, and not a straight line in ``ln S_t``.
+    With ``ρ_SX = −0.9`` and ``ρ12`` near the admissible minimum (the SPX 2022-12-30 marking fit
+    of 2026-09-22 sits 0.002 above it) the pricing paths' ``(ln S_t, X¹_t, X²_t)`` are almost
+    collinear one day in (smallest eigenvalue of their correlation ≈ 0.008) and the tensor fit
+    evaluated at ``(ln S_t, 0, 0)`` — off the plane it was identified on — is unconstrained:
+    measured on this case with the factors held at 0, the 1y 110 % call spread's date-1 marks
+    averaged 0.028 against a 0.360 value (minimum −5.0; mark − ``E[V | ln S_t]`` mean −0.33, rms
+    0.68); on the M8b study-B pure-LV rows the KO var preset's call-spread leg lost 40 vol points
+    over the first five days.  A straight line misses the conditional mean in the ``ln S`` tails
+    (measured here: the binned mean of ``X`` on the pricing paths deviates from the line by
+    0.75–3.1 conditional standard deviations in the 1 % tails at 1 to 63 days, ≤ 0.11 for the
+    spline; the date-1 marks in the world's upper 1 % tail: rms 0.23 against ``E[V | ln S_t]``
+    for the line, 0.05 for the spline) — the tails where the study's KO var knocks out (hedged std
+    3.9 with the line against 2.5 with the spline, 2·10⁴ paths).  Checks, the property before the
+    recipe: on the pricing paths' own spots (a factor-stripped copy of the pricing paths, a
+    foreign world by construction) the imputation matches the binned conditional mean of each
+    factor within 0.3 conditional sd in every ``ln S`` bin, the 1 % tails included, at 1, 2, 21
+    and 63 days; the date-1 and date-2 marks at the world's states agree with the pricing model's
+    own spot-only regression ``E[V | ln S_t]`` (mean within 0.02, rms within 0.05; date 1 in each
+    1 % tail of the world's ``ln S``: rms within 0.10) and average to the ``t = 0`` value; the
+    1–99 % marks lie in ``[0, 1]`` and none is beyond ±0.25 of it; the imputed state equals the
+    spline regression re-derived here; the pricer notes the rule once; with spot-uncorrelated
+    factors the imputation is the spline's fit noise on a null target (measured over three seeds
+    at one day: rms 0.08–0.11 σ_X, max 0.4–0.8 σ_X; the line's 0.01–0.02 / 0.04–0.11), the
+    pre-2026-09-23 behaviour in expectation."""
+    from volsto.engine.paths import PathSet
+    from volsto.hedging import Digital
+    from volsto.hedging.pricing import CLIP_QUANTILE, FOREIGN_FACTOR_NOTE, FactorProjection
+    from volsto.market.varswap import ForwardVarianceCurve
+    from volsto.models.bergomi import BergomiSV
+
+    sim = SimConfig(n_paths=8_000, chunk_size=8_000, seed=11, dt_max=1.0 / 52.0)
+    world = BlackScholes(0.2, fc)
+    spread = Digital(strike=110.0, maturity=1.0, cp=1, width=2.0, discount=fc.rate_curve).product
+    dates = np.array([0.0, 1.0 / 252.0, 2.0 / 252.0, 21.0 / 252.0, 63.0 / 252.0])
+
+    def build(rho_s: float, rho12: float) -> tuple[ConditionalPricer, PathSet]:
+        params = BergomiParams(
+            nu=2.0, theta=0.15, k1=8.0, k2=0.2, rho12=rho12, rho_SX1=rho_s, rho_SX2=rho_s
+        )
+        kernel = BergomiSV(params, ForwardVarianceCurve.flat(0.04), fc)
+        grid = union_grid([kernel, world], [spread], dates, sim)
+        pr = ConditionalPricer(kernel, [spread], grid, sim)
+        hr = Hedger(PricingContext.from_model(kernel), world, sim=sim, verbose=False)
+        return pr, hr._simulate_world(grid)
+
+    def stripped(p: PathSet) -> PathSet:
+        """The pricing paths without their factor columns: a foreign world at the same spots."""
+        return PathSet(p.times, p.log_spot, p.variance, p.factors[:, :, :0], p.int_var, p.sum_sq)
+
+    def spot_spline(s: FloatArray) -> tuple[FloatArray, FloatArray, float, float, float, float]:
+        """The pricer's spline recipe in ``ln S``: standardised, clipped, 8 quantile knots."""
+        m, sd = float(s.mean()), float(s.std())
+        z = (s - m) / sd
+        lo, hi = float(np.quantile(z, CLIP_QUANTILE)), float(np.quantile(z, 1 - CLIP_QUANTILE))
+        zc = np.clip(z, lo, hi)
+        knots = np.unique(np.quantile(zc, np.linspace(0.0, 1.0, 10)[1:-1]))
+        return hedge_basis(zc[:, None], knots, 0), knots, m, sd, lo, hi
+
+    pr, wp = build(-0.9, 0.63)
+    assert wp.n_factors == 0 and pr.model.n_factors == 2
+    own_spots = stripped(pr.paths)
+    assert own_spots.n_factors == 0
+    v0, se0 = pr.value_at_zero(0)
+    edges_q = [0.0, 0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99, 1.0]
+    for t in dates[1:]:
+        col = pr.idx[float(t)]
+        s_p, x_p = pr.paths.log_spot_at(col), pr.paths.factors_at(col)
+        s_w = wp.log_spot_at(col)
+        fac = pr.pricing_factors(wp, col)
+        assert fac.shape == (wp.n_paths, 2)
+        # (i) the property: on the pricing paths' own spots the rule tracks the binned
+        # conditional mean of each factor in every ln S bin, the 1 % tails included (a straight
+        # line: 0.75-3.1 conditional sd in the tails)
+        x_hat = pr.pricing_factors(own_spots, col)
+        resid_sd = (x_p - x_hat).std(axis=0)
+        edges = np.quantile(s_p, edges_q)
+        worst = 0.0
+        for a, b in zip(edges[:-1], edges[1:]):
+            mk = (s_p >= a) & (s_p <= b)
+            d = (x_p[mk].mean(axis=0) - x_hat[mk].mean(axis=0)) / resid_sd
+            worst = max(worst, float(np.abs(d).max()))
+        print(f"t={t:.4f}: binned E[X|lnS] - rule, worst bin {worst:.3f} conditional sd")
+        assert worst < 0.3
+        xb, knots, m, sd, lo, hi = spot_spline(s_p)
+        z_w = np.clip((s_w - m) / sd, lo, hi)
+        if t < 3.0 / 252.0:
+            corr = np.corrcoef(np.column_stack([s_p, x_p]).T)
+            assert np.linalg.eigvalsh(corr)[0] < 0.02  # the collinear regime the rule is about
+            # (ii) the marks at the world's states against the pricing model's own E[V | ln S_t]
+            # (the same spline in ln S alone, fitted to the payoff, at the world's spots)
+            out, _ = pr.evaluate(0, float(t), wp, ["value"])
+            beta_v = np.linalg.lstsq(xb, pr.payoffs[0].base, rcond=None)[0]
+            bench = hedge_basis(z_w[:, None], knots, 0) @ beta_v
+            err = out["value"] - bench
+            mean_err, rms = float(err.mean()), float(np.sqrt(np.mean(err**2)))
+            q01_w, q99_w = np.quantile(s_w, [0.01, 0.99])
+            tails = {
+                "lower 1%": float(np.sqrt(np.mean(err[s_w <= q01_w] ** 2))),
+                "upper 1%": float(np.sqrt(np.mean(err[s_w >= q99_w] ** 2))),
+            }
+            print(
+                f"t={t:.4f}: min eig {np.linalg.eigvalsh(corr)[0]:.2e}, v0 {v0:.4f} +/- "
+                f"{se0:.4f}, mark mean {out['value'].mean():.4f} [{out['value'].min():+.3f}, "
+                f"{out['value'].max():+.3f}], mark - E[V|lnS] mean {mean_err:+.4f} rms {rms:.4f}, "
+                f"tail rms {tails}"
+            )
+            assert abs(mean_err) < 0.02 and rms < 0.05  # held at 0: -0.33 / 0.68 at date 1
+            assert abs(float(out["value"].mean()) - v0) < 0.02  # held at 0: 0.028 vs 0.360
+            if t < 1.5 / 252.0:
+                assert max(tails.values()) < 0.10  # line: 0.23 in the upper tail (spline 0.05)
+            q01, q99 = np.quantile(out["value"], [0.01, 0.99])
+            assert q01 > 0.0 and q99 < 1.0  # held at 0: the 1% quantile far below 0
+            assert np.all(out["value"] > -0.25) and np.all(out["value"] < 1.25)  # held at 0: -5.0
+        # (iii) the recipe: the spline regression of each factor on ln S_t, re-derived
+        beta_x = np.linalg.lstsq(xb, x_p, rcond=None)[0]
+        expect = hedge_basis(z_w[:, None], knots, 0) @ beta_x
+        assert np.allclose(fac, expect, rtol=1e-8, atol=1e-10)
+        proj = pr.factor_projections[col]
+        assert isinstance(proj, FactorProjection) and proj.knots.size == 8
+        feats, _ = pr.features(0, wp, float(t))
+        assert np.allclose(feats[:, 1:3], fac, rtol=0.0, atol=0.0)
+    assert FOREIGN_FACTOR_NOTE in pr.notes and pr.notes.count(FOREIGN_FACTOR_NOTE) == 1
+    # (iv) spot-uncorrelated factors: the imputation is the spline's fit noise on a null target
+    pr0, wp0 = build(0.0, 0.5)
+    col = pr0.idx[float(dates[1])]
+    fac0 = pr0.pricing_factors(wp0, col)
+    sd_x = pr0.paths.factors_at(col).std(axis=0).min()
+    print(
+        f"uncorrelated: rms(X_hat)/sd_X {fac0.std() / sd_x:.3f}, max {np.abs(fac0).max() / sd_x:.3f}"
+    )
+    assert fac0.std() < 0.25 * sd_x and np.abs(fac0).max() < 1.5 * sd_x
+    # the pricing paths themselves carry their own factors: no imputation (the note was
+    # emitted once, by the world call above, and is not repeated)
+    own = pr0.pricing_factors(pr0.paths, col)
+    assert np.array_equal(own, pr0.paths.factors_at(col))
+    assert pr0.notes.count(FOREIGN_FACTOR_NOTE) == 1

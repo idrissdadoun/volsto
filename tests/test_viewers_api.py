@@ -38,7 +38,7 @@ from _synthetic_store import (
 )
 from pandas.testing import assert_frame_equal
 
-from volsto.config import LocalVolConfig
+from volsto.config import LocalVolConfig, MarketConfig, load_yaml
 from volsto.viewers import api
 from volsto.viewers.config import ENV_VARS, ViewerConfig, build_parser
 from volsto.viewers.pages import PAGES, page_paths
@@ -430,7 +430,11 @@ def test_get_surface_builds_without_cache(synthetic: dict[str, object]) -> None:
     print(f"\nget_surface: placeholder {t1 - t0:.2f} s, {SNAPSHOT_NAME} {t2 - t1:.2f} s")
     assert ph.kind == "placeholder" and ph.spot == 100.0 and ph.path == ""
     assert sp.kind == "snapshot" and sp.path.endswith(f"{SNAPSHOT_NAME}.yaml")
-    assert sp.spot == pytest.approx(3901.35)
+    # the snapshot's spot is the level its options imply, not the vendor close (3901.35 on
+    # 2022-09-15; SPEC §13.1, 2026-09-22)
+    market = load_yaml(sp.path, MarketConfig, section="market")
+    assert sp.spot == pytest.approx(market.spot) and market.close == pytest.approx(3901.35)
+    assert abs(sp.spot / 3901.35 - 1) < 0.01
     lv_cfg = ph.spec.local_vol or LocalVolConfig()  # the reference spec uses the defaults
     assert ph.local_vol.local_var.shape == (lv_cfg.n_t, lv_cfg.n_k) == (400, 2401)
     assert np.all(ph.local_vol.local_var > 0)

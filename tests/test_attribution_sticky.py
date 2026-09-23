@@ -403,7 +403,8 @@ def test_ladders_on_a_repaired_essvi_day_need_more_halvings() -> None:
     without it): the curvature ladder's butterfly bump is refused after the default 4 halvings
     and passes with 6 (module docstring of :mod:`volsto.risk.attribution`); the sticky run of the
     date still calibrates the endpoints only."""
-    gate = ROOT / "outputs" / "essvi_gate" / "snapshots"
+    # the layout of `scripts/m7_hdn_history.py --tag _repaired --out outputs/essvi_gate`
+    gate = ROOT / "outputs" / "essvi_gate" / "snapshots" / "hdn_2022H2"
     d0, d1 = gate / "spx_2022-12-29.yaml", gate / "spx_2022-12-30.yaml"
     marking = ROOT / "configs" / "studies" / "m7_p1_marking" / "spx_ssr1_eps0.1.yaml"
     if not (d0.is_file() and d1.is_file()):

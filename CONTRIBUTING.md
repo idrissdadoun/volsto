@@ -77,6 +77,14 @@ number without a finite stderr"), find the single place that can enforce it, and
 test first — it will fail on every unlisted site, which is the point.
 
 Applied since (M10, 2026-09-16/17):
+- **Importer tag (2026-09-22):** a stored artefact must not outlive the code that produced it —
+  the calibration code tag (M4), the golden legacy backtest store (2026-09-19) and the backtest's
+  snapshot binding (2026-09-22: 25 proof-of-concept dates read `done` under a changed importer)
+  were three occurrences. One place: `IMPORTER_TAG` in `volsto/market/import_hdn.py`, written into
+  every snapshot's provenance, checked by the store's verdict and by `snapshot_bound`, and hashed
+  against the importer, surface and curve sources (`importer_guard.json`,
+  `test_importer_tag_guard`). Bump it when a change moves any snapshot; re-record the hash without
+  a bump only for a change proven not to, and say so in the commit.
 - **Studies:** every catalogue study declares its exact (error-free) numbers by kind in
   `EXACT_KINDS`; the walker in `volsto/studies/catalogue/_common.py` (run by
   `tests/test_catalogue_s1_s4.py` over every fast config) refuses any undeclared exact number, and

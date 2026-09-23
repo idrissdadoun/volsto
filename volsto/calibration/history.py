@@ -238,14 +238,25 @@ class SurfacePillarSource:
     log-contract strip (:func:`~volsto.market.varswap.varswap_strike`), ``spot`` from the forward
     curve."""
 
-    def __init__(self, surface: ImpliedSurface, *, skew_h: float = 1e-3) -> None:
+    def __init__(
+        self, surface: ImpliedSurface, *, skew_h: float = 1e-3, close: float | None = None
+    ) -> None:
         if skew_h <= 0:
             raise ValueError("skew_h must be positive")
+        if close is not None and close <= 0:
+            raise ValueError("close must be positive")
         self.surface = surface
         self.skew_h = float(skew_h)
+        self.close = None if close is None else float(close)
 
     @property
     def spot(self) -> float:
+        """The realised level the history's ``ln_spot`` uses: the official close when the
+        source was built from an importer snapshot (:meth:`SurfaceHistory.from_snapshots`;
+        the snapshot's ``spot`` is the level the option quotes imply, SPEC §13.1), else the
+        surface's spot (synthetic surfaces, where the two coincide)."""
+        if self.close is not None:
+            return self.close
         return float(self.surface.forward_curve.spot)
 
     def atm_vol(self, T: float) -> float:
@@ -535,14 +546,22 @@ class SurfaceHistory:
         """From importer snapshot YAML configs (:mod:`volsto.market.import_hdn`, loaded with
         :func:`volsto.market.loaders.load_ssvi_surface`); the date is ``provenance.quote_date``,
         else a ``YYYY-MM-DD`` in the file name.  Files are sorted by date."""
+        from volsto.config import MarketConfig, load_yaml
         from volsto.market.loaders import load_ssvi_surface
 
         dated = sorted((snapshot_date(p), Path(p)) for p in paths)
         if not dated:
             raise ValueError("no snapshot files given")
-        return cls.from_surfaces(
-            [(d, load_ssvi_surface(p)) for d, p in dated], pillars, skew_h=skew_h
-        )
+        sources: list[PillarSource] = []
+        for _, p in dated:
+            close = load_yaml(p, MarketConfig, section="market").close
+            if close is None:
+                raise ValueError(
+                    f"{p}: the snapshot has no market.close (imported before 2026-09-22, when "
+                    "spot became the option-implied level): re-import it"
+                )
+            sources.append(SurfacePillarSource(load_ssvi_surface(p), skew_h=skew_h, close=close))
+        return cls.from_sources([d for d, _ in dated], sources, pillars)
 
     @classmethod
     def from_callable(

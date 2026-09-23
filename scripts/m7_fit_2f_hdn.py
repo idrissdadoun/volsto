@@ -1,8 +1,10 @@
 """M7 real-data run: the 2022 H2 SPX history with the P1 break-even fitter (SPEC §15 Parts 2–4;
 owner's "M7 Part 3 FINAL" methodology; no fixed numbers).
 
-Input: ``outputs/m7/hdn_history_ssvi.csv`` (``scripts/m7_hdn_history.py --no-essvi``) and the
-snapshot of the pricing date in ``configs/surfaces/snapshots/hdn_2022H2_ssvi``.  Steps: the
+Input: ``outputs/essvi_gate/hdn_history_repaired.csv`` (``scripts/m7_hdn_history.py --tag
+_repaired --out outputs/essvi_gate``, the repaired eSSVI history; the plain-SSVI history
+``outputs/m7/hdn_history_ssvi.csv`` of ``--no-essvi`` until 2026-09-22) and the snapshot of the
+pricing date in ``configs/surfaces/snapshots/hdn_2022H2``.  Steps: the
 historical estimates at the last date (windows 100 / 60 — the sample has 127 trading days, so
 the SPEC's 250-day vol window is not available); the **historical-mode** fit (pillars 3M, 6M, 1Y
 — MatMin 3M, and the snapshots quote ATM maturities to 1.5–3y only, so the 2y / 3y pillars sit on
@@ -41,8 +43,8 @@ DIALS = (0.8, 1.0, 1.2)
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--history", default="outputs/m7/hdn_history_ssvi.csv")
-    ap.add_argument("--snapshots", default="configs/surfaces/snapshots/hdn_2022H2_ssvi")
+    ap.add_argument("--history", default="outputs/essvi_gate/hdn_history_repaired.csv")
+    ap.add_argument("--snapshots", default="configs/surfaces/snapshots/hdn_2022H2")
     ap.add_argument("--out", default="outputs/m7")
     ap.add_argument("--window-vol", type=int, default=100)
     ap.add_argument("--window-ssr", type=int, default=60)

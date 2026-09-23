@@ -40,7 +40,7 @@ Each convention is stated once here; the rest of the page uses it without restat
 | Trading days | 252 per year. This covers the realised-variance annualisation $A = 252$, the daily fixing schedule, the trading index of a seasoned trade ($j = 252\,t$), one business day ($1/252$, `volsto.risk.greeks.BUSINESS_DAY`) for theta and for the backtest attribution step, and $\sqrt{252}$ for historical vol of vol. | §6.1, §6.10, §7.3, §10.3, §15 Part 2 |
 | Simulation steps | $1/1460$ below 3 months, $1/365$ to 2 years, $1/250$ beyond. These are step sizes, not a day count. | §3.1 |
 | SABR quotes (step 0) | "365-day" quotes on ACT/365 maturities (section 6.1 of this page). | §15 Part 3 |
-| Spot, forward, rates | $S_t$ is the spot. $r$ is the rate and $q$ the continuous dividend yield or repo, both deterministic. $F(T) = S_0 \exp\int_0^T (r - q)$ is the forward. | §2.1 |
+| Spot, close, forward, rates | $S_t$ is the spot. For an imported day it is the level the option quotes imply (SPX options quote to 16:15; the vendor's close is the 16:00 print), and the official close is kept beside it as `market.close` — the level trades fix on and are struck at, never a pricing input. $r$ is the funding rate the options imply (the box-spread rate per expiry, smoothed on 1m–3y knots; the Treasury curve is provenance only) and $q$ the carry that reproduces every forward — dividends, repo and any remaining basis — both deterministic and continuous. $F(T) = S_0 \exp\int_0^T (r - q)$ is the forward. | §2.1, §13.1 |
 | Log-moneyness | Surfaces, local vol and the leverage use forward log-moneyness: $k = \ln(K/F(T))$ for a strike $K$, and $k = \ln(S/F(t))$ for the leverage's spot axis. The delta regimes of §7.2 write the smile in spot log-moneyness $\ln(K/S)$. | §2.2, §4.1, §7.2 |
 | Implied vol | $\hat\sigma(k, T)$ is the Black implied vol, a decimal (0.20 means 20 %). $w(k,T) = \hat\sigma^2 T$ is the total implied variance. ATMF (at the money forward) means $K = F(T)$, i.e. $k = 0$. | §2.2 |
 | Vol point (vp) | 0.01 of implied vol: 20 % to 21 % is +1 vp. Variance-swap strikes are quoted as a vol, in vol points. Vega is per vol point. | §6.1, §7.3 |
@@ -114,10 +114,20 @@ initial forward variance curve $\xi_0(T) = \frac{d}{dT}\big[T\,K_{\text{var}}(T)
 PCHIP interpolant of the strip, which keeps it positive and integrating back to the strip.
 
 **Importer** (`volsto-import`, `volsto.market.import_hdn`, §13). It reads HistoricalData.net
-end-of-day chains, implies forwards by put–call-parity regression, prunes butterfly and calendar
-violations, and fits $\theta_T$ at the pillars (1m, 3m, 6m, 1y, 18m, 2y, 3y) by isotonic least
-squares. The global parameters are fitted by vega-weighted least squares on $|k| \le 0.25$ and
-expiries from 3 weeks. The vendor's implied vols and Greeks are never inputs.
+end-of-day chains and implies, per expiry, the forward and the discount factor by put–call-parity
+regression over the near-the-money pairs (about 100 per expiry on SPX, forward standard error a
+few hundredths of a point). From those it builds the market of the day (§13.1, decisions of
+2026-09-22): the funding curve is a weighted fit of the per-expiry discount factors on 1m–3y
+knots; the spot is the level the forwards up to 45 days imply (the vendor's close is the 16:00
+print while the options quote to 16:15, so on evenings of large after-hours moves the two
+differ by tens of basis points — 38 of the 127 days of 2022 H2 by more than 10 bp, −92 bp on
+2022-10-27; the official close is kept as `market.close` for fixings and strikes); the carry
+curve then reproduces every forward exactly. Measured against the close instead, the 7-day
+carry ran from −17 % to +50 %; against the implied spot it is +1.8 % at the median, between
+−1.5 % and +3.3 %. It then prunes butterfly and calendar violations and fits $\theta_T$ at the
+pillars (1m, 3m, 6m, 1y, 18m, 2y, 3y) by isotonic least squares. The global parameters are
+fitted by vega-weighted least squares on $|k| \le 0.25$ and expiries from 3 weeks. The
+vendor's implied vols and Greeks are never inputs.
 
 ---
 

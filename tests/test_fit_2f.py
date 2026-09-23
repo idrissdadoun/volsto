@@ -86,7 +86,7 @@ fit_2f_module = importlib.import_module("volsto.calibration.fit_2f")
 ROOT = Path(__file__).resolve().parents[1]
 P82 = BergomiParams(1.74, 0.245, 5.35, 0.28, 0.0, -0.759, -0.487)
 STUDY_DIR = ROOT / "configs" / "studies" / "m7_p1_marking"
-SPX = ROOT / "configs" / "surfaces" / "snapshots" / "hdn_2022H2_ssvi" / "spx_2022-12-30.yaml"
+SPX = ROOT / "configs" / "surfaces" / "snapshots" / "hdn_2022H2" / "spx_2022-12-30.yaml"
 SSR_SIM = SimConfig(n_paths=40_000, dt_max=1.0 / 100.0, chunk_size=20_000, seed=7)
 
 
@@ -445,22 +445,25 @@ def test_ssr_target_and_skew_eps_exercised(spx, spx_fits) -> None:  # type: igno
 
 
 def test_binding_message_on_incompatible_pair(ref_fits, spx_fits, ssvi, caplog) -> None:  # type: ignore[no-untyped-def]
-    """An incompatible ``(ssr_target, skew_eps)`` pair binds: on SPX ``(1.0, 0.10)`` both points bind
-    (1Y at the steep edge ``(1+0.1)``, 3Y at the flat edge) and the message names the maturity, the
-    edge, the naked-vs-market skew and the achieved-vs-target SpotVolCovar per pillar; on the
+    """An incompatible ``(ssr_target, skew_eps)`` pair binds: on SPX ``(1.0, 0.10)`` the 1Y point
+    binds at the steep edge ``(1+0.1)`` and the message names the maturity, the edge, the
+    naked-vs-market skew and the achieved-vs-target SpotVolCovar per pillar (on the repaired
+    eSSVI anchor of 2026-09-22 the 3Y point is free; on the plain-SSVI anchor it bound at the flat
+    edge, its 2y/3y skew being steeper: −0.218 / −0.191 against −0.194 / −0.166); on the
     reference SSVI ``(1.0, 0.10)`` the SpotVolCovar the SSR asks for is out of reach within the ν
     cap 3.5 (the P1 covariance is +97% of target at 3M), both skew points bind and step 3 sits on
     the cap (``|ρ_SX1| = 1``, ρ12 +0.987: the collapse note fires); at ``(1.5, 0.05)`` the ν box
     binds (ρ = −1 / −1, ρ12 = +1) and the owner's ν-cap warning is logged and attached.  On SPX
     the constraint binds for every pair of ``ssr ∈ {1, 1.25, 1.5, 1.75, 2} × eps ∈ {0.05, 0.1, 0.2,
     0.3}`` except ``ssr 1.75`` with ``eps ≥ 0.2``: that compatible pair binds nothing, carries no
-    message and meets every SpotVolCovar target within 2%."""
+    message and meets every SpotVolCovar target within 4% (2.7 / 3.9 / 0.05 / 3.2 / 1.6 % on the
+    repaired eSSVI anchor of 2026-09-22; within 2% on the plain-SSVI anchor)."""
     r = spx_fits[(1.0, 0.10)]
     assert r.status == "binding"
     msgs = [m for m in r.messages if m.startswith("skew constraint binds")]
-    assert len(msgs) == 2
+    assert len(msgs) == 1
     assert "T=1 (lower edge: naked skew = (1+0.1) x Skew_SABR" in msgs[0]
-    assert "T=3 (upper edge: naked skew = (1-0.1) x Skew_SABR" in msgs[1]
+    assert list(r.constraints["binding_edge"]) == ["(1+0.1)", ""]
     for m in msgs:
         assert "SpotVolCovar achieved vs target: 0.25y" in m and "3y" in m
     assert BINDING_MESSAGE.split("{")[0] in msgs[0]
@@ -485,7 +488,7 @@ def test_binding_message_on_incompatible_pair(ref_fits, spx_fits, ssvi, caplog) 
     ok = fit_2f_marking(_spx_surface(), BreakEvenFitConfig(skew_eps=0.20), ssr_target=1.75)
     print(ok.status, ok.messages, np.round(ok.constraints["gap_rel"], 4).tolist())
     assert ok.status == "interior" and ok.messages == () and ok.first.active == ()
-    assert np.all(np.abs(ok.svc_rel_error) < 0.02)
+    assert np.all(np.abs(ok.svc_rel_error) < 0.04), ok.svc_rel_error
 
 
 def test_infeasible_message(spx) -> None:  # type: ignore[no-untyped-def]
@@ -509,14 +512,30 @@ def test_correl_rho_sabr_kept(spx_fits) -> None:  # type: ignore[no-untyped-def]
     """``Corr_BE = ρ_SABR`` always: the VolVar target is ``(SpotVolCovar_P1 / Corr_BE)²``, so the
     fitted model's spot/vol correlation ``SpotVolCovar / sqrt(VolVar)`` sits on ``ρ_SABR`` (within
     1% where the VolVar fit is tight) even where the covariance target is missed, and no
-    correlation is railed on SPX; the ρ12 collapse note (decision vii) fires on ``(1.5, 0.05)``
-    (ρ12 +0.988) and not on ``(1.0, 0.10)`` (+0.74)."""
-    assert any("collapsing" in n for n in spx_fits[(1.5, 0.05)].notes)
+    correlation is railed on SPX.  On the repaired eSSVI anchor of 2026-09-22 the ρ12 collapse
+    note (decision vii) fires on neither pair (ρ12 +0.65 at ``(1.0, 0.10)``, +0.30 at
+    ``(1.5, 0.05)``; on the plain-SSVI anchor it fired on ``(1.5, 0.05)`` at +0.988) — the
+    collapse itself is exercised on the reference surface in
+    :func:`test_binding_message_on_incompatible_pair`."""
+    assert not any("collapsing" in n for n in spx_fits[(1.5, 0.05)].notes)
     assert not any("collapsing" in n for n in spx_fits[(1.0, 0.10)].notes)
+    assert 0.2 < spx_fits[(1.5, 0.05)].params.rho12 < 0.4
     for r in spx_fits.values():
         t = r.table
         assert np.allclose(t["volvar_target"], (t["svc_model"] / t["corr_target"]) ** 2)
-        assert np.allclose(t["corr_model"], t["corr_target"], rtol=0.01), t[
+        # Corr_BE = rho_SABR is imposed through the VolVar target, so the fitted correlation
+        # misses rho_SABR by half the VolVar fit's relative miss: within 1% where the VolVar fit
+        # is within 2%, within 3% everywhere (on the repaired eSSVI anchor of 2026-09-22 the 2y
+        # and 3y VolVar fits miss by 3-4%, the correlations by up to 2.1%; the plain-SSVI anchor
+        # fitted VolVar within 2% at every pillar)
+        ratio = np.sqrt(t["volvar_target"] / t["volvar_model"])
+        np.testing.assert_allclose(t["corr_model"] / t["corr_target"], ratio, rtol=1e-6)
+        tight = np.abs(t["volvar_model"] / t["volvar_target"] - 1) < 0.02
+        assert tight.any()
+        assert np.allclose(t["corr_model"][tight], t["corr_target"][tight], rtol=0.01), t[
+            ["corr_model", "corr_target"]
+        ]
+        assert np.allclose(t["corr_model"], t["corr_target"], rtol=0.03), t[
             ["corr_model", "corr_target"]
         ]
         p = r.params
@@ -539,7 +558,7 @@ def test_tables_yaml_and_fit_spec(spx_fits, tmp_path) -> None:  # type: ignore[n
     doc = yaml.safe_load(r.config_yaml)
     assert from_mapping(BergomiParams, doc["model"]) == r.params
     assert from_mapping(BreakEvenFitConfig, doc["provenance"]["config"]) == r.config
-    assert doc["provenance"]["status"] == "binding" and len(doc["provenance"]["messages"]) == 2
+    assert doc["provenance"]["status"] == "binding" and len(doc["provenance"]["messages"]) == 1
     assert doc["provenance"]["iterations"] is None and doc["provenance"]["stage3"] is None
     base = dataclasses.replace(_reference_spec("2f"), model=P82)
     path = write_fit_spec(r, base, tmp_path / "x.yaml", n_particles=1234, ssr_target=1.0, label="x")

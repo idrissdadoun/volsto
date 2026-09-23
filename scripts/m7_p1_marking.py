@@ -8,8 +8,8 @@ Part 3 FINAL" and report decisions; methodology in the module docstrings of
 
 Fits: ``--pairs`` (default ``(ssr_target, skew_eps) = (1.0, 0.10)`` and ``(1.5, 0.05)``) with the
 fitter's defaults otherwise (pillars 3M–10Y inside the surface, MatMin 3M, SmoothBreakEven, k2 =
-0.2, ν cap 3.5).  Surfaces: the plain SSVI snapshot
-``configs/surfaces/snapshots/hdn_2022H2_ssvi/spx_2022-12-30.yaml`` (quoted to 3Y: the 5Y / 10Y
+0.2, ν cap 3.5).  Surfaces: the repaired eSSVI snapshot (since 2026-09-22; plain SSVI before)
+``configs/surfaces/snapshots/hdn_2022H2/spx_2022-12-30.yaml`` (quoted to 3Y: the 5Y / 10Y
 pillars are dropped and the 5Y skew constraint moves to 3Y, with the fitter's note) and, on
 request, the reference SSVI of ``configs/studies/lsv_reference_2f.yaml`` (to 10Y).
 
@@ -84,9 +84,7 @@ from volsto.studies.m6 import AUTOCALL_NAME, headline_products
 
 ROOT = Path(__file__).resolve().parents[1]
 REF_SPEC = ROOT / "configs" / "studies" / "lsv_reference_2f.yaml"
-SPX_SNAPSHOT = (
-    ROOT / "configs" / "surfaces" / "snapshots" / "hdn_2022H2_ssvi" / "spx_2022-12-30.yaml"
-)
+SPX_SNAPSHOT = ROOT / "configs" / "surfaces" / "snapshots" / "hdn_2022H2" / "spx_2022-12-30.yaml"
 STUDY_DIR = ROOT / "configs" / "studies" / "m7_p1_marking"
 FITS: tuple[tuple[float, float], ...] = ((1.0, 0.10), (1.5, 0.05))
 SURFACES = ("spx", "reference")

@@ -56,9 +56,29 @@ as such).
 
 **Evaluation at the world's states.**  The fitted polynomials are evaluated at the world paths'
 hedge states.  When the world model carries a different factor structure from the pricing model
-(a local-vol world under a two-factor pricing model, or the reverse) the pricing factors are set
-to their initial value 0 at every date — the desk's model sees no factor move it cannot observe
-— and the report says so; same class and factor count pass the factors through.
+(a local-vol or Black–Scholes world under a two-factor pricing model, or the reverse) the pricing
+factors are **imputed by their conditional mean given the spot under the pricing model**,
+``E[X_t | ln S_t]``, estimated at each date by regressing each factor on the pricer's own cubic
+spline in ``ln S_t`` — the value fits' spline: standardised ``ln S_t`` clipped to the pricing
+paths' ``[CLIP_QUANTILE, 1 − CLIP_QUANTILE]`` range, ``n_knots`` quantile knots
+(:func:`hedge_basis` with ``degree`` 0) — over the pricing paths
+(:meth:`ConditionalPricer.pricing_factors`, cached per column) — the desk observes the spot, and
+its own model says where the factors then sit; the pricer notes the rule
+(:data:`FOREIGN_FACTOR_NOTE`) and the report carries the note.  Same class and factor count pass
+the factors through.  Until 2026-09-23 the factors were held at their initial value 0: under a
+strongly spot-correlated fit the pricing paths' ``(ln S_t, X¹_t, X²_t)`` are nearly collinear at
+short horizons (the SPX 2022-12-30 marking fit of 2026-09-22 has ``ρ_SX = −0.87 / −0.94`` and
+``ρ12`` 0.002 above the admissible minimum, the Brownian correlation's smallest eigenvalue
+6·10⁻⁴), the point ``(ln S_t, 0, 0)`` lies off the plane the tensor fit was identified on, and the
+fitted value there is unconstrained — measured on the M8b study-B pure-LV rows: one day in, the
+KO var preset's barrier call spread was marked at 1.44 against a 0.43 value and its leg lost 40
+vol points over the first five days (hedged std 117 at 2·10⁴ paths).  A straight line in
+``ln S_t`` (the first imputation of 2026-09-23) misses the conditional mean in the ``ln S`` tails
+by 0.4–1.6 conditional standard deviations at every horizon — the tails where the KO var knocks
+out and its hedge is unwound: the call spread's marks against ``E[V | ln S_t]`` in the 99–99.9 %
+bin were off by +0.41 at 5·10³ paths (t = 5/252) and −0.18 at 2·10⁴ (t = 63/252), systematic, and
+the hedged std was 3.9 against 2.5 with the spline (the same-world reference 2.8).  With
+spot-uncorrelated factors the imputed state is 0, the pre-2026-09-23 behaviour.
 
 **Memory.**  Every bumped path set is kept for the hybrid targets at every date (``memory_bytes``:
 ≈ ``(3 + bump sides) × 5 arrays × n_paths × n_cols × 8`` bytes, 1.5 GB at 2·10⁴ paths, 260
@@ -151,6 +171,36 @@ SCRATCH_ENV = "VOLSTO_SCRATCH"
 STREAM_PREFIX = "volsto-bumps-"
 #: the five arrays of a :class:`~volsto.engine.paths.PathSet` written per streamed set
 _PATH_ARRAYS = ("log_spot", "variance", "factors", "int_var", "sum_sq")
+#: the pricer's note when it evaluates on a world without the pricing model's factor structure
+#: (:meth:`ConditionalPricer.pricing_factors`; module docstring, *Evaluation at the world's
+#: states*)
+FOREIGN_FACTOR_NOTE = (
+    "world without the pricing model's factor structure: the pricing factors are imputed as "
+    "E[X_t | ln S_t] under the pricing model (each factor regressed on the pricer's cubic spline "
+    "in ln S_t — quantile knots, clipped to the pricing paths' central range — over the pricing "
+    "paths, per date)"
+)
+
+
+@dataclass(frozen=True)
+class FactorProjection:
+    """One column's regression of the pricing factors on the spline in ``ln S_t``
+    (:meth:`ConditionalPricer.pricing_factors`): the standardisation ``(mean, scale)`` of
+    ``ln S_t``, its clip range ``[lo, hi]`` in standardised units, the interior ``knots`` and the
+    coefficients ``beta`` ``(4 + n_knots, n_factors)``."""
+
+    mean: float
+    scale: float
+    lo: float
+    hi: float
+    knots: FloatArray
+    beta: FloatArray
+
+    def evaluate(self, log_spot: FloatArray) -> FloatArray:
+        z = np.clip(
+            (np.asarray(log_spot, dtype=np.float64) - self.mean) / self.scale, self.lo, self.hi
+        )
+        return np.asarray(hedge_basis(z[:, None], self.knots, 0) @ self.beta, dtype=np.float64)
 
 
 @dataclass(frozen=True)
@@ -403,6 +453,12 @@ class ConditionalPricer:
     bumped_paths: dict[str, PathSet] = field(init=False, repr=False, default_factory=dict)
     #: the bumped sets' keys in simulation order (``"up"``, ``"dn"``, ``"bump:<name>:<side>"``)
     bump_keys: tuple[str, ...] = field(init=False, default=())
+    #: per pricing-path column, the regression of each factor on the spline in ``ln S_t`` that
+    #: imputes the factor state on a world without the pricing model's factor structure
+    #: (:meth:`pricing_factors`)
+    factor_projections: dict[int, FactorProjection] = field(
+        init=False, repr=False, default_factory=dict
+    )
     #: re-anchoring log-shift of each bumped set's future at the splice (module docstring)
     bump_shifts: dict[str, float] = field(init=False, repr=False, default_factory=dict)
     streamed: dict[str, dict[str, Path]] = field(init=False, repr=False, default_factory=dict)
@@ -676,20 +732,58 @@ class ConditionalPricer:
     def idx(self) -> Any:
         return self.grid.fixing_index
 
+    def pricing_factors(self, paths: PathSet, col: int) -> FloatArray:
+        """The pricing model's factor state on ``paths`` at column ``col``, ``(n_paths,
+        n_factors)``: the paths' own factors when they carry the pricing model's structure;
+        otherwise (a world of another class or factor count) their **conditional mean given the
+        spot**, ``E[X_t | ln S_t]`` under the pricing model — each factor regressed over the
+        pricing paths at that column on the pricer's cubic spline in ``ln S_t`` (the value fits'
+        conventions: standardised ``ln S_t`` clipped to the ``[CLIP_QUANTILE, 1 −
+        CLIP_QUANTILE]`` range, ``n_knots`` quantile knots, :func:`hedge_basis` with ``degree``
+        0), cached in ``factor_projections`` as a :class:`FactorProjection`; noted once
+        (:data:`FOREIGN_FACTOR_NOTE`).  A straight line in ``ln S_t`` misses the conditional mean
+        in the tails (module docstring, *Evaluation at the world's states*).  The regression is
+        flat — the factors' mean, i.e. the pre-2026-09-23 "held at 0" rule — at ``t = 0`` (one
+        spot) and for spot-uncorrelated factors."""
+        nf = int(self.model.n_factors)
+        if paths.n_factors == nf:
+            return paths.factors_at(col)
+        if nf == 0:
+            return np.zeros((paths.n_paths, 0))
+        if col not in self.factor_projections:
+            s = self.paths.log_spot_at(col)
+            m, sd = float(s.mean()), float(s.std())
+            sd = sd if sd > 0.0 else 1.0
+            z = (s - m) / sd
+            lo, hi = float(np.quantile(z, CLIP_QUANTILE)), float(np.quantile(z, 1 - CLIP_QUANTILE))
+            z = np.clip(z, lo, hi)
+            qs = np.linspace(0.0, 1.0, self.n_knots + 2)[1:-1]
+            knots = np.unique(np.quantile(z, qs)) if self.n_knots > 0 else np.zeros(0)
+            basis = hedge_basis(z[:, None], knots, 0)
+            beta = np.linalg.lstsq(basis, self.paths.factors_at(col), rcond=None)[0]
+            self.factor_projections[col] = FactorProjection(
+                m,
+                sd,
+                lo,
+                hi,
+                np.asarray(knots, dtype=np.float64),
+                np.asarray(beta, dtype=np.float64),
+            )
+            if FOREIGN_FACTOR_NOTE not in self.notes:
+                self.notes.append(FOREIGN_FACTOR_NOTE)
+        return self.factor_projections[col].evaluate(paths.log_spot_at(col))
+
     def features(self, obj_index: int, paths: PathSet, t: float) -> tuple[FloatArray, HedgeState]:
         """``(ln S_t, X_t, object state)`` on ``paths`` (pricing or world) for one object; a
-        world with another factor structure gets the pricing factors set to 0 (module
-        docstring)."""
+        world with another factor structure gets the pricing factors imputed as
+        ``E[X_t | ln S_t]`` (:meth:`pricing_factors`, module docstring)."""
         obj = self.objects[obj_index]
         col = self.idx[float(t)]
         hs = hedge_state(obj, paths, self.idx, t)
         base = [paths.log_spot_at(col)]
         nf = self.model.n_factors
         if nf:
-            if paths.n_factors == nf:
-                base.append(paths.factors_at(col))
-            else:
-                base.append(np.zeros((paths.n_paths, nf)))
+            base.append(self.pricing_factors(paths, col))
         feats = (
             np.column_stack([*base, hs.features]) if hs.features.shape[1] else np.column_stack(base)
         )
@@ -1253,11 +1347,13 @@ def union_grid(
 __all__ = [
     "BUMP_KINDS",
     "DEFAULT_KNOTS",
+    "FOREIGN_FACTOR_NOTE",
     "MIN_REGRESSION_PATHS",
     "SCRATCH_ENV",
     "STREAM_PREFIX",
     "Bump",
     "ConditionalPricer",
+    "FactorProjection",
     "Fit",
     "ObjectPayoffs",
     "hedge_basis",

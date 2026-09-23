@@ -6,6 +6,7 @@ git-ignored).
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import sys
 import time
@@ -17,8 +18,16 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from volsto.config import MarketConfig, SSVIConfig, load_yaml
-from volsto.market import ESSVISurface, SSVISurface, implied_vol, import_hdn
+from volsto.calibration.cache import spec_key
+from volsto.config import (
+    CalibrationSpec,
+    CurveConfig,
+    MarketConfig,
+    SSVIConfig,
+    load_yaml,
+    to_mapping,
+)
+from volsto.market import DiscountCurve, ESSVISurface, SSVISurface, implied_vol, import_hdn
 from volsto.market.import_hdn import (
     DEFAULT_CALENDAR_REPAIR,
     HDN_COLUMNS,
@@ -156,7 +165,7 @@ def test_snapshot_config_round_trip(pipeline: Pipeline, tmp_path: Path) -> None:
     surface = load_ssvi_surface(p)
     market = load_yaml(p, MarketConfig, section="market")
     ssvi = load_yaml(p, SSVIConfig, section="ssvi")
-    assert market.spot == pytest.approx(chain.attrs["spot"])
+    assert market.close == chain.attrs["spot"] and market.spot == points.spot.spot
     assert isinstance(surface, ESSVISurface)
     assert ssvi.rho == pytest.approx(float(np.mean(fit.params["rho"])))
     np.testing.assert_allclose(surface.atm_vol(1.0), fit.surface.atm_vol(1.0), rtol=1e-9)
@@ -531,3 +540,152 @@ def test_fit_points_are_the_returned_surface_on_the_ssvi_fallback(
     np.testing.assert_allclose(
         p["model_vol"].to_numpy(float), fit.surface.implied_vol_k(k, T), rtol=0.0, atol=1e-12
     )
+
+
+def _synthetic_forwards(
+    spot: float, funding: DiscountCurve, q: float, Ts: list[float], *, se_df: float = 2e-5
+) -> dict[str, import_hdn.ForwardEstimate]:
+    """Forward estimates of a market with a known funding curve and a flat carry ``q``: the
+    regression errors are the standard errors a 100-pair SPX parity regression gives."""
+    out = {}
+    for T in Ts:
+        df = float(funding.df(T))
+        F = spot * np.exp(-q * T) / df
+        out[f"E{T:.4f}"] = import_hdn.ForwardEstimate(f"E{T:.4f}", T, F, 0.02, df, 100, F, se_df)
+    return out
+
+
+def test_implied_funding_curve_recovers_a_known_curve() -> None:
+    """Exact regression discounts of a market whose funding curve lives on the fit's knots are
+    recovered to round-off, at the knots and between them (the fit's model is
+    ``DiscountCurve``'s own interpolation, so the curve returned reprices every expiry); the
+    Treasury spreads are reported against the manifest curve; a one-day expiry with a
+    meaningless implied rate does not move the fit."""
+    kn = list(import_hdn.FUNDING_KNOTS)
+    z_true = [0.030, 0.036, 0.041, 0.044, 0.043, 0.041]
+    curve = DiscountCurve(kn, z_true)
+    Ts = [
+        1 / 365,
+        2 / 365,
+        7 / 365,
+        14 / 365,
+        1 / 12,
+        0.15,
+        0.25,
+        0.4,
+        0.5,
+        0.7,
+        1.0,
+        1.4,
+        2.0,
+        2.6,
+        3.0,
+    ]
+    fwds = _synthetic_forwards(4000.0, curve, 0.015, Ts)
+    tsy = (np.array([1 / 12, 0.25, 1.0, 2.0, 5.0]), np.array([0.028, 0.033, 0.040, 0.039, 0.038]))
+    fitted, fit = import_hdn.implied_funding_curve(fwds, tsy)
+    assert fit.knots == tuple(kn) and fit.n_expiries == len(Ts)
+    np.testing.assert_allclose(fit.zero_rates, z_true, rtol=0, atol=1e-10)
+    np.testing.assert_allclose(fitted.df(Ts), curve.df(Ts), rtol=1e-12)
+    assert fit.rate_rmse < 1e-9 and fit.rate_max_abs_residual < 1e-9
+    assert fit.max_abs_spread == pytest.approx(max(abs(s) for s in fit.spreads))
+    assert fit.spreads[3] == pytest.approx(0.044 - 0.040, abs=1e-10)
+    # a one-day discount ten standard errors off (its implied rate 7% away from the curve) moves
+    # the 1m knot by under a basis point and the others by under a tenth of one: the weights are
+    # 1/var(ln DF), so an expiry's leverage on a knot scales with T² and a wild short-dated rate
+    # cannot steer the fit
+    wild = dict(fwds)
+    fe = wild["E0.0027"]
+    wild["E0.0027"] = dataclasses.replace(fe, discount=fe.discount * float(np.exp(-10 * 2e-5)))
+    assert abs(wild["E0.0027"].implied_rate - 0.03) > 0.07
+    _, fit2 = import_hdn.implied_funding_curve(wild, tsy)
+    assert abs(fit2.zero_rates[0] - z_true[0]) < 1e-4
+    np.testing.assert_allclose(fit2.zero_rates[1:], z_true[1:], rtol=0, atol=1e-5)
+    # knots beyond the quoted range are dropped; fewer than two usable expiries refused
+    _, short = import_hdn.implied_funding_curve({k: v for k, v in fwds.items() if v.T <= 0.5}, tsy)
+    assert short.knots == (1 / 12, 0.25, 0.5)
+    with pytest.raises(ValueError, match="fewer than two expiries"):
+        import_hdn.implied_funding_curve({"E1.0000": fwds["E1.0000"]}, tsy)
+
+
+def test_implied_spot_recovers_the_level_the_options_price() -> None:
+    """The implied spot is the level of the forwards' own market, not the close: with the close
+    50 bp below it, the estimate stays within a few standard errors of the true level and the
+    asynchrony fires; with the close at the true level it does not; the flat carry of the
+    window is recovered."""
+    curve = DiscountCurve.flat(0.04)
+    Ts = [1 / 365, 4 / 365, 7 / 365, 14 / 365, 21 / 365, 28 / 365, 35 / 365, 42 / 365, 0.25, 0.5]
+    fwds = _synthetic_forwards(4000.0, curve, 0.012, Ts)
+    est = import_hdn.implied_spot(fwds, curve, 4000.0 * (1 - 0.005))
+    assert est.n_expiries == 8 and est.window_days == import_hdn.SPOT_WINDOW_DAYS
+    assert est.spot == pytest.approx(4000.0, rel=1e-9) and est.q_short == pytest.approx(
+        0.012, abs=1e-9
+    )
+    assert est.offset_bp == pytest.approx(1e4 * (1 / (1 - 0.005) - 1), abs=1e-6)
+    assert 0 < est.stderr_bp < 1.0 and est.asynchronous and abs(est.z) > import_hdn.SPOT_ASYNC_SE
+    same = import_hdn.implied_spot(fwds, curve, 4000.0)
+    assert not same.asynchronous and abs(same.offset_bp) < 1e-6
+    # fewer expiries than the window asks for: the earliest ones are used
+    few = import_hdn.implied_spot({k: v for k, v in fwds.items() if v.T >= 0.25}, curve, 4000.0)
+    assert few.n_expiries == 2 and few.spot == pytest.approx(4000.0, rel=1e-9)
+
+
+def test_snapshot_market_is_the_options_market(pipeline: Pipeline) -> None:
+    """The snapshot's ``spot`` is the option-implied level and ``close`` the vendor's official
+    print (owner's decision 2026-09-22, SPEC §13.1); its rate curve is the funding curve the
+    options imply (the Treasury curve stays in the provenance); its carry curve reproduces every
+    retained forward exactly; the estimates are recorded in the provenance; the close is not a
+    pricing input (the calibration key ignores it, the mapping omits it while ``None``)."""
+    cfg, fit, points, chain = pipeline
+    m = cfg["market"]
+    est, fund = points.spot, points.funding
+    assert m["close"] == chain.attrs["spot"] == est.close
+    assert m["spot"] == est.spot != m["close"]
+    assert abs(est.offset_bp) < 100 and est.stderr_bp < 2.0 and est.n_expiries >= 3
+    assert list(m["rate_curve"]["times"]) == list(fund.knots)
+    assert list(m["rate_curve"]["rates"]) == list(fund.zero_rates)
+    assert cfg["provenance"]["rate_curve_percent"]["zeros"] == chain.attrs["rate_zeros"]
+    assert cfg["provenance"]["spot"]["offset_bp"] == est.offset_bp
+    assert cfg["provenance"]["funding"]["max_abs_spread"] == fund.max_abs_spread < 0.02
+    fc = fit.surface.forward_curve
+    tbl = points.table
+    for T in sorted(tbl["T"].unique()):
+        assert float(fc.forward(T)) == pytest.approx(
+            float(tbl.loc[tbl["T"] == T, "forward"].iloc[0]), rel=1e-12
+        )
+    # the carry curve is ordinary at every tenor once the spot is the options' level
+    q = [float(-np.log(fc.dividend_curve.df(T)) / T) for T in (7 / 365, 1 / 12, 0.5, 1.0)]
+    assert all(-0.01 < x < 0.03 for x in q), q
+    # the close is a fixing, not a pricing input
+    market = MarketConfig(
+        m["spot"], CurveConfig(**m["rate_curve"]), CurveConfig(**m["dividend_curve"])
+    )
+    with_close = dataclasses.replace(market, close=m["close"])
+    assert "close" not in to_mapping(market) and to_mapping(with_close)["close"] == m["close"]
+    base = load_yaml(ROOT / "configs" / "studies" / "lsv_reference_2f_nu087.yaml", CalibrationSpec)
+    assert spec_key(dataclasses.replace(base, market=market)) == spec_key(
+        dataclasses.replace(base, market=with_close)
+    )
+
+
+def test_importer_tag_guard() -> None:
+    """The source of the importer, the surfaces and the curves is hashed; a change without a
+    bump of ``IMPORTER_TAG`` (and a refreshed ``importer_guard.json``) fails here — the same
+    contract as the calibration code tag (``tests/test_lsv.py::test_calibration_code_tag_guard``).
+    The tag is what the backtest store checks a stored snapshot against (SPEC §10.3)."""
+    from volsto.market.import_hdn import (
+        IMPORTER_GUARD_FILE,
+        IMPORTER_TAG,
+        check_importer_guard,
+        importer_source_hash,
+        read_importer_guard,
+    )
+
+    assert IMPORTER_GUARD_FILE.exists(), "importer_guard.json missing: run write_importer_guard()"
+    assert IMPORTER_TAG in read_importer_guard() and len(importer_source_hash()) == 64
+    check_importer_guard()
+
+
+def test_snapshot_provenance_names_the_importer_tag(pipeline: Pipeline) -> None:
+    cfg, _fit, _points, _chain = pipeline
+    assert cfg["provenance"]["importer_tag"] == import_hdn.IMPORTER_TAG

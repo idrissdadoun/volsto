@@ -38,7 +38,7 @@ import datetime as _dt
 import hashlib
 import json
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -108,6 +108,35 @@ HDN_COLUMNS: tuple[str, ...] = (
     "vega",
     "rho",
 )
+IMPORTER_TAG: str = "2026-09-22"
+"""The importer's numerics tag, written into every snapshot's ``provenance.importer_tag`` and
+checked by the backtest store (a stored snapshot imported under another tag is stale and is
+re-imported).  Bump it whenever a change moves any snapshot an import produces; the source of
+:data:`IMPORTER_GUARDED_MODULES` is hashed against it (:func:`check_importer_guard`,
+``tests/test_import_hdn.py::test_importer_tag_guard``), so a source change without a bump —
+or, for a change proven not to move any snapshot, without a re-recorded hash — fails there."""
+IMPORTER_GUARDED_MODULES: tuple[str, ...] = (
+    "volsto/market/import_hdn.py",
+    "volsto/market/surface.py",
+    "volsto/market/curves.py",
+)
+IMPORTER_GUARD_FILE = Path(__file__).resolve().parent / "importer_guard.json"
+FUNDING_KNOTS: tuple[float, ...] = (1.0 / 12.0, 0.25, 0.5, 1.0, 2.0, 3.0)
+"""Knots of the option-implied funding curve (:func:`implied_funding_curve`): zero rates
+piecewise linear in ``T`` between them, flat outside; knots beyond the last quoted expiry are
+dropped."""
+FUNDING_SPREAD_WARN: float = 0.02
+"""Largest |funding - Treasury| zero-rate spread (per year) at a knot before the importer logs a
+warning (a data problem, not a market level)."""
+SPOT_WINDOW_DAYS: int = 45
+"""Expiries up to this many days give the option-implied spot (:func:`implied_spot`)."""
+SPOT_MIN_EXPIRIES: int = 3
+"""Fewest expiries the implied-spot regression accepts (the earliest ones when the window holds
+fewer)."""
+SPOT_ASYNC_BP: float = 10.0
+SPOT_ASYNC_SE: float = 3.0
+"""An implied spot more than ``SPOT_ASYNC_BP`` and ``SPOT_ASYNC_SE`` standard errors away from
+the close is logged as a spot asynchrony (the 16:00 close against the 16:15 option quotes)."""
 CONSTRUCTOR_MIN_MATURITY: float = 1.0 / 365.0
 """``min_maturity`` of the surfaces the importer builds (the constructors' default): the short end
 of the butterfly check the ``η`` cap covers (:func:`_eta_theta_range`)."""
@@ -246,10 +275,15 @@ class ForwardEstimate:
     discount: float
     n_pairs: int
     vendor_style_forward: float  # closest-strike parity with the manifest rate (README §5.4)
+    discount_stderr: float = float("nan")  # of ``discount`` (the regression's ``b``); NaN: none
 
     @property
     def implied_rate(self) -> float:
         return float(-np.log(self.discount) / self.T)
+
+    @property
+    def implied_rate_stderr(self) -> float:
+        return float(self.discount_stderr / (self.discount * self.T))
 
 
 def implied_forward(
@@ -286,7 +320,8 @@ def implied_forward(
         A = np.column_stack([np.ones_like(K), K])
         coef, res, _, _ = np.linalg.lstsq(A, y, rcond=None)
         a, b = float(coef[0]), float(coef[1])
-        if b >= 0:  # degenerate: use the theoretical discount
+        degenerate = b >= 0
+        if degenerate:  # degenerate: use the theoretical discount (no regression discount)
             b = -np.exp(-r * T)
             a = float(np.mean(y - b * K))
         F = -a / b
@@ -297,11 +332,13 @@ def implied_forward(
         grad = np.array([-1.0 / b, a / (b * b)])
         se = float(np.sqrt(max(grad @ cov @ grad, 0.0)))
         disc = -b
+        se_df = float("nan") if degenerate else float(np.sqrt(max(cov[1, 1], 0.0)))
     else:
         disc = float(np.exp(-r * T))
         F = float(K[0] + (y[0]) / disc)
         se = float("nan")
-    return ForwardEstimate(expiry, T, float(F), se, float(disc), len(K), vendor_f)
+        se_df = float("nan")
+    return ForwardEstimate(expiry, T, float(F), se, float(disc), len(K), vendor_f, se_df)
 
 
 def implied_forwards(
@@ -330,12 +367,185 @@ def implied_forwards(
 # --------------------------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class FundingFit:
+    """The option-implied funding curve (:func:`implied_funding_curve`): zero rates at the knots
+    from the parity regressions' discount factors, and how they sit against the Treasury curve."""
+
+    knots: tuple[float, ...]
+    zero_rates: tuple[float, ...]
+    treasury_zero_rates: tuple[float, ...]
+    n_expiries: int
+    rate_rmse: float  # weighted RMS of the per-expiry implied-rate residuals, per year
+    rate_max_abs_residual: float  # over expiries of at least one month
+    max_abs_spread: float  # largest |funding − Treasury| at a knot, per year
+
+    @property
+    def spreads(self) -> tuple[float, ...]:
+        return tuple(z - t for z, t in zip(self.zero_rates, self.treasury_zero_rates))
+
+
+@dataclass(frozen=True)
+class SpotEstimate:
+    """The level the option quotes imply for the index (:func:`implied_spot`) against the
+    vendor's official close."""
+
+    close: float
+    spot: float
+    stderr_bp: float
+    offset_bp: float  # 1e4 (spot / close − 1)
+    z: float  # offset / stderr
+    q_short: float  # the flat carry of the window, per year (diagnostic)
+    n_expiries: int
+    window_days: int
+    asynchronous: bool  # |offset| > SPOT_ASYNC_BP and |z| > SPOT_ASYNC_SE
+
+
+def implied_funding_curve(
+    forwards: Mapping[str, ForwardEstimate],
+    treasury: tuple[FloatArray, FloatArray],
+    *,
+    knots: Sequence[float] = FUNDING_KNOTS,
+) -> tuple[DiscountCurve, FundingFit]:
+    """The funding curve the option market implies (owner's decision 2026-09-22, SPEC §13.1):
+    zero rates at ``knots`` (those up to the last quoted expiry), piecewise linear in ``T`` and
+    flat outside, fitted by weighted least squares to every expiry's regression discount
+    ``−ln DF_i = T_i z(T_i)`` with weights ``1 / var(ln DF_i)`` from the parity regressions —
+    the box-spread rate of each expiry, so a one-day expiry (whose rate is meaningless) weighs
+    ``T_i²`` less than a one-year one.  Payoffs are discounted on this curve; the Treasury curve
+    (``treasury = (tenors, zeros)``) is reported beside it.  Raises when fewer than two expiries
+    carry a regression discount or fewer than two knots lie inside the quoted range."""
+    fes = sorted(
+        (
+            fe
+            for fe in forwards.values()
+            if np.isfinite(fe.discount_stderr) and fe.discount_stderr > 0 and fe.discount > 0
+        ),
+        key=lambda fe: fe.T,
+    )
+    if len(fes) < 2:
+        raise ValueError("fewer than two expiries carry a regression discount factor")
+    T = np.array([fe.T for fe in fes])
+    df = np.array([fe.discount for fe in fes])
+    y = -np.log(df)
+    w = (df / np.array([fe.discount_stderr for fe in fes])) ** 2  # 1 / var(ln DF)
+    kn = np.array([float(k) for k in knots if k <= T[-1] * 1.05])
+    if kn.size < 2:
+        raise ValueError(f"the quoted expiries reach {T[-1]:.3f} y: fewer than two funding knots")
+    # the model is DiscountCurve's own interpolation: g(T) = −ln DF(T) linear in T between the
+    # knots from g(0) = 0, the last slope extended beyond the last knot; g at the knots is fitted
+    m = kn.size
+    X = np.zeros((T.size, m))
+    seg = np.clip(np.searchsorted(kn, T, side="right"), 0, m - 1)  # segment [k0[seg], k0[seg+1]]
+    k0 = np.concatenate(([0.0], kn))
+    lo, hi = k0[seg], k0[seg + 1]  # knot times bounding T (k0[0] = 0 carries g = 0)
+    frac = (T - lo) / (hi - lo)  # > 1 beyond the last knot: the last slope extended
+    rows = np.arange(T.size)
+    X[rows, seg] = frac
+    inner = seg >= 1
+    X[rows[inner], seg[inner] - 1] += 1.0 - frac[inner]
+    sw = np.sqrt(w)
+    g, *_ = np.linalg.lstsq(X * sw[:, None], y * sw, rcond=None)
+    if not np.all(np.isfinite(g)):
+        raise ValueError("the funding-curve fit is singular")
+    z = g / kn
+    resid = (y - X @ g) / T  # implied-rate residual per expiry
+    rmse = float(np.sqrt(np.sum(w * T**2 * resid**2) / np.sum(w * T**2)))
+    long = T >= 1.0 / 12.0
+    max_res = float(np.max(np.abs(resid[long]))) if np.any(long) else float("nan")
+    tsy = interpolate_rate(np.asarray(treasury[0], float), np.asarray(treasury[1], float), kn)
+    fit = FundingFit(
+        tuple(float(k) for k in kn),
+        tuple(float(v) for v in z),
+        tuple(float(v) for v in tsy),
+        len(fes),
+        rmse,
+        max_res,
+        float(np.max(np.abs(z - tsy))),
+    )
+    if fit.max_abs_spread > FUNDING_SPREAD_WARN:
+        log.warning(
+            "funding curve %.0f bp from Treasury at a knot (zero rates %s vs %s)",
+            1e4 * fit.max_abs_spread,
+            np.round(z, 4).tolist(),
+            np.round(tsy, 4).tolist(),
+        )
+    return DiscountCurve(kn, z), fit
+
+
+def implied_spot(
+    forwards: Mapping[str, ForwardEstimate],
+    rate_curve: DiscountCurve,
+    close: float,
+    *,
+    window_days: int = SPOT_WINDOW_DAYS,
+    min_expiries: int = SPOT_MIN_EXPIRIES,
+) -> SpotEstimate:
+    """The index level the option quotes imply (owner's decision 2026-09-22, SPEC §13.1): the
+    intercept of ``ln F_i − r_i T_i = ln S − q T_i`` over the expiries within ``window_days``
+    (the earliest ``min_expiries`` when the window holds fewer), weighted by the forwards'
+    regression errors, with the flat carry ``q`` of the window as the slope.  The HDN close is
+    the 16:00 print while SPX options quote until 16:15, so on evenings of large after-hours
+    moves the two differ by tens of basis points; the snapshot's ``spot`` is this level and
+    ``close`` keeps the official print for fixings.  The standard error is the regression's,
+    inflated by ``max(1, χ²/dof)``; a difference beyond :data:`SPOT_ASYNC_BP` and
+    :data:`SPOT_ASYNC_SE` is logged."""
+    if close <= 0:
+        raise ValueError("close must be positive")
+    fes = sorted(
+        (
+            fe
+            for fe in forwards.values()
+            if np.isfinite(fe.forward_stderr) and fe.forward_stderr > 0
+        ),
+        key=lambda fe: fe.T,
+    )
+    window = [fe for fe in fes if window_days / 365.0 >= fe.T]
+    if len(window) < min_expiries:
+        window = fes[:min_expiries]
+    if len(window) < 2:
+        raise ValueError("fewer than two expiries with a forward standard error")
+    T = np.array([fe.T for fe in window])
+    F = np.array([fe.forward for fe in window])
+    y = np.log(F) - rate_curve.zero_rate(T) * T
+    w = (F / np.array([fe.forward_stderr for fe in window])) ** 2
+    X = np.column_stack([np.ones_like(T), -T])
+    sw = np.sqrt(w)
+    coef, *_ = np.linalg.lstsq(X * sw[:, None], y * sw, rcond=None)
+    ln_s, q = float(coef[0]), float(coef[1])
+    dof = max(len(window) - 2, 1)
+    chi2 = float(np.sum(w * (y - X @ coef) ** 2))
+    cov = np.linalg.inv((X * w[:, None]).T @ X) * max(1.0, chi2 / dof)
+    se_bp = 1e4 * float(np.sqrt(max(cov[0, 0], 0.0)))
+    spot = float(np.exp(ln_s))
+    offset_bp = 1e4 * (spot / close - 1.0)
+    z = offset_bp / se_bp if se_bp > 0 else float("inf")
+    asynchronous = abs(offset_bp) > SPOT_ASYNC_BP and abs(z) > SPOT_ASYNC_SE
+    if asynchronous:
+        log.warning(
+            "spot asynchrony: the options imply %.2f against the close %.2f (%+.1f bp, %.1f se, "
+            "%d expiries to %d days)",
+            spot,
+            close,
+            offset_bp,
+            z,
+            len(window),
+            round(float(T[-1]) * 365.0),
+        )
+    return SpotEstimate(
+        float(close), spot, se_bp, offset_bp, z, q, len(window), int(window_days), asynchronous
+    )
+
+
 @dataclass
 class SurfacePoints:
-    """Retained quotes, one row per (expiry, strike): mid implied vol vs the implied forward."""
+    """Retained quotes, one row per (expiry, strike): mid implied vol vs the implied forward;
+    the spot and funding estimates the market section is built from."""
 
     table: pd.DataFrame
     forwards: dict[str, ForwardEstimate]
+    spot: SpotEstimate
+    funding: FundingFit
     dropped: dict[str, int] = field(default_factory=dict)
 
 
@@ -489,25 +699,31 @@ def to_grid_surface(
     mats = sorted(table["T"].unique())
     ks = [table[table["T"] == T]["k"].to_numpy() for T in mats]
     ws = [table[table["T"] == T]["w"].to_numpy() for T in mats]
+    treasury = (
+        np.asarray(chain.attrs["rate_tenors"], float),
+        np.asarray(chain.attrs["rate_zeros"], float),
+    )
+    funding, funding_fit = implied_funding_curve(forwards, treasury)
+    spot_est = implied_spot(forwards, funding, spot)
     fc = forward_curve_from_forwards(
-        spot,
-        chain.attrs["rate_tenors"],
-        chain.attrs["rate_zeros"],
+        spot_est.spot,
+        funding,
         {T: float(table[table["T"] == T]["forward"].iloc[0]) for T in mats},
     )
     surface = GridSurface(mats, ks, ws, fc, fc.rate_curve, max_maturity=max(mats[-1], 3.0))
-    return surface, SurfacePoints(table, forwards, dropped)
+    return surface, SurfacePoints(table, forwards, spot_est, funding_fit, dropped)
 
 
 def forward_curve_from_forwards(
-    spot: float, tenors: list[float], zeros: list[float], forwards: dict[float, float]
+    spot: float, rate_curve: DiscountCurve, forwards: dict[float, float]
 ) -> ForwardCurve:
-    """Rate curve from the Treasury tenors (zero rates); dividend curve implied by the forwards:
-    ``DF_q(T) = F(T) DF_r(T) / S``, log-linear between expiries."""
-    rate = DiscountCurve(tenors, zeros)
+    """The market of a day: ``spot`` (the option-implied level), the funding curve, and the
+    carry ("dividend") curve that reproduces every retained forward exactly,
+    ``DF_q(T) = F(T) DF_r(T) / S``, log-linear between expiries — dividends, repo and any basis
+    the funding curve does not carry."""
     Ts = np.array(sorted(forwards))
-    q_zero = np.array([-np.log(forwards[T] * float(rate.df(T)) / spot) / T for T in Ts])
-    return ForwardCurve(spot, rate, DiscountCurve(Ts, q_zero))
+    q_zero = np.array([-np.log(forwards[T] * float(rate_curve.df(T)) / spot) / T for T in Ts])
+    return ForwardCurve(spot, rate_curve, DiscountCurve(Ts, q_zero))
 
 
 # --------------------------------------------------------------------------------------------
@@ -1191,6 +1407,7 @@ def snapshot_config(
     out: dict[str, Any] = {
         "market": {
             "spot": fc.spot,
+            "close": points.spot.close,
             "rate_curve": {
                 "times": fc.rate_curve.times.tolist(),
                 "rates": fc.rate_curve.zero_rates.tolist(),
@@ -1234,17 +1451,68 @@ def snapshot_config(
                 for fe in points.forwards.values()
                 if fe.T in set(points.table["T"])
             },
+            "spot": asdict(points.spot),
+            "funding": asdict(points.funding),
             "rate_curve_percent": {
                 "tenors_years": chain.attrs["rate_tenors"],
                 "zeros": chain.attrs["rate_zeros"],
             },
             "code_version": volsto.__version__,
+            "importer_tag": IMPORTER_TAG,
             "created_utc": _dt.datetime.now(_dt.UTC).isoformat(timespec="seconds"),
         },
     }
     if essvi:
         out["essvi"] = {"rhos": [float(r) for r in rho_param]}
     return out
+
+
+def importer_source_hash() -> str:
+    """SHA-256 of the concatenated source of :data:`IMPORTER_GUARDED_MODULES` (line endings
+    normalised) — the same construction as the calibration code-tag guard."""
+    root = Path(volsto.__file__).resolve().parents[1]
+    h = hashlib.sha256()
+    for rel in IMPORTER_GUARDED_MODULES:
+        text = (root / rel).read_text(encoding="utf-8").replace("\r\n", "\n")
+        h.update(rel.encode())
+        h.update(b"\0")
+        h.update(text.encode("utf-8"))
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+def read_importer_guard() -> dict[str, str]:
+    """Stored ``{importer_tag: source_hash}``; a missing file is an empty mapping."""
+    if IMPORTER_GUARD_FILE.exists():
+        data = json.loads(IMPORTER_GUARD_FILE.read_text())
+        return {str(k): str(v) for k, v in data.items()}
+    return {}
+
+
+def write_importer_guard() -> Path:
+    """Record the current source hash under the current tag (run after bumping the tag, or
+    after a change proven not to move any snapshot — say which in the commit)."""
+    guard = read_importer_guard()
+    guard[IMPORTER_TAG] = importer_source_hash()
+    IMPORTER_GUARD_FILE.write_text(json.dumps(guard, indent=1, sort_keys=True) + "\n")
+    return IMPORTER_GUARD_FILE
+
+
+def check_importer_guard() -> None:
+    """Raise if the guarded sources changed without a bump of :data:`IMPORTER_TAG` (or a
+    re-recorded hash).  To accept a change: bump the tag in this module and run
+    ``python -c "from volsto.market.import_hdn import write_importer_guard as w; w()"``."""
+    stored = read_importer_guard().get(IMPORTER_TAG)
+    current = importer_source_hash()
+    if stored is None:
+        raise AssertionError(
+            f"no stored source hash for IMPORTER_TAG={IMPORTER_TAG!r}; run write_importer_guard()"
+        )
+    if stored != current:
+        raise AssertionError(
+            f"importer sources changed but IMPORTER_TAG ({IMPORTER_TAG!r}) was not bumped: stored "
+            f"{stored[:12]}…, current {current[:12]}… — bump the tag and run write_importer_guard()"
+        )
 
 
 def write_snapshot(cfg: dict[str, Any], path: str | Path) -> Path:
@@ -1328,6 +1596,19 @@ def main(argv: list[str] | None = None) -> int:
         out,
         len(points.table),
         points.table["expiry"].nunique(),
+    )
+    sp, fu = points.spot, points.funding
+    log.info(
+        "spot %.2f implied by %d expiries (close %.2f, %+.1f bp, %.1f se); funding zero rates %s "
+        "at %s (Treasury spread %s bp)",
+        sp.spot,
+        sp.n_expiries,
+        sp.close,
+        sp.offset_bp,
+        sp.z,
+        [round(z, 4) for z in fu.zero_rates],
+        [round(k, 3) for k in fu.knots],
+        [round(1e4 * d) for d in fu.spreads],
     )
     log.info(
         "SSVI residuals per expiry (vol points):\n%s", fit.residuals.round(3).to_string(index=False)

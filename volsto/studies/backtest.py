@@ -368,7 +368,12 @@ from volsto.config import (
 from volsto.engine.grid import TimeGrid
 from volsto.engine.mc import MonteCarlo
 from volsto.market.curves import DiscountCurve, ForwardCurve
-from volsto.market.import_hdn import DEFAULT_CALENDAR_REPAIR, import_day, write_snapshot
+from volsto.market.import_hdn import (
+    DEFAULT_CALENDAR_REPAIR,
+    IMPORTER_TAG,
+    import_day,
+    write_snapshot,
+)
 from volsto.market.loaders import snapshot_spec
 from volsto.market.surface import ArbitrageError, ImpliedSurface, surface_from_config
 from volsto.market.varswap import varswap_strike
@@ -2391,6 +2396,14 @@ def choose_pointer(
     return choice
 
 
+def importer_tag_reason(tag: str | None) -> str:
+    """Why a date whose snapshot was imported under another importer tag is stale."""
+    return (
+        f"its snapshot was imported by importer {tag or 'untagged (before 2026-09-22)'} "
+        f"(current {IMPORTER_TAG}): --resume re-imports it and recomputes the date"
+    )
+
+
 def _record_mismatch(stored: Mapping[str, Any], expected: Mapping[str, Any]) -> str:
     """Why a stored dependency record differs from the recomputed one (``""`` when equal)."""
     for name in dict.fromkeys([*expected, *stored]):
@@ -2456,11 +2469,13 @@ def _reread_pause(k: int) -> None:
 
 @dataclass(frozen=True)
 class SnapshotRead:
-    """A snapshot as one read saw it: its digest, and the spec parsed from the same bytes."""
+    """A snapshot as one read saw it: its digest, the spec parsed from the same bytes, and the
+    importer tag its provenance names (``None`` when untagged: imported before 2026-09-22)."""
 
     digest: str
     spec: CalibrationSpec | None
     error: str = ""
+    importer_tag: str | None = None
 
 
 def read_snapshot(base: CalibrationSpec, path: Path) -> tuple[SnapshotRead, bytes | None]:
@@ -2478,7 +2493,17 @@ def read_snapshot(base: CalibrationSpec, path: Path) -> tuple[SnapshotRead, byte
             spec = snapshot_spec(base, copy)
     except (OSError, KeyError, TypeError, ValueError, ConfigError, yaml.YAMLError) as exc:
         return SnapshotRead(digest, None, f"{type(exc).__name__}: {exc}"), data
-    return SnapshotRead(digest, spec), data
+    return SnapshotRead(digest, spec, importer_tag=_importer_tag_of(data)), data
+
+
+def _importer_tag_of(data: bytes) -> str | None:
+    """``provenance.importer_tag`` of a snapshot's bytes (``None`` when absent or unreadable)."""
+    try:
+        prov = yaml.safe_load(data).get("provenance")
+    except (AttributeError, ValueError, yaml.YAMLError):
+        return None
+    tag = prov.get("importer_tag") if isinstance(prov, Mapping) else None
+    return str(tag) if tag is not None else None
 
 
 class RecordInputs(Protocol):
@@ -3005,7 +3030,14 @@ class Ledger:
         expected = dependency_record(
             self, date, doc, content.files, link_of, inputs=self, version=int(version)
         )
-        return _record_mismatch(stored, expected), tuple(dict.fromkeys(waits)), None, False
+        mismatch = _record_mismatch(stored, expected)
+        if not mismatch and status in RESULT_STATUSES:
+            # the snapshot the record names is intact, but the importer that wrote it is not
+            # the current one: a fresh import would differ (SPEC §13.1, 2026-09-22)
+            tag = self.read_snapshot(date).importer_tag
+            if tag != IMPORTER_TAG:
+                mismatch = importer_tag_reason(tag)
+        return mismatch, tuple(dict.fromkeys(waits)), None, False
 
     def _own_links(
         self, date: str, doc: Mapping[str, Any], files: AttemptContent
@@ -3924,7 +3956,19 @@ class DateState:
 
     @property
     def spot(self) -> float:
+        """The pricing level: the snapshot's spot (the level the option quotes imply)."""
         return float(self.spec.market.spot)
+
+    @property
+    def close(self) -> float:
+        """The official close of the date (``market.close``): what trades fix on and are struck
+        at.  Snapshots imported before 2026-09-22 carry none and are refused."""
+        if self.spec.market.close is None:
+            raise DateFailure(
+                f"{self.date}: the snapshot {self.snapshot} has no market.close (imported "
+                "before 2026-09-22, when spot became the option-implied level): re-import it"
+            )
+        return float(self.spec.market.close)
 
     @property
     def discount(self) -> DiscountCurve:
@@ -3962,6 +4006,7 @@ def _snapshot_ok(
         and ins.get("manifest_sha256") == manifest_sha
         and bool(fit.get("essvi")) == bool(surf["essvi"])
         and repaired == bool(surf["calendar_repair"])
+        and prov.get("importer_tag") == IMPORTER_TAG
     )
 
 
@@ -4196,15 +4241,21 @@ class BacktestRun:
         return read, data, True, seconds
 
     def close(self, date: str) -> float:
-        """The realised close of a date: the spot of its snapshot, as parsed (the digest of the
-        parsed bytes is what the records name)."""
+        """The realised close of a date: ``market.close`` of its snapshot, as parsed (the digest
+        of the parsed bytes is what the records name) — the official print, not the
+        option-implied ``spot`` (SPEC §13.1)."""
         if date in self.unavailable:
             raise CloseUnavailable(self.unavailable[date])
         if date not in self._closes:
             read, _, _, _ = self.ensure_snapshot(date)
             assert read.spec is not None
             _note_use(self.snapshots_used, date, read.digest)
-            self._closes[date] = float(read.spec.market.spot)
+            if read.spec.market.close is None:
+                raise DateFailure(
+                    f"{date}: the snapshot has no market.close (imported before 2026-09-22): "
+                    "re-import it"
+                )
+            self._closes[date] = float(read.spec.market.close)
         return self._closes[date]
 
     def missing_close_message(self, date: str, reason: str, *, absent: bool) -> str:
@@ -4326,7 +4377,9 @@ class BacktestRun:
         t1 = time.perf_counter()
         record = fit_record(fit)
         record["history"] = pillar_quantities(surface)
-        record["history"]["ln_spot"] = math.log(float(spec.market.spot))
+        if spec.market.close is None:
+            raise DateFailure(f"{date}: the snapshot has no market.close: re-import it")
+        record["history"]["ln_spot"] = math.log(float(spec.market.close))
         prov = yaml.safe_load(data)["provenance"]
         record["calendar"] = {
             k: v for k, v in dict(prov.get("fit", {})).items() if str(k).startswith("calendar_")
@@ -4388,8 +4441,9 @@ class BacktestRun:
     def built(self, trade: TradeInstance) -> BuiltTrade:
         if trade.trade_id not in self._built:
             st = self.state(trade.inception)
+            # struck at the official close (the level the fixings are observed against)
             self._built[trade.trade_id] = build_product(
-                trade.spec, st.spot, st.surface, st.discount
+                trade.spec, st.close, st.surface, st.discount
             )
         return self._built[trade.trade_id]
 
@@ -4574,6 +4628,7 @@ class BacktestRun:
                 "date": date,
                 "config_hash": self.hash,
                 "spot": st.spot,
+                "close": st.close,
                 "cache_key": st.key,
                 "n_particles": st.spec.particle.n_particles,
                 "horizon": st.spec.particle.horizon,
@@ -5367,7 +5422,7 @@ def run_probe(
         specs = {trade_label(t): t for t in (*cfg.fixed, *cfg.rolling)}
         pricing: dict[str, tuple[float, float]] = {}
         for label, spec in specs.items():
-            built = build_product(spec, a.spot, a.surface, a.discount)
+            built = build_product(spec, a.close, a.surface, a.discount)
             times = []
             for n in (hi, lo):
                 sim = dataclasses.replace(run.sim, n_paths=n, chunk_size=min(run.sim.chunk_size, n))
@@ -5397,10 +5452,10 @@ def run_probe(
             )
             held = RealisedHistory(hist.trade_date, hist.dates[:1], hist.closes[:1])
             for spec in cfg.fixed:
-                built = build_product(spec, a.spot, a.surface, a.discount)
+                built = build_product(spec, a.close, a.surface, a.discount)
                 p1 = replay(built.product, hist, d1, discount=b.discount).result
                 pt = replay(
-                    built.product, held.extended(d1, a.spot), d1, discount=a.discount
+                    built.product, held.extended(d1, a.close), d1, discount=a.discount
                 ).result
                 if not isinstance(p1, Product) or not isinstance(pt, Product):
                     continue
@@ -6919,7 +6974,7 @@ def _window_results(
 ) -> None:
     """The window as the data shows it: dates, first and last close, return and close-to-close
     realised vol (252-day annualisation) — the narrative's description, computed."""
-    spots = [float(fits[d]["spot"]) for d in marked if "spot" in fits[d]]
+    spots = [float(fits[d]["close"]) for d in marked if "close" in fits[d]]
     if len(spots) < 2:
         b.add_exact("window", "spx", "n_closes", float(len(spots)), unit="", source=SRC)
         return

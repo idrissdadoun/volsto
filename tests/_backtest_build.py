@@ -234,12 +234,31 @@ def _run_toy_backtest(root: Path) -> dict[str, Any]:
     }
 
 
+SHIFTED_COLUMNS: tuple[str, ...] = (
+    "underlying_close",
+    "strike",
+    "bid",
+    "ask",
+    "open",
+    "high",
+    "low",
+    "close",
+    "trade_vwap",
+)
+"""The price-denominated columns :func:`shift_vendor_day` scales."""
+
+
 def shift_vendor_day(src: Path, dest: Path, factor: float) -> None:
-    """A copy of an HDN day file whose SPX / SPXW rows have their ``underlying_close`` (the
-    importer's spot) times ``factor``; every other byte is kept."""
+    """A copy of an HDN day file whose SPX / SPXW rows are a homothety of the market by
+    ``factor``: the close, the strikes and every option price times ``factor`` (blank fields
+    kept blank), implied vols and the rest of the row untouched.  Under the importer of
+    2026-09-22 the spot is the level the options imply, so scaling the close alone would change
+    only ``market.close``; the homothety scales the implied spot and every forward by
+    ``factor`` and leaves the surface identical in forward log-moneyness — a different
+    calibration key, the same fit."""
     lines = src.read_text(encoding="utf-8").splitlines(keepends=True)
     header = lines[0].rstrip("\r\n").split(",")
-    col = header.index("underlying_close")
+    cols = [header.index(c) for c in SHIFTED_COLUMNS]
     out = [lines[0]]
     for line in lines[1:]:
         if '"' in line:
@@ -247,7 +266,9 @@ def shift_vendor_day(src: Path, dest: Path, factor: float) -> None:
         if line.startswith("SPX"):
             end = line[len(line.rstrip("\r\n")) :]
             fields = line.rstrip("\r\n").split(",")
-            fields[col] = repr(float(fields[col]) * factor)
+            for col in cols:
+                if fields[col] != "":
+                    fields[col] = repr(float(fields[col]) * factor)
             line = ",".join(fields) + end
         out.append(line)
     dest.write_text("".join(out), encoding="utf-8")
@@ -256,7 +277,7 @@ def shift_vendor_day(src: Path, dest: Path, factor: float) -> None:
 def _calibrate_shifted(base: Path) -> dict[str, Any]:
     """The fixture's second calibration, for the integrity walking test: a private data root
     ``base/shifted/hdn`` (links to the sample's day files of the toy dates and a copy of its
-    manifest) whose :data:`TOY_SHIFTED_DATE` day file has its SPX close times
+    manifest) whose :data:`TOY_SHIFTED_DATE` day file is the SPX market scaled by
     :data:`TOY_SHIFTED_SPOT` (:func:`shift_vendor_day`); that date is imported from it, marked,
     and its leverage calibrated into ``base/shifted/cache`` at the toy size."""
     from volsto.studies import backtest
