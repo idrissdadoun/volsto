@@ -85,6 +85,12 @@ MIN_ZONE_QUOTES: Final[int] = 3
 initial value (1: plain SABR extrapolation) and flagged — the documents' "wide open
 configuration" otherwise leaves it to the solver's noise."""
 PARAM_NAMES: Final[tuple[str, ...]] = ("sigma", "rho", "nu", "t_d", "t_u", "ex_d", "ex_u")
+STEP0_MIN_QUOTES: Final[int] = 20
+"""Fewest quotes an expiry's fit needs to enter step 0 (:class:`SabrwTermStructure`).  Measured
+over the 2022 H2 SPX sample (4 711 fits, 2026-09-27): the median expiry holds 118 quotes, 1 % hold
+fewer than 40, and the two fits on fewer than 20 are both on 2022-11-25 — one of them the 1.57y
+expiry on 10 quotes with ``rho`` = +0.57, which made every SABRW variant infeasible (SPEC §15
+Part 3)."""
 
 
 @dataclass(frozen=True)
@@ -396,26 +402,47 @@ class SabrwTermStructure:
     and the skew and curvature are the fits' central-zone terms (:func:`atm_triplet`),
     interpolated linearly in ``T`` in the desk's 365-day quotes ``Smile_365 = 200 √T skw`` and
     ``Convex_365 = 100 T cvx`` and held flat beyond the fitted expiries (volsto's rule: the
-    documents give none).  Fits on one maturity (SPX and SPXW on the same date) keep the one with
-    more quotes."""
+    documents give none).  A fit enters with at least ``min_quotes`` quotes
+    (:data:`STEP0_MIN_QUOTES`) and ``ρ``, ``ν`` off their bounds; the others are listed in
+    ``excluded`` (``(T, reason)``) and named in ``label``, which the target set's flags carry.
+    Of the fits left on one maturity (SPX and SPXW on the same date) the one with more quotes is
+    kept."""
 
     T: tuple[float, ...]
     smile_365: tuple[float, ...]
     convex_365: tuple[float, ...]
     atm_vol: Callable[[float], float]
     label: str
+    excluded: tuple[tuple[float, str], ...] = ()
 
     @classmethod
     def from_fits(
-        cls, fits: Sequence[SabrwFit], atm_vol: Callable[[float], float]
+        cls,
+        fits: Sequence[SabrwFit],
+        atm_vol: Callable[[float], float],
+        *,
+        min_quotes: int = STEP0_MIN_QUOTES,
     ) -> SabrwTermStructure:
+        if min_quotes < 1:
+            raise ValueError("min_quotes must be at least 1")
         by_t: dict[float, SabrwFit] = {}
+        excluded: list[tuple[float, str]] = []
         for f in fits:
+            railed = [b for b in f.at_bound if b in ("rho", "nu")]
+            if f.n < min_quotes:
+                excluded.append((f.T, f"{f.n} quotes < {min_quotes}"))
+                continue
+            if railed:
+                excluded.append((f.T, f"{', '.join(railed)} at a bound"))
+                continue
             kept = by_t.get(f.T)
             if kept is None or f.n > kept.n:
                 by_t[f.T] = f
         if len(by_t) < 2:
-            raise ValueError("a term structure needs fits on at least two maturities")
+            raise ValueError(
+                "a term structure needs fits on at least two maturities"
+                + (f" ({len(excluded)} excluded: {excluded})" if excluded else "")
+            )
         ts = sorted(by_t)
         smile, convex = [], []
         for t in ts:
@@ -423,7 +450,9 @@ class SabrwTermStructure:
             smile.append(200.0 * float(np.sqrt(t)) * skw)
             convex.append(100.0 * t * cvx)
         label = f"SABRW fits of {len(ts)} expiries ({ts[0]:.3f}y to {ts[-1]:.3f}y)"
-        return cls(tuple(ts), tuple(smile), tuple(convex), atm_vol, label)
+        if excluded:
+            label += "; excluded: " + ", ".join(f"T={t:.3f} ({why})" for t, why in excluded)
+        return cls(tuple(ts), tuple(smile), tuple(convex), atm_vol, label, tuple(excluded))
 
     def triplet(self, T: float) -> tuple[float, float, float]:
         """``(atf, ∂σ̂/∂k, ∂²σ̂/∂k²)`` at ``T``."""
@@ -442,6 +471,7 @@ __all__ = [
     "PARAM_NAMES",
     "SMILE_MIN_FLOOR",
     "SMILE_MIN_SEARCH",
+    "STEP0_MIN_QUOTES",
     "ZONE_DELTA_PUT",
     "ZONE_EXD_FACTOR",
     "ZONE_EXU_FACTOR",

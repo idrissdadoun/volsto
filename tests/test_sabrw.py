@@ -15,6 +15,7 @@ from scipy.stats import norm
 
 from volsto.market.sabrw import (
     MIN_ZONE_QUOTES,
+    STEP0_MIN_QUOTES,
     SabrwFit,
     SabrwParams,
     SabrwTermStructure,
@@ -187,8 +188,8 @@ def test_fit_on_the_2022_12_30_one_year_slice() -> None:
     )
 
 
-def _fit(T: float, params: SabrwParams, n: int = 20) -> SabrwFit:
-    return SabrwFit(T, params, zones(params, T)[0], 0.0, 0.0, n, (), ())
+def _fit(T: float, params: SabrwParams, n: int = 60, at_bound: tuple[str, ...] = ()) -> SabrwFit:
+    return SabrwFit(T, params, zones(params, T)[0], 0.0, 0.0, n, (), at_bound)
 
 
 def test_term_structure_interpolates_the_365_quotes() -> None:
@@ -215,7 +216,38 @@ def test_term_structure_interpolates_the_365_quotes() -> None:
     assert skw == pytest.approx(sm / (200.0 * np.sqrt(0.5)), rel=1e-12)
     assert cvx == pytest.approx(cv / (100.0 * 0.5), rel=1e-12)
     assert ts.triplet(5.0)[1] == pytest.approx(ts.smile_365[-1] / (200.0 * np.sqrt(5.0)))
-    twin = _fit(1.0, SabrwParams(0.21, -0.2, 0.3), n=5)
-    assert SabrwTermStructure.from_fits([*fits, twin], lambda T: 0.2).smile_365 == ts.smile_365
+    twin = _fit(1.0, SabrwParams(0.21, -0.2, 0.3), n=40)
+    with_twin = SabrwTermStructure.from_fits([*fits, twin], lambda T: 0.2)
+    assert with_twin.smile_365 == ts.smile_365 and with_twin.excluded == ()
     with pytest.raises(ValueError, match="two maturities"):
         SabrwTermStructure.from_fits(fits[:1], lambda T: 0.2)
+
+
+def test_term_structure_excludes_thin_and_railed_fits() -> None:
+    """The step-0 quote rule (SPEC §15 Part 3, 2026-09-27): an expiry on fewer than
+    :data:`STEP0_MIN_QUOTES` quotes — the 2022-11-25 case, 10 quotes fitting ``ρ`` = +0.57 — or
+    with ``ρ`` / ``ν`` at a bound does not enter step 0; the exclusions are recorded and named in
+    the label (hence in the target set's flags); a maturity keeps its valid fit when the other
+    fit on it is excluded; ``min_quotes`` is a parameter; fewer than two maturities left raise
+    and say what was excluded."""
+    good = [_fit(T, SabrwParams(0.21, -0.75, 0.9 - 0.2 * i)) for i, T in enumerate((0.25, 1.0))]
+    thin = _fit(1.57, SabrwParams(0.28, 0.57, 2.16), n=10)
+    railed = _fit(0.5, SabrwParams(0.2, -0.999, 1.2), at_bound=("rho",))
+    shadow = _fit(1.0, SabrwParams(0.21, -0.2, 0.3), n=200, at_bound=("nu", "t_u"))
+    ts = SabrwTermStructure.from_fits([*good, thin, railed, shadow], lambda T: 0.2)
+    assert ts.T == (0.25, 1.0)
+    assert ts.excluded == (
+        (1.57, f"10 quotes < {STEP0_MIN_QUOTES}"),
+        (0.5, "rho at a bound"),
+        (1.0, "nu at a bound"),
+    )
+    assert "excluded: T=1.570 (10 quotes < 20), T=0.500 (rho at a bound)" in ts.label
+    ref = SabrwTermStructure.from_fits(good, lambda T: 0.2)
+    assert ts.smile_365 == ref.smile_365 and ts.convex_365 == ref.convex_365
+    assert ts.triplet(3.0) == ref.triplet(3.0)  # the long end held from 1y, not from the thin fit
+    loose = SabrwTermStructure.from_fits([*good, thin], lambda T: 0.2, min_quotes=5)
+    assert loose.T == (0.25, 1.0, 1.57) and loose.excluded == ()
+    with pytest.raises(ValueError, match="1 excluded"):
+        SabrwTermStructure.from_fits([good[0], thin], lambda T: 0.2)
+    with pytest.raises(ValueError, match="min_quotes"):
+        SabrwTermStructure.from_fits(good, lambda T: 0.2, min_quotes=0)
