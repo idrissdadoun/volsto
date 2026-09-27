@@ -159,6 +159,7 @@ from volsto.calibration.targets import (
     SABR_CURVATURE_H,
     SIGMA0_MATURITY,
     SsrInput,
+    Step0Triplets,
     TargetSet,
     historical_targets,
     marking_targets,
@@ -2521,15 +2522,24 @@ def fit_2f_marking(
     iterate_against_simulation: int = 0,
     assert_stage3: bool = True,
     skew_h: float | None = None,
+    step0: Step0Triplets | None = None,
 ) -> FitResult:
     """Marking mode on a surface: targets by :func:`~volsto.calibration.targets.marking_targets`
     (the config's pillars, ``mat_min``, SmoothBreakEven, the radicand guard and step-0
     conventions), ``ξ₀`` the surface's variance-swap strip to the last fitted pillar.
     ``skew_h`` (default ``None``: the M7 marking fit, unchanged) is the stencil-consistent
-    argument of :func:`marking_targets_for`."""
+    argument of :func:`marking_targets_for`.  ``step0`` (default ``None``: the surface's ATM
+    derivatives) takes step 0 from a triplet source — the desk's SABRW fits
+    (:class:`volsto.market.sabrw.SabrwTermStructure`, SPEC §15 Part 3)."""
     c = cfg or BreakEvenFitConfig()
     targets = marking_targets_for(
-        surface, c, ssr_target=ssr_target, anchor_power=anchor_power, h=h, skew_h=skew_h
+        surface,
+        c,
+        ssr_target=ssr_target,
+        anchor_power=anchor_power,
+        h=h,
+        skew_h=skew_h,
+        step0=step0,
     )
     t_max = float(min(surface.max_maturity, max(targets.pillars)))
     xi0 = xi0_curve(surface, t_max)
@@ -2563,8 +2573,10 @@ def marking_targets_for(
     anchor_power: float = 1.0,
     h: float = SABR_CURVATURE_H,
     skew_h: float | None = None,
+    step0: Step0Triplets | None = None,
 ) -> TargetSet:
-    """:func:`~volsto.calibration.targets.marking_targets` with the config's target settings.
+    """:func:`~volsto.calibration.targets.marking_targets` with the config's target settings
+    (``step0``: an optional step-0 triplet source, the desk's SABRW fits).
 
     ``h`` is the curvature stencil's half-width; ``skew_h`` (default ``None``: the surface's
     analytic ATM skew when it has one — the M7 reading, unchanged) reads the skew by the central
@@ -2584,6 +2596,7 @@ def marking_targets_for(
         atf_ref=cfg.atf_ref,
         radicand_floor=cfg.radicand_floor,
         skew_h=skew_h,
+        step0=step0,
     )
 
 

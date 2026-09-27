@@ -1137,3 +1137,60 @@ def test_marking_targets_stencil_consistent_argument(spx) -> None:  # type: igno
     assert np.array_equal(m7.skew_fn(t), np.asarray(surf.atm_skew(t), dtype=np.float64))
     with pytest.raises(ValueError):
         marking_targets_for(surf, cfg, ssr_target=1.0, skew_h=0.0)
+
+
+HDN_SAMPLE = ROOT / "data" / "hdn_sample" / "options_sample_2022H2"
+
+
+def test_step0_from_sabrw_fits(spx) -> None:  # type: ignore[no-untyped-def]
+    """Step 0 from the desk's SABRW fits (SPEC §15 Part 3): synthetic fits with ``ρ = −0.75`` on
+    every expiry give correlation targets of −0.75 at every pillar (up to the ATM level the
+    surface supplies), the flags name the source, the ATM term structure stays the surface's, and
+    ``skew_h`` with a source raises.  On the SPX anchor's own quotes (HDN sample) the targets sit
+    inside (−0.9, −0.65), nothing is clipped and the correlation matrix is no longer near-singular
+    (measured 2026-09-26: above 0.01, against 6·10⁻⁴ from the surface's ATM derivatives)."""
+    from volsto.calibration.fit_2f import CORRELATION_EIGEN_FLAG, marking_targets_for
+    from volsto.market.sabrw import SabrwFit, SabrwParams, SabrwTermStructure, zones
+
+    def atm(T: float) -> float:
+        return float(spx.atm_vol(T))
+
+    fits = []
+    for T in (0.1, 0.25, 0.5, 1.0, 2.0, 3.0):
+        prm = SabrwParams(atm(T), -0.75, 0.8 * T**-0.4)
+        fits.append(SabrwFit(T, prm, zones(prm, T)[0], 0.0, 0.0, 30, (), ()))
+    ts = SabrwTermStructure.from_fits(fits, atm)
+    cfg = BreakEvenFitConfig(skew_eps=0.10)
+    t = marking_targets_for(spx, cfg, step0=ts)
+    np.testing.assert_allclose(t.correl_target, -0.75, rtol=0, atol=1e-6)
+    assert any(f.startswith("step 0: SABRW fits of 6 expiries") for f in t.flags)
+    assert float(t.atm_vol_fn(np.array([1.0]))[0]) == pytest.approx(atm(1.0))
+    with pytest.raises(ValueError, match="skew_h"):
+        marking_targets_for(spx, cfg, step0=ts, skew_h=0.05)
+    from volsto.calibration.targets import sabr_reduce_triplet
+
+    with pytest.raises(ValueError, match="radicand_floor"):
+        sabr_reduce_triplet(ts, 1.0, radicand_floor=1.0)
+    if not HDN_SAMPLE.exists():
+        pytest.skip("HDN sample not present: the real-quote half is skipped")
+    from volsto.market import import_hdn as ih
+
+    f = ih.HdnFilters()
+    ch = ih.load_day(
+        HDN_SAMPLE / "day_by_date" / "2022-12-30_options.csv",
+        "SPX",
+        manifest=ih.load_manifest(HDN_SAMPLE),
+    )
+    _, pts = ih.to_grid_surface(
+        ch, ih.implied_forwards(ch, max_years=f.max_years, band=f.near_atm_band), f
+    )
+    real = SabrwTermStructure.from_fits(ih.sabrw_fits(pts, t_min=0.05, t_max=3.1), atm)
+    r = fit_2f_marking(spx, cfg, ssr_target=1.0, step0=real)
+    c = np.asarray(r.targets.correl_target)
+    print(
+        f"\nSABRW step 0 on 2022-12-30: Corr_BE {np.round(c, 3).tolist()}, "
+        f"min eigenvalue {r.min_correlation_eigenvalue:.4f}, params {r.params}"
+    )
+    assert np.all((c > -0.9) & (c < -0.65))
+    assert not any("clipped" in fl for fl in r.targets.flags)
+    assert r.min_correlation_eigenvalue > CORRELATION_EIGEN_FLAG

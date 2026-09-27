@@ -15,7 +15,9 @@ from scipy.stats import norm
 
 from volsto.market.sabrw import (
     MIN_ZONE_QUOTES,
+    SabrwFit,
     SabrwParams,
+    SabrwTermStructure,
     SabrwZones,
     atm_triplet,
     breakeven_from_triplet,
@@ -183,3 +185,37 @@ def test_fit_on_the_2022_12_30_one_year_slice() -> None:
     assert rho == pytest.approx(fit.params.rho, rel=1e-12) and nu == pytest.approx(
         fit.params.nu, rel=1e-12
     )
+
+
+def _fit(T: float, params: SabrwParams, n: int = 20) -> SabrwFit:
+    return SabrwFit(T, params, zones(params, T)[0], 0.0, 0.0, n, (), ())
+
+
+def test_term_structure_interpolates_the_365_quotes() -> None:
+    """:class:`SabrwTermStructure` returns, at a fitted expiry, the surface's ATM level and that
+    fit's own skew and curvature exactly; between expiries the desk's 365-day quotes
+    ``Smile_365 = 200 √T skw`` and ``Convex_365 = 100 T cvx`` are linear in ``T``; beyond the last
+    expiry they are held flat; two fits on one maturity keep the one with more quotes; fewer than
+    two maturities raise."""
+    fits = [
+        _fit(T, SabrwParams(0.21, -0.75 + 0.05 * i, 0.9 - 0.2 * i))
+        for i, T in enumerate((0.25, 1.0, 3.0))
+    ]
+    ts = SabrwTermStructure.from_fits(fits, lambda T: 0.2)
+    assert ts.T == (0.25, 1.0, 3.0) and "3 expiries" in ts.label
+    for f in fits:
+        atf, skw, cvx = ts.triplet(f.T)
+        _, s0, c0 = atm_triplet(f.params)
+        assert atf == 0.2
+        assert skw == pytest.approx(s0, rel=1e-12) and cvx == pytest.approx(c0, rel=1e-12)
+    w = (0.5 - 0.25) / (1.0 - 0.25)
+    sm = (1 - w) * ts.smile_365[0] + w * ts.smile_365[1]
+    cv = (1 - w) * ts.convex_365[0] + w * ts.convex_365[1]
+    _, skw, cvx = ts.triplet(0.5)
+    assert skw == pytest.approx(sm / (200.0 * np.sqrt(0.5)), rel=1e-12)
+    assert cvx == pytest.approx(cv / (100.0 * 0.5), rel=1e-12)
+    assert ts.triplet(5.0)[1] == pytest.approx(ts.smile_365[-1] / (200.0 * np.sqrt(5.0)))
+    twin = _fit(1.0, SabrwParams(0.21, -0.2, 0.3), n=5)
+    assert SabrwTermStructure.from_fits([*fits, twin], lambda T: 0.2).smile_365 == ts.smile_365
+    with pytest.raises(ValueError, match="two maturities"):
+        SabrwTermStructure.from_fits(fits[:1], lambda T: 0.2)

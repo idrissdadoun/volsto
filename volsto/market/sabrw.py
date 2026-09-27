@@ -44,6 +44,7 @@ pricing surface: its place is the step-0 input of the marking calibration.  Chec
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Final
 
@@ -387,6 +388,53 @@ def fit_sabrw(
     )
 
 
+@dataclass(frozen=True)
+class SabrwTermStructure:
+    """Step 0's triplet source from per-expiry SABRW fits (the ``Step0Triplets`` protocol of
+    :mod:`volsto.calibration.targets`; SPEC §15 Part 3).  At maturity ``T`` the ATM level is
+    ``atm_vol(T)`` — the pricing surface's: per-expiry SABR levels are not calendar-monotone —,
+    and the skew and curvature are the fits' central-zone terms (:func:`atm_triplet`),
+    interpolated linearly in ``T`` in the desk's 365-day quotes ``Smile_365 = 200 √T skw`` and
+    ``Convex_365 = 100 T cvx`` and held flat beyond the fitted expiries (volsto's rule: the
+    documents give none).  Fits on one maturity (SPX and SPXW on the same date) keep the one with
+    more quotes."""
+
+    T: tuple[float, ...]
+    smile_365: tuple[float, ...]
+    convex_365: tuple[float, ...]
+    atm_vol: Callable[[float], float]
+    label: str
+
+    @classmethod
+    def from_fits(
+        cls, fits: Sequence[SabrwFit], atm_vol: Callable[[float], float]
+    ) -> SabrwTermStructure:
+        by_t: dict[float, SabrwFit] = {}
+        for f in fits:
+            kept = by_t.get(f.T)
+            if kept is None or f.n > kept.n:
+                by_t[f.T] = f
+        if len(by_t) < 2:
+            raise ValueError("a term structure needs fits on at least two maturities")
+        ts = sorted(by_t)
+        smile, convex = [], []
+        for t in ts:
+            _, skw, cvx = atm_triplet(by_t[t].params)
+            smile.append(200.0 * float(np.sqrt(t)) * skw)
+            convex.append(100.0 * t * cvx)
+        label = f"SABRW fits of {len(ts)} expiries ({ts[0]:.3f}y to {ts[-1]:.3f}y)"
+        return cls(tuple(ts), tuple(smile), tuple(convex), atm_vol, label)
+
+    def triplet(self, T: float) -> tuple[float, float, float]:
+        """``(atf, ∂σ̂/∂k, ∂²σ̂/∂k²)`` at ``T``."""
+        t = float(T)
+        if not t > 0.0:
+            raise ValueError("T must be positive")
+        sm = float(np.interp(t, self.T, self.smile_365))
+        cv = float(np.interp(t, self.T, self.convex_365))
+        return float(self.atm_vol(t)), sm / (200.0 * float(np.sqrt(t))), cv / (100.0 * t)
+
+
 __all__ = [
     "AT_BOUND_REL",
     "BOUNDS",
@@ -400,6 +448,7 @@ __all__ = [
     "ZONE_SIGMA_REF",
     "SabrwFit",
     "SabrwParams",
+    "SabrwTermStructure",
     "SabrwZones",
     "atm_triplet",
     "breakeven_from_triplet",

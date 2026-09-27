@@ -53,6 +53,7 @@ import volsto
 from volsto.config import to_mapping
 from volsto.market.bs import black_vega, implied_vol
 from volsto.market.curves import DiscountCurve, ForwardCurve
+from volsto.market.sabrw import SabrwFit, fit_sabrw
 from volsto.market.surface import (
     CALENDAR_SEGMENT_N,
     CalendarCertificate,
@@ -712,6 +713,37 @@ def to_grid_surface(
     )
     surface = GridSurface(mats, ks, ws, fc, fc.rate_curve, max_maturity=max(mats[-1], 3.0))
     return surface, SurfacePoints(table, forwards, spot_est, funding_fit, dropped)
+
+
+SABRW_SPREAD_FLOOR: float = 5e-4
+"""Smallest per-quote weight of :func:`sabrw_fits` (0.05 vol points)."""
+
+
+def sabrw_fits(
+    points: SurfacePoints,
+    *,
+    t_min: float,
+    t_max: float,
+    spread_floor: float = SABRW_SPREAD_FLOOR,
+) -> tuple[SabrwFit, ...]:
+    """The desk's SABRW fitted to every retained expiry with ``t_min ≤ T ≤ t_max`` and at least
+    seven quotes (:func:`volsto.market.sabrw.fit_sabrw`), weights the quote's half bid–ask spread
+    in vol (``iv_ask_used``, ``iv_bid_used``) floored at ``spread_floor`` — volsto's choice, the
+    documents do not give the weights (SPEC §15 Part 3)."""
+    if not 0.0 < t_min < t_max:
+        raise ValueError("need 0 < t_min < t_max")
+    tbl = points.table
+    out: list[SabrwFit] = []
+    for T in sorted(float(t) for t in tbl["T"].unique()):
+        if not t_min <= T <= t_max:
+            continue
+        g = tbl[tbl["T"] == T]
+        if len(g) < 7:
+            continue
+        half = 0.5 * (g["iv_ask_used"].to_numpy(float) - g["iv_bid_used"].to_numpy(float))
+        w = np.maximum(np.nan_to_num(half, nan=spread_floor), spread_floor)
+        out.append(fit_sabrw(g["k"].to_numpy(float), g["iv_mid"].to_numpy(float), w, T))
+    return tuple(out)
 
 
 def forward_curve_from_forwards(

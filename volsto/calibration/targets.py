@@ -102,7 +102,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import Any, Protocol
 
 import numpy as np
 import pandas as pd
@@ -235,6 +235,23 @@ def sabr_from_365(
     return float(atf), float(smi), float(cvx)
 
 
+def _check_step0_inputs(atf_ref: float, radicand_floor: float | None) -> None:
+    if atf_ref <= 0:
+        raise ValueError("atf_ref must be positive")
+    if radicand_floor is not None and not 0.0 <= radicand_floor < 1.0:
+        raise ValueError("radicand_floor must be in [0, 1) or None")
+
+
+class Step0Triplets(Protocol):
+    """A step-0 source other than the surface's ATM derivatives: ``triplet(T)`` is the physical
+    ATM triplet ``(atf, ∂σ̂/∂k, ∂²σ̂/∂k²)`` at maturity ``T``, ``label`` names it in the flags
+    (:class:`volsto.market.sabrw.SabrwTermStructure`, the desk's SABRW fits; SPEC §15 Part 3)."""
+
+    label: str
+
+    def triplet(self, T: float) -> tuple[float, float, float]: ...
+
+
 def sabr_reduce(
     surface: Any,
     T: float,
@@ -249,10 +266,7 @@ def sabr_reduce(
     ``c`` (the radicand floored at ``6 smi² (1 − c)``, logged and flagged when it fires; ``None``
     disables it); ``skew_h`` the stencil-consistent skew read of
     :func:`surface_atm_derivatives` (``None``: unchanged)."""
-    if atf_ref <= 0:
-        raise ValueError("atf_ref must be positive")
-    if radicand_floor is not None and not 0.0 <= radicand_floor < 1.0:
-        raise ValueError("radicand_floor must be in [0, 1) or None")
+    _check_step0_inputs(atf_ref, radicand_floor)
     atf0, skew0, curv0, analytic = surface_atm_derivatives(surface, T, h, skew_h)
     flags: list[str] = []
     if skew_h is not None:
@@ -265,6 +279,62 @@ def sabr_reduce(
             f"skew and curvature by central differences of half-width {h:g} (no analytic "
             "atm_skew): unreliable on an interpolated grid"
         )
+    return _sabr_pillar(
+        float(T),
+        atf0,
+        skew0,
+        curv0,
+        flags,
+        h=float(h),
+        sabrw_power=sabrw_power,
+        atf_ref=atf_ref,
+        radicand_floor=radicand_floor,
+        skew_h=skew_h,
+    )
+
+
+def sabr_reduce_triplet(
+    source: Step0Triplets,
+    T: float,
+    *,
+    radicand_floor: float | None = DEFAULT_RADICAND_FLOOR,
+) -> SabrPillar:
+    """Step 0 of one pillar from a triplet source (:class:`Step0Triplets`: the desk's SABRW fits,
+    SPEC §15 Part 3) instead of the surface's ATM derivatives.  The triplet is physical, so the
+    ``(atf/atf_ref)^SabrW_Power`` normalisation of the desk's stored convexity cancels in the round
+    trip: the reduction runs at ``p = 0`` and returns the fits' own ``(ν, ρ)`` up to the ATM level
+    the source supplies."""
+    _check_step0_inputs(DEFAULT_ATF_REF, radicand_floor)
+    atf0, skew0, curv0 = source.triplet(float(T))
+    return _sabr_pillar(
+        float(T),
+        float(atf0),
+        float(skew0),
+        float(curv0),
+        [],
+        h=float("nan"),
+        sabrw_power=0.0,
+        atf_ref=DEFAULT_ATF_REF,
+        radicand_floor=radicand_floor,
+        skew_h=None,
+    )
+
+
+def _sabr_pillar(
+    T: float,
+    atf0: float,
+    skew0: float,
+    curv0: float,
+    flags: list[str],
+    *,
+    h: float,
+    sabrw_power: float,
+    atf_ref: float,
+    radicand_floor: float | None,
+    skew_h: float | None,
+) -> SabrPillar:
+    """Step 0 from an ATM triplet ``(atf0, ∂σ̂/∂k, ∂²σ̂/∂k²)``: the owner's conversion, the
+    radicand guard, ``(ν_SABR, ρ_SABR)`` and the flags (module docstring)."""
     atf, skew, cvx = sabr_from_365(
         float(T),
         100.0 * atf0,
@@ -589,6 +659,7 @@ def marking_targets(
     atf_ref: float = DEFAULT_ATF_REF,
     radicand_floor: float | None = DEFAULT_RADICAND_FLOOR,
     skew_h: float | None = None,
+    step0: Step0Triplets | None = None,
 ) -> TargetSet:
     """Marking-mode targets from a surface (steps 0 and 1 of the module docstring).
     ``ssr_target`` is a scalar, one value per retained pillar, a mapping ``T → value``
@@ -596,17 +667,29 @@ def marking_targets(
     :data:`SIGMA0_MATURITY`.  ``skew_h`` (default ``None``: the M7 reading, unchanged) reads the
     skew — the step-0 ``smi`` and the skew constraint's ``skew_fn`` alike — by the central
     difference of half-width ``skew_h`` and the curvature by that of half-width ``h``: the
-    stencil of a finite strike strip (:func:`surface_atm_derivatives`)."""
+    stencil of a finite strike strip (:func:`surface_atm_derivatives`).  ``step0`` (default
+    ``None``: the surface's ATM derivatives, unchanged) takes step 0's triplet — and the skew the
+    two-point constraint compares with — from a :class:`Step0Triplets` source instead (the desk's
+    SABRW fits, SPEC §15 Part 3); the ATM term structure (``σ_0``, the 3M anchor, ``atm_vol_fn``)
+    stays the surface's."""
     ps, flags = _filter_pillars(pillars, mat_min, getattr(surface, "max_maturity", None))
+    if step0 is not None:
+        if skew_h is not None:
+            raise ValueError("skew_h reads the surface; it does not apply with a step-0 source")
+        flags.append(f"step 0: {step0.label}")
     sabr = tuple(
-        sabr_reduce(
-            surface,
-            float(T),
-            h,
-            sabrw_power=sabrw_power,
-            atf_ref=atf_ref,
-            radicand_floor=radicand_floor,
-            skew_h=skew_h,
+        (
+            sabr_reduce(
+                surface,
+                float(T),
+                h,
+                sabrw_power=sabrw_power,
+                atf_ref=atf_ref,
+                radicand_floor=radicand_floor,
+                skew_h=skew_h,
+            )
+            if step0 is None
+            else sabr_reduce_triplet(step0, float(T), radicand_floor=radicand_floor)
         )
         for T in ps
     )
@@ -634,7 +717,13 @@ def marking_targets(
     corr = np.array([s.rho_sabr for s in sabr])
     skew = np.array([s.skew_sabr for s in sabr])
     fn = getattr(surface, "atm_skew", None)
-    if callable(fn) and skew_h is None:
+    if step0 is not None:
+        src = step0
+
+        def skew_fn(t: FloatArray) -> FloatArray:
+            return np.array([src.triplet(float(x))[1] for x in t], dtype=np.float64)
+
+    elif callable(fn) and skew_h is None:
 
         def skew_fn(t: FloatArray) -> FloatArray:
             return np.asarray(surface.atm_skew(t), dtype=np.float64)
@@ -671,7 +760,7 @@ def marking_targets(
         smooth_breakeven=bool(smooth_breakeven),
         smooth_degree=int(degree),
         mat_min=float(mat_min),
-        sabrw_power=float(sabrw_power),
+        sabrw_power=float(sabrw_power) if step0 is None else 0.0,
         atf_ref=float(atf_ref),
     )
 
