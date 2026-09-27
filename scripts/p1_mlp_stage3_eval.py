@@ -1,8 +1,9 @@
 """The desk's most-likely-path break-evens (``volsto.analytics.p1_mlp``) against the stage-3
 simulations already on disk (SPEC §15 Part 3, *The note's engine*): no fit, no Monte Carlo, no
 calibration.  For each simulated parameter set of ``outputs/step0_stage3`` and
-``outputs/step0_stage3_caps`` (five dates of 2022 H2; today's and the new marking default, the
-new one also at ν caps 4.0 and 4.5), SpotVolCovar and VolVar at the stored parameters, in
+``outputs/step0_stage3_caps`` and ``outputs/step0_stage3_atmf`` (five dates of 2022 H2;
+today's and the new marking default, the new one also at ν caps 4.0 and 4.5; the refits with
+the ATMF kernels), SpotVolCovar and VolVar at the stored parameters, in
 volsto's absolute units and with volsto's ``σ_0`` (the simulations' normalisation), by:
 
 * ``volsto`` — volsto's first-order engine (the naked kernels on the variance-swap forward
@@ -35,7 +36,7 @@ f2 = importlib.import_module("volsto.calibration.fit_2f")
 
 ROOT = Path(__file__).resolve().parents[1]
 SNAPSHOTS = ROOT / "configs" / "surfaces" / "snapshots" / "hdn_2022H2"
-RUNS = ("outputs/step0_stage3", "outputs/step0_stage3_caps")
+RUNS = ("outputs/step0_stage3", "outputs/step0_stage3_caps", "outputs/step0_stage3_atmf")
 ENGINES = ("volsto", "note_fo", "note")
 
 
