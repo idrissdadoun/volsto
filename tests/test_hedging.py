@@ -37,6 +37,7 @@ wall-clock assertion.  Every P&L figure carries its standard error.
 from __future__ import annotations
 
 import dataclasses
+import itertools
 import re
 from pathlib import Path
 from typing import Any
@@ -939,6 +940,73 @@ def _state(fc: ForwardCurve, curv: FloatArray) -> object:
     from volsto.hedging.hedger import _StateSurface
 
     return _StateSurface(np.array(_RULE_PILLARS), _RULE_ATF, _RULE_SKEW, np.asarray(curv), fc)
+
+
+def test_targets_beyond_cap(fc: ForwardCurve) -> None:
+    """:func:`targets_beyond_cap` lists exactly the pillars whose break-even correlation target
+    exceeds the cap — the pillars :func:`refit_targets` caps: none on a regular smile, the 3M
+    pillar alone when its curvature puts ``Corr_SABR`` at −0.983 (beyond 0.97, inside [−1, 1]);
+    a cap outside ``(0, 1]`` raises."""
+    from volsto.hedging.hedger import refit_targets, targets_beyond_cap
+
+    rule = _rule_for()
+    regular = rule.marking_targets(_state(fc, _CURV_REGULAR))
+    assert targets_beyond_cap(regular, rule.correlation_cap) == ()
+    steep_state = _state(fc, np.array([_CURV_STEEP_3M, *_CURV_REGULAR[1:]]))
+    steep = rule.marking_targets(steep_state)
+    got = targets_beyond_cap(steep, rule.correlation_cap)
+    assert [T for T, _ in got] == [0.25]
+    assert got[0][1] == pytest.approx(float(steep.correl_target[0]), abs=1e-15)
+    assert abs(got[0][1]) > rule.correlation_cap
+    capped = refit_targets(steep_state, rule, regular)
+    assert (
+        capped.corr_capped and not refit_targets(_state(fc, _CURV_REGULAR), rule, None).corr_capped
+    )
+    for bad in (0.0, 1.5):
+        with pytest.raises(ValueError, match="cap"):
+            targets_beyond_cap(regular, bad)
+
+
+def test_base_fit_beyond_the_cap_is_noted(bs: BlackScholes, fc: ForwardCurve) -> None:
+    """When the base marking fit's own correlation targets exceed the refit cap, every refit caps
+    what the base fit does not and a refit on an unmoved state already moves the parameters (the
+    repaired eSSVI anchor of 2026-09-22: 1y, 2y and 3y beyond 0.97, SPEC §8.2): the run says so
+    in its notes, naming the pillars; a base fit inside the cap adds no such note.  Black–Scholes
+    pricing and world, the rule's skew read stubbed flat (no refit fires, no calibration)."""
+    from types import SimpleNamespace
+
+    rule_targets = _rule_for()
+    steep = rule_targets.marking_targets(_state(fc, np.array([_CURV_STEEP_3M, *_CURV_REGULAR[1:]])))
+    regular = rule_targets.marking_targets(_state(fc, _CURV_REGULAR))
+    disc = fc.rate_curve
+    opt = EuropeanOption(100.0, 1.0, 1, disc)
+    strat = GreekTargetStrategy((Target("delta"),), [Spot()], ridge=1e-10, name="delta")
+    sim = SimConfig(n_paths=2_000, chunk_size=2_000, seed=3, dt_max=1.0 / 52.0)
+    notes = {}
+    for label, targets in (("steep", steep), ("regular", regular)):
+        rule = RecalibrationRule(pillars=(0.25, 0.5), h=0.05, strip_paths=sim.n_paths)
+        rule.base_fit = SimpleNamespace(targets=targets)
+        h = Hedger(
+            PricingContext.from_model(bs),
+            bs,
+            Schedule("monthly"),
+            Costs(),
+            recalibration=rule,
+            sim=sim,
+            world_paths=sim.n_paths,
+            verbose=False,
+        )
+
+        def flat_skew(pr: object, kdx: int, t: float, rule_: object, world: object) -> FloatArray:
+            return np.zeros(1)
+
+        h._world_skew = flat_skew  # type: ignore[method-assign,assignment]
+        r = h.run(opt, strat)
+        assert r.budget["refits"] == 0.0
+        notes[label] = [n for n in r.pricing_notes if "exceed the refit cap" in n]
+    assert len(notes["steep"]) == 1 and "T=0.25 (" in notes["steep"][0]
+    assert f"{float(steep.correl_target[0]):+.4f}" in notes["steep"][0]
+    assert notes["regular"] == []
 
 
 def test_refit_targets_guarded_fallback_on_a_synthetic_set(fc: ForwardCurve) -> None:
@@ -2195,7 +2263,7 @@ def test_foreign_world_factors_imputed_by_their_conditional_mean(fc: ForwardCurv
         resid_sd = (x_p - x_hat).std(axis=0)
         edges = np.quantile(s_p, edges_q)
         worst = 0.0
-        for a, b in zip(edges[:-1], edges[1:]):
+        for a, b in itertools.pairwise(edges):
             mk = (s_p >= a) & (s_p <= b)
             d = (x_p[mk].mean(axis=0) - x_hat[mk].mean(axis=0)) / resid_sd
             worst = max(worst, float(np.abs(d).max()))

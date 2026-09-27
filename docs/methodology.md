@@ -363,6 +363,14 @@ when it fires (§15 Part 3, decision iii). Other flags, none silent:
 - no analytic ATM skew (central differences are used instead);
 - $\nu_{\text{SABR}}^2 T > 1$.
 
+**Limitation on SSVI surfaces (2026-09-26).** On an SSVI-family smile the step-0 correlation
+depends only on the pillar's $\rho_T$ and ATM vol,
+$\mathrm{Corr}_{\text{SABR}}^2 = 4\rho^2/\big(6\rho^2 + 3(0.3/\sigma_0)^p(1-2\rho^2)\big)$
+($2\rho/\sqrt3$ at $p = 0$), not on the market's curvature, and reaches $-1$ at
+$|\rho_T| \approx 0.80$: the repaired eSSVI anchor's 1y pillar reads $-1.048$, clipped. The desk
+computes the triplet from SABRW fits to the market instead, whose correlation stays inside
+$(-1, 1)$; volsto's step 0 is to take its input from SABRW fits (SPEC §15 Part 3).
+
 ### 6.2 Step 1: break-even targets (the SSR dial)
 
 `marking_targets` computes, per pillar,

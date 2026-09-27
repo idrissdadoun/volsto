@@ -508,6 +508,29 @@ def test_infeasible_message(spx) -> None:  # type: ignore[no-untyped-def]
     assert r.params.nu <= 0.3 * (1 + 1e-6)
 
 
+def test_correlation_min_eigenvalue(spx_fits, ref_fits) -> None:  # type: ignore[no-untyped-def]
+    """:func:`correlation_min_eigenvalue` is the smallest eigenvalue of the correlation matrix of
+    ``(S, X¹, X²)``: 1 for independent factors, the closed form ``1 − sqrt(ρ_SX1² + ρ_SX2²)`` when
+    the factors are uncorrelated with each other, near 0 at the collapsed corner.  Every fit is
+    noted near-singular exactly when it reads below :data:`CORRELATION_EIGEN_FLAG`; the SPX
+    ``(1.0, 0.10)`` fit on the repaired eSSVI anchor is (6·10⁻⁴: ``χ`` at its −0.99 bound —
+    SPEC §8.2)."""
+    from volsto.calibration.fit_2f import CORRELATION_EIGEN_FLAG, correlation_min_eigenvalue
+
+    ind = dataclasses.replace(P82, rho_SX1=0.0, rho_SX2=0.0, rho12=0.0)
+    assert correlation_min_eigenvalue(ind) == pytest.approx(1.0, abs=1e-12)
+    unc = dataclasses.replace(P82, rho_SX1=-0.6, rho_SX2=-0.5, rho12=0.0)
+    assert correlation_min_eigenvalue(unc) == pytest.approx(1 - np.hypot(0.6, 0.5), abs=1e-12)
+    near = dataclasses.replace(P82, rho_SX1=-0.99, rho_SX2=-0.99, rho12=0.98)
+    assert 0.0 < correlation_min_eigenvalue(near) < 1e-2
+    for r in (*spx_fits.values(), *ref_fits.values()):
+        flagged = any("near-singular" in n for n in r.notes)
+        assert flagged == (r.min_correlation_eigenvalue < CORRELATION_EIGEN_FLAG), r.notes
+    anchor = spx_fits[(1.0, 0.10)]
+    assert anchor.min_correlation_eigenvalue < 1e-3
+    assert any("near-singular" in n for n in anchor.notes)
+
+
 def test_correl_rho_sabr_kept(spx_fits) -> None:  # type: ignore[no-untyped-def]
     """``Corr_BE = ρ_SABR`` always: the VolVar target is ``(SpotVolCovar_P1 / Corr_BE)²``, so the
     fitted model's spot/vol correlation ``SpotVolCovar / sqrt(VolVar)`` sits on ``ρ_SABR`` (within

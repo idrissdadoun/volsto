@@ -806,6 +806,18 @@ class RefitTargets:
     correl_read: FloatArray
 
 
+def targets_beyond_cap(targets: TargetSet, cap: float) -> tuple[tuple[float, float], ...]:
+    """``(T, Corr_BE)`` of the pillars whose break-even correlation target exceeds ``cap`` in
+    magnitude: the pillars :func:`refit_targets` caps.  Applied to the base marking fit it tells
+    whether a refit can reproduce the base fit at all (on the repaired eSSVI anchor of 2026-09-22
+    the base targets sit beyond 0.97 at 1y, 2y and 3y: every refit caps them, the base fit does
+    not — SPEC §8.2).  Checked by ``tests/test_hedging.py::test_targets_beyond_cap``."""
+    if not 0.0 < cap <= 1.0:
+        raise ValueError("cap must be in (0, 1]")
+    ct = np.asarray(targets.correl_target, dtype=np.float64)
+    return tuple((float(T), float(c)) for T, c in zip(targets.pillars, ct) if abs(float(c)) > cap)
+
+
 def refit_targets(
     surface: Any, rule: RecalibrationRule, base_targets: TargetSet | None
 ) -> RefitTargets:
@@ -1456,6 +1468,18 @@ class Hedger:
                         "status": rule.base_fit.status,
                     }
                 )
+            if rule.base_fit is not None:
+                beyond = targets_beyond_cap(rule.base_fit.targets, rule.correlation_cap)
+                if beyond:
+                    note = (
+                        f"recalibration policy {rule.policy}: the base marking fit's own "
+                        f"correlation targets exceed the refit cap {rule.correlation_cap:g} at "
+                        + ", ".join(f"T={T:g} ({c:+.4f})" for T, c in beyond)
+                        + ": every refit caps what the base fit does not, so a refit on an "
+                        "unmoved state already moves the parameters (SPEC §8.2)"
+                    )
+                    log.warning(note)
+                    run_notes.append(note)
 
         def values_at(
             pr: ConditionalPricer, obj: int, t: float, want: Sequence[str]
@@ -2272,4 +2296,5 @@ __all__ = [
     "refit_targets",
     "spot_factor_projection",
     "step0_degenerate_pillars",
+    "targets_beyond_cap",
 ]

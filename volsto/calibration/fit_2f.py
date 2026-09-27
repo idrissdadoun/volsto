@@ -182,6 +182,13 @@ DEFAULT_SKEW_WEIGHT = 10.0
 DEFAULT_STAGE3_TOLERANCE = 0.10
 #: ``|ρ12|`` above which the two-factor structure is flagged as collapsing (report decision vii)
 RHO12_COLLAPSE = 0.9
+#: smallest eigenvalue of the fitted Brownian correlation matrix of ``(S, X¹, X²)`` below which the
+#: fit is noted as near-singular (:func:`correlation_min_eigenvalue`).  At the repaired eSSVI anchor
+#: of 2026-09-22 the SPX marking fit reads 6·10⁻⁴ (``χ`` at its −0.99 bound, every break-even
+#: correlation target at or beyond −0.97 from 1y): the pricing paths' ``(ln S, X¹, X²)`` are then
+#: nearly collinear, and the regressions on the factors (the hedger's conditional pricer, the
+#: minimum-variance delta) are ill-identified — SPEC §8.2.  The plain-SSVI anchor read 0.030
+CORRELATION_EIGEN_FLAG = 1e-2
 #: ``note`` of a stage-3 check row without a finite non-zero first-order value: the verdict
 #: falls back to the gap vs the fit's target (:func:`breakeven_check`)
 NO_FIRST_ORDER_NOTE = "no first-order value: target gap used"
@@ -2030,6 +2037,12 @@ class FitResult:
         return np.asarray(self.table["svc_model"] / self.table["svc_target"] - 1.0)
 
     @property
+    def min_correlation_eigenvalue(self) -> float:
+        """The smallest eigenvalue of the fitted correlation matrix of ``(S, X¹, X²)``
+        (:func:`correlation_min_eigenvalue`)."""
+        return correlation_min_eigenvalue(self.params)
+
+    @property
     def config_yaml(self) -> str:
         """A loadable model config (``model`` :class:`BergomiParams`, ``breakeven``,
         ``risk_regime``) and the provenance (targets, settings, status, messages, the constraint
@@ -2289,6 +2302,14 @@ def fit_2f(
             f"rho12 = {params.rho12:+.3f}: |rho12| > {c.rho12_flag:g}, two-factor structure "
             "collapsing (the two factors are nearly one)"
         )
+    lam_min = correlation_min_eigenvalue(params)
+    if lam_min < CORRELATION_EIGEN_FLAG:
+        notes.append(
+            f"correlation of (S, X1, X2) near-singular: smallest eigenvalue {lam_min:.2e} < "
+            f"{CORRELATION_EIGEN_FLAG:g} (rho_SX1 {params.rho_SX1:+.3f}, rho_SX2 "
+            f"{params.rho_SX2:+.3f}, rho12 {params.rho12:+.3f}): the spot and the two factors are "
+            "nearly collinear, regressions on the factors are ill-identified (SPEC §8.2)"
+        )
     s3 = None
     recalibrated = False
     if stage3 is not None:
@@ -2342,6 +2363,17 @@ def naked_kernel(result: FitResult, forward_curve: Any) -> Any:
     from volsto.models.bergomi import BergomiSV
 
     return BergomiSV(result.params, result.xi0, forward_curve)
+
+
+def correlation_min_eigenvalue(params: BergomiParams) -> float:
+    """The smallest eigenvalue of the Brownian correlation matrix of ``(S, X¹, X²)``,
+    ``[[1, ρ_SX1, ρ_SX2], [ρ_SX1, 1, ρ12], [ρ_SX2, ρ12, 1]]``: 0 on the boundary of the admissible
+    set (the collapsed ``ρ_SX1 = ρ_SX2 = −1, ρ12 = +1`` included), noted below
+    :data:`CORRELATION_EIGEN_FLAG`.  Checked by
+    ``tests/test_fit_2f.py::test_correlation_min_eigenvalue``."""
+    r1, r2, r12 = float(params.rho_SX1), float(params.rho_SX2), float(params.rho12)
+    corr = np.array([[1.0, r1, r2], [r1, 1.0, r12], [r2, r12, 1.0]])
+    return float(np.linalg.eigvalsh(corr)[0])
 
 
 def fit_2f_marking(
@@ -2556,6 +2588,7 @@ def load_fit_spec(path: str | Path) -> FitSpec:
 
 __all__ = [
     "BINDING_MESSAGE",
+    "CORRELATION_EIGEN_FLAG",
     "DEFAULT_K2",
     "DEFAULT_NU_CAP",
     "DEFAULT_SKEW_EPS",
@@ -2589,6 +2622,7 @@ __all__ = [
     "affine_maps",
     "affine_maps_from_kernels",
     "breakeven_check",
+    "correlation_min_eigenvalue",
     "fit_2f",
     "fit_2f_historical",
     "fit_2f_marking",
