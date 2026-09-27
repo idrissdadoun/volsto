@@ -208,6 +208,8 @@ SKEW_MODE_CHOICES = ("auto", *SKEW_MODES)
 WEIGHT_KINDS = ("relative", "uniform")
 #: term-structure factor ``f(t)`` of the leverage integrals
 TERM_STRUCTURE_KINDS = ("atmf", "flat", "vs")
+KERNEL_CURVES: tuple[str, ...] = ("atmf",)
+"""Values of :attr:`BreakEvenFitConfig.kernel_curve` other than ``None`` (the caller's curve)."""
 #: the risk regime paired with a marking fit (sticky strike: ``ssr_target = 1``)
 RISK_REGIME = "sticky_strike"
 #: standard errors above this are reported as NaN (numerically unidentified; :mod:`stability`)
@@ -261,7 +263,10 @@ class BreakEvenFitConfig:
     (normalised to a tuple), ``skew_weight`` (soft mode only; 10), ``radicand_floor``
     (the step-0 guard ``c``),
     ``weights_covar`` (:data:`WEIGHT_KINDS` or one weight per fitted pillar), ``term_structure``
-    (``f(t)`` of the leverage integrals).  Step 3: ``weights_volvar``, ``nu_cap`` (config cap of
+    (``f(t)`` of the leverage integrals), ``kernel_curve`` (the forward variance of the naked
+    kernels ``A``, ``J``: ``None`` the variance-swap curve the caller passes, the M7 engine;
+    ``"atmf"`` the ATMF one, the desk note's ``ξ̂`` — option of 2026-09-27, SPEC §15 Part 3).
+    Step 3: ``weights_volvar``, ``nu_cap`` (config cap of
     both minimisations, 3.5, warning when bound), ``chi_bounds``, ``omega_max``.  Diagnostics:
     ``stage3_tolerance`` (the stage-3 assertion, 10%), ``rho12_flag`` (``|ρ12|`` above which the
     two-factor structure is flagged as collapsing, 0.9).  Quadrature orders
@@ -287,6 +292,7 @@ class BreakEvenFitConfig:
     weights_covar: str | tuple[float, ...] = "relative"
     weights_volvar: str | tuple[float, ...] = "relative"
     term_structure: str = "atmf"
+    kernel_curve: str | None = None
     nu_cap: float = DEFAULT_NU_CAP
     chi_bounds: tuple[float, float] = (-0.99, 0.99)
     omega_max: float = 20.0
@@ -298,7 +304,7 @@ class BreakEvenFitConfig:
     n_quad_ts: int = 32
     n_inner_ts: int = 24
 
-    OMIT_WHEN_NONE: ClassVar[frozenset[str]] = frozenset({"k2_bounds", "k2_grid"})
+    OMIT_WHEN_NONE: ClassVar[frozenset[str]] = frozenset({"k2_bounds", "k2_grid", "kernel_curve"})
     """Options left out of the config's mapping while unset, so a config without them maps — and
     hashes (the backtest's config hash includes the resolved fit config) — exactly as before they
     existed (:func:`volsto.config.to_mapping`)."""
@@ -368,6 +374,8 @@ class BreakEvenFitConfig:
                 raise ValueError("explicit weights must be finite and positive")
         if self.term_structure not in TERM_STRUCTURE_KINDS:
             raise ValueError(f"term_structure must be one of {TERM_STRUCTURE_KINDS}")
+        if self.kernel_curve is not None and self.kernel_curve not in KERNEL_CURVES:
+            raise ValueError(f"kernel_curve must be None or one of {KERNEL_CURVES}")
         if self.nu_cap <= 0:
             raise ValueError("nu_cap must be positive")
         clo, chi_ = self.chi_bounds
@@ -869,7 +877,14 @@ class _FirstProblem:
     constraints: tuple[SkewConstraint, ...]
     nu_cap: float
     k2: float
+    skew_band: FloatArray | None = None
     cache: dict[float, P1Maps] = field(default_factory=dict, compare=False, repr=False)
+
+    @property
+    def band(self) -> FloatArray:
+        """The skews the band (and the soft penalty) compare the naked skew with: the targets'
+        ``band_skew`` when set (a step-0 source), else the market skew of the leverage term."""
+        return self.skew_market if self.skew_band is None else self.skew_band
 
     def maps(self, k1: float) -> P1Maps:
         key = float(k1)
@@ -904,7 +919,7 @@ class _FirstProblem:
         y = sw * (self.svc_target - b)
         if self.skew_mode == "soft":
             s = math.sqrt(self.skew_weight)
-            R = np.vstack((R, s * mm.naked.j / self.skew_market[:, None]))
+            R = np.vstack((R, s * mm.naked.j / self.band[:, None]))
             y = np.concatenate((y, np.full(self.T.size, s)))
         return mm, R, y, self.T.size
 
@@ -990,6 +1005,18 @@ def _select_pillars(targets: TargetSet, pillars: Sequence[float]) -> tuple[Float
     return np.asarray(idx, dtype=np.int64), notes
 
 
+def _engine_curve(
+    targets: TargetSet, xi0: ForwardVarianceCurve, cfg: BreakEvenFitConfig
+) -> ForwardVarianceCurve:
+    """The forward variance the first-order engine's naked kernels ``A``, ``J`` read: the
+    caller's ``xi0`` (``kernel_curve`` ``None``: the variance-swap curve, the M7 engine) or the
+    ATMF one (``"atmf"``: :meth:`TargetSet.atmf_curve`, the desk note's ``ξ̂`` — measured against
+    the stage-3 simulations, SPEC §15 Part 3)."""
+    if cfg.kernel_curve is None:
+        return xi0
+    return targets.atmf_curve(float(np.max(np.asarray(targets.pillars, dtype=np.float64))))
+
+
 def _first_problem(
     targets: TargetSet,
     cfg: BreakEvenFitConfig,
@@ -1004,6 +1031,11 @@ def _first_problem(
     skew = np.asarray(targets.skew_target, dtype=np.float64)[idx]
     if np.any(skew == 0) or not np.all(np.isfinite(skew)):
         raise ValueError("the fit needs finite, non-zero market skews at every pillar")
+    band = (
+        None if targets.band_skew is None else np.asarray(targets.band_skew, dtype=np.float64)[idx]
+    )
+    if band is not None and (np.any(band == 0) or not np.all(np.isfinite(band))):
+        raise ValueError("the fit needs finite, non-zero band skews at every pillar")
     quads = tuple(pillar_quad(xi0, float(t), n_quad=cfg.n_quad, n_inner=cfg.n_inner) for t in T)
     bank = term_structure_bank(
         targets,
@@ -1020,7 +1052,7 @@ def _first_problem(
             "historical mode: the leverage integrals interpolate the skew residual (S - lambda.J) "
             "linearly between the pillars, flat outside"
         )
-    constraints, cnotes = _skew_constraints(T, skew, cfg)
+    constraints, cnotes = _skew_constraints(T, skew if band is None else band, cfg)
     if cfg.skew_mode == "twopoint":
         notes += cnotes
     svc = np.asarray(targets.spot_vol_covar, dtype=np.float64)[idx]
@@ -1049,6 +1081,7 @@ def _first_problem(
         constraints,
         float(cfg.nu_cap),
         float(cfg.k2),
+        band,
     )
     return prob, notes
 
@@ -1095,7 +1128,7 @@ def k1_profile(
     k1s: Sequence[float] | FloatArray | None = None,
 ) -> pd.DataFrame:
     """The first-minimisation objective along ``k1`` (default: the config's coarse grid)."""
-    prob, _ = _first_problem(targets, cfg, xi0)
+    prob, _ = _first_problem(targets, cfg, _engine_curve(targets, xi0, cfg))
     grid = _k1_grid(cfg) if k1s is None else np.asarray(k1s, dtype=np.float64)
     return _profile_frame([prob.solve(float(k)) for k in grid])
 
@@ -1192,9 +1225,9 @@ def _first_table(prob: _FirstProblem, lam: FloatArray, mm: P1Maps) -> pd.DataFra
             "sensi_spot": mm.sensi_spot(lam),
             "ssr_first_order": mm.ssr_first_order(lam),
             "ssr_implied": prob.svc_target / (prob.sigma_0 * prob.skew_market),
-            "skew_market": prob.skew_market,
+            "skew_market": prob.band,
             "skew_naked": naked,
-            "skew_gap_rel": naked / prob.skew_market - 1.0,
+            "skew_gap_rel": naked / prob.band - 1.0,
         }
     )
 
@@ -1360,7 +1393,13 @@ def fit_first(
     """Step 2 (module docstring); ``svc_correction`` divides the SpotVolCovar targets (the
     iteration against simulation of :func:`fit_2f`)."""
     t0 = time.perf_counter()
+    xi0 = _engine_curve(targets, xi0, cfg)
     prob, notes = _first_problem(targets, cfg, xi0, svc_correction)
+    if cfg.kernel_curve is not None:
+        notes.append(
+            f"naked kernels A, J on the {cfg.kernel_curve.upper()} forward variance "
+            "(kernel_curve; the M7 engine reads the variance-swap curve)"
+        )
     if cfg.k2_bounds is None:
         best, sols = _optimise_k1(prob, cfg)
     else:

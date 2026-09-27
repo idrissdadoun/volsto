@@ -426,7 +426,9 @@ class TargetSet:
     """Break-even targets per pillar (absolute vol units, module docstring).  ``vovol`` is
     ``VoV_BE`` (smoothed when ``smooth_breakeven``), ``vov_be_raw`` before smoothing,
     ``correl_target`` ``Corr_BE``; ``atf_anchor`` the 3M ATMF vol of the anchoring (NaN in
-    historical mode)."""
+    historical mode); ``band_skew`` the pillar skews the skew band compares the naked skew with
+    when they are not ``skew_target`` (a step-0 source's; ``None``: ``skew_target``), the leverage
+    term always reading ``skew_target`` and ``skew_fn``, the pricing surface's."""
 
     mode: str
     pillars: FloatArray
@@ -457,6 +459,7 @@ class TargetSet:
     mat_min: float = 0.0
     sabrw_power: float = float("nan")
     atf_ref: float = float("nan")
+    band_skew: FloatArray | None = None
 
     @property
     def term_structure_source(self) -> str:
@@ -669,9 +672,10 @@ def marking_targets(
     difference of half-width ``skew_h`` and the curvature by that of half-width ``h``: the
     stencil of a finite strike strip (:func:`surface_atm_derivatives`).  ``step0`` (default
     ``None``: the surface's ATM derivatives, unchanged) takes step 0's triplet — and the skew the
-    two-point constraint compares with — from a :class:`Step0Triplets` source instead (the desk's
-    SABRW fits, SPEC §15 Part 3); the ATM term structure (``σ_0``, the 3M anchor, ``atm_vol_fn``)
-    stays the surface's."""
+    skew band compares with, ``band_skew`` — from a :class:`Step0Triplets` source instead (the
+    desk's SABRW fits, SPEC §15 Part 3); the ATM term structure (``σ_0``, the 3M anchor,
+    ``atm_vol_fn``) and the skew of the leverage term (``skew_target``, ``skew_fn``) stay the
+    surface's."""
     ps, flags = _filter_pillars(pillars, mat_min, getattr(surface, "max_maturity", None))
     if step0 is not None:
         if skew_h is not None:
@@ -716,14 +720,14 @@ def marking_targets(
                 )
     corr = np.array([s.rho_sabr for s in sabr])
     skew = np.array([s.skew_sabr for s in sabr])
-    fn = getattr(surface, "atm_skew", None)
+    band_skew: FloatArray | None = None
     if step0 is not None:
-        src = step0
-
-        def skew_fn(t: FloatArray) -> FloatArray:
-            return np.array([src.triplet(float(x))[1] for x in t], dtype=np.float64)
-
-    elif callable(fn) and skew_h is None:
+        # the band compares with the source's skew; the leverage term reads the pricing
+        # surface's, the smile the calibrated LSV reproduces
+        band_skew = skew
+        skew = np.array([surface_atm_derivatives(surface, float(T), h)[1] for T in ps])
+    fn = getattr(surface, "atm_skew", None)
+    if callable(fn) and skew_h is None:
 
         def skew_fn(t: FloatArray) -> FloatArray:
             return np.asarray(surface.atm_skew(t), dtype=np.float64)
@@ -762,6 +766,7 @@ def marking_targets(
         mat_min=float(mat_min),
         sabrw_power=float(sabrw_power) if step0 is None else 0.0,
         atf_ref=float(atf_ref),
+        band_skew=band_skew,
     )
 
 

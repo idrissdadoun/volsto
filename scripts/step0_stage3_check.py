@@ -63,7 +63,18 @@ def main() -> None:
     ap.add_argument("--mixing-paths", type=int, default=100_000)
     ap.add_argument("--cache", default=str(ROOT / "cache"))
     ap.add_argument("--out", default=str(ROOT / "outputs" / "step0_stage3"))
-    ap.add_argument("--variants", nargs="*", default=["today", "new"], choices=["today", "new"])
+    ap.add_argument(
+        "--variants",
+        nargs="*",
+        default=["today", "new"],
+        choices=["today", "surface_k2", "new"],
+    )
+    ap.add_argument(
+        "--kernel-curve",
+        default=None,
+        choices=["atmf"],
+        help="the fit's kernel_curve (default: the variance-swap curve); variants named <v>_atmf",
+    )
     ap.add_argument(
         "--nu-caps",
         nargs="*",
@@ -92,11 +103,15 @@ def main() -> None:
         )
         base = {
             "today": ({"skew_eps": 0.10}, None),
+            "surface_k2": ({"skew_eps": 0.10, "k2_bounds": K2_BOUNDS}, None),
             "new": ({"skew_eps": 0.10, "k2_bounds": K2_BOUNDS}, ts),
         }
+        kc = {} if a.kernel_curve is None else {"kernel_curve": a.kernel_curve}
+        sfx = "" if a.kernel_curve is None else f"_{a.kernel_curve}"
         variants = {
-            (v if cap == DEFAULT_NU_CAP else f"{v}_cap{cap:g}"): (
-                BreakEvenFitConfig(**base[v][0], nu_cap=cap),
+            (v if cap == DEFAULT_NU_CAP else f"{v}_cap{cap:g}")
+            + sfx: (
+                BreakEvenFitConfig(**base[v][0], **kc, nu_cap=cap),
                 base[v][1],
             )
             for v in a.variants

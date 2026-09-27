@@ -146,3 +146,28 @@ def test_quadrature_has_converged_and_validation() -> None:
         mlp_setup(surf, p, 0.0)
     with pytest.raises(ValueError, match="MlpGrid"):
         MlpGrid(5, 48, 48)
+
+
+def test_volsto_engine_on_atmf_kernels_is_the_notes_first_order() -> None:
+    """volsto's first-order engine with ``kernel_curve="atmf"`` reads the note's ATMF forward
+    variance: its ``A`` and ``λ·J`` equal the closed forms' first-order pieces on the anchor
+    to 5e-4 (volsto's quadrature raised to 512 × 256 nodes; its ATMF curve interpolates the
+    surface's ATMF variance on a weekly grid, which rounds the kinks at the pillars: 1.1e-4 at
+    3M measured)."""
+    f2 = importlib.import_module("volsto.calibration.fit_2f")
+
+    surf = load_ssvi_surface(SPX)
+    p = to_breakeven(SPX_FIT)
+    cfg = f2.BreakEvenFitConfig(skew_eps=0.10, n_quad=512, n_inner=256, kernel_curve="atmf")
+    targets = f2.marking_targets_for(surf, cfg, ssr_target=1.0)
+    curve = f2._engine_curve(targets, None, cfg)
+    prob, _ = f2._first_problem(targets, cfg, curve)
+    mm = prob.maps(p.k1)
+    lam = np.array([p.lambda1, p.lambda2])
+    for i, T in enumerate(prob.T):
+        s = mlp_setup(surf, p, float(T))
+        assert s.leading_sensi("X") / (0.5 * p.omega1) == pytest.approx(mm.naked.A[i, 0], rel=5e-4)
+        assert s.leading_sensi("Y") / (0.5 * p.omega2) == pytest.approx(mm.naked.A[i, 1], rel=5e-4)
+        cxi = float(np.sum(np.diff(s.s) * 0.5 * (s.c0[1:] + s.c0[:-1]) * s.xi_mid))
+        lam_j = cxi / (2.0 * (s.Q0T / T) ** 1.5 * T**2)
+        assert lam_j == pytest.approx(float(mm.naked.J[i] @ lam), rel=5e-4)

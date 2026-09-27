@@ -1165,6 +1165,18 @@ def test_step0_from_sabrw_fits(spx) -> None:  # type: ignore[no-untyped-def]
     np.testing.assert_allclose(t.correl_target, -0.75, rtol=0, atol=1e-6)
     assert any(f.startswith("step 0: SABRW fits of 6 expiries") for f in t.flags)
     assert float(t.atm_vol_fn(np.array([1.0]))[0]) == pytest.approx(atm(1.0))
+    # the band reads the source's skew, the leverage term the surface's (fixed 2026-09-27)
+    assert t.band_skew is not None
+    np.testing.assert_allclose(
+        t.band_skew, [ts.triplet(float(T))[1] for T in t.pillars], rtol=1e-12
+    )
+    np.testing.assert_allclose(t.skew_target, spx.atm_skew(t.pillars), rtol=1e-12)
+    np.testing.assert_allclose(t.market_skew(t.pillars), spx.atm_skew(t.pillars), rtol=1e-12)
+    rb = fit_2f_marking(spx, cfg, ssr_target=1.0, step0=ts)
+    cons = rb.constraints.set_index("T")["skew_market"]
+    for T, v in cons.items():
+        assert v == pytest.approx(float(t.band_skew[list(t.pillars).index(T)]), rel=1e-12)
+    assert marking_targets_for(spx, cfg).band_skew is None
     with pytest.raises(ValueError, match="skew_h"):
         marking_targets_for(spx, cfg, step0=ts, skew_h=0.05)
     from volsto.calibration.targets import sabr_reduce_triplet
@@ -1194,3 +1206,23 @@ def test_step0_from_sabrw_fits(spx) -> None:  # type: ignore[no-untyped-def]
     assert np.all((c > -0.9) & (c < -0.65))
     assert not any("clipped" in fl for fl in r.targets.flags)
     assert r.min_correlation_eigenvalue > CORRELATION_EIGEN_FLAG
+
+
+def test_kernel_curve_option(spx) -> None:  # type: ignore[no-untyped-def]
+    """``kernel_curve="atmf"`` (SPEC §15 Part 3, the desk note's engine): the naked kernels read
+    the ATMF forward variance instead of the variance-swap curve — the fit runs, says so in its
+    notes and moves; the default is unchanged and maps as before (no backtest hash moves); other
+    values raise."""
+    from volsto.config import to_mapping
+
+    base = BreakEvenFitConfig(skew_eps=0.10)
+    atmf = BreakEvenFitConfig(skew_eps=0.10, kernel_curve="atmf")
+    assert "kernel_curve" not in to_mapping(base)
+    assert to_mapping(atmf)["kernel_curve"] == "atmf"
+    with pytest.raises(ValueError, match="kernel_curve"):
+        BreakEvenFitConfig(kernel_curve="vs")
+    r0 = fit_2f_marking(spx, base, ssr_target=1.0)
+    r1 = fit_2f_marking(spx, atmf, ssr_target=1.0)
+    assert any("naked kernels A, J on the ATMF forward variance" in n for n in r1.first.notes)
+    assert not any("naked kernels" in n for n in r0.first.notes)
+    assert r1.params != r0.params
