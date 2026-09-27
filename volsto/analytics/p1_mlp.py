@@ -333,6 +333,95 @@ class _Setup:
         return float(sigma_0 * (market - naked))
 
 
+class MlpPillar:
+    """The note's break-evens of one maturity at fixed ``(k1, k2)`` as functions of ``λ`` alone —
+    the marking fit's step 1 with ``engine="mlp"`` (SPEC §15 Part 3).  SensiX and SensiY are
+    linear in ``ω1`` and ``ω2`` (every ``∂`` of eq. 57 carries ``ω_i``), so :meth:`evaluate`
+    returns ``(SensiSpot, G_X, G_Y)`` with ``SensiX = ω1 G_X``, ``SensiY = ω2 G_Y`` and
+    ``SpotVolCovar = SensiSpot + λ1 G_X + λ2 G_Y`` (log-vol units): the covariance depends on
+    ``(k1, k2, λ1, λ2)`` only, as the note says.  Everything that does not depend on ``λ`` — the
+    grids, ``Q̄``, ``γ``, the kernel integrals of ``c`` and of its derivatives, the market part of
+    SensiSpot — is computed once."""
+
+    def __init__(
+        self,
+        surface: Any,
+        T: float,
+        k1: float,
+        k2: float,
+        *,
+        sigma_0: float,
+        grid: MlpGrid | None = None,
+    ) -> None:
+        g_ = grid or MlpGrid()
+        base = BreakEvenParams(float(k1), float(k2), 1.0, 1.0, 0.0, 0.0, 0.0)
+        st = _Setup(surface, base, float(T), g_)
+        self.surface, self.T, self.k1, self.k2 = surface, float(T), float(k1), float(k2)
+        self.sigma_0 = float(sigma_0)
+        self.t, self.wt, self.idx, self.u, self.wu = st.t, st.wt, st.idx, st.u, st.wu
+        self.Q0t, self.Q0T, self.gam = st.Q0t, st.Q0T, st.gam0
+        gsq = np.sqrt(st.xi_mid)
+        s_ = st.s
+        self.E1 = _kernel_cum(s_, gsq, self.k1, 0.0)[st.idx]
+        self.E2 = _kernel_cum(s_, gsq, self.k2, 0.0)[st.idx]
+        self.der: dict[str, tuple[FloatArray, FloatArray, FloatArray, float, float]] = {}
+        for f, kf in (("X", self.k1), ("Y", self.k2)):
+            dq = _exp_cum(s_, st.xi_mid, kf)
+            self.der[f] = (
+                0.5 * _kernel_cum(s_, gsq, self.k1, kf)[st.idx],
+                0.5 * _kernel_cum(s_, gsq, self.k2, kf)[st.idx],
+                dq[st.idx],
+                float(dq[-1]),
+                kf,
+            )
+        xi_t = _dw_dt(surface, np.zeros_like(st.t), st.t)
+        sig_t = np.sqrt(st.Q0t / st.t)
+        sig_T = math.sqrt(st.Q0T / self.T)
+        S_t = _atm_skew(surface, st.t)
+        S_T = float(_atm_skew(surface, np.array([self.T]))[0])
+        self.market = S_T / sig_T + float(np.sum(st.wt * S_t * xi_t / sig_t)) / st.Q0T
+        self.N1 = float(np.sum(st.wt * self.E1 * xi_t / st.Q0t))
+        self.N2 = float(np.sum(st.wt * self.E2 * xi_t / st.Q0t))
+        self.atmf_vol = sig_T
+        self._setup = st
+
+    def evaluate(self, lam: FloatArray) -> tuple[float, float, float]:
+        """``(SensiSpot, G_X, G_Y)`` at ``λ = (λ1, λ2)`` (log-vol units, class docstring)."""
+        l1, l2 = float(lam[0]), float(lam[1])
+        c = l1 * self.E1 + l2 * self.E2
+        Qt, QT, gam = self.Q0t, self.Q0T, self.gam
+        eta = np.exp(0.5 * c - 0.5 * c * c / QT)
+        mu = (1.0 - Qt / QT) * c
+        tt = np.broadcast_to(self.t[:, None], (self.t.size, self.u.size))
+        k = mu[:, None] + gam[:, None] * self.u[None, :]
+        w = np.asarray(self.surface.total_variance(k, tt), dtype=np.float64)
+        dw = _dw_dt(self.surface, k, tt)
+        sw, sq = np.sqrt(w), np.sqrt(Qt)[:, None]
+        d_mkt = k / sw + 0.5 * sw
+        d_til = (k + 0.5 * Qt[:, None] - c[:, None]) / sq
+        sig2 = dw * (sq / sw) * np.exp(-0.5 * d_mkt**2 + 0.5 * d_til**2)
+        I0 = sig2 @ self.wu
+        I1 = sig2 @ (self.wu * self.u)
+        I2 = sig2 @ (self.wu * (self.u**2 - 1.0))
+        v00 = float(np.sum(self.wt * eta * I0)) / self.T
+        out = []
+        for f in ("X", "Y"):
+            a1, a2, dQt, dQT, kf = self.der[f]
+            dc = l1 * a1 + l2 * a2
+            deta = eta * (0.5 * dc - c * dc / QT + 0.5 * c * c * dQT / QT**2)
+            dmu = dc * (1.0 - Qt / QT) - c * (dQt / QT - Qt * dQT / QT**2)
+            dgam = (dQt - (2.0 * Qt * dQt / QT - Qt * Qt * dQT / QT**2)) / (2.0 * gam)
+            integrand = (
+                np.exp(-kf * self.t) * eta * I0
+                + deta * I0
+                + (eta / gam) * dmu * I1
+                + (eta / gam) * dgam * I2
+            )
+            out.append(float(np.sum(self.wt * integrand)) / self.T / (2.0 * v00))
+        spot = self.sigma_0 * (self.market - (l1 * self.N1 + l2 * self.N2) / (2.0 * QT))
+        return spot, out[0], out[1]
+
+
 def mlp_breakevens(
     surface: Any,
     p: BreakEvenParams,
@@ -377,6 +466,7 @@ __all__ = [
     "N_U_DEFAULT",
     "MlpBreakEvens",
     "MlpGrid",
+    "MlpPillar",
     "mlp_breakevens",
     "mlp_setup",
 ]

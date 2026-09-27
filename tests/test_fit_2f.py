@@ -1249,3 +1249,72 @@ def test_sigma0_maturity_option(spx) -> None:  # type: ignore[no-untyped-def]
     np.testing.assert_allclose(t3.atf_anchor / t3.sigma_0, 1.0, rtol=1e-12)
     r3 = fit_2f_marking(spx, three, ssr_target=1.0)
     assert r3.params != fit_2f_marking(spx, base, ssr_target=1.0).params
+
+
+def test_production_bounds_option(spx) -> None:  # type: ignore[no-untyped-def]
+    """The desk note's bounds (``PRODUCTION_BOUNDS``, its §3 table): no ``ν`` cap, the first
+    fit's box ``|λ_i| ≤ 0.99 omega_max`` and the second's ``|λ_i| ≤ ω_i ≤ omega_max = 500 %``,
+    ``k1 ≤ 100``.  The fit runs, respects them and says so; the default is unchanged (a ``ν`` cap
+    with ``omega_max > 2 nu_cap``)."""
+    from volsto.calibration.fit_2f import LAMBDA_BOX_FRACTION, PRODUCTION_BOUNDS
+
+    cfg = BreakEvenFitConfig(skew_eps=0.10, kernel_curve="atmf", **PRODUCTION_BOUNDS)
+    assert cfg.nu_cap is None and cfg.omega_max == 5.0 and cfg.k1_bounds == (0.3, 100.0)
+    r = fit_2f_marking(spx, cfg, ssr_target=1.0)
+    b = r.breakeven
+    box = LAMBDA_BOX_FRACTION * cfg.omega_max
+    assert abs(b.lambda1) <= box + 1e-9 and abs(b.lambda2) <= box + 1e-9
+    assert b.omega1 <= cfg.omega_max + 1e-9 and b.omega2 <= cfg.omega_max + 1e-9
+    assert "no nu cap (omega_i <= 5" in r.summary()
+    assert not any("nu at cap" in m for m in r.messages)
+    with pytest.raises(ValueError, match="omega_max must be positive"):
+        BreakEvenFitConfig(nu_cap=None, omega_max=0.0)
+    with pytest.raises(ValueError, match="omega_max must exceed 2 nu_cap"):
+        BreakEvenFitConfig(omega_max=5.0)
+    assert BreakEvenFitConfig().nu_cap == 3.5
+
+
+def test_volvar_target_direct_option(spx) -> None:  # type: ignore[no-untyped-def]
+    """``volvar_target="direct"`` (the desk note's step 2) fits VolVar to the targets' ``VoV_BE²``
+    itself; the default rebuilds it from the achieved covariance (``(SpotVolCovar_P1/Corr_BE)²``,
+    the M7 rule) and maps as before."""
+    from volsto.config import to_mapping
+
+    base = BreakEvenFitConfig(skew_eps=0.10)
+    direct = BreakEvenFitConfig(skew_eps=0.10, volvar_target="direct")
+    assert "volvar_target" not in to_mapping(base)
+    with pytest.raises(ValueError, match="volvar_target"):
+        BreakEvenFitConfig(volvar_target="rebuilt")
+    rd = fit_2f_marking(spx, direct, ssr_target=1.0)
+    rb = fit_2f_marking(spx, base, ssr_target=1.0)
+    idx = [list(rd.targets.pillars).index(T) for T in rd.second.table["T"]]
+    np.testing.assert_allclose(
+        rd.second.table["volvar_target"], np.asarray(rd.targets.vol_var)[idx], rtol=1e-12
+    )
+    rebuilt = (rb.first.table["svc_model"] / np.asarray(rb.targets.correl_target)[idx]) ** 2
+    np.testing.assert_allclose(rb.second.table["volvar_target"], rebuilt, rtol=1e-12)
+    assert any("volvar_target='direct'" in n for n in rd.second.notes)
+
+
+def test_mlp_engine_fit(spx) -> None:  # type: ignore[no-untyped-def]
+    """``engine="mlp"`` (SPEC §15 Part 3): step 1 minimises the desk note's closed-form
+    SpotVolCovar and step 2 fits VolVar on the note's sensitivities, so the fit's tables are the
+    note's break-evens at the fitted parameters (``volsto.analytics.p1_mlp.mlp_breakevens``); it
+    needs the ATMF kernels; the default maps as before."""
+    from volsto.analytics.p1_mlp import mlp_breakevens
+    from volsto.config import to_mapping
+
+    with pytest.raises(ValueError, match="kernel_curve='atmf'"):
+        BreakEvenFitConfig(engine="mlp")
+    with pytest.raises(ValueError, match="engine"):
+        BreakEvenFitConfig(engine="exact", kernel_curve="atmf")
+    assert "engine" not in to_mapping(BreakEvenFitConfig())
+    cfg = BreakEvenFitConfig(skew_eps=0.10, kernel_curve="atmf", engine="mlp")
+    r = fit_2f_marking(spx, cfg, ssr_target=1.0)
+    assert any("engine 'mlp'" in n for n in r.first.notes)
+    t1, t2 = r.first.table, r.second.table
+    for i, T in enumerate(t1["T"]):
+        be = mlp_breakevens(spx, r.breakeven, float(T), sigma_0=r.targets.sigma_0)
+        svc, vv = be.absolute()
+        assert float(t1["svc_model"][i]) == pytest.approx(svc, rel=1e-4)
+        assert float(t2["volvar_model"][i]) == pytest.approx(vv, rel=1e-4)

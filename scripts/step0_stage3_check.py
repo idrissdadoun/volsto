@@ -28,6 +28,7 @@ import pandas as pd
 from volsto.calibration.cache import LeverageCache, build_market
 from volsto.calibration.fit_2f import (
     DEFAULT_NU_CAP,
+    PRODUCTION_BOUNDS,
     BreakEvenFitConfig,
     Stage3Inputs,
     fit_2f_marking,
@@ -67,7 +68,24 @@ def main() -> None:
         "--variants",
         nargs="*",
         default=["today", "new"],
-        choices=["today", "surface_k2", "new"],
+        choices=["today", "surface_k2", "sabrw", "new"],
+    )
+    ap.add_argument(
+        "--production-bounds",
+        action="store_true",
+        help="the desk note's bounds (no nu cap, omega_i <= 5, k1 <= 100); variants named ..._pb",
+    )
+    ap.add_argument(
+        "--engines",
+        nargs="*",
+        default=["none"],
+        help="fit engines to run (none: first order; mlp: the note's closed forms, _mlp)",
+    )
+    ap.add_argument(
+        "--volvar-targets",
+        nargs="*",
+        default=["none"],
+        help="volvar_target values to run (none: the M7 rebuild; direct: the note's step 2)",
     )
     ap.add_argument(
         "--sigma0-maturity",
@@ -110,6 +128,7 @@ def main() -> None:
         base = {
             "today": ({"skew_eps": 0.10}, None),
             "surface_k2": ({"skew_eps": 0.10, "k2_bounds": K2_BOUNDS}, None),
+            "sabrw": ({"skew_eps": 0.10}, ts),
             "new": ({"skew_eps": 0.10, "k2_bounds": K2_BOUNDS}, ts),
         }
         kc = {} if a.kernel_curve is None else {"kernel_curve": a.kernel_curve}
@@ -117,14 +136,26 @@ def main() -> None:
         if a.sigma0_maturity is not None:
             kc["sigma0_maturity"] = a.sigma0_maturity
             sfx += f"_s{a.sigma0_maturity:g}"
+        if a.production_bounds:
+            kc.update(PRODUCTION_BOUNDS)
+            sfx += "_pb"
         variants = {
             (v if cap == DEFAULT_NU_CAP else f"{v}_cap{cap:g}")
-            + sfx: (
-                BreakEvenFitConfig(**base[v][0], **kc, nu_cap=cap),
+            + sfx
+            + ("" if en == "none" else f"_{en}")
+            + ("" if vt == "none" else "_vd"): (
+                BreakEvenFitConfig(
+                    **base[v][0],
+                    **{"nu_cap": cap, **kc},
+                    **({} if vt == "none" else {"volvar_target": vt}),
+                    **({} if en == "none" else {"engine": en}),
+                ),
                 base[v][1],
             )
             for v in a.variants
             for cap in a.nu_caps
+            for en in a.engines
+            for vt in a.volvar_targets
         }
         for name, (cfg, src) in variants.items():
             t0 = time.perf_counter()

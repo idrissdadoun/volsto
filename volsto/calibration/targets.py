@@ -428,7 +428,9 @@ class TargetSet:
     ``correl_target`` ``Corr_BE``; ``atf_anchor`` the 3M ATMF vol of the anchoring (NaN in
     historical mode); ``band_skew`` the pillar skews the skew band compares the naked skew with
     when they are not ``skew_target`` (a step-0 source's; ``None``: ``skew_target``), the leverage
-    term always reading ``skew_target`` and ``skew_fn``, the pricing surface's."""
+    term always reading ``skew_target`` and ``skew_fn``, the pricing surface's; ``surface`` the
+    surface a marking target set was read from (the note's closed forms need its smile; ``None``
+    in historical mode)."""
 
     mode: str
     pillars: FloatArray
@@ -460,6 +462,7 @@ class TargetSet:
     sabrw_power: float = float("nan")
     atf_ref: float = float("nan")
     band_skew: FloatArray | None = None
+    surface: Any = field(default=None, repr=False, compare=False)
 
     @property
     def term_structure_source(self) -> str:
@@ -767,6 +770,7 @@ def marking_targets(
         sabrw_power=float(sabrw_power) if step0 is None else 0.0,
         atf_ref=float(atf_ref),
         band_skew=band_skew,
+        surface=surface,
     )
 
 

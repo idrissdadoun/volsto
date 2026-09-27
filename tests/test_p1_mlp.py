@@ -171,3 +171,22 @@ def test_volsto_engine_on_atmf_kernels_is_the_notes_first_order() -> None:
         cxi = float(np.sum(np.diff(s.s) * 0.5 * (s.c0[1:] + s.c0[:-1]) * s.xi_mid))
         lam_j = cxi / (2.0 * (s.Q0T / T) ** 1.5 * T**2)
         assert lam_j == pytest.approx(float(mm.naked.J[i] @ lam), rel=5e-4)
+
+
+def test_mlp_pillar_is_the_engine() -> None:
+    """:class:`MlpPillar` (the fit's per-pillar evaluator, everything but ``λ`` precomputed)
+    returns the engine's SensiSpot and ``SensiX/ω1``, ``SensiY/ω2`` exactly on the same grid, and
+    to 1e-4 on the fit's lighter grid."""
+    from volsto.analytics.p1_mlp import MlpPillar
+    from volsto.calibration.fit_2f import MLP_FIT_GRID
+
+    surf = load_ssvi_surface(SPX)
+    p = to_breakeven(SPX_FIT)
+    lam = np.array([p.lambda1, p.lambda2])
+    for T in (0.25, 1.0, 3.0):
+        be = mlp_breakevens(surf, p, T, sigma_0=0.2)
+        for grid, tol in ((None, 1e-12), (MLP_FIT_GRID, 1e-4)):
+            spot, gx, gy = MlpPillar(surf, T, p.k1, p.k2, sigma_0=0.2, grid=grid).evaluate(lam)
+            assert spot == pytest.approx(be.sensi_spot, rel=tol)
+            assert p.omega1 * gx == pytest.approx(be.sensi_x, rel=tol)
+            assert p.omega2 * gy == pytest.approx(be.sensi_y, rel=tol)

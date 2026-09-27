@@ -148,6 +148,7 @@ from numpy.typing import NDArray
 from scipy.optimize import linprog, minimize, minimize_scalar
 
 from volsto.analytics.breakeven import Kernels, _gl
+from volsto.analytics.p1_mlp import MlpGrid, MlpPillar
 from volsto.analytics.reparam import BreakEvenParams
 from volsto.calibration.history import WINDOW_SSR, WINDOW_VOL, SurfaceHistory
 from volsto.calibration.targets import (
@@ -227,12 +228,24 @@ BINDING_MESSAGE = (
 )
 #: the QP infeasible at every k1 (module docstring)
 INFEASIBLE_MESSAGE = (
-    "infeasible: no (lambda1, lambda2) meets {what} inside |lambda1| + |lambda2| <= 2 nu_cap = "
-    "{box:g} at any k1 in [{k1_lo:g}, {k1_hi:g}]; returned the least-violation fit (skew bounds "
+    "infeasible: no (lambda1, lambda2) meets {what} inside {box} "
+    "at any k1 in [{k1_lo:g}, {k1_hi:g}]; returned the least-violation fit (skew bounds "
     "relaxed by {delta:.4f} x |Skew_SABR| at k1 = {k1:.4g}, box kept): naked skew {skews}; "
     "SpotVolCovar achieved vs target: {svc}"
 )
 _BOX_LABELS = ("nu box l1+l2", "nu box l1-l2", "nu box -l1+l2", "nu box -l1-l2")
+_FACTOR_BOX_LABELS = ("lambda1 upper", "lambda1 lower", "lambda2 upper", "lambda2 lower")
+#: the desk note's step-1 box ``|λ_i| ≤ 0.99 ω_max`` (its §3 parameter table), used without a ν cap
+LAMBDA_BOX_FRACTION = 0.99
+#: values of :attr:`BreakEvenFitConfig.engine` other than ``None`` (the first-order engine)
+FIT_ENGINES: tuple[str, ...] = ("mlp",)
+#: the quadrature of the note's closed forms inside the fit (SensiX / SensiY to ~1e-7, SensiSpot
+#: to ~1e-5 of the fine grid; ``volsto.analytics.p1_mlp``)
+MLP_FIT_GRID = MlpGrid(n_fine=400, n_gl=24, n_u=32)
+#: values of :attr:`BreakEvenFitConfig.volvar_target` other than ``None`` (the M7 rebuild)
+VOLVAR_TARGETS: tuple[str, ...] = ("direct",)
+#: the desk note's bounds (its §3 table): no ν cap, ``ω_i ≤ 500 %`` per factor, ``k1 ≤ 100``
+PRODUCTION_BOUNDS: dict[str, Any] = {"nu_cap": None, "omega_max": 5.0, "k1_bounds": (0.3, 100.0)}
 _TOL_T = 1e-9
 _TOL_ACTIVE = 1e-9
 _TOL_FEAS = 1e-9
@@ -269,7 +282,13 @@ class BreakEvenFitConfig:
     ``sigma0_maturity`` (the maturity of the ATMF vol taken as ``σ_0``: ``None`` 1M,
     :data:`~volsto.calibration.targets.SIGMA0_MATURITY`; the desk note takes 3M, its §6).
     Step 3: ``weights_volvar``, ``nu_cap`` (config cap of
-    both minimisations, 3.5, warning when bound), ``chi_bounds``, ``omega_max``.  Diagnostics:
+    both minimisations, 3.5, warning when bound; ``None``: no ``ν`` cap, the first fit's box then
+    ``|λ_i| ≤ 0.99 omega_max`` and the second's ``|λ_i| ≤ ω_i ≤ omega_max`` — the desk note's
+    bounds, :data:`PRODUCTION_BOUNDS`), ``chi_bounds``, ``omega_max``, ``volvar_target``
+    (``None``: rebuilt from the achieved covariance, the M7 rule; ``"direct"``: the targets'
+    ``VoV_BE²``, the note's step 2), ``engine`` (``None``: the first-order break-evens;
+    ``"mlp"``: the desk note's most-likely-path closed forms, :class:`MlpMaps`, with
+    ``kernel_curve="atmf"``).  Diagnostics:
     ``stage3_tolerance`` (the stage-3 assertion, 10%), ``rho12_flag`` (``|ρ12|`` above which the
     two-factor structure is flagged as collapsing, 0.9).  Quadrature orders
     ``n_quad`` / ``n_inner`` (pillar kernels) and ``n_ts`` / ``n_quad_ts`` / ``n_inner_ts`` (the
@@ -296,7 +315,9 @@ class BreakEvenFitConfig:
     term_structure: str = "atmf"
     kernel_curve: str | None = None
     sigma0_maturity: float | None = None
-    nu_cap: float = DEFAULT_NU_CAP
+    volvar_target: str | None = None
+    engine: str | None = None
+    nu_cap: float | None = DEFAULT_NU_CAP
     chi_bounds: tuple[float, float] = (-0.99, 0.99)
     omega_max: float = 20.0
     stage3_tolerance: float = DEFAULT_STAGE3_TOLERANCE
@@ -308,7 +329,7 @@ class BreakEvenFitConfig:
     n_inner_ts: int = 24
 
     OMIT_WHEN_NONE: ClassVar[frozenset[str]] = frozenset(
-        {"k2_bounds", "k2_grid", "kernel_curve", "sigma0_maturity"}
+        {"k2_bounds", "k2_grid", "kernel_curve", "sigma0_maturity", "volvar_target", "engine"}
     )
     """Options left out of the config's mapping while unset, so a config without them maps — and
     hashes (the backtest's config hash includes the resolved fit config) — exactly as before they
@@ -383,12 +404,23 @@ class BreakEvenFitConfig:
             raise ValueError(f"kernel_curve must be None or one of {KERNEL_CURVES}")
         if self.sigma0_maturity is not None and not self.sigma0_maturity > 0.0:
             raise ValueError("sigma0_maturity must be positive (or None: the 1M ATMF vol)")
-        if self.nu_cap <= 0:
-            raise ValueError("nu_cap must be positive")
+        if self.volvar_target is not None and self.volvar_target not in VOLVAR_TARGETS:
+            raise ValueError(f"volvar_target must be None or one of {VOLVAR_TARGETS}")
+        if self.engine is not None and self.engine not in FIT_ENGINES:
+            raise ValueError(f"engine must be None or one of {FIT_ENGINES}")
+        if self.engine == "mlp" and self.kernel_curve != "atmf":
+            raise ValueError(
+                "engine='mlp' (the desk note's closed forms) reads the ATMF forward variance: set "
+                "kernel_curve='atmf'"
+            )
+        if self.nu_cap is not None and self.nu_cap <= 0:
+            raise ValueError("nu_cap must be positive (or None: no nu cap, the desk note's bounds)")
         clo, chi_ = self.chi_bounds
         if not -1.0 <= clo < chi_ <= 1.0:
             raise ValueError("chi_bounds must be increasing inside [-1, 1]")
-        if self.omega_max <= 2.0 * self.nu_cap:
+        if not self.omega_max > 0.0:
+            raise ValueError("omega_max must be positive")
+        if self.nu_cap is not None and self.omega_max <= 2.0 * self.nu_cap:
             raise ValueError(
                 "omega_max must exceed 2 nu_cap (the first fit allows |lambda_i| <= 2 nu_cap)"
             )
@@ -700,6 +732,48 @@ class P1Maps:
         return np.asarray(self.svc(lam) / (self.sigma_0 * self.skew_market), dtype=np.float64)
 
 
+@dataclass(frozen=True)
+class MlpMaps(P1Maps):
+    """The step-2 maps of ``engine="mlp"`` (SPEC §15 Part 3): SpotVolCovar, its spot and naked
+    parts and the first-order SSR from the desk note's closed forms at any ``λ``
+    (:class:`volsto.analytics.p1_mlp.MlpPillar`: ``SpotVolCovar = atf (SensiSpot + λ1 G_X + λ2
+    G_Y)``); the naked skew stays ``λ·J`` (the note's §8); ``naked.A`` is ``2 G`` at ``lam_star``,
+    the solution, so step 3's ``SensiX_i = ½ ω_i A_i atf`` is the note's ``ω_i G_i atf``."""
+
+    pillars: tuple[Any, ...] = ()
+    atf_mlp: FloatArray = field(default_factory=lambda: np.zeros(0))
+    lam_star: FloatArray = field(default_factory=lambda: np.zeros(2))
+
+    def values(self, lam: FloatArray) -> tuple[FloatArray, FloatArray]:
+        """``(SensiSpot, G)`` per pillar at ``λ``: absolute SensiSpot and ``G`` of shape (n, 2)."""
+        v = np.array([p.evaluate(lam) for p in self.pillars], dtype=np.float64)
+        return np.asarray(v[:, 0] * self.atf_mlp, dtype=np.float64), v[:, 1:]
+
+    def svc(self, lam: FloatArray) -> FloatArray:
+        spot, G = self.values(lam)
+        return np.asarray(spot + self.atf_mlp * (G @ lam), dtype=np.float64)
+
+    def svc_naked(self, lam: FloatArray) -> FloatArray:
+        _, G = self.values(lam)
+        return np.asarray(self.atf_mlp * (G @ lam), dtype=np.float64)
+
+    def sensi_spot(self, lam: FloatArray) -> FloatArray:
+        return self.values(lam)[0]
+
+
+def _mlp_maps(fo: P1Maps, pillars: tuple[Any, ...], lam: FloatArray) -> MlpMaps:
+    atf = np.asarray(fo.naked.atf, dtype=np.float64)
+    G = np.array([p.evaluate(lam)[1:] for p in pillars], dtype=np.float64)
+    A_eff = 2.0 * G
+    nk = fo.naked
+    naked = AffineMaps(
+        nk.k1, nk.k2, nk.T, atf, 0.5 * atf[:, None] * A_eff, nk.j, A_eff, nk.J, nk.sigma_hat
+    )
+    return MlpMaps(
+        naked, fo.I, fo.skew_market, fo.I_market, fo.sigma_0, pillars, atf, np.asarray(lam)
+    )
+
+
 # --------------------------------------------------------------------------------------------
 # the inner problem: exact 2-D QP
 # --------------------------------------------------------------------------------------------
@@ -882,10 +956,14 @@ class _FirstProblem:
     skew_mode: str
     skew_weight: float
     constraints: tuple[SkewConstraint, ...]
-    nu_cap: float
+    nu_cap: float | None
     k2: float
     skew_band: FloatArray | None = None
+    omega_max: float = 20.0
+    engine: str | None = None
+    surface: Any = field(default=None, compare=False, repr=False)
     cache: dict[float, P1Maps] = field(default_factory=dict, compare=False, repr=False)
+    mlp_cache: dict[float, tuple[Any, ...]] = field(default_factory=dict, compare=False, repr=False)
 
     @property
     def band(self) -> FloatArray:
@@ -932,11 +1010,18 @@ class _FirstProblem:
 
     def constraint_rows(self, mm: P1Maps) -> tuple[FloatArray, FloatArray, FloatArray, list[str]]:
         """``(G, h, scale, labels)``: the ν box and, in two-point mode, the two slabs."""
-        rows = [np.array([1.0, 1.0]), np.array([1.0, -1.0]), np.array([-1.0, 1.0])]
-        rows.append(np.array([-1.0, -1.0]))
-        h = [2.0 * self.nu_cap] * 4
-        scale = [2.0 * self.nu_cap] * 4
-        labels = list(_BOX_LABELS)
+        if self.nu_cap is not None:
+            rows = [np.array([1.0, 1.0]), np.array([1.0, -1.0]), np.array([-1.0, 1.0])]
+            rows.append(np.array([-1.0, -1.0]))
+            box = 2.0 * self.nu_cap
+            labels = list(_BOX_LABELS)
+        else:
+            rows = [np.array([1.0, 0.0]), np.array([-1.0, 0.0])]
+            rows += [np.array([0.0, 1.0]), np.array([0.0, -1.0])]
+            box = LAMBDA_BOX_FRACTION * self.omega_max
+            labels = list(_FACTOR_BOX_LABELS)
+        h = [box] * 4
+        scale = [box] * 4
         if self.skew_mode == "twopoint":
             for c in self.constraints:
                 j = mm.naked.j[c.index]
@@ -958,12 +1043,15 @@ class _FirstProblem:
         G, h, scale, labels = self.constraint_rows(mm)
         lam, active, feas = _qp2(H, g, G, h)
         violation = 0.0
+        relax = np.array([not lab.startswith(("nu box", "lambda")) for lab in labels])
         if not feas:
-            relax = np.array([not lab.startswith("nu box") for lab in labels])
             violation = _min_violation(G / scale[:, None], h / scale, relax)
             lam, active, feas2 = _qp2(H, g, G, h + (violation + _TOL_FEAS) * scale * relax)
             if not feas2:  # numerical: take the LP point
                 lam = np.zeros(2)
+        if self.engine == "mlp":
+            h_used = h if violation <= 0.0 else h + (violation + _TOL_FEAS) * scale * relax
+            return _solve_mlp(self, float(k1), mm, lam, G, h_used, scale, labels, violation)
         r = R @ lam - y
         o_skew = float(r[n:] @ r[n:]) if r.size > n else 0.0
         cov = (
@@ -982,6 +1070,79 @@ class _FirstProblem:
             np.asarray(cov, dtype=np.float64),
             mm,
         )
+
+
+def _mlp_pillars(prob: _FirstProblem, k1: float) -> tuple[Any, ...]:
+    key = float(k1)
+    pl = prob.mlp_cache.get(key)
+    if pl is None:
+        pl = tuple(
+            MlpPillar(prob.surface, float(T), key, prob.k2, sigma_0=prob.sigma_0, grid=MLP_FIT_GRID)
+            for T in prob.T
+        )
+        if len(prob.mlp_cache) > 512:
+            prob.mlp_cache.clear()
+        prob.mlp_cache[key] = pl
+    return pl
+
+
+def _solve_mlp(
+    prob: _FirstProblem,
+    k1: float,
+    fo: P1Maps,
+    lam0: FloatArray,
+    G: FloatArray,
+    h: FloatArray,
+    scale: FloatArray,
+    labels: list[str],
+    violation: float,
+) -> InnerSolution:
+    """Step 2's inner problem on the desk note's closed forms: SLSQP from the first-order QP
+    solution ``lam0`` under the same linear constraints ``G λ ≤ h`` (the band and the box)."""
+    pillars = _mlp_pillars(prob, k1)
+    atf = np.asarray(fo.naked.atf, dtype=np.float64)
+    sw = np.sqrt(prob.wc)
+    soft = prob.skew_mode == "soft"
+    s_w = math.sqrt(prob.skew_weight)
+
+    def resid(lam: FloatArray) -> FloatArray:
+        v = np.array([p.evaluate(lam) for p in pillars], dtype=np.float64)
+        svc = atf * (v[:, 0] + v[:, 1:] @ lam)
+        r = sw * (svc - prob.svc_target)
+        if soft:
+            r = np.concatenate((r, s_w * (fo.naked.j @ lam / prob.band - 1.0)))
+        return np.asarray(r, dtype=np.float64)
+
+    def obj(lam: FloatArray) -> float:
+        r = resid(lam)
+        return float(r @ r)
+
+    cons: list[Any] = [{"type": "ineq", "fun": lambda x: h - G @ x, "jac": lambda x: -G}]
+    res = minimize(
+        obj,
+        np.asarray(lam0, dtype=np.float64),
+        method="SLSQP",
+        constraints=cons,
+        options={"ftol": 1e-14, "maxiter": 200},
+    )
+    lam = np.asarray(res.x, dtype=np.float64)
+    if not np.all(G @ lam <= h + 1e-9 * (1.0 + np.abs(h))) or obj(lam) > obj(lam0):
+        lam = np.asarray(lam0, dtype=np.float64)
+    r = resid(lam)
+    n = prob.T.size
+    o_skew = float(r[n:] @ r[n:]) if r.size > n else 0.0
+    act = np.flatnonzero(np.abs(G @ lam - h) <= 1e-7 * scale)
+    return InnerSolution(
+        float(k1),
+        lam,
+        float(r @ r),
+        o_skew,
+        tuple(labels[i] for i in act),
+        violation <= 0.0,
+        violation,
+        np.full((2, 2), np.nan),
+        _mlp_maps(fo, pillars, lam),
+    )
 
 
 def _sandwich(J: FloatArray, sigma: FloatArray) -> FloatArray:
@@ -1086,10 +1247,24 @@ def _first_problem(
         cfg.skew_mode,
         float(cfg.skew_weight),
         constraints,
-        float(cfg.nu_cap),
+        None if cfg.nu_cap is None else float(cfg.nu_cap),
         float(cfg.k2),
         band,
+        float(cfg.omega_max),
+        cfg.engine,
+        targets.surface,
     )
+    if cfg.engine == "mlp":
+        if targets.surface is None:
+            raise ValueError(
+                "engine='mlp' needs marking targets read from a surface (the note's closed forms "
+                "read its smile)"
+            )
+        notes.append(
+            "engine 'mlp': step 2 minimises the desk note's closed-form SpotVolCovar (most-likely "
+            "path: SensiX, SensiY eq. 57 / appendix D, SensiSpot eq. 43) from the first-order QP "
+            "solution at each k1, under the same band and box"
+        )
     return prob, notes
 
 
@@ -1361,7 +1536,7 @@ def _optimise_k2(
 
     def run(k2: float) -> Run:
         c = _k2_config(cfg, k2)
-        p = replace(prob, k2=float(k2), cache={})
+        p = replace(prob, k2=float(k2), cache={}, mlp_cache={})
         best, sols = _optimise_k1(p, c)
         return c, p, best, sols
 
@@ -1519,6 +1694,12 @@ def fit_second(
             "historical mode: the empirical VolVar target is kept (the correlation-preserving "
             "rebuild applies to the SABR correlation of marking mode)"
         )
+    elif cfg.volvar_target == "direct":
+        vv_t = vv_req
+        notes.append(
+            "VolVar target: the targets' VoV_BE^2 itself (volvar_target='direct', the desk note's "
+            "step 2); the M7 rule rebuilds it from the achieved covariance"
+        )
     elif np.all(np.isfinite(corr) & (np.abs(corr) > 1e-12)):
         vv_t = np.asarray((svc / corr) ** 2, dtype=np.float64)
     else:
@@ -1547,8 +1728,12 @@ def fit_second(
         r = vv - vv_t
         return float(np.sum(w * r * r))
 
+    cap = cfg.nu_cap
+
     def slack(x: FloatArray) -> float:
-        return cfg.nu_cap - volvar_p1(x, lam, A, atf, spot)[1]
+        return (np.inf if cap is None else cap) - volvar_p1(x, lam, A, atf, spot)[1]
+
+    cons: list[Any] = [] if cap is None else [{"type": "ineq", "fun": slack}]
 
     base = np.maximum(np.abs(lam), 0.05)
     starts = [np.array([lower[0] * (1 + 1e-6), lower[1] * (1 + 1e-6), 0.0])]
@@ -1564,7 +1749,7 @@ def fit_second(
             x0,
             method="SLSQP",
             bounds=bounds,
-            constraints=[{"type": "ineq", "fun": slack}],
+            constraints=cons,
             options={"ftol": 1e-15, "maxiter": 1000},
         )
         x = np.clip(np.asarray(res.x, dtype=np.float64), lower, upper)
@@ -1615,9 +1800,12 @@ def fit_second(
         flags.append("chi at lower bound")
     if x[2] >= upper[2] - 1e-6:
         flags.append("chi at upper bound")
-    at_cap = bool(nu >= cfg.nu_cap * (1.0 - 1e-5))
+    at_cap = cfg.nu_cap is not None and bool(nu >= cfg.nu_cap * (1.0 - 1e-5))
     if at_cap:
         flags.append(f"nu at cap {cfg.nu_cap:g}")
+    for i, nm in enumerate(names[:2]):
+        if x[i] >= upper[i] * (1 - 1e-5):
+            flags.append(f"{nm} at omega_max {cfg.omega_max:g}")
     table = pd.DataFrame(
         {
             "T": first.maps.T,
@@ -1692,7 +1880,12 @@ def fit_messages(
         msgs.append(
             INFEASIBLE_MESSAGE.format(
                 what=what,
-                box=2.0 * cfg.nu_cap,
+                box=(
+                    f"|lambda1| + |lambda2| <= 2 nu_cap = {2.0 * cfg.nu_cap:g}"
+                    if cfg.nu_cap is not None
+                    else f"|lambda_i| <= {LAMBDA_BOX_FRACTION:g} omega_max = "
+                    f"{LAMBDA_BOX_FRACTION * cfg.omega_max:g}"
+                ),
                 k1_lo=cfg.k1_bounds[0],
                 k1_hi=cfg.k1_bounds[1],
                 delta=first.violation,
@@ -1724,7 +1917,18 @@ def fit_messages(
                     )
                 )
                 status = "binding"
-    if first.box_binding or second.nu_at_cap:
+    hits = [f for f in second.bound_flags if "at omega_max" in f]
+    if cfg.nu_cap is None and (first.box_binding or hits):
+        where = ", ".join(
+            (["step 2 box |lambda_i| <= 0.99 omega_max"] if first.box_binding else []) + hits
+        )
+        msgs.append(
+            f"per-factor bound binds ({where}; the desk note's bounds, omega_max "
+            f"{cfg.omega_max:g}): first-order break-evens biased at large vol of vol"
+        )
+        if status == "interior":
+            status = "binding"
+    elif first.box_binding or second.nu_at_cap:
         warn = NU_CAP_WARNING.format(cap=cfg.nu_cap)
         where = "step 2 box |lambda1|+|lambda2| <= 2 nu_cap" if first.box_binding else "step 3"
         log.warning("%s (%s)", warn, where)
@@ -2285,11 +2489,17 @@ class FitResult:
     def summary(self) -> str:
         p, b, f, s, cfg = self.params, self.breakeven, self.first, self.second, self.config
         when = "" if self.pricing_date is None else f" @ {self.pricing_date.date()}"
+        cap_text = (
+            f"nu_cap {cfg.nu_cap:g}"
+            if cfg.nu_cap is not None
+            else f"no nu cap (omega_i <= {cfg.omega_max:g}, |lambda_i| <= "
+            f"{LAMBDA_BOX_FRACTION:g} omega_max)"
+        )
         lines = [
             f"fit_2f [{self.targets.mode}]{when}: status {self.status.upper()}; ssr_target "
             f"{np.round(self.targets.ssr_target, 3).tolist()}, skew_mode {cfg.skew_mode}, "
             f"skew_eps {tuple(float(e) for e in cfg.skew_eps)} at {cfg.skew_pillars}, "  # type: ignore[union-attr]
-            f"nu_cap {cfg.nu_cap:g}",
+            f"{cap_text}",
         ]
         lines += [f"MESSAGE: {m}" for m in self.messages]
         lines += [
@@ -2793,16 +3003,21 @@ __all__ = [
     "DEFAULT_SKEW_PILLARS",
     "DEFAULT_SKEW_WEIGHT",
     "DEFAULT_STAGE3_TOLERANCE",
+    "FIT_ENGINES",
     "INFEASIBLE_MESSAGE",
     "K2_GRID_DEFAULT",
+    "LAMBDA_BOX_FRACTION",
     "MAX_FINITE_SE",
+    "MLP_FIT_GRID",
     "NO_FIRST_ORDER_NOTE",
     "NU_CAP_WARNING",
+    "PRODUCTION_BOUNDS",
     "RHO12_COLLAPSE",
     "RISK_REGIME",
     "SKEW_MODES",
     "SKEW_MODE_CHOICES",
     "TERM_STRUCTURE_KINDS",
+    "VOLVAR_TARGETS",
     "WEIGHT_KINDS",
     "AffineMaps",
     "BreakEvenFitConfig",
@@ -2811,6 +3026,7 @@ __all__ = [
     "FitResult",
     "FitSpec",
     "InnerSolution",
+    "MlpMaps",
     "P1Maps",
     "PillarQuad",
     "SecondFit",
