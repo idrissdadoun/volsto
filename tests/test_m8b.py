@@ -897,6 +897,45 @@ def test_study_b_pure_lv_cliquet_end_to_end(tmp_path: Path) -> None:
     assert len(load_results(tmp_path, "B")) == 1
 
 
+def test_static_prediction_cache_is_keyed_on_the_marking_fit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cached study-C static prediction is reused only for the marking fit it was computed from
+    (the fitted model and the fit config): a file of another fit — or one written before the fit
+    was recorded — is recomputed (the stubbed rotation is called), never reused."""
+    from volsto.config import to_mapping
+    from volsto.studies import m8b
+
+    cfg = _cfg(tmp_path)
+    env = StudyEnvironment(cfg)
+    path = m8b.static_prediction_path(cfg.out, "autocall 3y", "sabr_linked")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    marking = json.loads(
+        json.dumps(
+            {
+                "model": to_mapping(env.fit_spec.spec.model),
+                "config": to_mapping(env.fit_spec.config),
+            }
+        )
+    )
+    base = {"n_paths": cfg.rotation_paths, "n_particles": cfg.rotation_particles}
+
+    class RotationCalledError(Exception):
+        pass
+
+    def stub(*args: object, **kwargs: object) -> object:
+        raise RotationCalledError
+
+    monkeypatch.setattr(m8b, "rotation_shadow_sensitivity", stub)
+    path.write_text(json.dumps({**base, "marking": marking}))
+    assert static_prediction("autocall 3y", "sabr_linked", env)["from_cache"]
+    other = {**marking, "model": {**marking["model"], "nu": marking["model"]["nu"] + 0.1}}
+    for stale in (base, {**base, "marking": other}):
+        path.write_text(json.dumps(stale))
+        with pytest.raises(RotationCalledError):
+            static_prediction("autocall 3y", "sabr_linked", env)
+
+
 @pytest.mark.slow
 def test_study_c_first_order_agreement_at_one_rota(tmp_path: Path) -> None:
     """Study C, 3y autocall, +1 rota, ``sabr_linked``, 4·10³ paths: the recalibration P&L (desk

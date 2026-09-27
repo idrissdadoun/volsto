@@ -195,6 +195,7 @@ from volsto.viewers.grid import (
     enumerate_points,
     grid_mapping,
     load_grid,
+    marking_digest,
     parse_shard,
     resolve_marking,
     shard,
@@ -893,8 +894,10 @@ def compute_point(
     row["n_particles"] = grid.particle.n_particles
     row["horizon"] = grid.particle.horizon
     if point.mode == "marking":
-        # the id names the surface, not its content: --resume compares this digest
+        # the id names the surface, not its content: --resume compares these digests
         manifest["surface_digest"] = surface_digest(point.spec)
+        manifest["marking_fit"] = point.fit
+        manifest["marking_digest"] = marking_digest(point)
     if point.marking is not None:
         m = point.marking
         row["fit_status"] = m.status
@@ -1179,7 +1182,9 @@ def pending_steps(
     done once stored (no model).  A stored marking point whose manifest's ``surface_digest``
     (:func:`~volsto.viewers.grid.surface_digest`; absent before M10 Part 3) differs from the
     grid surface's is stale — its id names the surface, not its content — and is recomputed
-    (``("all",)``, logged)."""
+    (``("all",)``, logged); so is one whose ``marking_digest``
+    (:func:`~volsto.viewers.grid.marking_digest`: the surface, the resolved fit config, the
+    snapshot's SABRW fits; absent before the named fits of 2026-09-27) differs."""
     if not store.has_point(point.id):
         return ("all",)
     if point.mode == "marking":
@@ -1192,6 +1197,18 @@ def pending_steps(
                 point.label,
                 str(stored_digest)[:12] if stored_digest else "(none recorded)",
                 current[:12],
+            )
+            return ("all",)
+        stored_fit = _stored_manifest(store, point.id).get("marking_digest")
+        current_fit = marking_digest(point)
+        if stored_fit != current_fit:
+            log.info(
+                "resume: %s is stale — its stored marking digest %s differs from the grid "
+                "point's %s (fit %s); recomputing",
+                point.label,
+                str(stored_fit)[:12] if stored_fit else "(none recorded)",
+                current_fit[:12],
+                point.fit,
             )
             return ("all",)
     row = _stored_row(store, point.id)

@@ -11,7 +11,10 @@ variants, then :func:`~volsto.calibration.fit_2f.stage3_validation` at the fitte
 the protocol of the M7 Part 3 report (break-even pillars 3M and 1Y, the engine bias
 ``simulated / first-order − 1`` against the 10 % tolerance, the target gaps reported).  Outputs
 in ``--out`` (git-ignored): ``check.csv`` (date × variant × pillar × quantity), ``fits.csv``
-(date × variant) and ``summary.md``.
+(date × variant) and ``summary.md``.  The variants ``desk`` / ``desk_cap`` / ``desk_pb`` are the
+named fit :data:`~volsto.calibration.fit_2f.DESK_FIT` as it stands / under the ν cap 3.5 / under
+the desk note's bounds, step 0 from the snapshot's stored SABRW fits (the option flags do not
+apply to them).
 """
 
 from __future__ import annotations
@@ -32,11 +35,12 @@ from volsto.calibration.fit_2f import (
     BreakEvenFitConfig,
     Stage3Inputs,
     fit_2f_marking,
+    fit_preset,
     stage3_validation,
 )
 from volsto.config import CalibrationSpec, SimConfig, load_yaml
 from volsto.market import import_hdn as ih
-from volsto.market.loaders import snapshot_spec
+from volsto.market.loaders import load_step0_source, snapshot_spec
 from volsto.market.sabrw import SabrwTermStructure
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -68,7 +72,10 @@ def main() -> None:
         "--variants",
         nargs="*",
         default=["today", "new"],
-        choices=["today", "surface_k2", "sabrw", "new"],
+        choices=["today", "surface_k2", "sabrw", "new", "desk", "desk_cap", "desk_pb"],
+        help="desk: the named fit DESK_FIT as it stands (step 0 from the snapshot's stored "
+        "SABRW fits; the option flags below do not apply to it); desk_cap / desk_pb: DESK_FIT "
+        "under the nu cap 3.5 (omega_max 20, k1 <= 20) / the desk note's bounds",
     )
     ap.add_argument(
         "--production-bounds",
@@ -121,10 +128,12 @@ def main() -> None:
             spec, particle=dataclasses.replace(spec.particle, n_particles=int(a.n_particles))
         )
         _, surf, _ = build_market(spec)
-        _cfg, _fit, points, _chain = ih.import_day(a.root, date)
-        ts = SabrwTermStructure.from_fits(
-            ih.sabrw_fits(points, t_min=0.05, t_max=3.1), _atm_of(surf)
-        )
+        ts = None
+        if {"sabrw", "new"} & set(a.variants):
+            _cfg, _fit, points, _chain = ih.import_day(a.root, date)
+            ts = SabrwTermStructure.from_fits(
+                ih.sabrw_fits(points, t_min=0.05, t_max=3.1), _atm_of(surf)
+            )
         base = {
             "today": ({"skew_eps": 0.10}, None),
             "surface_k2": ({"skew_eps": 0.10, "k2_bounds": K2_BOUNDS}, None),
@@ -153,10 +162,21 @@ def main() -> None:
                 base[v][1],
             )
             for v in a.variants
+            if not v.startswith("desk")
             for cap in a.nu_caps
             for en in a.engines
             for vt in a.volvar_targets
         }
+        desk_bounds = {
+            "desk": {},
+            "desk_cap": {"nu_cap": DEFAULT_NU_CAP, "omega_max": 20.0, "k1_bounds": (0.3, 20.0)},
+            "desk_pb": dict(PRODUCTION_BOUNDS),
+        }
+        for v in (v for v in a.variants if v.startswith("desk")):
+            variants[v] = (
+                fit_preset("desk", skew_eps=0.10, **desk_bounds[v]),
+                load_step0_source(SNAPSHOTS / f"spx_{date}.yaml", surf),
+            )
         for name, (cfg, src) in variants.items():
             t0 = time.perf_counter()
             r = fit_2f_marking(surf, cfg, ssr_target=1.0, step0=src)
@@ -231,8 +251,9 @@ def main() -> None:
     lines = [
         "# Stage-3 check of the marking default (SPEC §15 Part 3)",
         "",
-        f"{len(a.dates)} dates x 2 variants; wall {wall:.0f} s; recalibrated: "
-        f"{int(f['recalibrated'].sum())} of {len(f)} fits (the others from the cache).",
+        f"{len(a.dates)} dates x {f['variant'].nunique()} variants; wall {wall:.0f} s; "
+        f"recalibrated: {int(f['recalibrated'].sum())} of {len(f)} fits (the others from the "
+        "cache).",
         "",
         "| date | variant | nu | k2 | verdict | quantity | T | simulated +/- se | first order | "
         "engine bias | target | simulated vs target |",

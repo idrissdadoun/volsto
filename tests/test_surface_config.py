@@ -585,13 +585,15 @@ def test_resume_recomputes_a_marking_point_whose_surface_changed(
     """A marking point's id names its surface, not the surface's content: the precompute records
     :func:`~volsto.viewers.grid.surface_digest` in the point's manifest and ``--resume``
     (:func:`~volsto.viewers.precompute.pending_steps`) recomputes a stored point whose digest
-    differs from the grid surface's (or was never recorded), with a log line; the id format is
-    unchanged.  No fit and no calibration: the fit is stubbed infeasible."""
+    differs from the grid surface's (or was never recorded), with a log line; so does one whose
+    ``marking_digest`` (:func:`~volsto.viewers.grid.marking_digest`: the named fit's resolved
+    config and the snapshot's SABRW fits) differs or is absent.  The id format is unchanged.  No
+    fit and no calibration: the fit is stubbed infeasible."""
     import logging
 
     from volsto.calibration.cache import LeverageCache
     from volsto.viewers import precompute
-    from volsto.viewers.grid import surface_digest
+    from volsto.viewers.grid import marking_digest, surface_digest
     from volsto.viewers.store import PointResult, ResultsStore
 
     grid = load_grid(GRIDS / "default.yaml")
@@ -629,6 +631,23 @@ def test_resume_recomputes_a_marking_point_whose_surface_changed(
         with caplog.at_level(logging.INFO, logger="volsto.viewers.precompute"):
             assert precompute.pending_steps(point, store, cache, "none") == ("all",)
         assert any("stale" in r.getMessage() for r in caplog.records)
+    # the fit it read (SPEC §15 Part 3): the resolved config and the snapshot's SABRW fits — a
+    # stored point with another marking digest, or none, is stale too
+    assert res.manifest["marking_fit"] == "desk"
+    assert res.manifest["marking_digest"] == marking_digest(point)
+    other = dataclasses.replace(point, fit="m7")
+    assert marking_digest(other) != marking_digest(point)
+    for stored_fit in (marking_digest(other), None):
+        manifest = dict(res.manifest)
+        if stored_fit is None:
+            manifest.pop("marking_digest")
+        else:
+            manifest["marking_digest"] = stored_fit
+        store.write_point(PointResult(res.point_id, res.row, res.tables, manifest))
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="volsto.viewers.precompute"):
+            assert precompute.pending_steps(point, store, cache, "none") == ("all",)
+        assert any("marking digest" in r.getMessage() for r in caplog.records)
     # the other modes ignore the digest (their ids carry the content)
     lv_point = next(
         p for p in enumerate_points(grid) if p.surface == "spx_2022-12-02" and p.mode == "lv"

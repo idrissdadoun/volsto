@@ -144,12 +144,13 @@ import pandas as pd
 from numpy.typing import NDArray
 
 from volsto.calibration.cache import CacheMissError, LeverageCache
-from volsto.calibration.fit_2f import BreakEvenFitConfig, load_fit_spec
+from volsto.calibration.fit_2f import load_fit_spec
 from volsto.config import (
     CalibrationSpec,
     SimConfig,
     SurfacePerturbation,
     load_yaml,
+    to_mapping,
 )
 from volsto.engine.grid import TimeGrid
 from volsto.engine.mc import MonteCarlo
@@ -1478,15 +1479,20 @@ def study_c_rule(policy: str, env: StudyEnvironment) -> RecalibrationRule:
     :data:`STUDY_C_SKEW_MOVE_THRESHOLD` and caps the refit's correlation target at the hedger's
     :data:`~volsto.hedging.hedger.REFIT_CORRELATION_CAP` (with the guarded fallback,
     :func:`~volsto.hedging.hedger.refit_targets`)."""
+    base = env.fit_spec.config
     rcfg = dataclasses.replace(
-        env.fit_spec.config,
+        base,
         pillars=STUDY_C_RULE_PILLARS,
         mat_min=0.0,
         skew_pillars=STUDY_C_RULE_SKEW_PILLARS,
+        # the state surfaces are quadratic smiles without wings: the first-order engine
+        engine=None,
     )
     return RecalibrationRule(
         pillars=STUDY_C_RULE_PILLARS,
         fit_config=rcfg,
+        step0=env.fit_spec.step0_source(env.surface),
+        step0_surface=env.surface if base.step0 is not None else None,
         policy=policy,
         ssr_target=env.fit_spec.ssr_target,
         skew_move_threshold=STUDY_C_SKEW_MOVE_THRESHOLD,
@@ -1522,9 +1528,10 @@ def make_hedger(task: Task, env: StudyEnvironment) -> tuple[Hedger, Product, dic
                 "curvature_h": rule.curvature_stencil,
                 "strip_strikes": "forward moneyness F(t+tau)/F(t) e^k",
                 "correlation_cap": rule.correlation_cap,
-                "static_greek_config": "fit_2f_marking on the full snapshot surface, "
-                "BreakEvenFitConfig(skew_eps=fit spec's) with its skew pillars relocated to "
-                "the snapshot's last pillar (1Y / 3Y on SPX)",
+                "static_greek_config": "fit_2f_marking on the full snapshot surface with the "
+                "marking fit spec's config (and its snapshot's SABRW fits when its step 0 "
+                "reads them), the skew pillars relocated to the snapshot's last pillar (1Y / 3Y "
+                "on SPX)",
             }
             cls = RecordingHedger
     elif task.study == "B":
@@ -1939,24 +1946,33 @@ def static_prediction(
     """``d(fee)/d(rota)`` of a product under ``policy`` in the desk convention
     (:func:`~volsto.risk.shadow_rotation.rotation_shadow_sensitivity` on the M7 base spec at the
     config's rotation particles / paths), scaled to the product's unit; cached as JSON under
-    ``<out>/C`` (resume)."""
+    ``<out>/C`` (resume) with the marking fit it was computed from — a cached prediction of
+    another marking fit (the model or the fit config; files written before 2026-09-27 record
+    neither) is recomputed, never reused."""
     cfg = env.cfg
     p = static_prediction_path(cfg.out, product_name, policy)
+    marking = {
+        "model": to_mapping(env.fit_spec.spec.model),
+        "config": to_mapping(env.fit_spec.config),
+    }
     if p.exists():
         cached: dict[str, Any] = dict(json.loads(p.read_text(encoding="utf-8")))
         if (
             int(cached.get("n_paths", -1)) == cfg.rotation_paths
             and int(cached.get("n_particles", -1)) == cfg.rotation_particles
+            and cached.get("marking") == json.loads(json.dumps(marking))
         ):
             return {**cached, "from_cache": True}
     t0 = time.perf_counter()
     product = env.product(product_name)
     unit, scale, _ = env.unit_of(product_name)
     misses0 = len(env.cache.manifest())
+    base_spec = spx_base_spec(cfg.rotation_particles)
     rep = rotation_shadow_sensitivity(
         product,
-        spx_base_spec(cfg.rotation_particles),
-        BreakEvenFitConfig(skew_eps=env.fit_spec.config.skew_eps),
+        base_spec,
+        env.fit_spec.config,
+        step0=env.fit_spec.step0_source(surface_of(RiskState(base_spec))),
         ssr_target=float(env.fit_spec.ssr_target),
         cache=env.cache,
         pricing_sim=SimConfig(
@@ -1981,6 +1997,7 @@ def static_prediction(
         "n_particles": int(cfg.rotation_particles),
         "seed": DEFAULT_ROTATION_SEED,
         "size": rep.size,
+        "marking": marking,
         "base_fit_equals_marking_fit": bool(same_fit),
         "n_calibrations": int(rep.n_calibrations),
         "n_cache_misses": int(rep.n_cache_misses),

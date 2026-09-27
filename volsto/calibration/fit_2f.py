@@ -244,11 +244,15 @@ FIT_ENGINES: tuple[str, ...] = ("mlp",)
 MLP_FIT_GRID = MlpGrid(n_fine=400, n_gl=24, n_u=32)
 #: values of :attr:`BreakEvenFitConfig.volvar_target` other than ``None`` (the M7 rebuild)
 VOLVAR_TARGETS: tuple[str, ...] = ("direct",)
+#: values of :attr:`BreakEvenFitConfig.step0` other than ``None`` (the surface's ATM derivatives)
+STEP0_SOURCES: tuple[str, ...] = ("sabrw",)
 #: the desk note's bounds (its §3 table): no ν cap, ``ω_i ≤ 500 %`` per factor, ``k1 ≤ 100``
 PRODUCTION_BOUNDS: dict[str, Any] = {"nu_cap": None, "omega_max": 5.0, "k1_bounds": (0.3, 100.0)}
 _TOL_T = 1e-9
 _TOL_ACTIVE = 1e-9
 _TOL_FEAS = 1e-9
+#: the repository root (a fit spec names its snapshot relative to it)
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 # --------------------------------------------------------------------------------------------
@@ -288,7 +292,11 @@ class BreakEvenFitConfig:
     (``None``: rebuilt from the achieved covariance, the M7 rule; ``"direct"``: the targets'
     ``VoV_BE²``, the note's step 2), ``engine`` (``None``: the first-order break-evens;
     ``"mlp"``: the desk note's most-likely-path closed forms, :class:`MlpMaps`, with
-    ``kernel_curve="atmf"``).  Diagnostics:
+    ``kernel_curve="atmf"``), ``step0`` (``None``: step 0 reads the surface's ATM derivatives;
+    ``"sabrw"``: the date's stored SABRW fits, which the caller passes as the ``step0`` source —
+    :func:`volsto.market.loaders.load_step0_source`, or
+    :class:`~volsto.calibration.targets.ShiftedTriplets` on a moved surface —, a marking fit
+    without one raising).  Diagnostics:
     ``stage3_tolerance`` (the stage-3 assertion, 10%), ``rho12_flag`` (``|ρ12|`` above which the
     two-factor structure is flagged as collapsing, 0.9).  Quadrature orders
     ``n_quad`` / ``n_inner`` (pillar kernels) and ``n_ts`` / ``n_quad_ts`` / ``n_inner_ts`` (the
@@ -317,6 +325,7 @@ class BreakEvenFitConfig:
     sigma0_maturity: float | None = None
     volvar_target: str | None = None
     engine: str | None = None
+    step0: str | None = None
     nu_cap: float | None = DEFAULT_NU_CAP
     chi_bounds: tuple[float, float] = (-0.99, 0.99)
     omega_max: float = 20.0
@@ -329,7 +338,15 @@ class BreakEvenFitConfig:
     n_inner_ts: int = 24
 
     OMIT_WHEN_NONE: ClassVar[frozenset[str]] = frozenset(
-        {"k2_bounds", "k2_grid", "kernel_curve", "sigma0_maturity", "volvar_target", "engine"}
+        {
+            "k2_bounds",
+            "k2_grid",
+            "kernel_curve",
+            "sigma0_maturity",
+            "volvar_target",
+            "engine",
+            "step0",
+        }
     )
     """Options left out of the config's mapping while unset, so a config without them maps — and
     hashes (the backtest's config hash includes the resolved fit config) — exactly as before they
@@ -413,6 +430,8 @@ class BreakEvenFitConfig:
                 "engine='mlp' (the desk note's closed forms) reads the ATMF forward variance: set "
                 "kernel_curve='atmf'"
             )
+        if self.step0 is not None and self.step0 not in STEP0_SOURCES:
+            raise ValueError(f"step0 must be None or one of {STEP0_SOURCES}")
         if self.nu_cap is not None and self.nu_cap <= 0:
             raise ValueError("nu_cap must be positive (or None: no nu cap, the desk note's bounds)")
         clo, chi_ = self.chi_bounds
@@ -435,6 +454,33 @@ class BreakEvenFitConfig:
         if len(e) != 2:
             raise ValueError(f"eps_pair needs a two-point band; this one has {len(e)} points")
         return float(e[0]), float(e[1])
+
+
+#: the desk's marking fit (SPEC §15 Part 3, the owner's default of 2026-09-27): step 0 from the
+#: date's stored SABRW fits (``step0="sabrw"``: the caller passes them), ``k2`` fitted inside
+#: ``(0.05, 5)``, the naked kernels on the ATMF forward variance, ``σ_0`` the 3M ATMF vol and the
+#: desk note's bounds (:data:`PRODUCTION_BOUNDS`); the pipelines use it with their ``skew_eps``
+#: (the backtest's ``marking.fit``, the viewer grid's ``marking.fit``)
+DESK_FIT = BreakEvenFitConfig(
+    k2_bounds=(0.05, 5.0),
+    kernel_curve="atmf",
+    sigma0_maturity=0.25,
+    step0="sabrw",
+    **PRODUCTION_BOUNDS,
+)
+#: :data:`DESK_FIT` for the surfaces the hedger simulates (quadratic smiles per pillar, no wings):
+#: the first-order engine, which reads the smile at the money only
+DESK_FIT_STENCIL = replace(DESK_FIT, engine=None)
+#: the named marking fits of the pipelines' configs: ``"m7"`` the M7 fit (step 0 from the
+#: surface, ``k2`` 0.2, ν cap 3.5, the variance-swap kernels), ``"desk"`` :data:`DESK_FIT`
+FIT_PRESETS: dict[str, BreakEvenFitConfig] = {"m7": BreakEvenFitConfig(), "desk": DESK_FIT}
+
+
+def fit_preset(name: str, **changes: Any) -> BreakEvenFitConfig:
+    """The named marking fit (:data:`FIT_PRESETS`) with ``changes`` (``skew_eps``, pillars…)."""
+    if name not in FIT_PRESETS:
+        raise ValueError(f"fit preset {name!r} must be one of {sorted(FIT_PRESETS)}")
+    return replace(FIT_PRESETS[name], **changes)
 
 
 def resolve_skew_mode(cfg: BreakEvenFitConfig, targets: TargetSet) -> tuple[str, str]:
@@ -2839,7 +2885,14 @@ def marking_targets_for(
     difference of that half-width instead.  Passing both reads a surface on the stencil of a
     finite strike strip: the M8b recalibration rule's base fit does so on the pricing snapshot
     with the strip's ``(h, curvature_h)`` so its held targets and a refit's compare like for
-    like (:meth:`volsto.hedging.hedger.RecalibrationRule.marking_targets`)."""
+    like (:meth:`volsto.hedging.hedger.RecalibrationRule.marking_targets`).  A config whose
+    ``step0`` names a source needs one: without ``step0`` it raises (no silent fall-back to the
+    surface's derivatives)."""
+    if cfg.step0 is not None and step0 is None:
+        raise ValueError(
+            f"the fit config's step 0 reads the date's {cfg.step0.upper()} fits: pass them as "
+            "step0 (volsto.market.loaders.load_step0_source; ShiftedTriplets on a moved surface)"
+        )
     return marking_targets(
         surface,
         cfg.pillars,
@@ -2883,8 +2936,11 @@ def fit_2f_historical(
     """Historical mode on a :class:`~volsto.calibration.history.SurfaceHistory` at ``end``
     (default: the last date): targets by :func:`~volsto.calibration.targets.historical_targets`
     on the config's pillars present in the history and at or above ``mat_min``, ``ξ₀`` from the
-    pricing date's VS vols at all the history's pillars."""
+    pricing date's VS vols at all the history's pillars.  Step 0 is a marking step: a config
+    with a ``step0`` source raises."""
     c = cfg or BreakEvenFitConfig()
+    if c.step0 is not None:
+        raise ValueError("step0 applies to marking mode: the historical targets have no step 0")
     e = history.date_index(end)
     end_ts = history.dates[e]
     hp = np.asarray(history.pillars, dtype=np.float64)
@@ -2930,6 +2986,28 @@ class FitSpec:
     @property
     def breakeven(self) -> BreakEvenParams:
         return BreakEvenParams(**{k: float(v) for k, v in self.fit["breakeven"].items()})
+
+    @property
+    def snapshot(self) -> str | None:
+        """The snapshot the fit read, relative to the repository root (``fit.snapshot``, recorded
+        since the named fits of 2026-09-27), ``None`` when the entry names none."""
+        v = self.fit.get("snapshot")
+        return None if v is None else str(v)
+
+    def step0_source(self, surface: Any) -> Step0Triplets | None:
+        """Step 0's source of the entry's fit on ``surface`` (the fit's surface): ``None`` when
+        the config's step 0 reads the surface, else the SABRW fits of the entry's snapshot
+        (:func:`volsto.market.loaders.load_step0_source`); an entry without one raises."""
+        if self.config.step0 is None:
+            return None
+        if self.snapshot is None:
+            raise ValueError(
+                f"{self.path}: the fit's step 0 reads a snapshot's SABRW fits and the entry names "
+                "no snapshot (fit.snapshot)"
+            )
+        from volsto.market.loaders import load_step0_source
+
+        return load_step0_source(_REPO_ROOT / self.snapshot, surface)
 
 
 def fit_spec_document(
@@ -3003,7 +3081,10 @@ __all__ = [
     "DEFAULT_SKEW_PILLARS",
     "DEFAULT_SKEW_WEIGHT",
     "DEFAULT_STAGE3_TOLERANCE",
+    "DESK_FIT",
+    "DESK_FIT_STENCIL",
     "FIT_ENGINES",
+    "FIT_PRESETS",
     "INFEASIBLE_MESSAGE",
     "K2_GRID_DEFAULT",
     "LAMBDA_BOX_FRACTION",
@@ -3016,6 +3097,7 @@ __all__ = [
     "RISK_REGIME",
     "SKEW_MODES",
     "SKEW_MODE_CHOICES",
+    "STEP0_SOURCES",
     "TERM_STRUCTURE_KINDS",
     "VOLVAR_TARGETS",
     "WEIGHT_KINDS",
@@ -3043,6 +3125,7 @@ __all__ = [
     "fit_2f_marking",
     "fit_first",
     "fit_messages",
+    "fit_preset",
     "fit_second",
     "fit_spec_document",
     "k1_profile",

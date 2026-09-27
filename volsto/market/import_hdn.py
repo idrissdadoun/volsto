@@ -53,7 +53,7 @@ import volsto
 from volsto.config import to_mapping
 from volsto.market.bs import black_vega, implied_vol
 from volsto.market.curves import DiscountCurve, ForwardCurve
-from volsto.market.sabrw import SabrwFit, fit_sabrw
+from volsto.market.sabrw import PARAM_NAMES, SabrwFit, fit_sabrw
 from volsto.market.surface import (
     CALENDAR_SEGMENT_N,
     CalendarCertificate,
@@ -109,7 +109,7 @@ HDN_COLUMNS: tuple[str, ...] = (
     "vega",
     "rho",
 )
-IMPORTER_TAG: str = "2026-09-22"
+IMPORTER_TAG: str = "2026-09-27"
 """The importer's numerics tag, written into every snapshot's ``provenance.importer_tag`` and
 checked by the backtest store (a stored snapshot imported under another tag is stale and is
 re-imported).  Bump it whenever a change moves any snapshot an import produces; the source of
@@ -716,6 +716,9 @@ def to_grid_surface(
 
 
 SABRW_SPREAD_FLOOR: float = 5e-4
+SABRW_T_MIN: float = 0.05
+"""Shortest expiry the snapshot's SABRW fits cover (18 days: shorter expiries are noisy and no
+marking pillar reads them)."""
 """Smallest per-quote weight of :func:`sabrw_fits` (0.05 vol points)."""
 
 
@@ -744,6 +747,33 @@ def sabrw_fits(
         w = np.maximum(np.nan_to_num(half, nan=spread_floor), spread_floor)
         out.append(fit_sabrw(g["k"].to_numpy(float), g["iv_mid"].to_numpy(float), w, T))
     return tuple(out)
+
+
+def sabrw_section(fits: Sequence[SabrwFit]) -> dict[str, Any]:
+    """The snapshot's ``sabrw`` section (SPEC §15 Part 3): per expiry the SABRW parameters, the
+    number of quotes, the fit errors, the held and railed parameters and the flags — what the desk
+    stores (the owner: MSD keeps the SABRW parameters) and step 0 reads back
+    (:func:`volsto.market.loaders.load_step0_source`)."""
+    return {
+        "importer_tag": IMPORTER_TAG,
+        "t_min": SABRW_T_MIN,
+        "spread_floor": SABRW_SPREAD_FLOOR,
+        "fits": [
+            {
+                "T": float(f.T),
+                "n": int(f.n),
+                "params": {
+                    k: float(v) for k, v in zip(PARAM_NAMES, f.params.as_array(), strict=True)
+                },
+                "rms_vp": float(f.rms_vp),
+                "weighted_rms": float(f.weighted_rms),
+                "held": list(f.held),
+                "at_bound": list(f.at_bound),
+                "flags": list(f.flags),
+            }
+            for f in fits
+        ],
+    }
 
 
 def forward_curve_from_forwards(
@@ -1416,9 +1446,11 @@ def snapshot_config(
     *,
     source_file: Path,
     manifest: dict[str, Any],
+    sabrw: Sequence[SabrwFit] | None = None,
 ) -> dict[str, Any]:
     """Dated market config: ``market`` + ``ssvi`` sections (loadable by ``load_ssvi_surface``)
-    plus ``provenance``."""
+    plus ``provenance``, and the ``sabrw`` section when ``sabrw`` fits are given
+    (:func:`sabrw_section`; outside the surface config, so no calibration key moves)."""
     fc = fit.surface.forward_curve
     sha = hashlib.sha256(Path(source_file).read_bytes()).hexdigest()
     listed: dict[str, Any] = next(
@@ -1496,6 +1528,8 @@ def snapshot_config(
     }
     if essvi:
         out["essvi"] = {"rhos": [float(r) for r in rho_param]}
+    if sabrw is not None:
+        out["sabrw"] = sabrw_section(sabrw)
     return out
 
 
@@ -1576,7 +1610,9 @@ def import_day(
     fwds = implied_forwards(chain, max_years=f.max_years, band=f.near_atm_band)
     grid, points = to_grid_surface(chain, fwds, f)
     fit = fit_ssvi(grid, points, filters=f, essvi=essvi, calendar_repair=calendar_repair)
-    cfg = snapshot_config(chain, fit, points, f, source_file=path, manifest=manifest)
+    t_max = float(points.table["T"].max())
+    fits = sabrw_fits(points, t_min=SABRW_T_MIN, t_max=t_max) if t_max > SABRW_T_MIN else ()
+    cfg = snapshot_config(chain, fit, points, f, source_file=path, manifest=manifest, sabrw=fits)
     return cfg, fit, points, chain
 
 

@@ -1056,6 +1056,53 @@ def test_refit_targets_guarded_fallback_on_a_synthetic_set(fc: ForwardCurve) -> 
         refit_targets(good, _rule_for("sticky_breakeven"), None)
 
 
+class _SyntheticSource:
+    """A step-0 triplet source at the rule pillars: the state's ATM level, a 10 % steeper skew
+    and a flat curvature (a stand-in for the pricing snapshot's SABRW fits)."""
+
+    label = "synthetic SABRW source"
+
+    def triplet(self, T: float) -> tuple[float, float, float]:
+        atf = float(np.interp(T, _RULE_PILLARS, _RULE_ATF))
+        return atf, 1.1 * float(np.interp(T, _RULE_PILLARS, _RULE_SKEW)), 0.3
+
+
+def test_rule_step0_source_moves_with_the_state(fc: ForwardCurve) -> None:
+    """A rule whose config reads step 0 from the SABRW fits (SPEC §15 Part 3): on the surface the
+    source belongs to the targets read the source itself; on a state surface they read it moved
+    with the surface on the strip's stencil (:class:`~volsto.calibration.targets.ShiftedTriplets`)
+    — on a state equal to the base the targets are the base's exactly, and a skew move of the state
+    moves the source's skew (the one the band compares with) by the same amount.  Without the
+    source's surface the rule raises."""
+    from volsto.calibration.fit_2f import fit_preset
+    from volsto.calibration.targets import ShiftedTriplets
+    from volsto.hedging.hedger import _StateSurface
+
+    cfg = fit_preset("desk", pillars=_RULE_PILLARS, mat_min=0.0, skew_pillars=(1.0, 3.0))
+    src = _SyntheticSource()
+    rule = RecalibrationRule(pillars=_RULE_PILLARS, fit_config=cfg, ssr_target=1.0, step0=src)
+    base = _state(fc, _CURV_REGULAR)
+    with pytest.raises(ValueError, match="step0_surface"):
+        rule.marking_targets(base)
+    rule.step0_surface = base
+    assert rule.step0_for(base) is src
+    twin = _state(fc, _CURV_REGULAR)
+    sh = rule.step0_for(twin)
+    assert isinstance(sh, ShiftedTriplets)
+    assert sh.h == rule.curvature_stencil and sh.skew_h == rule.h
+    t0, t1 = rule.marking_targets(base), rule.marking_targets(twin)
+    assert any(f == "step 0: synthetic SABRW source" for f in t0.flags)
+    for name in ("correl_target", "spot_vol_covar", "band_skew", "skew_target"):
+        assert np.array_equal(getattr(t1, name), getattr(t0, name)), name
+    moved = _StateSurface(
+        np.array(_RULE_PILLARS), _RULE_ATF, _RULE_SKEW - 0.02, np.asarray(_CURV_REGULAR), fc
+    )
+    t2 = rule.marking_targets(moved)
+    assert t2.band_skew is not None and t0.band_skew is not None
+    np.testing.assert_allclose(t2.band_skew - t0.band_skew, -0.02, rtol=0, atol=1e-12)
+    np.testing.assert_allclose(t2.skew_target - t0.skew_target, -0.02, rtol=0, atol=1e-12)
+
+
 def test_refit_correlation_cap(fc: ForwardCurve) -> None:
     """``|correl_target| <= correlation_cap`` on every refit (:data:`REFIT_CORRELATION_CAP`
     0.97): a regular (unguarded) 3M pillar reading ``Corr_SABR = −0.983`` is capped to −0.97

@@ -42,7 +42,7 @@ import pytest
 import yaml
 
 from volsto.calibration.cache import CacheMissError, LeverageCache, build_market
-from volsto.calibration.fit_2f import BreakEvenFitConfig, fit_2f_marking
+from volsto.calibration.fit_2f import BreakEvenFitConfig, fit_2f_marking, fit_preset
 from volsto.config import (
     BergomiParams,
     CalibrationSpec,
@@ -51,7 +51,7 @@ from volsto.config import (
     from_mapping,
     load_yaml,
 )
-from volsto.market.loaders import snapshot_spec
+from volsto.market.loaders import load_step0_source, snapshot_spec
 from volsto.market.surface import atm_skew_numeric, perturbed_surface
 from volsto.risk.engine import RiskState, Sensitivity, surface_of
 from volsto.risk.shadow_rotation import (
@@ -429,6 +429,32 @@ def test_sign_test_on_the_recorded_study() -> None:
     assert ratio > 1.0, ratio  # the deck's ordering (measured about 1.4)
 
 
+def test_rotated_refit_with_the_desk_fit() -> None:
+    """The desk's fit (SPEC §15 Part 3) under the rotation: the base fit reads the snapshot's SABRW
+    fits and each refit reads them moved with the rotated surface — the source's skew, the one
+    the skew band compares with, moves by the surface's, ∓ one rota at every pillar, as the
+    surface-step-0 targets do; a source without its base surface raises."""
+    spec = _spec("spx")
+    src = load_step0_source(SPX, surface_of(RiskState(spec)))
+    cfg = fit_preset("desk", skew_eps=0.10)
+    states, fits, size = rotation_states(spec, cfg, ssr_target=1.0, step0=src)
+    base, up, dn = fits["base"], fits["up"], fits["down"]
+    assert size == 1.0 and states["base"].spec.model == base.params
+    assert any(f.startswith("step 0: SABRW fits") for f in base.targets.flags)
+    assert any(f.endswith("moved with the surface") for f in up.targets.flags)
+    assert base.targets.band_skew is not None and up.targets.band_skew is not None
+    assert dn.targets.band_skew is not None
+    slope = np.array([rota_slope(t) for t in base.targets.pillars])
+    assert np.allclose(up.targets.band_skew - base.targets.band_skew, -slope, rtol=1e-4)
+    assert np.allclose(dn.targets.band_skew - base.targets.band_skew, slope, rtol=1e-4)
+    assert np.allclose(up.targets.skew_target - base.targets.skew_target, -slope, rtol=1e-4)
+    print("desk nu:", dn.params.nu, base.params.nu, up.params.nu)
+    with pytest.raises(ValueError, match="base surface"):
+        refit_on_rotated(
+            surface_of(states["up"]), base, cfg, ssr_target=1.0, policy="sabr_linked", step0=src
+        )
+
+
 @pytest.mark.parametrize("policy", OWNER_POLICIES)
 def test_shadow_rotation_on_cached_calibrations(policy: str) -> None:
     """d(fee)/d(rota) of the M6 headline 3y autocall at ``(ssr 1, eps 0.10)`` on the cached
@@ -442,8 +468,12 @@ def test_shadow_rotation_on_cached_calibrations(policy: str) -> None:
     if doc is None:
         pytest.skip(f"rotation_spx_{policy}.yaml absent (scripts/m7_p1_marking.py)")
     spec = _spec("spx")
-    cfg = BreakEvenFitConfig(skew_eps=float(doc["skew_eps"]))
-    _, fits, _ = rotation_states(spec, cfg, ssr_target=float(doc["ssr_target"]), policy=policy)
+    # the record's named fit (records written before 2026-09-27 carry none: the M7 fit)
+    cfg = fit_preset(str(doc.get("fit", "m7")), skew_eps=float(doc["skew_eps"]))
+    step0 = None if cfg.step0 is None else load_step0_source(SPX, surface_of(RiskState(spec)))
+    _, fits, _ = rotation_states(
+        spec, cfg, ssr_target=float(doc["ssr_target"]), policy=policy, step0=step0
+    )
     for name, f in fits.items():
         assert f.params == from_mapping(BergomiParams, doc["fits"][name]), name
     fc, _, _ = build_market(spec)
@@ -454,6 +484,7 @@ def test_shadow_rotation_on_cached_calibrations(policy: str) -> None:
             product,
             spec,
             cfg,
+            step0=step0,
             ssr_target=float(doc["ssr_target"]),
             cache=LeverageCache(ROOT / "cache"),
             pricing_sim=sim,

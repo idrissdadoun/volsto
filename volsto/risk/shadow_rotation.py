@@ -84,7 +84,7 @@ from volsto.calibration.fit_2f import (
     fit_2f_marking,
     marking_targets_for,
 )
-from volsto.calibration.targets import TargetSet
+from volsto.calibration.targets import ShiftedTriplets, Step0Triplets, TargetSet
 from volsto.config import BergomiParams, CalibrationSpec, SimConfig, SurfacePerturbation
 from volsto.market.surface import saturated_k
 from volsto.market.varswap import xi0_curve
@@ -332,13 +332,23 @@ def refit_on_rotated(
     *,
     ssr_target: float,
     policy: str,
+    step0: Step0Triplets | None = None,
+    base_surface: Any = None,
 ) -> FitResult:
-    """The P1 set refit on a rotated surface under ``policy`` (module docstring)."""
+    """The P1 set refit on a rotated surface under ``policy`` (module docstring).  ``step0`` (the
+    base date's step-0 source, the snapshot's SABRW fits, with ``base_surface`` the surface it
+    belongs to) is read moved with the surface
+    (:class:`~volsto.calibration.targets.ShiftedTriplets`, SPEC §15 Part 3)."""
     if policy not in RECALIBRATION_POLICIES:
         raise ValueError(f"policy must be one of {RECALIBRATION_POLICIES}")
+    src: Step0Triplets | None = None
+    if step0 is not None:
+        if base_surface is None:
+            raise ValueError("a step-0 source needs the base surface it belongs to")
+        src = ShiftedTriplets(step0, base_surface, rotated_surface)
     if policy == "sabr_linked":
-        return fit_2f_marking(rotated_surface, cfg, ssr_target=ssr_target)
-    tg = marking_targets_for(rotated_surface, cfg, ssr_target=ssr_target)
+        return fit_2f_marking(rotated_surface, cfg, ssr_target=ssr_target, step0=src)
+    tg = marking_targets_for(rotated_surface, cfg, ssr_target=ssr_target, step0=src)
     # the holding rule lives in held_targets (shared with the hedger's RecalibrationRule)
     sticky = held_targets(tg, base_fit.targets, policy)
     t_max = float(min(rotated_surface.max_maturity, max(sticky.pillars)))
@@ -407,15 +417,18 @@ def rotation_states(
     k_cap: float = ROTA_K_CAP,
     engine: RiskEngine | None = None,
     policy: str = "sabr_linked",
+    step0: Step0Triplets | None = None,
 ) -> tuple[dict[str, RiskState], dict[str, FitResult], float]:
     """The five states of the greek (``base``, ``up``, ``down`` with the base set; ``up_refit``,
     ``down_refit`` with the refit sets under ``policy``) and the three fits; the base state's
     model is the fit on the base surface (``base_spec.model`` is replaced).  ``engine`` (when
-    given) halves bumps that fail the arbitrage checks; the achieved size is returned."""
+    given) halves bumps that fail the arbitrage checks; the achieved size is returned.
+    ``step0``: the base snapshot's step-0 source (its SABRW fits), moved with each rotated
+    surface in the refits."""
     if policy not in RECALIBRATION_POLICIES:
         raise ValueError(f"policy must be one of {RECALIBRATION_POLICIES}")
     base_surface = surface_of(RiskState(base_spec))
-    fits = {"base": fit_2f_marking(base_surface, cfg, ssr_target=ssr_target)}
+    fits = {"base": fit_2f_marking(base_surface, cfg, ssr_target=ssr_target, step0=step0)}
     base = RiskState(dataclasses.replace(base_spec, model=fits["base"].params), None, "base")
     s = float(size)
     if engine is not None:
@@ -431,7 +444,13 @@ def rotation_states(
     states = {"base": base, "up": up, "down": dn}
     for name, st in (("up", up), ("down", dn)):
         f = refit_on_rotated(
-            surface_of(st), fits["base"], cfg, ssr_target=ssr_target, policy=policy
+            surface_of(st),
+            fits["base"],
+            cfg,
+            ssr_target=ssr_target,
+            policy=policy,
+            step0=step0,
+            base_surface=base_surface,
         )
         fits[name] = f
         states[f"{name}_refit"] = RiskState(
@@ -455,13 +474,15 @@ def rotation_shadow_sensitivity(
     product_name: str = "product",
     vol_point_tenors: tuple[float, ...] = (0.5, 1.0),
     policy: str = "sabr_linked",
+    step0: Step0Triplets | None = None,
 ) -> ShadowRotationReport:
     """``d(fee)/d(rota)`` in the declared convention: the P1 usual, recalibrated and shadow
     rotations under ``policy``, the LV rotation of the same product, the fee and desk-P&L
-    quantities (module docstring, :func:`shadow_quantities`)."""
+    quantities (module docstring, :func:`shadow_quantities`).  ``step0``: the base snapshot's
+    step-0 source (:func:`rotation_states`)."""
     t0 = time.perf_counter()
     base_surface = surface_of(RiskState(base_spec))
-    base_fit = fit_2f_marking(base_surface, cfg, ssr_target=ssr_target)
+    base_fit = fit_2f_marking(base_surface, cfg, ssr_target=ssr_target, step0=step0)
     base = RiskState(dataclasses.replace(base_spec, model=base_fit.params), None, "base")
     builder = LSVBuilder(cache, base, allow_calibrate=allow_calibrate)
     engine = RiskEngine(builder, pricing_sim)
@@ -474,6 +495,7 @@ def rotation_shadow_sensitivity(
         k_cap=k_cap,
         engine=engine,
         policy=policy,
+        step0=step0,
     )
     mode = "recalibrate"
     p1 = {k: engine.priced(product, states[k], mode).payoffs for k in P1_STATES}

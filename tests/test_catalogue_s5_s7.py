@@ -161,7 +161,7 @@ reference_spec: configs/studies/lsv_reference_2f.yaml
 surfaces:
   - {name: placeholder, kind: placeholder, one_factor: false, two_factor: false, marking: true}
 particle: {n_particles: 20000, horizon: 1.0}
-marking: {ssr_target: [1.0, 1.5], skew_eps: [0.05, 0.10]}
+marking: {ssr_target: [1.0, 1.5], skew_eps: [0.05, 0.10], fit: m7}
 include_degenerate: false
 products: {m4: true, m6: false, conditional: false, cliquet_maturities: [1.0]}
 pricing: {n_paths: 4000, seed: 2024}
@@ -1214,15 +1214,19 @@ def test_s5_and_the_precompute_share_one_marking_fit(monkeypatch: pytest.MonkeyP
     class CalledError(Exception):
         pass
 
-    def stub(surface: Any, ssr_target: float, skew_eps: float) -> Any:
-        raise CalledError((ssr_target, skew_eps))
+    def stub(surface: Any, ssr_target: float, skew_eps: float, **kw: Any) -> Any:
+        raise CalledError((ssr_target, skew_eps, kw))
 
     monkeypatch.setattr(grid_mod, "marking_fit", stub)
     g = grid_mod.load_grid(ROOT / "configs" / "grids" / "toy_marking.yaml")
     point = next(p for p in grid_mod.enumerate_points(g) if p.mode == "marking")
     with pytest.raises(CalledError) as info:
         grid_mod.resolve_marking(point, surface=None)  # type: ignore[arg-type]
-    assert info.value.args[0] == (point.axes["ssr_target"], point.axes["skew_eps"])
+    assert info.value.args[0] == (
+        point.axes["ssr_target"],
+        point.axes["skew_eps"],
+        {"fit": "m7", "snapshot": None},
+    )
 
 
 def _synthetic_marking_store(tmp: Path) -> tuple[Path, Path]:

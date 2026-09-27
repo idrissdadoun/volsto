@@ -347,7 +347,13 @@ from volsto.calibration.cache import (
     code_version,
     spec_key,
 )
-from volsto.calibration.fit_2f import BreakEvenFitConfig, FitResult, fit_2f_marking
+from volsto.calibration.fit_2f import (
+    FIT_PRESETS,
+    BreakEvenFitConfig,
+    FitResult,
+    fit_2f_marking,
+    fit_preset,
+)
 from volsto.calibration.history import (
     DEFAULT_PILLARS,
     MIN_INCREMENTS,
@@ -374,7 +380,7 @@ from volsto.market.import_hdn import (
     import_day,
     write_snapshot,
 )
-from volsto.market.loaders import snapshot_spec
+from volsto.market.loaders import sabrw_fits_from_config, snapshot_spec, step0_source
 from volsto.market.surface import ArbitrageError, ImpliedSurface, surface_from_config
 from volsto.market.varswap import varswap_strike
 from volsto.models.leverage import LeverageFunction
@@ -753,11 +759,13 @@ def _iso(value: Any, where: str) -> str:
     raise ConfigError(f"{where}: expected a YYYY-MM-DD date, got {value!r}")
 
 
-def _mapping(data: Any, keys: Sequence[str], where: str) -> dict[str, Any]:
-    """``data`` checked to be a mapping with exactly ``keys``."""
+def _mapping(
+    data: Any, keys: Sequence[str], where: str, optional: Sequence[str] = ()
+) -> dict[str, Any]:
+    """``data`` checked to be a mapping with exactly ``keys`` (and any of ``optional``)."""
     if not isinstance(data, Mapping):
         raise ConfigError(f"{where}: expected a mapping, got {data!r}")
-    unknown = sorted(str(k) for k in set(data) - set(keys))
+    unknown = sorted(str(k) for k in set(data) - set(keys) - set(optional))
     missing = [k for k in keys if k not in data]
     if unknown:
         raise ConfigError(f"{where}: unknown keys {unknown}; expected {list(keys)}")
@@ -878,6 +886,10 @@ CONFIG_SECTIONS: dict[str, tuple[str, ...]] = {
     "stability": ("window_vol", "window_ssr", "share", "band", "fit"),
     "paths": ("out", "cache", "snapshots"),
 }
+#: Optional keys of a section.  ``marking.fit`` names the marking fit
+#: (:data:`~volsto.calibration.fit_2f.FIT_PRESETS`); absent or ``m7`` it is the M7 fit and is left
+#: out of the normalised mapping, so a config naming it hashes exactly as before the key existed.
+CONFIG_OPTIONAL: dict[str, tuple[str, ...]] = {"marking": ("fit",)}
 CONFIG_KEYS: tuple[str, ...] = ("name", *CONFIG_SECTIONS)
 #: ``data.missing_close``: what an unreadable day file does (module docstring).
 MISSING_CLOSE: tuple[str, ...] = ("fail", "skip_date")
@@ -917,7 +929,10 @@ class BacktestConfig:
         name = top["name"]
         if not isinstance(name, str) or not name or not all(c.isalnum() or c in "_-" for c in name):
             raise ConfigError(f"{source}: name {name!r} must match [A-Za-z0-9_-]+")
-        s = {k: _mapping(top[k], keys, f"{source}: {k}") for k, keys in CONFIG_SECTIONS.items()}
+        s = {
+            k: _mapping(top[k], keys, f"{source}: {k}", CONFIG_OPTIONAL.get(k, ()))
+            for k, keys in CONFIG_SECTIONS.items()
+        }
         raw: dict[str, Any] = {"name": name}
         d = s["data"]
         raw["data"] = {
@@ -951,6 +966,9 @@ class BacktestConfig:
             "skew_eps": eps,
             "stage3": False,
         }
+        fit = _choice(m.get("fit", "m7"), sorted(FIT_PRESETS), "marking.fit")
+        if fit != "m7":
+            raw["marking"]["fit"] = fit
         c = s["calibration"]
         n_part = int(_num(c["n_particles"], "calibration.n_particles", positive=True, integer=True))
         if n_part % 2:
@@ -1221,7 +1239,10 @@ class BacktestConfig:
         )
 
     def fit_config(self) -> BreakEvenFitConfig:
-        return BreakEvenFitConfig(skew_eps=float(self.section("marking")["skew_eps"]))
+        """The marking fit: the preset ``marking.fit`` (:data:`~volsto.calibration.fit_2f.
+        FIT_PRESETS`; absent, the M7 fit) at ``marking.skew_eps``."""
+        m = self.section("marking")
+        return fit_preset(str(m.get("fit", "m7")), skew_eps=float(m["skew_eps"]))
 
 
 def _fit_config(values: Mapping[str, Any]) -> BreakEvenFitConfig:
@@ -4369,7 +4390,16 @@ class BacktestRun:
         fc = ForwardCurve.from_config(spec.market)
         surface = surface_from_config(spec.surface, fc, fc.rate_curve)
         m = self.cfg.section("marking")
-        fit = fit_2f_marking(surface, self.cfg.fit_config(), ssr_target=float(m["ssr_target"]))
+        cfg = self.cfg.fit_config()
+        parsed = yaml.safe_load(data)
+        step0 = None
+        if cfg.step0 is not None:
+            # the date's SABRW fits, from the bytes just verified (never a second read)
+            fits = sabrw_fits_from_config(parsed)
+            if fits is None:
+                raise DateFailure(f"{date}: the snapshot has no sabrw section: re-import it")
+            step0 = step0_source(fits, surface)
+        fit = fit_2f_marking(surface, cfg, ssr_target=float(m["ssr_target"]), step0=step0)
         fit_s = time.perf_counter() - t0
         if fit.status == "infeasible":
             raise DateFailure(f"{date}: the marking fit is infeasible: {'; '.join(fit.messages)}")
@@ -4380,7 +4410,7 @@ class BacktestRun:
         if spec.market.close is None:
             raise DateFailure(f"{date}: the snapshot has no market.close: re-import it")
         record["history"]["ln_spot"] = math.log(float(spec.market.close))
-        prov = yaml.safe_load(data)["provenance"]
+        prov = parsed["provenance"]
         record["calendar"] = {
             k: v for k, v in dict(prov.get("fit", {})).items() if str(k).startswith("calendar_")
         }
@@ -6857,7 +6887,7 @@ def _setup_results(
             float(cfg.n_paths),
             f"seed {cfg.section('pricing')['seed']} on every date (CRN)",
         ),
-        ("ssr_target", float(m["ssr_target"]), "marking fit, stage 3 off"),
+        ("ssr_target", float(m["ssr_target"]), f"marking fit {m.get('fit', 'm7')!r}, stage 3 off"),
         ("skew_eps", float(m["skew_eps"]), ""),
         (
             "pillars",

@@ -7,8 +7,11 @@ Part 3 FINAL" and report decisions; methodology in the module docstrings of
 :mod:`volsto.risk.shadow_rotation`).
 
 Fits: ``--pairs`` (default ``(ssr_target, skew_eps) = (1.0, 0.10)`` and ``(1.5, 0.05)``) with the
-fitter's defaults otherwise (pillars 3M–10Y inside the surface, MatMin 3M, SmoothBreakEven, k2 =
-0.2, ν cap 3.5).  Surfaces: the repaired eSSVI snapshot (since 2026-09-22; plain SSVI before)
+named fit ``--fit`` (:data:`volsto.calibration.fit_2f.FIT_PRESETS`; default ``desk`` since
+2026-09-27 — step 0 from the snapshot's SABRW fits, k2 fitted, ATMF kernels, 3M ``σ_0``, the desk
+note's bounds —, ``m7`` the M7 fit: k2 = 0.2, ν cap 3.5; pillars 3M–10Y inside the surface,
+MatMin 3M, SmoothBreakEven either way).  The reference SSVI has no quotes: it runs with
+``--fit m7`` only.  Surfaces: the repaired eSSVI snapshot (since 2026-09-22; plain SSVI before)
 ``configs/surfaces/snapshots/hdn_2022H2/spx_2022-12-30.yaml`` (quoted to 3Y: the 5Y / 10Y
 pillars are dropped and the 5Y skew constraint moves to 3Y, with the fitter's note) and, on
 request, the reference SSVI of ``configs/studies/lsv_reference_2f.yaml`` (to 10Y).
@@ -60,11 +63,12 @@ import yaml
 
 from volsto.calibration.cache import LeverageCache, build_market
 from volsto.calibration.fit_2f import (
-    BreakEvenFitConfig,
+    FIT_PRESETS,
     BreakEvenValidationError,
     FitResult,
     Stage3Inputs,
     fit_2f_marking,
+    fit_preset,
     stage3_validation,
     write_fit_spec,
 )
@@ -74,7 +78,7 @@ from volsto.config import (
     load_yaml,
     to_mapping,
 )
-from volsto.market.loaders import snapshot_spec
+from volsto.market.loaders import load_step0_source, snapshot_spec
 from volsto.risk.shadow_rotation import (
     RECALIBRATION_POLICIES,
     ROTATION_CONVENTION,
@@ -103,6 +107,16 @@ def base_spec(surface: str, n_particles: int) -> CalibrationSpec:
     return dataclasses.replace(
         ref, particle=dataclasses.replace(ref.particle, n_particles=n_particles)
     )
+
+
+def step0_of(surface: str, fit: str, surf: Any) -> Any:
+    """Step 0's source of the named fit on ``surface`` (built on ``surf``): the SPX snapshot's
+    SABRW fits when the fit reads them, else ``None``."""
+    if FIT_PRESETS[fit].step0 is None:
+        return None
+    if surface != "spx":
+        raise SystemExit(f"--fit {fit} reads a snapshot's SABRW fits: {surface!r} has no quotes")
+    return load_step0_source(SPX_SNAPSHOT, surf)
 
 
 def label(surface: str, ssr: float, eps: float) -> str:
@@ -178,6 +192,7 @@ def markdown_table(df: pd.DataFrame, digits: int = 4) -> str:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--surfaces", default="spx", help="comma-separated: spx, reference")
+    ap.add_argument("--fit", default="desk", choices=sorted(FIT_PRESETS), help="named fit")
     ap.add_argument("--pairs", default="1.0:0.10,1.5:0.05", help="ssr_target:skew_eps pairs")
     ap.add_argument("--iterate", type=int, default=0, help="iterate_against_simulation k")
     ap.add_argument("--n-particles", type=int, default=200_000)
@@ -205,10 +220,11 @@ def main() -> None:
     for surface in surfaces:
         spec = base_spec(surface, int(args.n_particles))
         _, surf, _ = build_market(spec)
+        step0 = step0_of(surface, args.fit, surf)
         for ssr, eps in pairs:
             t0 = time.perf_counter()
-            cfg = BreakEvenFitConfig(skew_eps=eps)
-            r = fit_2f_marking(surf, cfg, ssr_target=ssr)
+            cfg = fit_preset(args.fit, skew_eps=eps)
+            r = fit_2f_marking(surf, cfg, ssr_target=ssr, step0=step0)
             fo_s = time.perf_counter() - t0
             iterated: FitResult | None = None
             if args.iterate and not args.no_stage3:
@@ -230,6 +246,7 @@ def main() -> None:
                         ),
                         iterate_against_simulation=int(args.iterate),
                         assert_stage3=False,
+                        step0=step0,
                     )
                 except BreakEvenValidationError as exc:
                     iterated = exc.result
@@ -282,7 +299,16 @@ def main() -> None:
                 n_particles=int(args.n_particles),
                 ssr_target=ssr,
                 label=name,
-                extra={"surface": surface, "skew_eps": eps},
+                extra={
+                    "surface": surface,
+                    "skew_eps": eps,
+                    "fit": args.fit,
+                    **(
+                        {"snapshot": SPX_SNAPSHOT.relative_to(ROOT).as_posix()}
+                        if surface == "spx"
+                        else {}
+                    ),
+                },
             )
             print(f"[{name}] {r.status}; fit {fo_s:.1f} s; spec {spec_path.name}", flush=True)
             if not args.no_stage3:
@@ -374,13 +400,14 @@ def main() -> None:
         combos = [(sf, pol) for sf in args.rotation.split(",") if sf for pol in policies]
         for surface, policy in combos:
             spec = base_spec(surface, int(args.n_particles))
-            fc, _, _ = build_market(spec)
+            fc, rsurf, _ = build_market(spec)
             product = headline_products(fc.rate_curve, spec.market.spot)[AUTOCALL_NAME]
             misses_before = len(cache.manifest())
             rep = rotation_shadow_sensitivity(
                 product,
                 spec,
-                BreakEvenFitConfig(skew_eps=0.10),
+                fit_preset(args.fit, skew_eps=0.10),
+                step0=step0_of(surface, args.fit, rsurf),
                 ssr_target=1.0,
                 cache=cache,
                 pricing_sim=rsim,
@@ -392,6 +419,7 @@ def main() -> None:
             doc = {
                 "surface": surface,
                 "policy": policy,
+                "fit": args.fit,
                 "ssr_target": 1.0,
                 "skew_eps": 0.10,
                 "size": rep.size,

@@ -689,3 +689,22 @@ def test_importer_tag_guard() -> None:
 def test_snapshot_provenance_names_the_importer_tag(pipeline: Pipeline) -> None:
     cfg, _fit, _points, _chain = pipeline
     assert cfg["provenance"]["importer_tag"] == import_hdn.IMPORTER_TAG
+
+
+def test_snapshot_stores_the_sabrw_fits(pipeline: Pipeline, tmp_path: Path) -> None:
+    """The snapshot stores the day's SABRW fits (its ``sabrw`` section, SPEC §15 Part 3): the
+    loader reads back exactly :func:`~volsto.market.import_hdn.sabrw_fits` of the day's retained
+    quotes — every expiry from ``SABRW_T_MIN`` to the last with at least seven quotes, parameters,
+    zones, errors, counts, held slopes, bounds and flags bit for bit — under the importer's tag;
+    the committed SPX anchor carries the same section as a fresh import of its day."""
+    from volsto.market.loaders import load_sabrw_fits
+
+    cfg, _fit, points, _chain = pipeline
+    assert cfg["sabrw"]["importer_tag"] == import_hdn.IMPORTER_TAG
+    path = import_hdn.write_snapshot(cfg, tmp_path / "snap.yaml")
+    want = import_hdn.sabrw_fits(
+        points, t_min=import_hdn.SABRW_T_MIN, t_max=float(points.table["T"].max())
+    )
+    assert len(want) >= 30 and load_sabrw_fits(path) == want
+    committed = ROOT / "configs" / "surfaces" / "snapshots" / "hdn_2022H2" / f"spx_{DAY}.yaml"
+    assert load_sabrw_fits(committed) == want

@@ -13,7 +13,11 @@ SSR 1 under each variant of :data:`VARIANTS`:
 * ``sabrw`` — step 0 from the SABRW fits (the round trip at ``p = 0``); ``sabrw_p1`` the other
   reading of the desk's stored convexity (the fits' curvature taken as physical, then scaled by
   ``(atf_ref/atf)^1`` as the surface path does); ``sabrw_k2`` with ``k2`` fitted;
-  ``sabrw_k2_band4`` with ``k2`` fitted and the band on 3M / 6M / 1Y / 3Y at 0.3 / 0.2 / 0.1 / 0.1.
+  ``sabrw_k2_band4`` with ``k2`` fitted and the band on 3M / 6M / 1Y / 3Y at 0.3 / 0.2 / 0.1 / 0.1;
+* ``desk`` — the named fit :data:`~volsto.calibration.fit_2f.DESK_FIT` as it stands (step 0 from
+  the SABRW fits, ``k2`` fitted, ATMF kernels, 3M ``σ_0``, the desk note's bounds) at ``ε`` 0.10.
+
+``--variants`` runs a subset.
 
 Outputs in ``--out`` (git-ignored): ``variants.csv`` (date × variant: status, parameters,
 smallest correlation eigenvalue, largest covariance miss, clipped pillars, binding edges, wall
@@ -35,7 +39,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from volsto.calibration.fit_2f import BreakEvenFitConfig, fit_2f_marking
+from volsto.calibration.fit_2f import BreakEvenFitConfig, fit_2f_marking, fit_preset
 from volsto.calibration.targets import DEFAULT_ATF_REF
 from volsto.market import import_hdn as ih
 from volsto.market.sabrw import SabrwTermStructure
@@ -43,8 +47,8 @@ from volsto.market.sabrw import SabrwTermStructure
 K2_BOUNDS = (0.05, 5.0)
 BAND4 = (0.25, 0.5, 1.0, 3.0)
 EPS4 = (0.3, 0.2, 0.1, 0.1)
-#: variant -> (config overrides, step-0 source: "surface" | "sabrw" | "sabrw_p1")
-VARIANTS: dict[str, tuple[dict[str, Any], str]] = {
+#: variant -> (config overrides or a named fit, step-0 source: "surface" | "sabrw" | "sabrw_p1")
+VARIANTS: dict[str, tuple[dict[str, Any] | str, str]] = {
     "surface": ({}, "surface"),
     "surface_p0": ({"sabrw_power": 0.0}, "surface"),
     "surface_k2": ({"k2_bounds": K2_BOUNDS}, "surface"),
@@ -55,6 +59,7 @@ VARIANTS: dict[str, tuple[dict[str, Any], str]] = {
         {"k2_bounds": K2_BOUNDS, "skew_pillars": BAND4, "skew_eps": EPS4},
         "sabrw",
     ),
+    "desk": ("desk", "sabrw"),
 }
 
 
@@ -71,8 +76,10 @@ class PowerScaled:
         return atf, skw, cvx * (DEFAULT_ATF_REF / atf) ** self.power
 
 
-def run_date(args: tuple[str, str, float, float]) -> tuple[list[dict], list[dict], list[dict]]:
-    root, date, t_min, t_max = args
+def run_date(
+    args: tuple[str, str, float, float, tuple[str, ...]],
+) -> tuple[list[dict], list[dict], list[dict]]:
+    root, date, t_min, t_max, names = args
     rows: list[dict] = []
     pillars: list[dict] = []
     sab: list[dict] = []
@@ -85,7 +92,7 @@ def run_date(args: tuple[str, str, float, float]) -> tuple[list[dict], list[dict
     except Exception as exc:  # the date is recorded as failed for every variant
         traceback.print_exc()
         err = f"import or SABRW: {type(exc).__name__}: {exc}"
-        return [dict(date=date, variant=n, status="error", error=err) for n in VARIANTS], [], []
+        return [dict(date=date, variant=n, status="error", error=err) for n in names], [], []
     t_import = time.time() - t0
     for f in fits:
         p = f.params
@@ -111,16 +118,17 @@ def run_date(args: tuple[str, str, float, float]) -> tuple[list[dict], list[dict
         "sabrw": ts,
         "sabrw_p1": PowerScaled(ts, 1.0, ts.label + " (curvature scaled, SabrW_Power 1)"),
     }
-    for name, (over, src) in VARIANTS.items():
+    for name in names:
+        over, src = VARIANTS[name]
         t1 = time.time()
         row: dict[str, Any] = dict(date=date, variant=name, import_s=t_import)
         try:
-            r = fit_2f_marking(
-                surface,
-                BreakEvenFitConfig(**over),
-                ssr_target=1.0,
-                step0=sources[src],
+            cfg = (
+                fit_preset(over, skew_eps=0.10)
+                if isinstance(over, str)
+                else BreakEvenFitConfig(**over)
             )
+            r = fit_2f_marking(surface, cfg, ssr_target=1.0, step0=sources[src])
             prm = r.params
             miss = np.asarray(r.svc_rel_error, dtype=float)
             tg = r.targets
@@ -169,10 +177,11 @@ def _q(s: pd.Series, q: float) -> float:
 
 def summary(v: pd.DataFrame, p: pd.DataFrame, s: pd.DataFrame, wall: float, n_dates: int) -> str:
     ok = v[v["status"] != "error"]
+    names = [n for n in VARIANTS if n in set(v["variant"])]
     lines = [
         "# Step 0 from SABRW fits: the 2022 H2 SPX measurement",
         "",
-        f"{n_dates} dates, {len(VARIANTS)} variants; wall {wall:.0f} s; recalibrated: no "
+        f"{n_dates} dates, {len(names)} variants; wall {wall:.0f} s; recalibrated: no "
         "(marking fits only, no Monte Carlo).",
         f"Errors: {int((v['status'] == 'error').sum())} of {len(v)} fits.",
         "",
@@ -182,7 +191,7 @@ def summary(v: pd.DataFrame, p: pd.DataFrame, s: pd.DataFrame, wall: float, n_da
         "daily |dnu| median | daily |drho12| median |",
         "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
-    for name in VARIANTS:
+    for name in names:
         g = ok[ok["variant"] == name].sort_values("date")
         if g.empty:
             lines.append(f"| {name} | all failed |" + " |" * 13)
@@ -216,7 +225,7 @@ def summary(v: pd.DataFrame, p: pd.DataFrame, s: pd.DataFrame, wall: float, n_da
         + " |"
     )
     lines.append("|---|" + "---|" * (2 * len(ts)))
-    for name in VARIANTS:
+    for name in names:
         g = p[p["variant"] == name]
         c = [g.loc[g["T"] == t, "corr_target"].median() for t in ts]
         m = [100 * g.loc[g["T"] == t, "svc_miss"].abs().median() for t in ts]
@@ -250,6 +259,7 @@ def main() -> None:
     ap.add_argument("--t-max", type=float, default=3.1)
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 2))
     ap.add_argument("--dates", nargs="*", help="default: every day of the sample")
+    ap.add_argument("--variants", nargs="*", default=list(VARIANTS), choices=list(VARIANTS))
     a = ap.parse_args()
     root = Path(a.root)
     dates = a.dates or sorted(
@@ -258,7 +268,7 @@ def main() -> None:
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
-    jobs = [(str(root), d, a.t_min, a.t_max) for d in dates]
+    jobs = [(str(root), d, a.t_min, a.t_max, tuple(a.variants)) for d in dates]
     rows: list[dict] = []
     pil: list[dict] = []
     sab: list[dict] = []

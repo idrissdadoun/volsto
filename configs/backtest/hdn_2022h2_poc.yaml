@@ -46,6 +46,8 @@ marking:
   skew_eps: 0.10
   stage3: false            # off: minutes per date, and its engine-bias assertion FAILS for the
                            # SPX (1.0, 0.10) mark (SPEC §15); the marked SSR is first order
+  fit: desk                # the desk's marking fit (SPEC §15 Part 3): step 0 from the snapshot's
+                           # SABRW fits, k2 fitted, ATMF kernels, 3M sigma_0, the note's bounds
 calibration:
   base_spec: configs/studies/lsv_reference_2f.yaml   # particle, scheme and step schedule
   n_particles: 800000      # production (SPEC §11)

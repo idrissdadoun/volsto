@@ -553,3 +553,721 @@ essvi:
   - -0.7157776527991353
   - -0.6939395351649541
   - -0.6816697807450912
+sabrw:
+  importer_tag: '2026-09-27'
+  t_min: 0.05
+  spread_floor: 0.0005
+  fits:
+  - T: 0.057534246575342465
+    n: 89
+    params:
+      sigma: 0.22953541290755733
+      rho: -0.8144783911967903
+      nu: 1.7735043893251814
+      t_d: 1.196535651214274
+      t_u: 1.0
+      ex_d: 9.999999999999998
+      ex_u: 1.0
+    rms_vp: 1.6243725684404766
+    weighted_rms: 4.373447322963372
+    held:
+    - t_u
+    - ex_u
+    at_bound:
+    - ex_d
+    flags:
+    - 'slopes held at their initial value (zone with < 3 quotes): {''t_u'': 0, ''ex_u'':
+      0}'
+    - 'parameters at a bound: [''ex_d'']'
+  - T: 0.06301369863013699
+    n: 56
+    params:
+      sigma: 0.23512064407123504
+      rho: -0.817583575882848
+      nu: 1.662906040147086
+      t_d: 1.4803856983108623
+      t_u: 1.0
+      ex_d: 9.999999999999998
+      ex_u: 1.0
+    rms_vp: 1.0304183657938308
+    weighted_rms: 4.7526392056979265
+    held:
+    - t_u
+    - ex_u
+    at_bound:
+    - ex_d
+    flags:
+    - 'slopes held at their initial value (zone with < 3 quotes): {''t_u'': 0, ''ex_u'':
+      0}'
+    - 'parameters at a bound: [''ex_d'']'
+  - T: 0.0684931506849315
+    n: 149
+    params:
+      sigma: 0.23542758575374456
+      rho: -0.7865897422563115
+      nu: 1.7761687257921357
+      t_d: 1.2317531354107307
+      t_u: 1.0
+      ex_d: 9.999999999999972
+      ex_u: 1.0
+    rms_vp: 1.0584115646294676
+    weighted_rms: 5.9622942614618415
+    held:
+    - t_u
+    - ex_u
+    at_bound:
+    - ex_d
+    flags:
+    - 'slopes held at their initial value (zone with < 3 quotes): {''t_u'': 0, ''ex_u'':
+      0}'
+    - 'parameters at a bound: [''ex_d'']'
+  - T: 0.07671232876712329
+    n: 54
+    params:
+      sigma: 0.2316568894774649
+      rho: -0.8461839231780891
+      nu: 1.527595936825507
+      t_d: 1.5973910219778162
+      t_u: 1.0
+      ex_d: 9.999999999999998
+      ex_u: 1.0
+    rms_vp: 0.8675850058387894
+    weighted_rms: 3.9839157106787497
+    held:
+    - t_u
+    - ex_u
+    at_bound:
+    - ex_d
+    flags:
+    - 'slopes held at their initial value (zone with < 3 quotes): {''t_u'': 0, ''ex_u'':
+      0}'
+    - 'parameters at a bound: [''ex_d'']'
+  - T: 0.08493150684931507
+    n: 223
+    params:
+      sigma: 0.23274239171584293
+      rho: -0.7292036518458981
+      nu: 1.7977330309585557
+      t_d: 1.2600166651577487
+      t_u: 1.0
+      ex_d: 9.999999999998918
+      ex_u: 1.0
+    rms_vp: 1.1144511928228835
+    weighted_rms: 6.124735162826205
+    held:
+    - t_u
+    - ex_u
+    at_bound:
+    - ex_d
+    flags:
+    - 'slopes held at their initial value (zone with < 3 quotes): {''t_u'': 0, ''ex_u'':
+      0}'
+    - 'zone coverage changed during the fit for [''t_u'']: {''ex_d'': 10, ''t_d'':
+      60, ''t_u'': 0, ''ex_u'': 0} -> {''ex_d'': 10, ''t_d'': 60, ''t_u'': 12, ''ex_u'':
+      0}'
+    - 'parameters at a bound: [''ex_d'']'
+  - T: 0.08767123287671233
+    n: 213
+    params:
+      sigma: 0.2319417493964825
+      rho: -0.7227269291560838
+      nu: 1.7669440509579788
+      t_d: 1.2940331521596085
+      t_u: 1.0
+      ex_d: 9.999999999999917
+      ex_u: 1.0
+    rms_vp: 1.0810974764540338
+    weighted_rms: 8.13806733881054
+    held:
+    - t_u
+    - ex_u
+    at_bound:
+    - ex_d
+    flags:
+    - 'slopes held at their initial value (zone with < 3 quotes): {''t_u'': 0, ''ex_u'':
+      0}'
+    - 'zone coverage changed during the fit for [''t_u'']: {''ex_d'': 10, ''t_d'':
+      55, ''t_u'': 0, ''ex_u'': 0} -> {''ex_d'': 10, ''t_d'': 55, ''t_u'': 11, ''ex_u'':
+      0}'
+    - 'parameters at a bound: [''ex_d'']'
+  - T: 0.10684931506849316
+    n: 139
+    params:
+      sigma: 0.2370253933541385
+      rho: -0.8187742622228239
+      nu: 1.5547582394574677
+      t_d: 1.4232890070501538
+      t_u: 1.0
+      ex_d: 9.999999999999998
+      ex_u: 1.0
+    rms_vp: 0.9086683507592246
+    weighted_rms: 5.757559213157721
+    held:
+    - t_u
+    - ex_u
+    at_bound:
+    - ex_d
+    flags:
+    - 'slopes held at their initial value (zone with < 3 quotes): {''t_u'': 0, ''ex_u'':
+      0}'
+    - 'parameters at a bound: [''ex_d'']'
+  - T: 0.12054794520547946
+    n: 250
+    params:
+      sigma: 0.23391806946763982
+      rho: -0.7013370705355609
+      nu: 1.6725312953020415
+      t_d: 1.2316609129083036
+      t_u: 1.0
+      ex_d: 9.999999999999995
+      ex_u: 1.0
+    rms_vp: 0.8528150997826531
+    weighted_rms: 6.712137478930069
+    held:
+    - t_u
+    - ex_u
+    at_bound:
+    - ex_d
+    flags:
+    - 'slopes held at their initial value (zone with < 3 quotes): {''t_u'': 2, ''ex_u'':
+      0}'
+    - 'zone coverage changed during the fit for [''t_u'']: {''ex_d'': 6, ''t_d'':
+      57, ''t_u'': 2, ''ex_u'': 0} -> {''ex_d'': 6, ''t_d'': 57, ''t_u'': 25, ''ex_u'':
+      0}'
+    - 'parameters at a bound: [''ex_d'']'
+  - T: 0.12602739726027398
+    n: 87
+    params:
+      sigma: 0.23722593822914334
+      rho: -0.7742131252299632
+      nu: 1.5732651926486103
+      t_d: 1.2836148643452803
+      t_u: 1.0
+      ex_d: 1.0
+      ex_u: 1.0
+    rms_vp: 0.9211743606008531
+    weighted_rms: 5.644204719161053
+    held:
+    - t_u
+    - ex_d
+    - ex_u
+    at_bound: []
+    flags:
+    - 'slopes held at their initial value (zone with < 3 quotes): {''t_u'': 0, ''ex_d'':
+      2, ''ex_u'': 0}'
+  - T: 0.16164383561643836
+    n: 251
+    params:
+      sigma: 0.23280991264223852
+      rho: -0.6966510311443889
+      nu: 1.5778995316572837
+      t_d: 1.152055869544136
+      t_u: 1.0
+      ex_d: 9.999999999999877
+      ex_u: 1.0
+    rms_vp: 0.7292015762085883
+    weighted_rms: 6.75551702859445
+    held:
+    - t_u
+    - ex_u
+    at_bound:
+    - ex_d
+    flags:
+    - 'slopes held at their initial value (zone with < 3 quotes): {''t_u'': 1, ''ex_u'':
+      0}'
+    - 'zone coverage changed during the fit for [''t_u'']: {''ex_d'': 3, ''t_d'':
+      50, ''t_u'': 1, ''ex_u'': 0} -> {''ex_d'': 3, ''t_d'': 50, ''t_u'': 28, ''ex_u'':
+      0}'
+    - 'parameters at a bound: [''ex_d'']'
+  - T: 0.1643835616438356
+    n: 253
+    params:
+      sigma: 0.2323295807208664
+      rho: -0.6944568067354013
+      nu: 1.5094021789023366
+      t_d: 1.3895354715691062
+      t_u: 8.010258790702855
+      ex_d: 9.999801023607088
+      ex_u: 1.0
+    rms_vp: 0.7356042833802587
+    weighted_rms: 8.180406621296786
+    held:
+    - ex_u
+    at_bound:
+    - ex_d
+    flags:
+    - 'slopes held at their initial value (zone with < 3 quotes): {''ex_u'': 0}'
+    - 'parameters at a bound: [''ex_d'']'
+  - T: 0.20273972602739726
+    n: 291
+    params:
+      sigma: 0.2339195368879974
+      rho: -0.7014657954636542
+      nu: 1.4464684988640333
+      t_d: 1.1318430859004636
+      t_u: 3.697951059527851
+      ex_d: 1.0
+      ex_u: 1.0
+    rms_vp: 0.6640060042375917
+    weighted_rms: 6.421177633506192
+    held:
+    - ex_d
+    - ex_u
+    at_bound: []
+    flags:
+    - 'slopes held at their initial value (zone with < 3 quotes): {''ex_d'': 0, ''ex_u'':
+      0}'
+    - 'zone coverage changed during the fit for [''ex_u'']: {''ex_d'': 0, ''t_d'':
+      55, ''t_u'': 12, ''ex_u'': 0} -> {''ex_d'': 0, ''t_d'': 55, ''t_u'': 40, ''ex_u'':
+      4}'
+  - T: 0.25753424657534246
+    n: 241
+    params:
+      sigma: 0.23530637218993422
+      rho: -0.7135862184062156
+      nu: 1.3162094404906288
+      t_d: 1.253074480773271
+      t_u: 3.0304710299338056
+      ex_d: 1.0
+      ex_u: 1.0
+    rms_vp: 0.4267236491058872
+    weighted_rms: 4.260145352358202
+    held:
+    - ex_d
+    - ex_u
+    at_bound: []
+    flags:
+    - 'slopes held at their initial value (zone with < 3 quotes): {''ex_d'': 0, ''ex_u'':
+      0}'
+  - T: 0.2602739726027397
+    n: 264
+    params:
+      sigma: 0.23509534778531796
+      rho: -0.7056232596496989
+      nu: 1.3209321807976933
+      t_d: 1.267899621576074
+      t_u: 2.50180382986552
+      ex_d: 1.0
+      ex_u: 1.0
+    rms_vp: 0.3587017360889928
+    weighted_rms: 5.524638720952912
+    held:
+    - ex_d
+    - ex_u
+    at_bound: []
+    flags:
+    - 'slopes held at their initial value (zone with < 3 quotes): {''ex_d'': 0, ''ex_u'':
+      0}'
+  - T: 0.2876712328767123
+    n: 173
+    params:
+      sigma: 0.23393792550227946
+      rho: -0.7234754321833751
+      nu: 1.2578883301584085
+      t_d: 1.2729538708018162
+      t_u: 3.099231634402295
+      ex_d: 1.0
+      ex_u: 1.0
+    rms_vp: 0.3246593197763652
+    weighted_rms: 4.552540384972451
+    held:
+    - ex_d
+    - ex_u
+    at_bound: []
+    flags:
+    - 'slopes held at their initial value (zone with < 3 quotes): {''ex_d'': 0, ''ex_u'':
+      0}'
+  - T: 0.33424657534246577
+    n: 200
+    params:
+      sigma: 0.23879367107966562
+      rho: -0.7372812004271466
+      nu: 1.1908625813637523
+      t_d: 1.2082172660140982
+      t_u: 3.0448042127749138
+      ex_d: 1.0
+      ex_u: 1.0
+    rms_vp: 0.3495088215974677
+    weighted_rms: 3.5253054005111415
+    held:
+    - ex_d
+    - ex_u
+    at_bound: []
+    flags:
+    - 'slopes held at their initial value (zone with < 3 quotes): {''ex_d'': 0, ''ex_u'':
+      0}'
+  - T: 0.336986301369863
+    n: 198
+    params:
+      sigma: 0.2388146997162093
+      rho: -0.7368531526801045
+      nu: 1.185004782225532
+      t_d: 1.2301229829013276
+      t_u: 2.9701866787480014
+      ex_d: 1.0
+      ex_u: 1.0
+    rms_vp: 0.3587740761912516
+    weighted_rms: 4.60269785809626
+    held:
+    - ex_d
+    - ex_u
+    at_bound: []
+    flags:
+    - 'slopes held at their initial value (zone with < 3 quotes): {''ex_d'': 0, ''ex_u'':
+      0}'
+  - T: 0.3698630136986301
+    n: 122
+    params:
+      sigma: 0.23745554792718884
+      rho: -0.7557448883704958
+      nu: 1.153329116596008
+      t_d: 1.1399837155624073
+      t_u: 4.758412578072732
+      ex_d: 1.0
+      ex_u: 1.0
+    rms_vp: 0.2882757887694451
+    weighted_rms: 3.9567856670260113
+    held:
+    - ex_d
+    - ex_u
+    at_bound: []
+    flags:
+    - 'slopes held at their initial value (zone with < 3 quotes): {''ex_d'': 0, ''ex_u'':
+      0}'
+  - T: 0.410958904109589
+    n: 189
+    params:
+      sigma: 0.2396799210141576
+      rho: -0.739566814003566
+      nu: 1.1136150289431215
+      t_d: 1.2374664566347953
+      t_u: 2.234055193931893
+      ex_d: 1.0
+      ex_u: 1.0
+    rms_vp: 0.3263764221672489
+    weighted_rms: 3.5997798915070467
+    held:
+    - ex_d
+    - ex_u
+    at_bound: []
+    flags:
+    - 'slopes held at their initial value (zone with < 3 quotes): {''ex_d'': 0, ''ex_u'':
+      1}'
+  - T: 0.4136986301369863
+    n: 200
+    params:
+      sigma: 0.23963657864167082
+      rho: -0.7404435321643231
+      nu: 1.1037268281569796
+      t_d: 1.2585796935265834
+      t_u: 2.2730768827092906
+      ex_d: 1.0
+      ex_u: 1.0
+    rms_vp: 0.2887092946629278
+    weighted_rms: 3.9159592155423932
+    held:
+    - ex_d
+    - ex_u
+    at_bound: []
+    flags:
+    - 'slopes held at their initial value (zone with < 3 quotes): {''ex_d'': 0, ''ex_u'':
+      0}'
+  - T: 0.4520547945205479
+    n: 238
+    params:
+      sigma: 0.23922259474285593
+      rho: -0.7500297381363641
+      nu: 1.0633027304206055
+      t_d: 1.2196428756574647
+      t_u: 2.852713721167274
+      ex_d: 1.0
+      ex_u: 1.0
+    rms_vp: 0.3165535428222506
+    weighted_rms: 2.9918471429359115
+    held:
+    - ex_d
+    - ex_u
+    at_bound: []
+    flags:
+    - 'slopes held at their initial value (zone with < 3 quotes): {''ex_d'': 0, ''ex_u'':
+      1}'
+  - T: 0.5068493150684932
+    n: 93
+    params:
+      sigma: 0.23780869222349615
+      rho: -0.7438292627267689
+      nu: 1.0323987385972886
+      t_d: 1.2052435025403536
+      t_u: 1.723546604733203
+      ex_d: 1.0
+      ex_u: 1.0
+    rms_vp: 0.22440344568329332
+    weighted_rms: 2.5176856046942593
+    held:
+    - ex_d
+    - ex_u
+    at_bound: []
+    flags:
+    - 'slopes held at their initial value (zone with < 3 quotes): {''ex_d'': 0, ''ex_u'':
+      1}'
+  - T: 0.5835616438356165
+    n: 108
+    params:
+      sigma: 0.2388228659051936
+      rho: -0.7484861553448915
+      nu: 0.9929484496860401
+      t_d: 1.0552743460617953
+      t_u: 1.6907602040022258
+      ex_d: 1.0
+      ex_u: 1.0
+    rms_vp: 0.23703802092736448
+    weighted_rms: 2.4612751135829622
+    held:
+    - ex_d
+    - ex_u
+    at_bound: []
+    flags:
+    - 'slopes held at their initial value (zone with < 3 quotes): {''ex_d'': 0, ''ex_u'':
+      0}'
+  - T: 0.6602739726027397
+    n: 116
+    params:
+      sigma: 0.23953126204006028
+      rho: -0.7540324809328378
+      nu: 0.9475604712320319
+      t_d: 0.9725698986116099
+      t_u: 1.6690332972244537
+      ex_d: 1.0
+      ex_u: 0.050000000726375234
+    rms_vp: 0.26928606185314624
+    weighted_rms: 2.8497637020583833
+    held:
+    - ex_d
+    at_bound:
+    - ex_u
+    flags:
+    - 'slopes held at their initial value (zone with < 3 quotes): {''ex_d'': 0}'
+    - 'zone coverage changed during the fit for [''ex_u'']: {''ex_d'': 0, ''t_d'':
+      11, ''t_u'': 25, ''ex_u'': 4} -> {''ex_d'': 0, ''t_d'': 11, ''t_u'': 22, ''ex_u'':
+      1}'
+    - 'parameters at a bound: [''ex_u'']'
+  - T: 0.7013698630136986
+    n: 111
+    params:
+      sigma: 0.2401064453945373
+      rho: -0.7678143055720875
+      nu: 0.8949955748327806
+      t_d: 1.0391419776172304
+      t_u: 2.95255800172077
+      ex_d: 1.0
+      ex_u: 1.0
+    rms_vp: 0.3002442981053996
+    weighted_rms: 2.8896124360772366
+    held:
+    - ex_d
+    - ex_u
+    at_bound: []
+    flags:
+    - 'slopes held at their initial value (zone with < 3 quotes): {''ex_d'': 0, ''ex_u'':
+      2}'
+  - T: 0.7561643835616438
+    n: 105
+    params:
+      sigma: 0.23933490422621867
+      rho: -0.7650496742472621
+      nu: 0.8863139552251712
+      t_d: 0.9259746406728023
+      t_u: 2.076073656491839
+      ex_d: 1.0
+      ex_u: 6.4032492971953685
+    rms_vp: 0.27187713878770353
+    weighted_rms: 2.1797730983710646
+    held:
+    - ex_d
+    at_bound: []
+    flags:
+    - 'slopes held at their initial value (zone with < 3 quotes): {''ex_d'': 0}'
+    - 'zone coverage changed during the fit for [''ex_u'']: {''ex_d'': 0, ''t_d'':
+      12, ''t_u'': 12, ''ex_u'': 4} -> {''ex_d'': 0, ''t_d'': 12, ''t_u'': 11, ''ex_u'':
+      0}'
+  - T: 0.8328767123287671
+    n: 122
+    params:
+      sigma: 0.23956572518434327
+      rho: -0.7566392972390453
+      nu: 0.8585316732764837
+      t_d: 0.8725839583382309
+      t_u: 1.8911009131473366
+      ex_d: 1.0
+      ex_u: 1.1774533986860687
+    rms_vp: 0.2682382183372289
+    weighted_rms: 2.019026474155191
+    held:
+    - ex_d
+    at_bound: []
+    flags:
+    - 'slopes held at their initial value (zone with < 3 quotes): {''ex_d'': 0}'
+    - 'zone coverage changed during the fit for [''ex_u'']: {''ex_d'': 0, ''t_d'':
+      23, ''t_u'': 18, ''ex_u'': 3} -> {''ex_d'': 0, ''t_d'': 23, ''t_u'': 12, ''ex_u'':
+      0}'
+  - T: 0.9095890410958904
+    n: 125
+    params:
+      sigma: 0.23860508826080584
+      rho: -0.7509571646674635
+      nu: 0.8374327512015053
+      t_d: 0.8208319306881238
+      t_u: 1.3797623444637364
+      ex_d: 1.0
+      ex_u: 0.21139866158265852
+    rms_vp: 0.2390102910026835
+    weighted_rms: 2.5301019519684362
+    held:
+    - ex_d
+    at_bound: []
+    flags:
+    - 'slopes held at their initial value (zone with < 3 quotes): {''ex_d'': 0}'
+    - 'zone coverage changed during the fit for [''ex_u'']: {''ex_d'': 0, ''t_d'':
+      20, ''t_u'': 18, ''ex_u'': 3} -> {''ex_d'': 0, ''t_d'': 20, ''t_u'': 12, ''ex_u'':
+      0}'
+  - T: 0.9506849315068493
+    n: 72
+    params:
+      sigma: 0.24040512848937962
+      rho: -0.8143090032175023
+      nu: 0.7535026147033924
+      t_d: 1.0126075842319104
+      t_u: 1.0
+      ex_d: 1.0
+      ex_u: 1.0
+    rms_vp: 0.1576330928253724
+    weighted_rms: 1.7912633137888319
+    held:
+    - t_u
+    - ex_d
+    - ex_u
+    at_bound: []
+    flags:
+    - 'slopes held at their initial value (zone with < 3 quotes): {''t_u'': 1, ''ex_d'':
+      0, ''ex_u'': 0}'
+  - T: 1.0054794520547945
+    n: 92
+    params:
+      sigma: 0.23867190247199502
+      rho: -0.7548765422011817
+      nu: 0.7902551473875823
+      t_d: 0.8155224617084662
+      t_u: 2.5017699094548913
+      ex_d: 1.0
+      ex_u: 1.0
+    rms_vp: 0.23547835445502777
+    weighted_rms: 1.9047089284545193
+    held:
+    - ex_d
+    - ex_u
+    at_bound: []
+    flags:
+    - 'slopes held at their initial value (zone with < 3 quotes): {''ex_d'': 0, ''ex_u'':
+      2}'
+  - T: 1.082191780821918
+    n: 91
+    params:
+      sigma: 0.23845360981924982
+      rho: -0.7485946178194691
+      nu: 0.7663289756217261
+      t_d: 0.7235262341792281
+      t_u: 2.7770356079945144
+      ex_d: 1.0
+      ex_u: 1.0
+    rms_vp: 0.24478118505527907
+    weighted_rms: 1.4382927740169158
+    held:
+    - ex_d
+    - ex_u
+    at_bound: []
+    flags:
+    - 'slopes held at their initial value (zone with < 3 quotes): {''ex_d'': 0, ''ex_u'':
+      2}'
+  - T: 1.158904109589041
+    n: 81
+    params:
+      sigma: 0.23727697995312125
+      rho: -0.7408421340047919
+      nu: 0.7778620740075096
+      t_d: 0.3876769471035944
+      t_u: 1.792920836067148
+      ex_d: 1.0
+      ex_u: 0.8659056038662789
+    rms_vp: 0.26322263481670777
+    weighted_rms: 2.03392057138408
+    held:
+    - ex_d
+    at_bound: []
+    flags:
+    - 'slopes held at their initial value (zone with < 3 quotes): {''ex_d'': 0}'
+    - 'zone coverage changed during the fit for [''ex_u'']: {''ex_d'': 0, ''t_d'':
+      7, ''t_u'': 8, ''ex_u'': 4} -> {''ex_d'': 0, ''t_d'': 7, ''t_u'': 8, ''ex_u'':
+      0}'
+  - T: 1.4082191780821918
+    n: 129
+    params:
+      sigma: 0.23486068625080586
+      rho: -0.7209389844357379
+      nu: 0.7129360207007369
+      t_d: 0.1539337062194057
+      t_u: 1.9020361512117612
+      ex_d: 1.0
+      ex_u: 0.8504809414179807
+    rms_vp: 0.2626303538269973
+    weighted_rms: 2.0734452088387387
+    held:
+    - ex_d
+    at_bound: []
+    flags:
+    - 'slopes held at their initial value (zone with < 3 quotes): {''ex_d'': 0}'
+    - 'zone coverage changed during the fit for [''ex_u'']: {''ex_d'': 0, ''t_d'':
+      14, ''t_u'': 21, ''ex_u'': 8} -> {''ex_d'': 0, ''t_d'': 14, ''t_u'': 16, ''ex_u'':
+      0}'
+  - T: 1.926027397260274
+    n: 89
+    params:
+      sigma: 0.22903583155608123
+      rho: -0.7329546372483215
+      nu: 0.5904318810968715
+      t_d: 0.05000000002383337
+      t_u: 9.639145710582433
+      ex_d: 1.0
+      ex_u: 1.0
+    rms_vp: 0.24546982665071526
+    weighted_rms: 1.421853031000779
+    held:
+    - ex_d
+    - ex_u
+    at_bound:
+    - t_d
+    flags:
+    - 'slopes held at their initial value (zone with < 3 quotes): {''ex_d'': 0, ''ex_u'':
+      2}'
+    - 'parameters at a bound: [''t_d'']'
+  - T: 2.4246575342465753
+    n: 38
+    params:
+      sigma: 0.22420255505993686
+      rho: -0.7181097177638545
+      nu: 0.558288521613807
+      t_d: 1.0
+      t_u: 2.1732699524879044
+      ex_d: 1.0
+      ex_u: 0.7437532723435768
+    rms_vp: 0.24275731950176094
+    weighted_rms: 0.9638570245374526
+    held:
+    - t_d
+    - ex_d
+    at_bound: []
+    flags:
+    - 'slopes held at their initial value (zone with < 3 quotes): {''t_d'': 1, ''ex_d'':
+      0}'
+    - 'zone coverage changed during the fit for [''ex_u'']: {''ex_d'': 0, ''t_d'':
+      1, ''t_u'': 11, ''ex_u'': 3} -> {''ex_d'': 0, ''t_d'': 1, ''t_u'': 4, ''ex_u'':
+      0}'

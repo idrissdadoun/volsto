@@ -20,13 +20,16 @@ deterministic, ordered list of :class:`GridPoint` — one per model calibrated t
 * ``two_factor`` — named :class:`~volsto.config.BergomiParams` presets (Table 8.2) on the
   surfaces flagged ``two_factor: true``.
 * ``marking`` — the P1 marking fits :func:`~volsto.calibration.fit_2f.fit_2f_marking` at
-  ``ssr_target × skew_eps`` on the surfaces flagged ``marking: true`` (the SPX snapshots).  The
+  ``ssr_target × skew_eps`` on the surfaces flagged ``marking: true`` (the SPX snapshots), with
+  the named fit ``marking.fit`` (:data:`~volsto.calibration.fit_2f.FIT_PRESETS`: ``desk`` reads
+  step 0 from the snapshot's SABRW fits, so it runs on snapshots only).  The
   fit defines the model parameters, so a marking point is *resolved* by :func:`resolve_marking`
   (about 2 s per fit) only when it is computed; its id is the stable label
   ``marking:<surface>:ssr<s>:eps<e>`` (a cache key would need the fit first), the fitted
   parameters, the status (``interior`` / ``binding`` / ``infeasible``) and the leverage-cache key
-  are recorded in the store.  An infeasible fit is recorded as a point with status
-  ``infeasible`` and **no** calibration.
+  are recorded in the store with the digest of what the fit read (:func:`marking_digest`: the
+  surface, the resolved fit config, the snapshot's SABRW fits).  An infeasible fit is recorded as
+  a point with status ``infeasible`` and **no** calibration.
 
 Point ids of calibrated points (``one_factor``, ``two_factor``) are the leverage-cache key of
 their :class:`~volsto.config.CalibrationSpec` (market, surface, model, particle settings,
@@ -52,7 +55,7 @@ from typing import Any
 
 import volsto
 from volsto.calibration.cache import spec_key
-from volsto.calibration.fit_2f import BreakEvenFitConfig, FitResult, fit_2f_marking
+from volsto.calibration.fit_2f import FIT_PRESETS, FitResult, fit_2f_marking, fit_preset
 from volsto.config import (
     BergomiParams,
     CalibrationSpec,
@@ -61,7 +64,7 @@ from volsto.config import (
     load_yaml,
     to_mapping,
 )
-from volsto.market.loaders import snapshot_spec
+from volsto.market.loaders import load_sabrw_fits, snapshot_spec, step0_source
 from volsto.market.surface import ImpliedSurface
 
 log = logging.getLogger(__name__)
@@ -154,18 +157,22 @@ class TwoFactorPreset:
 
 @dataclass(frozen=True)
 class MarkingAxes:
-    """``ssr_target × skew_eps`` of :func:`~volsto.calibration.fit_2f.fit_2f_marking` (the
-    fitter's other settings at their documented defaults: k2 = 0.2, ν cap 3.5, two-point skew
-    constraint)."""
+    """``ssr_target × skew_eps`` of :func:`~volsto.calibration.fit_2f.fit_2f_marking` with the
+    named fit ``fit`` (:data:`~volsto.calibration.fit_2f.FIT_PRESETS`, no default: ``m7`` the M7
+    fit — k2 = 0.2, ν cap 3.5, step 0 from the surface —, ``desk`` the desk's, step 0 from the
+    snapshot's SABRW fits)."""
 
     ssr_target: tuple[float, ...]
     skew_eps: tuple[float, ...]
+    fit: str
 
     def __post_init__(self) -> None:
         if not (self.ssr_target and self.skew_eps):
             raise ValueError("marking axes must be non-empty")
         if any(s <= 0 for s in self.ssr_target) or any(e < 0 for e in self.skew_eps):
             raise ValueError("ssr_target must be positive and skew_eps non-negative")
+        if self.fit not in FIT_PRESETS:
+            raise ValueError(f"marking.fit must be one of {sorted(FIT_PRESETS)}")
 
 
 @dataclass(frozen=True)
@@ -284,6 +291,13 @@ class GridSpec:
         for e in self.extra_points:
             if e.surface not in names:
                 raise ValueError(f"extra point {e.label!r} names an unknown surface")
+        if self.marking is not None and FIT_PRESETS[self.marking.fit].step0 is not None:
+            bare = [s.name for s in self.surfaces if s.marking and s.kind != "snapshot"]
+            if bare:
+                raise ValueError(
+                    f"marking.fit {self.marking.fit!r} reads step 0 from a snapshot's SABRW fits: "
+                    f"surfaces {bare} have no quotes"
+                )
 
     def surface(self, name: str) -> SurfaceSpec:
         for s in self.surfaces:
@@ -390,7 +404,9 @@ class GridPoint:
     """One store row.  ``spec`` is the calibration spec (the LV placeholder model for ``lv``
     points; for an unresolved marking point the model is the placeholder too and ``resolved`` is
     False); ``axes`` holds the axis values that address the point on the pages; ``cache_key`` is
-    the leverage-cache key (None for ``lv`` and unresolved / infeasible marking points)."""
+    the leverage-cache key (None for ``lv`` and unresolved / infeasible marking points); a
+    marking point carries its named fit ``fit`` and its surface's ``snapshot`` path (relative to
+    the repository root; ``None`` on the placeholder)."""
 
     id: str
     label: str
@@ -402,6 +418,8 @@ class GridPoint:
     status: str = "ok"
     resolved: bool = True
     marking: MarkingSummary | None = None
+    fit: str | None = None
+    snapshot: str | None = None
 
     @property
     def params(self) -> BergomiParams | None:
@@ -487,6 +505,8 @@ def enumerate_points(grid: GridSpec) -> list[GridPoint]:
                         None,
                         "unresolved",
                         False,
+                        fit=grid.marking.fit,
+                        snapshot=surface.path,
                     )
                     per_surface.append(((3, (ssr, eps)), pt))
         for j, extra in enumerate(e for e in grid.extra_points if e.surface == surface.name):
@@ -582,13 +602,52 @@ def marking_summary(r: FitResult) -> MarkingSummary:
     )
 
 
-def marking_fit(surface: ImpliedSurface, ssr_target: float, skew_eps: float) -> FitResult:
+def marking_fit(
+    surface: ImpliedSurface,
+    ssr_target: float,
+    skew_eps: float,
+    *,
+    fit: str,
+    snapshot: str | None,
+) -> FitResult:
     """The P1 marking fit of one mark on a surface — the one call a marking point is resolved by
     (:func:`resolve_marking`) and the S5 catalogue study fits its binding map with
     (:mod:`volsto.studies.catalogue.s5_marking`): :func:`~volsto.calibration.fit_2f.
-    fit_2f_marking` with the fitter's documented defaults (k2 0.2, ν cap 3.5, two-point skew
-    constraint) at ``skew_eps``, and ``ssr_target``; no stage 3, so no leverage is built."""
-    return fit_2f_marking(surface, BreakEvenFitConfig(skew_eps=skew_eps), ssr_target=ssr_target)
+    fit_2f_marking` with the named fit ``fit`` (:data:`~volsto.calibration.fit_2f.FIT_PRESETS`)
+    at ``skew_eps``, and ``ssr_target``; a fit whose step 0 reads the SABRW fits reads those of
+    ``snapshot`` (the surface's file, relative to the repository root).  No stage 3, so no
+    leverage is built."""
+    cfg = fit_preset(fit, skew_eps=skew_eps)
+    step0 = None
+    if cfg.step0 is not None:
+        if snapshot is None:
+            raise ValueError(f"marking fit {fit!r} reads a snapshot's SABRW fits: no snapshot")
+        fits = load_sabrw_fits(REPO_ROOT / snapshot)
+        if fits is None:
+            raise ConfigError(f"{snapshot}: no sabrw section (the SABRW fits step 0 reads)")
+        step0 = step0_source(fits, surface)
+    return fit_2f_marking(surface, cfg, ssr_target=ssr_target, step0=step0)
+
+
+def marking_digest(point: GridPoint) -> str:
+    """SHA-256 of what a marking point's fit reads: the surface (:func:`surface_digest`), the
+    resolved fit config and — when its step 0 reads them — the snapshot's SABRW fits.  Stored in
+    the point's manifest; ``volsto-precompute --resume`` recomputes a point whose digest differs
+    (:func:`volsto.viewers.precompute.pending_steps`)."""
+    if point.mode != "marking" or point.fit is None:
+        raise ValueError("a marking digest needs a marking point with its fit")
+    cfg = fit_preset(point.fit, skew_eps=float(point.axes["skew_eps"]))
+    fits = None
+    if cfg.step0 is not None and point.snapshot is not None:
+        fits = load_sabrw_fits(REPO_ROOT / point.snapshot)
+    payload = {
+        "surface": surface_digest(point.spec),
+        "fit": to_mapping(cfg),
+        "ssr_target": float(point.axes["ssr_target"]),
+        "sabrw": None if fits is None else [to_mapping(f) for f in fits],
+    }
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
+    return hashlib.sha256(blob).hexdigest()
 
 
 def resolve_marking(point: GridPoint, surface: ImpliedSurface) -> GridPoint:
@@ -599,8 +658,10 @@ def resolve_marking(point: GridPoint, surface: ImpliedSurface) -> GridPoint:
         raise ValueError("only marking points are resolved by a fit")
     if point.resolved:
         return point
+    if point.fit is None:
+        raise ValueError(f"marking point {point.label!r} names no fit")
     ssr, eps = point.axes["ssr_target"], point.axes["skew_eps"]
-    r = marking_fit(surface, ssr, eps)
+    r = marking_fit(surface, ssr, eps, fit=point.fit, snapshot=point.snapshot)
     summary = marking_summary(r)
     spec = dataclasses.replace(point.spec, model=r.params)
     key = None if r.status == "infeasible" else spec_key(spec)

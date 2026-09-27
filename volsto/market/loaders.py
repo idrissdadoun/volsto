@@ -10,9 +10,11 @@ package for any other reader.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import Any
 
+import numpy as np
 import yaml
 
 from volsto.config import (
@@ -26,6 +28,7 @@ from volsto.config import (
 )
 from volsto.market.curves import DiscountCurve, ForwardCurve
 from volsto.market.dupire import LocalVolSurface
+from volsto.market.sabrw import SabrwFit, SabrwParams, SabrwTermStructure, zones
 from volsto.market.surface import SSVISurface, surface_from_config
 
 #: Keys of a snapshot's ``essvi`` section (the importer writes the pillar correlations only).
@@ -80,6 +83,64 @@ def load_ssvi_surface(path: str | Path) -> SSVISurface:
     file has an ``essvi`` section (:func:`load_surface_config`), the plain SSVI otherwise."""
     fc = load_market(path)
     return surface_from_config(load_surface_config(path), fc, fc.rate_curve)
+
+
+def sabrw_fits_from_config(raw: Mapping[str, Any]) -> tuple[SabrwFit, ...] | None:
+    """The SABRW fits of a parsed snapshot's ``sabrw`` section (written by
+    :func:`volsto.market.import_hdn.sabrw_section`), ``None`` when it has none: the one reader of
+    that section (:func:`load_sabrw_fits` reads the file)."""
+    if "sabrw" not in raw:
+        return None
+    out = []
+    for rec in raw["sabrw"]["fits"]:
+        prm = SabrwParams(**{str(k): float(v) for k, v in rec["params"].items()})
+        T = float(rec["T"])
+        out.append(
+            SabrwFit(
+                T,
+                prm,
+                zones(prm, T)[0],
+                float(rec["rms_vp"]),
+                float(rec["weighted_rms"]),
+                int(rec["n"]),
+                tuple(rec["held"]),
+                tuple(rec["at_bound"]),
+                tuple(rec["flags"]),
+            )
+        )
+    return tuple(out)
+
+
+def load_sabrw_fits(path: str | Path) -> tuple[SabrwFit, ...] | None:
+    """The SABRW fits stored in the snapshot at ``path`` (:func:`sabrw_fits_from_config`)."""
+    with Path(path).open("r", encoding="utf-8") as fh:
+        raw = yaml.safe_load(fh)
+    if not isinstance(raw, Mapping):
+        raise ConfigError(f"{path}: not a mapping")
+    return sabrw_fits_from_config(raw)
+
+
+def step0_source(fits: Sequence[SabrwFit], surface: Any) -> SabrwTermStructure:
+    """Step 0's source from a date's SABRW fits (SPEC §15 Part 3): their term structure with the
+    quote rule (:meth:`~volsto.market.sabrw.SabrwTermStructure.from_fits`) and the ATM level of
+    ``surface``, the date's pricing surface."""
+
+    def atm(T: float) -> float:
+        return float(np.asarray(surface.atm_vol(T)))
+
+    return SabrwTermStructure.from_fits(fits, atm)
+
+
+def load_step0_source(path: str | Path, surface: Any) -> SabrwTermStructure:
+    """:func:`step0_source` of the fits stored in the snapshot at ``path``; raises when the file
+    has none (imported before the importer stored them: re-import it)."""
+    fits = load_sabrw_fits(path)
+    if fits is None:
+        raise ConfigError(
+            f"{path}: no sabrw section (the date's SABRW fits): re-import the snapshot or add the "
+            "section (scripts/add_sabrw_sections.py)"
+        )
+    return step0_source(fits, surface)
 
 
 def load_local_vol(

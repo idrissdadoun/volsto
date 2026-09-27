@@ -85,6 +85,7 @@ import yaml
 from _backtest_build import BacktestBuild, toy_backtest_build  # noqa: F401
 
 from volsto.calibration import guard
+from volsto.calibration.fit_2f import BreakEvenFitConfig, fit_preset
 from volsto.calibration.history import DEFAULT_PILLARS
 from volsto.calibration.stability import PARAM_COLUMNS, flag_unidentified
 from volsto.config import CalibrationSpec, ConfigError, CurveConfig, MarketConfig, SimConfig
@@ -255,6 +256,17 @@ def test_configs_load_and_hash_rules(tmp_path: Path) -> None:
         data, stability=dict(data["stability"], fit=dict(data["stability"]["fit"], k2=0.25))
     )
     assert bt.BacktestConfig.from_mapping(fit_changed).content_hash() != toy.content_hash()
+    # the marking fit is named (SPEC §15 Part 3): the toy keeps the M7 fit, the runs the desk's;
+    # the M7 fit hashes as before the key existed (named or not), so no stored store moves
+    unnamed = dict(data, marking={k: v for k, v in data["marking"].items() if k != "fit"})
+    assert data["marking"]["fit"] == "m7" and "fit" not in toy.to_mapping()["marking"]
+    assert bt.BacktestConfig.from_mapping(unnamed).content_hash() == toy.content_hash()
+    desk = bt.BacktestConfig.from_mapping(dict(data, marking=dict(data["marking"], fit="desk")))
+    assert desk.content_hash() != toy.content_hash()
+    assert desk.content()["marking"]["resolved"]["step0"] == "sabrw"
+    assert toy.fit_config() == BreakEvenFitConfig(skew_eps=0.10)
+    for cfg_ in (poc, full):
+        assert cfg_.fit_config() == fit_preset("desk", skew_eps=0.10)
     for cfg_ in (poc, full, toy):
         assert cfg_.missing_close == "fail"
         assert cfg_.stability_fit_config().skew_mode == "soft"
@@ -277,6 +289,7 @@ def test_configs_load_and_hash_rules(tmp_path: Path) -> None:
         (lambda d: d.update(extra=1), "unknown keys"),
         (lambda d: d.pop("ssr"), "missing keys"),
         (lambda d: d["marking"].update(stage3=True), "stage3"),
+        (lambda d: d["marking"].update(fit="house"), "marking.fit"),
         (lambda d: d["attribution"].update(mode="recalibrate"), "sticky_leverage"),
         (lambda d: d["book"]["fixed"][0].update(maturity=0.3), "trading days"),
         (lambda d: d["book"]["fixed"][0].update(observations=4), "do not divide"),
@@ -343,6 +356,47 @@ def test_only_dates_takes_dates_and_ranges() -> None:
         bt._split_dates(["2022-08-02..2022-07-27"])
     with pytest.raises(ConfigError, match="YYYY-MM-DD"):
         bt._split_dates(["2022-07-27..soon"])
+
+
+def test_desk_marking_reads_the_snapshot_sabrw_fits(
+    build_copy: BacktestBuild, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``marking.fit: desk`` (SPEC §15 Part 3): a date's marking fit gets the desk preset at the
+    config's ``skew_eps`` and step 0's source built from the SABRW fits of the snapshot bytes the
+    date verified — the fits the loader reads from that file, at the surface's ATM level; a
+    parse without the section fails the date instead of falling back to the surface."""
+    from volsto.market.loaders import load_step0_source
+
+    b = build_copy
+    raw = cfg_at(b).to_mapping()
+    raw["marking"]["fit"] = "desk"
+    cfg = bt.BacktestConfig.from_mapping(raw, source=str(TOY_CONFIG)).with_paths(
+        out=b.store_root, cache=b.cache_root, snapshots=b.snapshots_root
+    )
+    seen: dict[str, Any] = {}
+
+    class FitCalledError(Exception):
+        pass
+
+    def fake(surface: Any, c: Any, *, ssr_target: float, step0: Any = None) -> Any:
+        seen.update(surface=surface, cfg=c, step0=step0, ssr=ssr_target)
+        raise FitCalledError
+
+    monkeypatch.setattr(bt, "fit_2f_marking", fake)
+    date = _backtest_build.TOY_BACKTEST_DATES[0]
+    run = bt.BacktestRun(cfg, allow_calibrate=False)
+    with pytest.raises(FitCalledError):
+        run._mark(date)
+    assert seen["cfg"] == fit_preset("desk", skew_eps=0.10) and seen["ssr"] == 1.0
+    want = load_step0_source(run.snapshot_path(date), seen["surface"])
+    assert seen["step0"].label == want.label
+    for T in (0.25, 1.0, 2.0):
+        assert seen["step0"].triplet(T) == want.triplet(T)
+    # a bound snapshot cannot lose its section (an edited file is unbound and re-imported, and
+    # the importer always writes it); the guard behind it fails the date, never falls back
+    monkeypatch.setattr(bt, "sabrw_fits_from_config", lambda raw: None)
+    with pytest.raises(bt.DateFailure, match="no sabrw section"):
+        bt.BacktestRun(cfg, allow_calibrate=False)._mark(date)
 
 
 def test_shards_split_the_only_dates_selection(tmp_path: Path) -> None:

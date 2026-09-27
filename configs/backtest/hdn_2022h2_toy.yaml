@@ -24,6 +24,7 @@ marking:
   ssr_target: 1.0
   skew_eps: 0.10
   stage3: false
+  fit: m7                  # the M7 fit: the toy store's cached leverages stay valid
 calibration:
   base_spec: configs/studies/lsv_reference_2f.yaml
   n_particles: 20000

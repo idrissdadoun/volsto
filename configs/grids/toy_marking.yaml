@@ -16,6 +16,7 @@ particle:
 marking:
   ssr_target: [1.0, 1.5]
   skew_eps: [0.05, 0.10]
+  fit: m7                  # the placeholder has no quotes: the M7 fit (step 0 from the surface)
 include_degenerate: false
 products:
   m4: true

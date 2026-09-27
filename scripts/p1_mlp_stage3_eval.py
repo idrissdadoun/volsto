@@ -40,9 +40,15 @@ RUNS = ("outputs/step0_stage3", "outputs/step0_stage3_caps", "outputs/step0_stag
 ENGINES = ("volsto", "note_fo", "note")
 
 
-def volsto_first_order(surf, p, k2: float) -> dict[float, tuple[float, float]]:  # type: ignore[no-untyped-def]
-    """volsto's first-order SpotVolCovar and VolVar per pillar at ``p`` (surface skew)."""
-    cfg = f2.BreakEvenFitConfig(skew_eps=0.10, k2=k2, k1_bounds=(k2 + 0.1, 100.0))
+def volsto_first_order(surf, p, k2: float, s0m: float) -> dict[float, tuple[float, float]]:  # type: ignore[no-untyped-def]
+    """volsto's first-order SpotVolCovar and VolVar per pillar at ``p`` (surface skew), ``σ_0``
+    the ATMF vol at ``s0m``."""
+    cfg = f2.BreakEvenFitConfig(
+        skew_eps=0.10,
+        k2=k2,
+        k1_bounds=(k2 + 0.1, 100.0),
+        sigma0_maturity=None if s0m == SIGMA0_MATURITY else s0m,
+    )
     targets = f2.marking_targets_for(surf, cfg, ssr_target=1.0)
     xi0 = xi0_curve(surf, float(min(surf.max_maturity, max(targets.pillars))))
     prob, _ = f2._first_problem(targets, cfg, xi0)
@@ -58,18 +64,25 @@ def volsto_first_order(surf, p, k2: float) -> dict[float, tuple[float, float]]: 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default=str(ROOT / "outputs" / "p1_mlp_eval"))
+    ap.add_argument("--runs", nargs="*", default=list(RUNS), help="stage-3 output directories")
+    ap.add_argument(
+        "--sigma0-maturity",
+        type=float,
+        default=SIGMA0_MATURITY,
+        help="the ATMF maturity of the simulations' sigma_0 (the runs' sigma0_maturity)",
+    )
     a = ap.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     t0 = time.perf_counter()
-    fits = pd.concat([pd.read_csv(ROOT / r / "fits.csv") for r in RUNS], ignore_index=True)
-    checks = pd.concat([pd.read_csv(ROOT / r / "check.csv") for r in RUNS], ignore_index=True)
+    fits = pd.concat([pd.read_csv(ROOT / r / "fits.csv") for r in a.runs], ignore_index=True)
+    checks = pd.concat([pd.read_csv(ROOT / r / "check.csv") for r in a.runs], ignore_index=True)
     fits = fits.drop_duplicates(["date", "variant"])
     checks = checks.drop_duplicates(["date", "variant", "T", "quantity"])
     rows = []
     for f in fits.itertuples():
         surf = load_ssvi_surface(SNAPSHOTS / f"spx_{f.date}.yaml")
-        sigma_0 = float(surf.atm_vol(SIGMA0_MATURITY))
+        sigma_0 = float(surf.atm_vol(a.sigma0_maturity))
         p = to_breakeven(
             BergomiParams(
                 nu=f.nu,
@@ -81,7 +94,7 @@ def main() -> None:
                 rho_SX2=f.rho_sx2,
             )
         )
-        vfo = volsto_first_order(surf, p, float(f.k2))
+        vfo = volsto_first_order(surf, p, float(f.k2), a.sigma0_maturity)
         mine = checks[(checks["date"] == f.date) & (checks["variant"] == f.variant)]
         for T in sorted(mine["T"].unique()):
             be = mlp_breakevens(surf, p, float(T), sigma_0=sigma_0)

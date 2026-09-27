@@ -9,7 +9,8 @@ two dials").
   ``(ssr_target, skew_eps)`` of ``params.binding_map`` the study runs the P1 marking fit through
   the one helper the precompute resolves a marking point with
   (:func:`volsto.viewers.grid.marking_fit`, called by :func:`~volsto.viewers.grid.
-  resolve_marking`: ``fit_2f_marking`` at k2 0.2, ν cap 3.5, two-point skew constraint)
+  resolve_marking`: ``fit_2f_marking`` with the grid's named fit ``marking.fit`` — the default
+  grid's ``desk``, step 0 from the snapshot's SABRW fits)
   **without stage 3**: a deterministic parameter fit of a few
   seconds (first-order break-even closed forms, a 2-D QP per k1 and a ten-start SLSQP), **not a
   leverage calibration** — nothing is simulated and no leverage is built.  The runner's guard
@@ -475,10 +476,13 @@ def _setup(
         )
 
 
-def _fit(surface: Any, ssr: float, eps: float) -> tuple[FitResult, float]:
-    """The precompute's own marking fit (:func:`volsto.viewers.grid.marking_fit`), timed."""
+def _fit(
+    surface: Any, ssr: float, eps: float, *, fit: str, snapshot: str | None
+) -> tuple[FitResult, float]:
+    """The precompute's own marking fit (:func:`volsto.viewers.grid.marking_fit`, the grid's
+    named fit), timed."""
     t0 = time.perf_counter()
-    r = marking_fit(surface, ssr, eps)
+    r = marking_fit(surface, ssr, eps, fit=fit, snapshot=snapshot)
     return r, time.perf_counter() - t0
 
 
@@ -494,12 +498,16 @@ def _binding_map(
     pts: Sequence[GridPoint],
 ) -> None:
     bm = ctx.params["binding_map"]
+    if grid.marking is None:
+        raise ValueError(f"S5 needs a grid with a marking section: {grid.name} has none")
     grid_ids = {(pt.surface, pt.axes["ssr_target"], pt.axes["skew_eps"]): pt.id for pt in pts}
     walls: dict[str, float] = {}
     for sname, surface in surfaces.items():
         for ssr in (float(x) for x in bm["ssr_target"]):
             for eps in (float(x) for x in bm["skew_eps"]):
-                r, wall = _fit(surface, ssr, eps)
+                r, wall = _fit(
+                    surface, ssr, eps, fit=grid.marking.fit, snapshot=grid.surface(sname).path
+                )
                 m = marking_summary(r)
                 row = mark_label(sname, ssr, eps)
                 walls[row] = round(wall, 3)

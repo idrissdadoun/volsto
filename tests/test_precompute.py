@@ -116,6 +116,18 @@ def test_default_grid_counts_and_shards() -> None:
     marking = [p for p in points if p.mode == "marking"]
     assert all(not p.resolved and p.cache_key is None for p in marking)
     assert marking[0].id == "marking:spx_2022-12-30:ssr0.75:eps0.05"
+    # the named fit (SPEC §15 Part 3): the default grid marks with the desk's fit, which reads
+    # each snapshot's SABRW fits; a placeholder has no quotes, so a desk grid refuses it
+    assert grid.marking is not None and grid.marking.fit == "desk"
+    assert all(p.fit == "desk" and p.snapshot is not None for p in marking)
+    assert marking[0].snapshot == "configs/surfaces/snapshots/hdn_2022H2/spx_2022-12-30.yaml"
+    with pytest.raises(ValueError, match=r"marking\.fit"):
+        dataclasses.replace(grid.marking, fit="house")
+    bare = dataclasses.replace(grid.surfaces[0], marking=True)
+    with pytest.raises(ValueError, match="no quotes"):
+        dataclasses.replace(grid, surfaces=(bare, *grid.surfaces[1:]))
+    toy = load_grid(ROOT / "configs" / "grids" / "toy_marking.yaml")
+    assert toy.marking is not None and toy.marking.fit == "m7"
 
 
 def _cache_keys(root: Path) -> set[str]:

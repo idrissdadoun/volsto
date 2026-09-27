@@ -680,8 +680,8 @@ def test_tables_yaml_and_fit_spec(spx_fits, tmp_path) -> None:  # type: ignore[n
 
 def test_realised_lsv_ssr_reported_for_study_fits(fast_sim) -> None:  # type: ignore[no-untyped-def]
     """The cached study fits of ``scripts/m7_p1_marking.py`` (``configs/studies/m7_p1_marking``;
-    skipped when absent): the recorded fit is reproduced by the fitter (same parameters, the cache
-    key), the cached leverage is read (never calibrated), stage 3 reports the calibrated LSV's
+    skipped when absent): the recorded fit is reproduced by the fitter with the entry's config and
+    step-0 source (same parameters, the cache key), the cached leverage is read (never calibrated), stage 3 reports the calibrated LSV's
     numerical SSR at 3M and 1Y with standard errors, the mean ``|L − 1|`` and the stage-3 assertion
     verdict at 3M — reported, not asserted equal to the SSR target / pass (the owner: the realised
     SSR is a diagnostic, about 1.4–2.0 at ``ssr_target = 1``)."""
@@ -694,7 +694,9 @@ def test_realised_lsv_ssr_reported_for_study_fits(fast_sim) -> None:  # type: ig
     for path in specs:
         fs = load_fit_spec(path)
         _, surface, _ = build_market(fs.spec)
-        r = fit_2f_marking(surface, fs.config, ssr_target=fs.ssr_target)
+        r = fit_2f_marking(
+            surface, fs.config, ssr_target=fs.ssr_target, step0=fs.step0_source(surface)
+        )
         assert r.params == fs.spec.model, (path.name, r.params, fs.spec.model)
         assert r.status == fs.fit["status"]
         lsv = _cached(fs.spec)
@@ -1146,7 +1148,8 @@ def test_step0_from_sabrw_fits(spx) -> None:  # type: ignore[no-untyped-def]
     """Step 0 from the desk's SABRW fits (SPEC §15 Part 3): synthetic fits with ``ρ = −0.75`` on
     every expiry give correlation targets of −0.75 at every pillar (up to the ATM level the
     surface supplies), the flags name the source, the ATM term structure stays the surface's, and
-    ``skew_h`` with a source raises.  On the SPX anchor's own quotes (HDN sample) the targets sit
+    ``skew_h`` with a source reads the leverage term's skew on that stencil.  On the SPX anchor's
+    own quotes (HDN sample) the targets sit
     inside (−0.9, −0.65), nothing is clipped and the correlation matrix is no longer near-singular
     (measured 2026-09-26: above 0.01, against 6·10⁻⁴ from the surface's ATM derivatives)."""
     from volsto.calibration.fit_2f import CORRELATION_EIGEN_FLAG, marking_targets_for
@@ -1177,8 +1180,19 @@ def test_step0_from_sabrw_fits(spx) -> None:  # type: ignore[no-untyped-def]
     for T, v in cons.items():
         assert v == pytest.approx(float(t.band_skew[list(t.pillars).index(T)]), rel=1e-12)
     assert marking_targets_for(spx, cfg).band_skew is None
-    with pytest.raises(ValueError, match="skew_h"):
-        marking_targets_for(spx, cfg, step0=ts, skew_h=0.05)
+    # with a stencil (the hedger's reading) the leverage term reads the surface on it; step 0 and
+    # the band stay the source's
+    from volsto.calibration.targets import surface_atm_derivatives
+
+    ts_h = marking_targets_for(spx, cfg, step0=ts, skew_h=0.05)
+    np.testing.assert_array_equal(ts_h.band_skew, t.band_skew)
+    np.testing.assert_array_equal(ts_h.correl_target, t.correl_target)
+    np.testing.assert_allclose(
+        ts_h.skew_target,
+        [surface_atm_derivatives(spx, float(T), skew_h=0.05)[1] for T in t.pillars],
+        rtol=1e-12,
+    )
+    assert np.max(np.abs(ts_h.skew_target / t.skew_target - 1.0)) > 1e-6
     from volsto.calibration.targets import sabr_reduce_triplet
 
     with pytest.raises(ValueError, match="radicand_floor"):
@@ -1294,6 +1308,90 @@ def test_volvar_target_direct_option(spx) -> None:  # type: ignore[no-untyped-de
     rebuilt = (rb.first.table["svc_model"] / np.asarray(rb.targets.correl_target)[idx]) ** 2
     np.testing.assert_allclose(rb.second.table["volvar_target"], rebuilt, rtol=1e-12)
     assert any("volvar_target='direct'" in n for n in rd.second.notes)
+
+
+def test_step0_config_and_the_stored_sabrw_fits(spx) -> None:  # type: ignore[no-untyped-def]
+    """``step0="sabrw"`` (SPEC §15 Part 3): every committed snapshot carries the day's SABRW fits
+    (its ``sabrw`` section) with at least two maturities passing the quote rule, the SSVI twin of a
+    date the same fits; step 0's source is built from them; a marking fit whose config names the
+    source raises without one (no silent fall-back to the surface's derivatives), historical mode
+    refuses it, other values raise and the default maps as before."""
+    from volsto.calibration.fit_2f import fit_2f_historical, marking_targets_for
+    from volsto.config import ConfigError, to_mapping
+    from volsto.market.loaders import load_sabrw_fits, load_step0_source
+    from volsto.market.sabrw import SabrwTermStructure
+
+    with pytest.raises(ValueError, match="step0"):
+        BreakEvenFitConfig(step0="surface")
+    assert "step0" not in to_mapping(BreakEvenFitConfig())
+    cfg = BreakEvenFitConfig(skew_eps=0.10, step0="sabrw")
+    assert to_mapping(cfg)["step0"] == "sabrw"
+    with pytest.raises(ValueError, match="SABRW fits: pass them as step0"):
+        marking_targets_for(spx, cfg)
+    with pytest.raises(ValueError, match="marking mode"):
+        fit_2f_historical(None, cfg)  # type: ignore[arg-type]
+    t = marking_targets_for(spx, cfg, step0=load_step0_source(SPX, spx))
+    assert any(f.startswith("step 0: SABRW fits of") for f in t.flags)
+    snaps = ROOT / "configs" / "surfaces" / "snapshots"
+    files = sorted(
+        [
+            *snaps.glob("*.yaml"),
+            *(snaps / "hdn_2022H2").glob("*.yaml"),
+            *(snaps / "hdn_2022H2_ssvi").glob("*.yaml"),
+        ]
+    )
+    assert len(files) == 256
+    for f in files:
+        fits = load_sabrw_fits(f)
+        assert fits is not None, f
+        SabrwTermStructure.from_fits(fits, lambda T: 0.2)  # at least two maturities kept
+    assert load_sabrw_fits(SPX) == load_sabrw_fits(snaps / "hdn_2022H2_ssvi" / SPX.name)
+    with pytest.raises(ConfigError, match="no sabrw section"):
+        load_step0_source(ROOT / "configs" / "surfaces" / "reference_ssvi.yaml", spx)
+
+
+class _Tilted:
+    """``surface`` with ``slope · k`` added to every smile: its ATM skew moves by ``slope``, its
+    ATM level and curvature do not."""
+
+    def __init__(self, surface: Any, slope: float) -> None:
+        self.s, self.b = surface, slope
+
+    def implied_vol_k(self, k: Any, T: Any) -> Any:
+        return self.s.implied_vol_k(k, T) + self.b * np.asarray(k, dtype=float)
+
+    def atm_skew(self, T: Any) -> Any:
+        return self.s.atm_skew(T) + self.b
+
+
+def test_shifted_triplets_move_with_the_surface(spx) -> None:  # type: ignore[no-untyped-def]
+    """:class:`~volsto.calibration.targets.ShiftedTriplets`, step 0's source on a moved surface
+    (SPEC §15 Part 3): on the unmoved surface — the same object or the snapshot loaded again —
+    the triplet is the base's exactly and the marking fit on it is the base fit, parameter for
+    parameter (the invariant a refit on an unmoved surface rests on); on a surface whose skew
+    moved by ``b`` the source's skew moves by ``b`` and its ATM level and curvature stay."""
+    from volsto.calibration.targets import ShiftedTriplets
+    from volsto.market.loaders import load_step0_source
+
+    src = load_step0_source(SPX, spx)
+    again = _spx_surface()
+    for surface in (spx, again):
+        sh = ShiftedTriplets(src, spx, surface)
+        assert sh.label.startswith(src.label) and sh.label.endswith("moved with the surface")
+        for T in (0.25, 0.7, 1.0, 3.0):
+            assert sh.triplet(T) == src.triplet(T)
+    cfg = BreakEvenFitConfig(skew_eps=0.10, step0="sabrw")
+    base = fit_2f_marking(spx, cfg, ssr_target=1.0, step0=src)
+    refit = fit_2f_marking(again, cfg, ssr_target=1.0, step0=ShiftedTriplets(src, spx, again))
+    assert refit.params == base.params
+    tilted = ShiftedTriplets(src, spx, _Tilted(spx, -0.05))
+    for T in (0.25, 1.0, 3.0):
+        (a0, s0, c0), (a1, s1, c1) = src.triplet(T), tilted.triplet(T)
+        assert a1 == a0
+        assert s1 == pytest.approx(s0 - 0.05, abs=1e-12)
+        assert c1 == pytest.approx(c0, abs=1e-8)
+    with pytest.raises(ValueError, match="h must be positive"):
+        ShiftedTriplets(src, spx, spx, h=0.0)
 
 
 def test_mlp_engine_fit(spx) -> None:  # type: ignore[no-untyped-def]

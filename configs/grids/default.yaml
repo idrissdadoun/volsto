@@ -42,9 +42,10 @@ one_factor:                # ν = ω / 2; ν = 0 is the LV point
 two_factor_presets:
   - name: "Table 8.2"      # Bergomi Table 8.2 (configs/studies/lsv_reference_2f.yaml)
     model: {nu: 1.74, theta: 0.245, k1: 5.35, k2: 0.28, rho12: 0.0, rho_SX1: -0.759, rho_SX2: -0.487}
-marking:                   # fit_2f_marking on each snapshot surface (k2 0.2, ν cap 3.5)
+marking:                   # fit_2f_marking on each snapshot surface
   ssr_target: [0.75, 1.0, 1.25, 1.5]
   skew_eps: [0.05, 0.10, 0.20]
+  fit: desk                # the desk's fit (SPEC §15 Part 3): step 0 from the snapshot's SABRW fits
 include_degenerate: true
 products:
   m4: true                 # run_headline: forward smile, fwd VS / vol swap, cliquets

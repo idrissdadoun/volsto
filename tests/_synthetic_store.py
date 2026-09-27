@@ -112,7 +112,7 @@ def synthetic_grid() -> GridSpec:
         pricing=PricingSettings(),
         risk=RiskSettings(),
         one_factor=OneFactorAxes((0.5,), (-0.7,), (1.5,)),
-        marking=MarkingAxes((1.0,), (0.1,)),
+        marking=MarkingAxes((1.0,), (0.1,), "m7"),
         include_degenerate=False,
     )
 

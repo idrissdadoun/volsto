@@ -545,6 +545,15 @@ class RecalibrationRule:
     may replace the fit call (``(state_surface, base_params) -> params``; the policy, the
     fallback and the cap are then the callable's business).  ``log_rows`` records every refit
     with its policy, its step-0 flags, ``fallback_applied``, ``corr_capped`` and ``at_bound``.
+
+    **Step 0 from the desk's SABRW fits** (a config with ``step0="sabrw"``, SPEC §15 Part 3):
+    ``step0`` is the pricing snapshot's source
+    (:func:`volsto.market.loaders.load_step0_source`) and ``step0_surface`` the surface it belongs
+    to (``None``: the pricing surface, set by the hedger before the base fit).  The base fit reads
+    the source; a refit on a state surface reads it moved with the surface
+    (:class:`~volsto.calibration.targets.ShiftedTriplets` on the strip's stencil), so under no
+    move a refit's targets are the base fit's.  The state surfaces are quadratic smiles without
+    wings: the rule's config reads the smile at the money (the first-order engine).
     """
 
     pillars: tuple[float, ...] = (0.25, 1.0)
@@ -560,6 +569,8 @@ class RecalibrationRule:
     strip_paths: int = DEFAULT_STRIP_PATHS
     correlation_cap: float = REFIT_CORRELATION_CAP
     curvature_h: float | None = None
+    step0: Any | None = None
+    step0_surface: Any | None = None
 
     def __post_init__(self) -> None:
         if self.policy not in RECALIBRATION_POLICIES:
@@ -600,6 +611,30 @@ class RecalibrationRule:
             surface,
             self.config(),
             ssr_target=self.ssr_target,
+            h=self.curvature_stencil,
+            skew_h=float(self.h),
+            step0=self.step0_for(surface),
+        )
+
+    def step0_for(self, surface: Any) -> Any | None:
+        """Step 0's source on ``surface``: ``None`` without one, the source itself on the surface
+        it belongs to, else the source moved with the surface
+        (:class:`~volsto.calibration.targets.ShiftedTriplets` on the strip's stencil)."""
+        if self.step0 is None:
+            return None
+        if self.step0_surface is None:
+            raise ValueError(
+                "the rule's step-0 source needs the surface it belongs to (step0_surface; the "
+                "hedger sets the pricing surface before the base fit)"
+            )
+        if surface is self.step0_surface:
+            return self.step0
+        from volsto.calibration.targets import ShiftedTriplets
+
+        return ShiftedTriplets(
+            self.step0,
+            self.step0_surface,
+            surface,
             h=self.curvature_stencil,
             skew_h=float(self.h),
         )
@@ -1429,6 +1464,8 @@ class Hedger:
         skew_ref: FloatArray | None = None
         rule = self.recalibration
         if rule is not None:
+            if rule.step0 is not None and rule.step0_surface is None:
+                rule.step0_surface = ctx.surface  # the source is the pricing snapshot's
             if strips is None:
                 strips = self.strip_surfaces(dates, rule)
             if (
@@ -1450,6 +1487,7 @@ class Hedger:
                     ssr_target=rule.ssr_target,
                     h=rule.curvature_stencil,
                     skew_h=float(rule.h),
+                    step0=rule.step0_for(ctx.surface),
                 )
                 msg = (
                     f"recalibration policy {rule.policy}: base marking fit computed from the "

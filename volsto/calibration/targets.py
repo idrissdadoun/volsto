@@ -247,7 +247,8 @@ class Step0Triplets(Protocol):
     ATM triplet ``(atf, ∂σ̂/∂k, ∂²σ̂/∂k²)`` at maturity ``T``, ``label`` names it in the flags
     (:class:`volsto.market.sabrw.SabrwTermStructure`, the desk's SABRW fits; SPEC §15 Part 3)."""
 
-    label: str
+    @property
+    def label(self) -> str: ...
 
     def triplet(self, T: float) -> tuple[float, float, float]: ...
 
@@ -318,6 +319,43 @@ def sabr_reduce_triplet(
         radicand_floor=radicand_floor,
         skew_h=None,
     )
+
+
+@dataclass(frozen=True)
+class ShiftedTriplets:
+    """A step-0 source carried onto a moved surface (SPEC §15 Part 3): ``base`` — the date's
+    source, the desk's SABRW fits of its quotes — plus the move of the surface's own ATM triplet
+    from ``base_surface`` (the date's surface) to ``surface`` (a bumped, rotated or simulated
+    state of it), component by component::
+
+        triplet(T) = base(T) + [read(surface, T) − read(base_surface, T)]
+
+    with ``read`` the surface's ATM derivatives (:func:`surface_atm_derivatives` at ``h`` and
+    ``skew_h``).  The fits describe the date's quotes, not the moved surface, so the source moves
+    with the surface; on the unmoved surface the shift is exactly zero and the base triplet comes
+    back unchanged."""
+
+    base: Step0Triplets
+    base_surface: Any
+    surface: Any
+    h: float = SABR_CURVATURE_H
+    skew_h: float | None = None
+
+    def __post_init__(self) -> None:
+        if not self.h > 0.0:
+            raise ValueError("h must be positive")
+
+    @property
+    def label(self) -> str:
+        return f"{self.base.label}; moved with the surface"
+
+    def triplet(self, T: float) -> tuple[float, float, float]:
+        """``base(T)`` plus the surface's move at ``T``."""
+        t = float(T)
+        a0, s0, c0 = (float(x) for x in self.base.triplet(t))
+        a1, s1, c1, _ = surface_atm_derivatives(self.surface, t, self.h, self.skew_h)
+        ab, sb, cb, _ = surface_atm_derivatives(self.base_surface, t, self.h, self.skew_h)
+        return a0 + (a1 - ab), s0 + (s1 - sb), c0 + (c1 - cb)
 
 
 def _sabr_pillar(
@@ -678,11 +716,10 @@ def marking_targets(
     skew band compares with, ``band_skew`` — from a :class:`Step0Triplets` source instead (the
     desk's SABRW fits, SPEC §15 Part 3); the ATM term structure (``σ_0``, the 3M anchor,
     ``atm_vol_fn``) and the skew of the leverage term (``skew_target``, ``skew_fn``) stay the
-    surface's."""
+    surface's, read on the ``skew_h`` stencil when it is given (the source's own reading of a
+    moved surface is :class:`ShiftedTriplets`')."""
     ps, flags = _filter_pillars(pillars, mat_min, getattr(surface, "max_maturity", None))
     if step0 is not None:
-        if skew_h is not None:
-            raise ValueError("skew_h reads the surface; it does not apply with a step-0 source")
         flags.append(f"step 0: {step0.label}")
     sabr = tuple(
         (
@@ -728,7 +765,7 @@ def marking_targets(
         # the band compares with the source's skew; the leverage term reads the pricing
         # surface's, the smile the calibrated LSV reproduces
         band_skew = skew
-        skew = np.array([surface_atm_derivatives(surface, float(T), h)[1] for T in ps])
+        skew = np.array([surface_atm_derivatives(surface, float(T), h, skew_h)[1] for T in ps])
     fn = getattr(surface, "atm_skew", None)
     if callable(fn) and skew_h is None:
 
@@ -889,6 +926,7 @@ __all__ = [
     "SKEW_EXPONENT_BOUNDS",
     "SMOOTH_FLAG_REL",
     "SabrPillar",
+    "ShiftedTriplets",
     "TargetSet",
     "historical_targets",
     "marking_targets",
