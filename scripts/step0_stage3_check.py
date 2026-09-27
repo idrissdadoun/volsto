@@ -22,10 +22,12 @@ import time
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from volsto.calibration.cache import LeverageCache, build_market
 from volsto.calibration.fit_2f import (
+    DEFAULT_NU_CAP,
     BreakEvenFitConfig,
     Stage3Inputs,
     fit_2f_marking,
@@ -61,6 +63,14 @@ def main() -> None:
     ap.add_argument("--mixing-paths", type=int, default=100_000)
     ap.add_argument("--cache", default=str(ROOT / "cache"))
     ap.add_argument("--out", default=str(ROOT / "outputs" / "step0_stage3"))
+    ap.add_argument("--variants", nargs="*", default=["today", "new"], choices=["today", "new"])
+    ap.add_argument(
+        "--nu-caps",
+        nargs="*",
+        type=float,
+        default=[DEFAULT_NU_CAP],
+        help="the fit's nu cap; a variant is run at each (named <variant>_cap<c> off the default)",
+    )
     a = ap.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -80,9 +90,17 @@ def main() -> None:
         ts = SabrwTermStructure.from_fits(
             ih.sabrw_fits(points, t_min=0.05, t_max=3.1), _atm_of(surf)
         )
+        base = {
+            "today": ({"skew_eps": 0.10}, None),
+            "new": ({"skew_eps": 0.10, "k2_bounds": K2_BOUNDS}, ts),
+        }
         variants = {
-            "today": (BreakEvenFitConfig(skew_eps=0.10), None),
-            "new": (BreakEvenFitConfig(skew_eps=0.10, k2_bounds=K2_BOUNDS), ts),
+            (v if cap == DEFAULT_NU_CAP else f"{v}_cap{cap:g}"): (
+                BreakEvenFitConfig(**base[v][0], nu_cap=cap),
+                base[v][1],
+            )
+            for v in a.variants
+            for cap in a.nu_caps
         }
         for name, (cfg, src) in variants.items():
             t0 = time.perf_counter()
@@ -125,6 +143,10 @@ def main() -> None:
                 rho12=p.rho12,
                 rho_sx1=p.rho_SX1,
                 rho_sx2=p.rho_SX2,
+                nu_cap=cfg.nu_cap,
+                max_first_order_miss=float(
+                    np.max(np.abs(np.asarray(r.svc_rel_error, dtype=float)))
+                ),
                 verdict="pass" if s3.within_tolerance else "FAIL",
                 max_bias_svc=float(
                     chk.query("quantity == 'SpotVolCovar'")["engine_bias"].abs().max()
