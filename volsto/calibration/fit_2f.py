@@ -132,6 +132,7 @@ Checked by ``tests/test_fit_2f.py`` and, for the shadow-rotation greek built on 
 
 from __future__ import annotations
 
+import itertools
 import logging
 import math
 import time
@@ -253,8 +254,10 @@ class BreakEvenFitConfig:
     (``k1_bounds[0]`` must exceed ``k2 + k1_min_gap``), ``k1_grid`` points of the coarse geometric
     grid,
     ``skew_mode`` (:data:`SKEW_MODE_CHOICES`; ``"auto"`` → two-point in marking mode, soft in
-    historical mode), ``skew_eps`` a float (both points) or ``(eps_s, eps_l)`` (normalised to a
-    pair), ``skew_pillars`` ``(T_s, T_l)``, ``skew_weight`` (soft mode only; 10), ``radicand_floor``
+    historical mode), ``skew_pillars`` the constrained maturities (default ``(T_s, T_l)`` =
+    ``(1, 5)``; any increasing list — the owner's decision of 2026-09-26 extends the band to the
+    short end, SPEC §15 Part 3), ``skew_eps`` a float (every point) or one value per skew pillar
+    (normalised to a tuple), ``skew_weight`` (soft mode only; 10), ``radicand_floor``
     (the step-0 guard ``c``),
     ``weights_covar`` (:data:`WEIGHT_KINDS` or one weight per fitted pillar), ``term_structure``
     (``f(t)`` of the leverage integrals).  Step 3: ``weights_volvar``, ``nu_cap`` (config cap of
@@ -277,8 +280,8 @@ class BreakEvenFitConfig:
     k1_grid: int = 25
     radicand_floor: float | None = DEFAULT_RADICAND_FLOOR
     skew_mode: str = "auto"
-    skew_eps: float | tuple[float, float] = DEFAULT_SKEW_EPS
-    skew_pillars: tuple[float, float] = DEFAULT_SKEW_PILLARS
+    skew_eps: float | tuple[float, ...] = DEFAULT_SKEW_EPS
+    skew_pillars: tuple[float, ...] = DEFAULT_SKEW_PILLARS
     skew_weight: float = DEFAULT_SKEW_WEIGHT
     weights_covar: str | tuple[float, ...] = "relative"
     weights_volvar: str | tuple[float, ...] = "relative"
@@ -339,14 +342,21 @@ class BreakEvenFitConfig:
             raise ValueError("stage3_tolerance must be in (0, 1)")
         if not 0.0 < self.rho12_flag <= 1.0:
             raise ValueError("rho12_flag must be in (0, 1]")
+        sp = tuple(float(t) for t in self.skew_pillars)
+        if not sp or sp[0] <= 0.0 or any(b <= a for a, b in itertools.pairwise(sp)):
+            raise ValueError("skew_pillars must be increasing positive maturities")
+        # stored as given: the config's mapping (hashed by the backtest) must not change
         eps = self.skew_eps
-        pair = (float(eps), float(eps)) if isinstance(eps, int | float) else tuple(eps)
-        if len(pair) != 2 or not all(math.isfinite(e) and e >= 0.0 for e in pair):
-            raise ValueError("skew_eps must be a non-negative float or an (eps_s, eps_l) pair")
-        object.__setattr__(self, "skew_eps", (float(pair[0]), float(pair[1])))
-        ts, tl = self.skew_pillars
-        if not 0 < ts < tl:
-            raise ValueError("skew_pillars must be increasing positive maturities (T_s, T_l)")
+        vals = (
+            (float(eps),) * len(sp)
+            if isinstance(eps, int | float)
+            else tuple(float(e) for e in eps)
+        )
+        if len(vals) != len(sp) or not all(math.isfinite(e) and e >= 0.0 for e in vals):
+            raise ValueError(
+                "skew_eps must be a non-negative float or one non-negative value per skew pillar"
+            )
+        object.__setattr__(self, "skew_eps", vals)
         if not (math.isfinite(self.skew_weight) and self.skew_weight >= 0.0):
             raise ValueError("skew_weight must be a finite non-negative number")
         for w in (self.weights_covar, self.weights_volvar):
@@ -371,8 +381,11 @@ class BreakEvenFitConfig:
 
     @property
     def eps_pair(self) -> tuple[float, float]:
+        """``(eps_s, eps_l)`` of the two-point constraint (a two-pillar band only)."""
         e = self.skew_eps
         assert isinstance(e, tuple)
+        if len(e) != 2:
+            raise ValueError(f"eps_pair needs a two-point band; this one has {len(e)} points")
         return float(e[0]), float(e[1])
 
 
@@ -780,7 +793,10 @@ def _skew_constraints(
 ) -> tuple[tuple[SkewConstraint, ...], list[str]]:
     notes: list[str] = []
     out = []
-    for name, req, eps in zip(("T_s", "T_l"), cfg.skew_pillars, cfg.eps_pair):
+    n = len(cfg.skew_pillars)
+    names = ("T_s", "T_l") if n == 2 else tuple(f"T_{i + 1}" for i in range(n))
+    assert isinstance(cfg.skew_eps, tuple)
+    for name, req, eps in zip(names, cfg.skew_pillars, cfg.skew_eps, strict=True):
         i = int(np.argmin(np.abs(T - req)))
         if abs(T[i] - req) > _TOL_T:
             notes.append(
@@ -788,10 +804,21 @@ def _skew_constraints(
                 f"{[round(float(x), 4) for x in T]}): applied at the nearest pillar {T[i]:g}y"
             )
         out.append(SkewConstraint(float(req), float(T[i]), i, float(eps), float(skew[i]), name))
-    if out[0].index == out[1].index:
-        notes.append(
-            f"both skew constraints fall on the pillar {out[0].T:g}y: one point constrained"
-        )
+    by_index: dict[int, list[str]] = {}
+    for c in out:
+        by_index.setdefault(c.index, []).append(c.name)
+    for idx, on_pillar in by_index.items():
+        if len(on_pillar) < 2:
+            continue
+        if n == 2:
+            notes.append(
+                f"both skew constraints fall on the pillar {out[0].T:g}y: one point constrained"
+            )
+        else:
+            notes.append(
+                f"skew constraints {on_pillar} fall on the pillar {float(T[idx]):g}y: the "
+                "intersection of their bands applies"
+            )
     return tuple(out), notes
 
 
@@ -1595,13 +1622,22 @@ def fit_messages(
     svc = _svc_text(first.table)
     ct = first.constraints
     if not first.feasible:
-        eps_s, eps_l = cfg.eps_pair
-        what = (
-            f"the two-point skew constraint (T={ct['T'].iloc[0]:g}y within eps_s={eps_s:g}, "
-            f"T={ct['T'].iloc[1]:g}y within eps_l={eps_l:g})"
-            if first.skew_mode == "twopoint"
-            else "the soft-mode box"
-        )
+        if first.skew_mode != "twopoint":
+            what = "the soft-mode box"
+        elif len(ct) == 2:
+            what = (
+                f"the two-point skew constraint (T={ct['T'].iloc[0]:g}y within "
+                f"eps_s={float(ct['eps'].iloc[0]):g}, T={ct['T'].iloc[1]:g}y within "
+                f"eps_l={float(ct['eps'].iloc[1]):g})"
+            )
+        else:
+            what = (
+                f"the {len(ct)}-point skew constraint ("
+                + ", ".join(
+                    f"T={float(t):g}y within eps={float(e):g}" for t, e in zip(ct["T"], ct["eps"])
+                )
+                + ")"
+            )
         skews = ", ".join(
             f"{r.T:g}y {r.skew_naked:+.5f} vs market {r.skew_market:+.5f} ({r.gap_rel:+.1%})"
             for r in ct.itertuples()
@@ -2202,11 +2238,11 @@ class FitResult:
     def summary(self) -> str:
         p, b, f, s, cfg = self.params, self.breakeven, self.first, self.second, self.config
         when = "" if self.pricing_date is None else f" @ {self.pricing_date.date()}"
-        eps_s, eps_l = cfg.eps_pair
         lines = [
             f"fit_2f [{self.targets.mode}]{when}: status {self.status.upper()}; ssr_target "
             f"{np.round(self.targets.ssr_target, 3).tolist()}, skew_mode {cfg.skew_mode}, "
-            f"skew_eps ({eps_s:g}, {eps_l:g}) at {cfg.skew_pillars}, nu_cap {cfg.nu_cap:g}",
+            f"skew_eps {tuple(float(e) for e in cfg.skew_eps)} at {cfg.skew_pillars}, "  # type: ignore[union-attr]
+            f"nu_cap {cfg.nu_cap:g}",
         ]
         lines += [f"MESSAGE: {m}" for m in self.messages]
         lines += [
@@ -2218,7 +2254,11 @@ class FitResult:
             f"{s.objective:.3e}; active {list(f.active)}; bounds {list(s.bound_flags)}; risk "
             f"regime {self.risk_regime}; wall clock {self.wall_seconds:.1f} s; recalibrated: "
             f"{'yes' if self.recalibrated else 'no'}",
-            "two-point skew constraint (naked vs market):",
+            (
+                "two-point skew constraint (naked vs market):"
+                if len(f.constraints) == 2
+                else f"{len(f.constraints)}-point skew constraint (naked vs market):"
+            ),
             f.constraints.round(5).to_string(index=False),
             "free short-end naked skew:",
             f.short_end.round(5).to_string(index=False),

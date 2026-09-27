@@ -551,6 +551,51 @@ def test_k2_fitted_within_bounds(spx) -> None:  # type: ignore[no-untyped-def]
     assert to_mapping(free_cfg)["k2_bounds"] == [0.05, 1.5]
 
 
+def test_skew_band_on_more_pillars(spx) -> None:  # type: ignore[no-untyped-def]
+    """Owner's decision of 2026-09-26: the band should also apply at the short end.
+    ``skew_pillars`` takes any increasing maturities and ``skew_eps`` one value for all or one per
+    pillar.  On the SPX anchor at ``(1.0, 0.10)`` with ``(0.25, 0.5, 1, 3)`` every point is a
+    constraint (``T_1`` … ``T_4``), the fit is feasible with the model's skew inside ±10 % at all
+    four (binding at 3M), and the free short end is 1M alone — at a price: the largest covariance
+    miss is several times the two-point fit's (measured 71 % against 14 %, SPEC §15 Part 3).  The
+    two-point default, its names, ``eps_pair`` and its mapping are unchanged; the config
+    round-trips; mismatched lengths and a non-increasing list raise."""
+    import yaml
+
+    from volsto.config import to_mapping
+
+    four = BreakEvenFitConfig(skew_eps=0.10, skew_pillars=(0.25, 0.5, 1.0, 3.0))
+    assert four.skew_eps == (0.10, 0.10, 0.10, 0.10)
+    with pytest.raises(ValueError, match="two-point"):
+        _ = four.eps_pair
+    r = fit_2f_marking(spx, four, ssr_target=1.0)
+    ct = r.constraints
+    assert list(ct["name"]) == ["T_1", "T_2", "T_3", "T_4"]
+    np.testing.assert_allclose(ct["T"], [0.25, 0.5, 1.0, 3.0])
+    assert r.first.feasible and bool(ct["within_eps"].all()) and r.status == "binding"
+    assert "T=0.25" in r.messages[0]
+    np.testing.assert_allclose(r.first.short_end["T"], [1.0 / 12.0])
+    two = fit_2f_marking(spx, BreakEvenFitConfig(skew_eps=0.10), ssr_target=1.0)
+    assert list(two.constraints["name"]) == ["T_s", "T_l"]
+    worst_four = float(np.max(np.abs(r.svc_rel_error)))
+    worst_two = float(np.max(np.abs(two.svc_rel_error)))
+    print(f"\nlargest covariance miss: four-point band {worst_four:.3f}, two-point {worst_two:.3f}")
+    assert worst_four > 2.0 * worst_two
+    per_point = BreakEvenFitConfig(
+        skew_eps=(0.3, 0.2, 0.1, 0.1), skew_pillars=(0.25, 0.5, 1.0, 3.0)
+    )
+    assert per_point.skew_eps == (0.3, 0.2, 0.1, 0.1)
+    doc = yaml.safe_load(r.config_yaml)
+    assert from_mapping(BreakEvenFitConfig, doc["provenance"]["config"]) == r.config
+    d = BreakEvenFitConfig()
+    assert d.skew_pillars == (1.0, 5.0) and d.eps_pair == (0.1, 0.1)
+    assert to_mapping(d)["skew_pillars"] == [1.0, 5.0] and to_mapping(d)["skew_eps"] == [0.1, 0.1]
+    with pytest.raises(ValueError, match="one non-negative value per skew pillar"):
+        BreakEvenFitConfig(skew_pillars=(0.25, 1.0, 3.0), skew_eps=(0.1, 0.1))
+    with pytest.raises(ValueError, match="increasing"):
+        BreakEvenFitConfig(skew_pillars=(1.0, 0.5))
+
+
 def test_correlation_min_eigenvalue(spx_fits, ref_fits) -> None:  # type: ignore[no-untyped-def]
     """:func:`correlation_min_eigenvalue` is the smallest eigenvalue of the correlation matrix of
     ``(S, X¹, X²)``: 1 for independent factors, the closed form ``1 − sqrt(ρ_SX1² + ρ_SX2²)`` when
