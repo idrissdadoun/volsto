@@ -138,7 +138,7 @@ import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 import pandas as pd
@@ -189,6 +189,9 @@ RHO12_COLLAPSE = 0.9
 #: nearly collinear, and the regressions on the factors (the hedger's conditional pricer, the
 #: minimum-variance delta) are ill-identified — SPEC §8.2.  The plain-SSVI anchor read 0.030
 CORRELATION_EIGEN_FLAG = 1e-2
+#: points of the geometric ``k2`` grid when ``BreakEvenFitConfig.k2_bounds`` is set and ``k2_grid``
+#: is ``None`` (:func:`_optimise_k2`)
+K2_GRID_DEFAULT = 9
 #: ``note`` of a stage-3 check row without a finite non-zero first-order value: the verdict
 #: falls back to the gap vs the fit's target (:func:`breakeven_check`)
 NO_FIRST_ORDER_NOTE = "no first-order value: target gap used"
@@ -242,8 +245,13 @@ class BreakEvenFitConfig:
 
     Targets: ``pillars`` (default 3M–10Y), ``mat_min`` (drop pillars below; 3M),
     ``smooth_breakeven`` (SmoothBreakEven, on), ``sabrw_power`` / ``atf_ref`` (the convexity
-    rescaling of step 0; 1 / 0.3).  Step 2: ``k2`` fixed (0.2), ``k1_bounds`` (``k1_bounds[0]``
-    must exceed ``k2 + k1_min_gap``), ``k1_grid`` points of the coarse geometric grid,
+    rescaling of step 0; 1 / 0.3).  Step 2: ``k2`` fixed (0.2) unless ``k2_bounds`` is set — then
+    ``k2`` is fitted inside it (``k2_grid`` points of a geometric grid — :data:`K2_GRID_DEFAULT`
+    when ``None`` —, the fixed ``k2`` among them when inside, then a bounded refinement; each
+    candidate runs the ``k1`` search with ``k1 > k2 + k1_min_gap``; owner's decision of
+    2026-09-26, SPEC §15 Part 3) —, ``k1_bounds``
+    (``k1_bounds[0]`` must exceed ``k2 + k1_min_gap``), ``k1_grid`` points of the coarse geometric
+    grid,
     ``skew_mode`` (:data:`SKEW_MODE_CHOICES`; ``"auto"`` → two-point in marking mode, soft in
     historical mode), ``skew_eps`` a float (both points) or ``(eps_s, eps_l)`` (normalised to a
     pair), ``skew_pillars`` ``(T_s, T_l)``, ``skew_weight`` (soft mode only; 10), ``radicand_floor``
@@ -262,6 +270,8 @@ class BreakEvenFitConfig:
     sabrw_power: float = DEFAULT_SABRW_POWER
     atf_ref: float = DEFAULT_ATF_REF
     k2: float = DEFAULT_K2
+    k2_bounds: tuple[float, float] | None = None
+    k2_grid: int | None = None
     k1_bounds: tuple[float, float] = (0.3, 20.0)
     k1_min_gap: float = 0.05
     k1_grid: int = 25
@@ -284,6 +294,11 @@ class BreakEvenFitConfig:
     n_quad_ts: int = 32
     n_inner_ts: int = 24
 
+    OMIT_WHEN_NONE: ClassVar[frozenset[str]] = frozenset({"k2_bounds", "k2_grid"})
+    """Options left out of the config's mapping while unset, so a config without them maps — and
+    hashes (the backtest's config hash includes the resolved fit config) — exactly as before they
+    existed (:func:`volsto.config.to_mapping`)."""
+
     def __post_init__(self) -> None:
         if not self.pillars or any(t <= 0 for t in self.pillars):
             raise ValueError("pillars must be positive maturities")
@@ -302,6 +317,20 @@ class BreakEvenFitConfig:
             )
         if self.k1_grid < 3:
             raise ValueError("k1_grid must be at least 3")
+        if self.k2_bounds is not None:
+            k2lo, k2hi = (float(x) for x in self.k2_bounds)
+            if not 0.0 < k2lo < k2hi:
+                raise ValueError("k2_bounds must be increasing positive values")
+            if not k2hi + self.k1_min_gap < hi:
+                raise ValueError(
+                    f"k2_bounds[1] + k1_min_gap = {k2hi + self.k1_min_gap:g} must stay below "
+                    f"k1_bounds[1] = {hi:g}"
+                )
+            if self.k2_grid is not None and self.k2_grid < 3:
+                raise ValueError("k2_grid must be at least 3")
+            object.__setattr__(self, "k2_bounds", (k2lo, k2hi))
+        elif self.k2_grid is not None:
+            raise ValueError("k2_grid needs k2_bounds (k2 is fixed without them)")
         if self.skew_mode not in SKEW_MODE_CHOICES:
             raise ValueError(f"skew_mode must be one of {SKEW_MODE_CHOICES}")
         if self.radicand_floor is not None and not 0.0 <= self.radicand_floor < 1.0:
@@ -1090,6 +1119,7 @@ class FirstFit:
     skew_mode: str
     notes: tuple[str, ...]
     wall_seconds: float
+    k2: float
 
     @property
     def lam(self) -> FloatArray:
@@ -1239,6 +1269,59 @@ def _first_stderr(
     return k1_se, np.asarray(cov[1:, 1:], dtype=np.float64), notes
 
 
+def _k2_config(cfg: BreakEvenFitConfig, k2: float) -> BreakEvenFitConfig:
+    """``cfg`` with ``k2`` fixed at ``k2`` and ``k1`` kept above ``k2 + k1_min_gap``."""
+    lo = max(cfg.k1_bounds[0], float(k2) + cfg.k1_min_gap * (1.0 + 1e-9))
+    return replace(cfg, k2=float(k2), k2_bounds=None, k1_bounds=(lo, cfg.k1_bounds[1]))
+
+
+def _optimise_k2(
+    prob: _FirstProblem, cfg: BreakEvenFitConfig
+) -> tuple[BreakEvenFitConfig, _FirstProblem, InnerSolution, list[InnerSolution], list[str]]:
+    """``k2`` fitted inside ``cfg.k2_bounds`` (:class:`BreakEvenFitConfig`): a geometric grid of
+    ``k2_grid`` points (the fixed ``cfg.k2`` added when inside the bounds, so the fitted
+    objective never exceeds the fixed-``k2`` one), then a bounded scalar refinement between the
+    best grid point's neighbours; every candidate runs :func:`_optimise_k1` on the same problem
+    (the pillar quadratures and the term-structure bank do not depend on ``k2``).  Returns the
+    winning ``k2``'s config and problem, its solution and ``k1`` profile, and the notes."""
+    assert cfg.k2_bounds is not None
+    lo, hi = cfg.k2_bounds
+    grid = np.geomspace(lo, hi, cfg.k2_grid or K2_GRID_DEFAULT)
+    if lo < cfg.k2 < hi:
+        grid = np.unique(np.concatenate((grid, [cfg.k2])))
+    Run = tuple[BreakEvenFitConfig, _FirstProblem, InnerSolution, list[InnerSolution]]
+
+    def run(k2: float) -> Run:
+        c = _k2_config(cfg, k2)
+        p = replace(prob, k2=float(k2), cache={})
+        best, sols = _optimise_k1(p, c)
+        return c, p, best, sols
+
+    runs = [run(float(k)) for k in grid]
+    i = min(range(len(runs)), key=lambda j: _rank(runs[j][2]))
+    best = runs[i]
+    a, b = float(grid[max(i - 1, 0)]), float(grid[min(i + 1, grid.size - 1)])
+    if b > a:
+
+        def score(k: float) -> float:
+            s = run(float(k))[2]
+            return s.objective if s.feasible else 1e12 * (1.0 + s.violation)
+
+        res = minimize_scalar(score, bounds=(a, b), method="bounded", options={"xatol": 1e-4 * b})
+        cand = run(float(res.x))
+        if _rank(cand[2]) <= _rank(best[2]):
+            best = cand
+    c, p, sol, sols = best
+    notes = [
+        f"k2 fitted: {c.k2:.4g} in {cfg.k2_bounds} (grid of {grid.size} points, bounded "
+        f"refinement; grid objectives "
+        f"{[round(float(r[2].objective), 6) if r[2].feasible else None for r in runs]})"
+    ]
+    if c.k2 <= lo * (1.0 + 1e-6) or c.k2 >= hi * (1.0 - 1e-6):
+        notes.append(f"k2 = {c.k2:.4g} sits on a bound of {cfg.k2_bounds}")
+    return c, p, sol, sols, notes
+
+
 def fit_first(
     targets: TargetSet,
     cfg: BreakEvenFitConfig,
@@ -1250,7 +1333,11 @@ def fit_first(
     iteration against simulation of :func:`fit_2f`)."""
     t0 = time.perf_counter()
     prob, notes = _first_problem(targets, cfg, xi0, svc_correction)
-    best, sols = _optimise_k1(prob, cfg)
+    if cfg.k2_bounds is None:
+        best, sols = _optimise_k1(prob, cfg)
+    else:
+        cfg, prob, best, sols, k2_notes = _optimise_k2(prob, cfg)
+        notes += k2_notes
     k1 = best.k1
     at_bound = bool(k1 <= cfg.k1_bounds[0] * (1 + 1e-6) or k1 >= cfg.k1_bounds[1] * (1 - 1e-6))
     if at_bound:
@@ -1277,6 +1364,7 @@ def fit_first(
         prob.skew_mode,
         tuple(notes),
         time.perf_counter() - t0,
+        float(cfg.k2),
     )
 
 
@@ -2123,8 +2211,8 @@ class FitResult:
         lines += [f"MESSAGE: {m}" for m in self.messages]
         lines += [
             f"params: nu {p.nu:.4f} theta {p.theta:.4f} k1 {p.k1:.4f} (se {f.k1_se:.3f}) k2 "
-            f"{p.k2:.3f} (fixed) rho_SX1 {p.rho_SX1:+.4f} rho_SX2 {p.rho_SX2:+.4f} rho12 "
-            f"{p.rho12:+.4f}",
+            f"{p.k2:.3f} ({'fitted in ' + str(cfg.k2_bounds) if cfg.k2_bounds else 'fixed'}) "
+            f"rho_SX1 {p.rho_SX1:+.4f} rho_SX2 {p.rho_SX2:+.4f} rho12 {p.rho12:+.4f}",
             f"break-even: omega1 {b.omega1:.4f} omega2 {b.omega2:.4f} lambda1 {b.lambda1:+.4f} "
             f"lambda2 {b.lambda2:+.4f} chi {b.chi:+.4f}; objectives {f.objective:.3e} / "
             f"{s.objective:.3e}; active {list(f.active)}; bounds {list(s.bound_flags)}; risk "
@@ -2208,7 +2296,13 @@ def fit_2f(
         second = fit_second(targets, c, first, volvar_correction=f_vv)
         status, messages = fit_messages(first, second, c)
         be = BreakEvenParams(
-            first.k1, c.k2, second.omega1, second.omega2, first.lambda1, first.lambda2, second.chi
+            first.k1,
+            first.k2,
+            second.omega1,
+            second.omega2,
+            first.lambda1,
+            first.lambda2,
+            second.chi,
         )
         params = be.to_book()
         st = second.table
@@ -2596,6 +2690,7 @@ __all__ = [
     "DEFAULT_SKEW_WEIGHT",
     "DEFAULT_STAGE3_TOLERANCE",
     "INFEASIBLE_MESSAGE",
+    "K2_GRID_DEFAULT",
     "MAX_FINITE_SE",
     "NO_FIRST_ORDER_NOTE",
     "NU_CAP_WARNING",

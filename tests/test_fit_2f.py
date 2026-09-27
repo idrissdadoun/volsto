@@ -508,6 +508,49 @@ def test_infeasible_message(spx) -> None:  # type: ignore[no-untyped-def]
     assert r.params.nu <= 0.3 * (1 + 1e-6)
 
 
+def test_k2_fitted_within_bounds(spx) -> None:  # type: ignore[no-untyped-def]
+    """Owner's decision of 2026-09-26: ``k2`` may be tuned.  With ``k2_bounds`` the first
+    minimisation fits ``k2`` on a geometric grid that includes the fixed ``k2`` and refines it,
+    each candidate running the ``k1`` search above ``k2 + k1_min_gap``: the covariance objective
+    never exceeds the fixed-``k2`` fit's, the fitted ``k2`` lies inside the bounds and reaches the
+    parameters, and the config round-trips through the fit's YAML.  On the SPX anchor at
+    ``(1.0, 0.10)`` it lands near 0.89 and the largest covariance miss falls from 14.4 % to
+    about 5 % (measured 2026-09-26; SPEC §15 Part 3).  Bounds that leave no room for ``k1``, a
+    decreasing or non-positive range and a grid under three points raise."""
+    import yaml
+
+    fixed = fit_2f_marking(spx, BreakEvenFitConfig(skew_eps=0.10), ssr_target=1.0)
+    free_cfg = BreakEvenFitConfig(skew_eps=0.10, k2_bounds=(0.05, 1.5))
+    free = fit_2f_marking(spx, free_cfg, ssr_target=1.0)
+    assert fixed.first.k2 == fixed.params.k2 == free_cfg.k2 == 0.2
+    assert 0.05 < free.first.k2 < 1.5 and free.params.k2 == pytest.approx(free.first.k2)
+    assert free.params.k1 > free.params.k2 + free_cfg.k1_min_gap
+    assert free.first.objective <= fixed.first.objective * (1.0 + 1e-9)
+    assert any(n.startswith("k2 fitted") for n in free.first.notes)
+    worst = {
+        name: float(np.max(np.abs(r.svc_rel_error)))
+        for name, r in (("fixed", fixed), ("free", free))
+    }
+    print(f"\nk2 {free.first.k2:.3f}: largest covariance miss {worst}")
+    assert worst["free"] < 0.5 * worst["fixed"]
+    doc = yaml.safe_load(free.config_yaml)
+    assert from_mapping(BreakEvenFitConfig, doc["provenance"]["config"]) == free.config
+    for bad in ((0.5, 0.2), (0.0, 1.0), (0.1, 19.99)):
+        with pytest.raises(ValueError, match="k2_bounds"):
+            BreakEvenFitConfig(k2_bounds=bad)
+    with pytest.raises(ValueError, match="k2_grid"):
+        BreakEvenFitConfig(k2_bounds=(0.1, 1.0), k2_grid=2)
+    with pytest.raises(ValueError, match="k2_grid needs k2_bounds"):
+        BreakEvenFitConfig(k2_grid=5)
+    # unset, the new options leave the config's mapping as it was: the backtest hashes the resolved
+    # fit config, so a field added at a behaviour-neutral default must not change it
+    from volsto.config import to_mapping
+
+    default_map = to_mapping(BreakEvenFitConfig())
+    assert "k2_bounds" not in default_map and "k2_grid" not in default_map
+    assert to_mapping(free_cfg)["k2_bounds"] == [0.05, 1.5]
+
+
 def test_correlation_min_eigenvalue(spx_fits, ref_fits) -> None:  # type: ignore[no-untyped-def]
     """:func:`correlation_min_eigenvalue` is the smallest eigenvalue of the correlation matrix of
     ``(S, X¹, X²)``: 1 for independent factors, the closed form ``1 − sqrt(ρ_SX1² + ρ_SX2²)`` when
