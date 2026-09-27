@@ -265,7 +265,9 @@ class BreakEvenFitConfig:
     ``weights_covar`` (:data:`WEIGHT_KINDS` or one weight per fitted pillar), ``term_structure``
     (``f(t)`` of the leverage integrals), ``kernel_curve`` (the forward variance of the naked
     kernels ``A``, ``J``: ``None`` the variance-swap curve the caller passes, the M7 engine;
-    ``"atmf"`` the ATMF one, the desk note's ``ξ̂`` — option of 2026-09-27, SPEC §15 Part 3).
+    ``"atmf"`` the ATMF one, the desk note's ``ξ̂`` — option of 2026-09-27, SPEC §15 Part 3),
+    ``sigma0_maturity`` (the maturity of the ATMF vol taken as ``σ_0``: ``None`` 1M,
+    :data:`~volsto.calibration.targets.SIGMA0_MATURITY`; the desk note takes 3M, its §6).
     Step 3: ``weights_volvar``, ``nu_cap`` (config cap of
     both minimisations, 3.5, warning when bound), ``chi_bounds``, ``omega_max``.  Diagnostics:
     ``stage3_tolerance`` (the stage-3 assertion, 10%), ``rho12_flag`` (``|ρ12|`` above which the
@@ -293,6 +295,7 @@ class BreakEvenFitConfig:
     weights_volvar: str | tuple[float, ...] = "relative"
     term_structure: str = "atmf"
     kernel_curve: str | None = None
+    sigma0_maturity: float | None = None
     nu_cap: float = DEFAULT_NU_CAP
     chi_bounds: tuple[float, float] = (-0.99, 0.99)
     omega_max: float = 20.0
@@ -304,7 +307,9 @@ class BreakEvenFitConfig:
     n_quad_ts: int = 32
     n_inner_ts: int = 24
 
-    OMIT_WHEN_NONE: ClassVar[frozenset[str]] = frozenset({"k2_bounds", "k2_grid", "kernel_curve"})
+    OMIT_WHEN_NONE: ClassVar[frozenset[str]] = frozenset(
+        {"k2_bounds", "k2_grid", "kernel_curve", "sigma0_maturity"}
+    )
     """Options left out of the config's mapping while unset, so a config without them maps — and
     hashes (the backtest's config hash includes the resolved fit config) — exactly as before they
     existed (:func:`volsto.config.to_mapping`)."""
@@ -376,6 +381,8 @@ class BreakEvenFitConfig:
             raise ValueError(f"term_structure must be one of {TERM_STRUCTURE_KINDS}")
         if self.kernel_curve is not None and self.kernel_curve not in KERNEL_CURVES:
             raise ValueError(f"kernel_curve must be None or one of {KERNEL_CURVES}")
+        if self.sigma0_maturity is not None and not self.sigma0_maturity > 0.0:
+            raise ValueError("sigma0_maturity must be positive (or None: the 1M ATMF vol)")
         if self.nu_cap <= 0:
             raise ValueError("nu_cap must be positive")
         clo, chi_ = self.chi_bounds
@@ -2636,6 +2643,11 @@ def marking_targets_for(
         radicand_floor=cfg.radicand_floor,
         skew_h=skew_h,
         step0=step0,
+        sigma_0=(
+            None
+            if cfg.sigma0_maturity is None
+            else float(np.asarray(surface.atm_vol(cfg.sigma0_maturity)))
+        ),
     )
 
 

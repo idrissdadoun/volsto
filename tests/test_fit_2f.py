@@ -1226,3 +1226,26 @@ def test_kernel_curve_option(spx) -> None:  # type: ignore[no-untyped-def]
     assert any("naked kernels A, J on the ATMF forward variance" in n for n in r1.first.notes)
     assert not any("naked kernels" in n for n in r0.first.notes)
     assert r1.params != r0.params
+
+
+def test_sigma0_maturity_option(spx) -> None:  # type: ignore[no-untyped-def]
+    """``sigma0_maturity`` (SPEC §15 Part 3, the desk note's §6): ``σ_0`` is the ATMF vol at that
+    maturity — at 3M the SSR the targets imply before smoothing is the SSR target itself
+    (``ssr · atf_3M/σ_0``); the default (1M) is unchanged and maps as before; non-positive
+    values raise."""
+    from volsto.calibration.fit_2f import marking_targets_for
+    from volsto.config import to_mapping
+
+    base = BreakEvenFitConfig(skew_eps=0.10)
+    three = BreakEvenFitConfig(skew_eps=0.10, sigma0_maturity=0.25)
+    assert "sigma0_maturity" not in to_mapping(base)
+    assert to_mapping(three)["sigma0_maturity"] == 0.25
+    with pytest.raises(ValueError, match="sigma0_maturity"):
+        BreakEvenFitConfig(sigma0_maturity=0.0)
+    t1 = marking_targets_for(spx, base, ssr_target=1.0)
+    t3 = marking_targets_for(spx, three, ssr_target=1.0)
+    assert t1.sigma_0 == pytest.approx(float(spx.atm_vol(1.0 / 12.0)), rel=1e-12)
+    assert t3.sigma_0 == pytest.approx(float(spx.atm_vol(0.25)), rel=1e-12)
+    np.testing.assert_allclose(t3.atf_anchor / t3.sigma_0, 1.0, rtol=1e-12)
+    r3 = fit_2f_marking(spx, three, ssr_target=1.0)
+    assert r3.params != fit_2f_marking(spx, base, ssr_target=1.0).params

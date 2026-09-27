@@ -70,6 +70,12 @@ def main() -> None:
         choices=["today", "surface_k2", "new"],
     )
     ap.add_argument(
+        "--sigma0-maturity",
+        type=float,
+        default=None,
+        help="the fit's sigma0_maturity (default: 1M); variants named <v>..._s<m>",
+    )
+    ap.add_argument(
         "--kernel-curve",
         default=None,
         choices=["atmf"],
@@ -108,6 +114,9 @@ def main() -> None:
         }
         kc = {} if a.kernel_curve is None else {"kernel_curve": a.kernel_curve}
         sfx = "" if a.kernel_curve is None else f"_{a.kernel_curve}"
+        if a.sigma0_maturity is not None:
+            kc["sigma0_maturity"] = a.sigma0_maturity
+            sfx += f"_s{a.sigma0_maturity:g}"
         variants = {
             (v if cap == DEFAULT_NU_CAP else f"{v}_cap{cap:g}")
             + sfx: (
