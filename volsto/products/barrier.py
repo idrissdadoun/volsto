@@ -668,6 +668,24 @@ class _BarrierOption(_BarrierBase):
         T, schedule = self._aged_times(dt)
         return self._rebuild(type(self), T, schedule)
 
+    def with_barrier(self, barrier: float) -> Product:
+        """The same contract with its barrier level at ``barrier`` (the monitoring, shift, gap and
+        rebate conventions kept): the barrier bump of :func:`volsto.risk.product_risk.
+        barrier_sensitivity` and the barrier-shift reserve."""
+        kw = self._kwargs()
+        return type(self)(
+            self.strike,
+            self.T,
+            self.cp,
+            float(barrier),
+            self.direction,
+            self.discount,
+            rebate=self.rebate,
+            rebate_timing=self.rebate_timing,
+            notional=self.notional,
+            **kw,  # type: ignore[arg-type]
+        )
+
     def _repr(self, kind: str) -> str:
         opt = "Call" if self.cp > 0 else "Put"
         reb = f"rebate {self.rebate:g}"

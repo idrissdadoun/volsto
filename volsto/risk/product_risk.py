@@ -11,10 +11,14 @@ exposure profile.
   − t_j) − 1d, …]`` with the same local / global bounds.  The jump ``after − before`` is the
   vega-to-delta conversion at the fixing (the forward start carries vega and almost no delta
   before ``T1`` and becomes a plain vanilla after it).
-* :func:`barrier_sensitivity` — ``∂price/∂B`` of a knock-out variance swap (central, ±0.5% of
-  the barrier, reported per unit spot and per 1% of the barrier) and ``∂price/∂H`` of the
-  vol-knock-out / knock-in put per vol point of the vol barrier; :func:`ko_probability_delta`
-  gives ``∂P(KO)/∂ln S`` from the ``"ko"`` statistic leg under the ``"model"`` regime;
+* :func:`barrier_sensitivity` — ``∂price/∂B`` of a knock-out variance swap or a spot barrier
+  option (knock-out / knock-in; central, ±0.5% of the barrier, reported per unit spot and per 1%
+  of the barrier) and ``∂price/∂H`` of the vol-knock-out / knock-in put per vol point of the vol
+  barrier; :func:`barrier_shift_table` the price of a barrier option or knock-out variance swap
+  with its barrier moved by a few signed relative shifts (positive: away from the spot) against
+  the contractual price, paired — the barrier-shift reserve of a conservative mark;
+  :func:`ko_probability_delta` gives ``∂P(KO)/∂ln S`` from the ``"ko"`` statistic leg under the
+  ``"model"`` regime;
   :func:`barrier_profile` the model delta / gamma profile within ±5% of a spot barrier in 0.5%
   steps (:func:`~volsto.risk.profiles.spot_profile`).
 * :func:`realised_variance_exposure` — the exposure of the price to the realised variance of
@@ -41,6 +45,7 @@ from numpy.typing import NDArray
 from volsto.config import SimConfig
 from volsto.engine.mc import MonteCarlo
 from volsto.models.base import Model
+from volsto.products.barrier import _BarrierOption
 from volsto.products.base import Portfolio, Product
 from volsto.products.cliquet import AdditiveCliquet
 from volsto.products.conditional_variance import KnockOutVarianceSwap, StatisticLeg
@@ -196,10 +201,24 @@ def _with_barrier(product: KnockOutVarianceSwap, barrier: float) -> KnockOutVari
         strict=product.strict,
         monitoring=product.monitoring,
         variant=product.variant,
+        settlement=product.settlement,
         daily_cap=product.daily_cap,
         annualisation=product.annualisation,
         notional=product.notional,
+        **product.state_kwargs(),
     )
+
+
+def _barrier_level(product: KnockOutVarianceSwap | _BarrierOption) -> float:
+    return float(product.barrier)
+
+
+def _moved(
+    product: KnockOutVarianceSwap | _BarrierOption, barrier: float
+) -> KnockOutVarianceSwap | Product:
+    if isinstance(product, KnockOutVarianceSwap):
+        return _with_barrier(product, barrier)
+    return product.with_barrier(barrier)
 
 
 def _with_vol_barrier(product: VolKnockOutPut, vol_ko: float) -> VolKnockOutPut:
@@ -218,17 +237,17 @@ def _with_vol_barrier(product: VolKnockOutPut, vol_ko: float) -> VolKnockOutPut:
 
 def barrier_sensitivity(
     engine: RiskEngine,
-    product: KnockOutVarianceSwap | VolKnockOutPut,
+    product: KnockOutVarianceSwap | VolKnockOutPut | _BarrierOption,
     state: RiskState,
     size: float = 0.005,
 ) -> dict[str, Sensitivity]:
-    """``∂price/∂B`` (knock-out variance swap: central ±``size`` relative; per unit spot and per
-    1% of the barrier) or ``∂price/∂H`` (vol knock-out / knock-in put: central ±``size`` in vol
-    units; per vol point)."""
+    """``∂price/∂B`` (knock-out variance swap or spot barrier option: central ±``size``
+    relative; per unit spot and per 1% of the barrier) or ``∂price/∂H`` (vol knock-out /
+    knock-in put: central ±``size`` in vol units; per vol point)."""
     out: dict[str, Sensitivity] = {}
-    if isinstance(product, KnockOutVarianceSwap):
-        b = product.barrier
-        up, dn = _with_barrier(product, b * (1 + size)), _with_barrier(product, b * (1 - size))
+    if isinstance(product, KnockOutVarianceSwap | _BarrierOption):
+        b = _barrier_level(product)
+        up, dn = _moved(product, b * (1 + size)), _moved(product, b * (1 - size))
         d_b = engine.paired(
             "dprice/dB",
             [
@@ -261,8 +280,43 @@ def barrier_sensitivity(
             scheme="central",
         )
     else:
-        raise TypeError("barrier sensitivity is defined for KO variance swaps and VKO puts")
+        raise TypeError(
+            "barrier sensitivity is defined for KO variance swaps, VKO puts and barrier options"
+        )
     return out
+
+
+def barrier_shift_table(
+    engine: RiskEngine,
+    product: KnockOutVarianceSwap | _BarrierOption,
+    state: RiskState,
+    shifts: tuple[float, ...] = (-0.02, -0.01, -0.005, 0.005, 0.01, 0.02),
+) -> pd.DataFrame:
+    """The price with the barrier moved by each signed relative shift — positive moves it AWAY
+    from the spot (an up barrier higher, a down barrier lower) — against the contractual price,
+    as a paired difference (common paths, leverage recalibrated): ``shift, barrier, delta_price,
+    stderr``.  For a long knock-out a shift away from the spot adds value, for a long knock-in it
+    removes it: the table is the barrier-shift reserve of a conservative mark in either
+    direction, never a single convention."""
+    b = _barrier_level(product)
+    sign = 1.0 if product.direction == "up" else -1.0
+    rows = []
+    for s in shifts:
+        level = b * (1.0 + sign * float(s))
+        d = engine.paired(
+            f"price(B {s:+.1%})",
+            [
+                (_moved(product, level), state, "recalibrate", 1.0),
+                (product, state, "recalibrate", -1.0),
+            ],
+            unit="price",
+            size=float(s),
+            scheme="forward",
+        )
+        rows.append(
+            {"shift": float(s), "barrier": level, "delta_price": d.value, "stderr": d.stderr}
+        )
+    return pd.DataFrame(rows)
 
 
 def ko_probability_delta(
@@ -399,6 +453,7 @@ def realised_variance_exposure(
 __all__ = [
     "barrier_profile",
     "barrier_sensitivity",
+    "barrier_shift_table",
     "fixing_risk",
     "ko_probability_delta",
     "realised_variance_exposure",

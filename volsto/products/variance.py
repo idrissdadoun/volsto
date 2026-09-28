@@ -5,6 +5,8 @@ grid:  ``RV = A · Σ_i ln²(S_{t_i}/S_{t_{i-1}})`` with annualisation ``A = 1/(
 default or ``A = annualisation / n`` (e.g. 252/n) when given.  A swap whose first fixing is at
 ``T₁ > 0`` is a forward variance swap over ``[T₁, T₂]``.  :class:`FVA` is the forward volatility
 agreement on the relative performance (a forward on the ``T₁``-dated ATM-forward straddle).
+:class:`VarianceOption` is the option on realised variance or realised vol (the desk's put on
+variance), on the same realised variance.
 
 Seasoned swaps (M10 Part 3, SPEC §6.10; built by :func:`volsto.products.seasoning.season`): the
 state inputs ``reference_fixing`` (the last realised close ``S_ref``; the first remaining return
@@ -342,6 +344,120 @@ class VolSwap(_RealisedVarianceProduct):
         return (
             f"{kind}: [{self.start:g}y, {self.maturity:g}y], {self.n_returns} returns, "
             f"strike {self.strike_vol * 100:.4g}% vol, vol notional {self.notional:g}"
+        )
+
+
+#: what a :class:`VarianceOption` is struck on
+VARIANCE_OPTION_UNDERLYINGS = ("variance", "vol")
+
+
+class VarianceOption(_RealisedVarianceProduct):
+    """Option on realised variance or realised vol, paid at the last fixing:
+    ``notional · max(cp · (X − K), 0)`` with ``X = RV`` and ``K = strike_vol²`` (``underlying =
+    "variance"``) or ``X = √RV`` and ``K = strike_vol`` (``"vol"``); ``cp = −1`` is the put — the
+    desk's put on variance —, ``+1`` the call.  ``RV`` is the variance swap's (module docstring:
+    the fixings, the annualisation, the seasoning state), so the call minus the put on the same
+    strike is the variance swap (the vol swap for ``"vol"``) path by path.  ``notional`` is a
+    variance notional for ``"variance"`` (vega notional / (2 K_vol) in market convention), a vol
+    notional for ``"vol"``."""
+
+    def __init__(
+        self,
+        fixing_times: ArrayLike,
+        strike_vol: float,
+        discount: DiscountCurve,
+        *,
+        cp: int = -1,
+        underlying: str = "variance",
+        notional: float = 1.0,
+        annualisation: float | None = None,
+        reference_fixing: float | None = None,
+        realised_sum_sq: float = 0.0,
+        realised_count: int = 0,
+        inception: float | None = None,
+        seasoned: bool = False,
+    ) -> None:
+        super().__init__(
+            fixing_times,
+            discount,
+            notional,
+            annualisation,
+            False,
+            reference_fixing=reference_fixing,
+            realised_sum_sq=realised_sum_sq,
+            realised_count=realised_count,
+            inception=inception,
+            seasoned=seasoned,
+        )
+        if not (np.isfinite(strike_vol) and strike_vol >= 0):
+            raise ValueError("strike_vol must be finite and non-negative")
+        if cp not in (-1, 1):
+            raise ValueError("cp must be -1 (put) or +1 (call)")
+        if underlying not in VARIANCE_OPTION_UNDERLYINGS:
+            raise ValueError(f"underlying must be one of {VARIANCE_OPTION_UNDERLYINGS}")
+        self.strike_vol = float(strike_vol)
+        self.cp = int(cp)
+        self.underlying = underlying
+
+    @classmethod
+    def daily(
+        cls,
+        maturity: float,
+        strike_vol: float,
+        discount: DiscountCurve,
+        *,
+        cp: int = -1,
+        underlying: str = "variance",
+        start: float = 0.0,
+        per_year: int = 252,
+        notional: float = 1.0,
+        annualisation: float | None = None,
+    ) -> VarianceOption:
+        return cls(
+            daily_schedule(maturity, per_year, start),
+            strike_vol,
+            discount,
+            cp=cp,
+            underlying=underlying,
+            notional=notional,
+            annualisation=annualisation,
+        )
+
+    @property
+    def strike(self) -> float:
+        """``K`` in the option's own units (variance or vol)."""
+        return self.strike_vol**2 if self.underlying == "variance" else self.strike_vol
+
+    def intrinsic(self, rv: FloatArray) -> FloatArray:
+        """``max(cp · (X − K), 0)`` per unit notional, undiscounted, for annualised ``rv``."""
+        x = rv if self.underlying == "variance" else np.sqrt(np.maximum(rv, 0.0))
+        return np.asarray(np.maximum(self.cp * (x - self.strike), 0.0), dtype=np.float64)
+
+    def payoff(self, paths: PathSet, idx: FixingIndex) -> FloatArray:
+        rv = self.realised_variance(paths, idx)
+        return np.asarray(
+            self.notional * float(self.df(self.maturity)) * self.intrinsic(rv), dtype=np.float64
+        )
+
+    def aged(self, dt: float) -> Product:
+        return VarianceOption(
+            shift_times(self._fixings, dt),
+            self.strike_vol,
+            self.discount,
+            cp=self.cp,
+            underlying=self.underlying,
+            notional=self.notional,
+            annualisation=self.annualisation,
+            **self.state_kwargs(),
+        )
+
+    def __repr__(self) -> str:
+        kind = "Put" if self.cp < 0 else "Call"
+        unit = "variance" if self.underlying == "variance" else "vol"
+        return (
+            f"{kind} on realised {unit}: [{self.start:g}y, {self.maturity:g}y], "
+            f"{self.n_returns} returns, strike {self.strike_vol * 100:.4g}% vol, "
+            f"{unit} notional {self.notional:g}{self._seasoned_repr()}"
         )
 
 

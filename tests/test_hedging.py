@@ -78,7 +78,7 @@ from volsto.market.bs import black_price
 from volsto.market.curves import ForwardCurve
 from volsto.models.bs import BlackScholes
 from volsto.products.autocall import Autocall, Phoenix
-from volsto.products.barrier import KnockOutOption
+from volsto.products.barrier import KnockInOption, KnockOutOption
 from volsto.products.base import Portfolio, daily_schedule
 from volsto.products.cliquet import AdditiveCliquet
 from volsto.products.conditional_variance import KnockOutVarianceSwap, UpVar
@@ -501,6 +501,9 @@ def _preset_products(fc: ForwardCurve) -> dict[str, object]:
         "AdditiveCliquet": AdditiveCliquet.study(1.0, disc),
         "ConditionalVarianceSwap": UpVar(daily, 100.0, 0.2, disc),
         "KnockOutVarianceSwap": KnockOutVarianceSwap(daily, 120.0, 0.2, disc, direction="up"),
+        # never knocks at 20% vol: the static put replicates it exactly (a zero P&L, checked);
+        # under Black–Scholes the realised vol is nearly deterministic, so a vol barrier near
+        # 20% is a noise coin-flip no instrument hedges — the knock-out is a stochastic-vol test
         "VolKnockOutPut": VolKnockOutPut(100.0, 1.0, 0.3, daily, disc),
         "Autocall": Autocall(
             (1.0 / 3, 2.0 / 3, 1.0),
@@ -528,16 +531,18 @@ def _preset_products(fc: ForwardCurve) -> dict[str, object]:
 
 #: measured hedged / unhedged P&L std ratios (Black–Scholes 20%, monthly rebalancing, 8·10³
 #: paths, 2026-09-15) of the presets that do NOT improve on the unhedged product at that
-#: frequency — recorded, bounded at 1.5× their measured value (SPEC §8.1 deviation 7c)
+#: frequency — recorded, bounded at 1.5× their measured value (SPEC §8.1 deviation 7c).  The
+#: variance swap (2.06) and the VKO put (2.12) left this list on 2026-09-27: their static legs
+#: carried the product's own sign (see test_static_legs_carry_the_hedge_sign)
 PRESETS_WORSE_THAN_UNHEDGED_MONTHLY: dict[str, float] = {
     # with the test's half-spreads (1 bp spot, 0.2 vp options): the churn of the noisy barrier
     # call-spread quantity is what costs (zero-cost ratios 1.48 and 1.68 for the two KO products)
     "KnockOutOption": 2.83,
-    "VarianceSwap": 2.06,
     "KnockOutVarianceSwap": 8.47,
     "ConditionalVarianceSwap": 1.50,
-    "VolKnockOutPut": 2.12,
 }
+#: products the preset's static legs replicate exactly under the test's Black–Scholes world
+EXACT_UNDER_BLACK_SCHOLES: frozenset[str] = frozenset({"VolKnockOutPut"})
 
 
 @pytest.mark.parametrize("name", sorted(_preset_products(ForwardCurve.from_config(MKT))))
@@ -565,8 +570,12 @@ def test_presets_run_end_to_end(bs: BlackScholes, fc: ForwardCurve, name: str) -
     assert np.all(np.isfinite(r.pnl_total)) and np.all(np.isfinite(r.pnl_zero_cost))
     assert np.all(r.costs >= 0.0) and np.allclose(r.pnl_zero_cost - r.costs, r.pnl_total)
     assert len(r.residual) == r.dates.size and all(f"residual:{g}" in r.residual for g in r.targets)
-    assert (rep.tables["distribution"]["stderr"] > 0).all()
     unhedged_std = float(np.std(r.pnl_product, ddof=1))
+    if name in EXACT_UNDER_BLACK_SCHOLES:
+        # the static legs replicate the product path by path: the zero-cost P&L is 0
+        assert float(np.std(r.pnl_zero_cost, ddof=1)) < 1e-9 * unhedged_std
+    else:
+        assert (rep.tables["distribution"]["stderr"] > 0).all()
     print(
         f"  hedged std {np.std(r.pnl_total, ddof=1):.5f} vs product std {unhedged_std:.5f}; notes {r.pricing_notes}"
     )
@@ -589,6 +598,66 @@ def test_presets_run_end_to_end(bs: BlackScholes, fc: ForwardCurve, name: str) -
         assert ratio <= 1.5 * PRESETS_WORSE_THAN_UNHEDGED_MONTHLY[name], ratio
     else:
         assert ratio <= 2.0, ratio
+
+
+#: the presets whose static legs replicate a piece of the product (a leg the product is LONG)
+STATIC_REPLICATING_PRESETS: tuple[str, ...] = (
+    "DigitalOption",
+    "VarianceSwap",
+    "VolKnockOutPut",
+    "KnockInOption",
+)
+
+
+@pytest.mark.parametrize("name", STATIC_REPLICATING_PRESETS)
+def test_static_legs_carry_the_hedge_sign(bs: BlackScholes, fc: ForwardCurve, name: str) -> None:
+    """The hedger holds the product long, so a static leg replicating a piece the product is long
+    is held SHORT (the invariant behind every preset's ``static`` map): each such leg's quantity
+    has the sign opposite to the product's exposure to it, and the preset hedges the product
+    better than the same preset with its static signs flipped (Black–Scholes 20%, world =
+    pricing, monthly, 8·10³ paths, zero costs; measured 2026-09-27: flipped / shipped std 2.8 for
+    the variance swap, 1.2 for the down-and-in put, the VKO put replicated exactly — it never
+    knocks out at 20% vol).  The same preset with the product's own sign doubled the exposure
+    (hedged / unhedged 2.06 and 2.12 for the variance swap and the VKO put before the fix)."""
+    disc = fc.rate_curve
+    daily = np.linspace(0.0, 1.0, 253)
+    product = {
+        "DigitalOption": DigitalOption(100.0, 1.0, 1, disc),
+        "VarianceSwap": VarianceSwap(daily, 0.04, disc, annualisation=252.0),
+        "VolKnockOutPut": VolKnockOutPut(100.0, 1.0, 0.3, daily, disc),
+        "KnockInOption": KnockInOption(
+            100.0,
+            1.0,
+            -1,
+            80.0,
+            "down",
+            disc,
+            monitoring="discrete",
+            fixing_times=daily,
+            strict=True,
+        ),
+    }[name]
+    h = Hedger(
+        PricingContext.from_model(bs),
+        bs,
+        Schedule("monthly"),
+        Costs(),
+        sim=SIM_SMALL,
+        world_paths=SIM_SMALL.n_paths,
+        verbose=False,
+    )
+    strat = default_strategy(product, h.preset_context(product))  # type: ignore[arg-type]
+    assert strat.static, name
+    assert all(float(v) < 0.0 for v in strat.static.values()), strat.static  # type: ignore[arg-type]
+    flipped = dataclasses.replace(strat, static={k: -float(v) for k, v in strat.static.items()})  # type: ignore[arg-type]
+    std = {}
+    for label, st in (("shipped", strat), ("flipped", flipped)):
+        r = h.run(product, st)  # type: ignore[arg-type]
+        std[label] = float(np.std(r.pnl_total, ddof=1))
+    unhedged = float(np.std(r.pnl_product, ddof=1))
+    print(name, {k: round(v / unhedged, 3) for k, v in std.items()})
+    assert std["shipped"] < std["flipped"], std
+    assert std["shipped"] < unhedged, (std, unhedged)
 
 
 def test_early_termination_unwinds(bs: BlackScholes, fc: ForwardCurve) -> None:

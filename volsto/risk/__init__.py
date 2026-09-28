@@ -76,6 +76,7 @@ from volsto.risk.ladders import (
 from volsto.risk.product_risk import (
     barrier_profile,
     barrier_sensitivity,
+    barrier_shift_table,
     fixing_risk,
     ko_probability_delta,
     realised_variance_exposure,
@@ -124,6 +125,7 @@ __all__ = [
     "bachelier_cliquet_value",
     "barrier_profile",
     "barrier_sensitivity",
+    "barrier_shift_table",
     "bs_cliquet_value_mc",
     "callable_dates",
     "check_pillars_calendar",

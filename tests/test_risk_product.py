@@ -10,7 +10,7 @@ import pytest
 from helpers import flat_state as _flat_state
 
 from volsto.config import SimConfig
-from volsto.market import bs_delta, bs_gamma, bs_volga
+from volsto.market import bs_barrier_price, bs_delta, bs_gamma, bs_volga
 from volsto.market.bs import norm_cdf
 from volsto.market.curves import ForwardCurve
 from volsto.models.bs import BlackScholes
@@ -18,6 +18,8 @@ from volsto.products import (
     AdditiveCliquet,
     EuropeanOption,
     ForwardStartStraddle,
+    KnockInOption,
+    KnockOutOption,
     KnockOutVarianceSwap,
     VarianceSwap,
     VolKnockOutPut,
@@ -28,6 +30,7 @@ from volsto.risk import (
     RiskEngine,
     barrier_profile,
     barrier_sensitivity,
+    barrier_shift_table,
     fixing_risk,
     fwd_var_convexity,
     ko_probability_delta,
@@ -124,6 +127,42 @@ def test_barrier_sensitivities_and_profile() -> None:
     prof = barrier_profile(engine, kov, state, 110.0)
     assert len(prof) == 21 and abs(prof["spot_over_barrier"].iloc[10] - 1.0) < 1e-9
     assert set(["price", "delta", "gamma", "gamma_fd"]).issubset(prof.columns)
+
+
+def test_barrier_option_sensitivity_and_shift_table() -> None:
+    """Spot barrier options (the payoff study): ``∂price/∂B`` of a continuously monitored
+    up-and-out call under Black–Scholes against the central difference of the Reiner–Rubinstein
+    closed form within 3 stderr; the down-and-out and down-and-in puts' sensitivities cancel path
+    by path (in-out parity: their sum is the vanilla, whatever the barrier) with the knock-out's
+    negative; the shift table moves the up-and-out barrier away from the spot for positive shifts
+    and adds value monotonically."""
+    engine = _engine(20_000, 1.0 / 100.0)
+    state = engine.builder.base
+    disc = surface_of(state).discount
+    uoc = KnockOutOption(100.0, 1.0, "call", 120.0, "up", disc, monitoring="continuous")
+    d = barrier_sensitivity(engine, uoc, state)["dprice_dB"]
+    h = 0.005
+
+    def closed(b: float) -> float:
+        return float(bs_barrier_price(100.0, 100.0, b, 1.0, SIGMA, R, Q, 1, "up", "out"))
+
+    ref = (closed(120.0 * (1 + h)) - closed(120.0 * (1 - h))) / (2 * 120.0 * h)
+    print(f"UOC dP/dB {d.value:.5f} +/- {d.stderr:.5f}, closed form {ref:.5f}")
+    assert abs(d.value - ref) < 3.0 * d.stderr + 2e-3 * abs(ref)
+    daily = daily_schedule(1.0, 252)
+    kw = dict(monitoring="discrete", fixing_times=daily, strict=True)
+    dop = KnockOutOption(100.0, 1.0, "put", 80.0, "down", disc, **kw)  # type: ignore[arg-type]
+    dip = KnockInOption(100.0, 1.0, "put", 80.0, "down", disc, **kw)  # type: ignore[arg-type]
+    s_out = barrier_sensitivity(engine, dop, state)["dprice_dB"]
+    s_in = barrier_sensitivity(engine, dip, state)["dprice_dB"]
+    assert s_out.value < -3.0 * s_out.stderr and s_in.value > 3.0 * s_in.stderr
+    assert s_out.value + s_in.value == pytest.approx(0.0, abs=1e-10)
+    table = barrier_shift_table(engine, uoc, state, shifts=(-0.01, 0.01, 0.02))
+    assert list(table["barrier"]) == pytest.approx([118.8, 121.2, 122.4])
+    assert np.all(np.diff(table["delta_price"].to_numpy()) > 0.0)
+    assert table["delta_price"].iloc[0] < 0.0 < table["delta_price"].iloc[1]
+    with pytest.raises(TypeError):
+        barrier_sensitivity(engine, EuropeanOption(100.0, 1.0, 1, disc), state)  # type: ignore[arg-type]
 
 
 def test_fwd_var_convexity_matches_volga_on_flat_surface() -> None:

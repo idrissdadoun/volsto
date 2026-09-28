@@ -68,7 +68,7 @@ from volsto.products.autocall import Autocall
 from volsto.products.base import Product
 from volsto.products.cliquet import AdditiveCliquet
 from volsto.products.conditional_variance import KnockOutVarianceSwap
-from volsto.products.variance import VarianceSwap
+from volsto.products.variance import VarianceOption, VarianceSwap
 from volsto.products.vko import VolKnockOutPut
 
 FloatArray = NDArray[np.float64]
@@ -371,6 +371,60 @@ def _replay_variance_swap(p: VarianceSwap, ctx: _Ctx) -> Replay:
     return Replay(ctx.as_of, ctx.elapsed, seasoned, (), state)
 
 
+def _replay_variance_option(p: VarianceOption, ctx: _Ctx) -> Replay:
+    """The option on realised variance: seasoned as the variance swap (the realised sum of squares,
+    the reference close, the inception), settled at its intrinsic value once every fixing is
+    realised."""
+    fix = p.fixing_times
+    j, real = _split(ctx, fix)
+    remaining = fix[~real] - ctx.elapsed
+    terms: dict[str, Any] = {
+        "cp": p.cp,
+        "underlying": p.underlying,
+        "notional": p.notional,
+        "annualisation": p.annualisation,
+    }
+    if not real.any():  # a forward-start option before its start
+        seasoned0 = VarianceOption(
+            remaining,
+            p.strike_vol,
+            ctx.discount,
+            **terms,
+            inception=float(fix[0]) - ctx.elapsed,
+            seasoned=True,
+        )
+        return Replay(ctx.as_of, ctx.elapsed, seasoned0, (), {"realised_returns": 0})
+    closes = ctx.history.closes_at(j[real])
+    r = np.diff(np.log(closes))
+    sum_sq = float(np.sum(r * r))
+    count = int(r.size)
+    state: dict[str, Any] = {"realised_returns": count, "realised_sum_sq": sum_sq}
+    if real.all():
+        rv = p.annualisation_factor * sum_sq
+        amount = p.notional * float(p.intrinsic(np.array([rv]))[0])
+        return ctx.settled(
+            amount,
+            float(fix[-1]) - ctx.elapsed,
+            "every fixing realised",
+            int(j[-1]),
+            "variance option settlement",
+            realised_variance=rv,
+            **state,
+        )
+    seasoned = VarianceOption(
+        remaining,
+        p.strike_vol,
+        ctx.discount,
+        **terms,
+        reference_fixing=float(closes[-1]),
+        realised_sum_sq=sum_sq,
+        realised_count=count,
+        inception=float(fix[0]) - ctx.elapsed,
+        seasoned=True,
+    )
+    return Replay(ctx.as_of, ctx.elapsed, seasoned, (), state)
+
+
 def _replay_ko_varswap(p: KnockOutVarianceSwap, ctx: _Ctx) -> Replay:
     fix = p.fixing_times
     j, real = _split(ctx, fix)
@@ -392,11 +446,15 @@ def _replay_ko_varswap(p: KnockOutVarianceSwap, ctx: _Ctx) -> Replay:
             if hit.any()
             else "every fixing realised"
         )
+        # paid at maturity, or at the knock-out close when the swap settles there
+        at_ko = hit.any() and p.settlement == "knock_out"
+        j_pay = int(j[real][first]) if at_ko else int(j[-1])
+        pay_time = float(fix[real][first]) - ctx.elapsed if at_ko else maturity_left
         return ctx.settled(
             amount,
-            maturity_left,
+            pay_time,
             reason,
-            int(j[-1]),
+            j_pay,
             "knock-out variance swap settlement",
             tau=tau,
             accrued=accrued,
@@ -424,6 +482,7 @@ def _ko_like(
         ctx.discount,
         direction=p.direction,
         strict=p.strict,
+        settlement=p.settlement,
         daily_cap=p.daily_cap,
         annualisation=p.annualisation,
         notional=p.notional,
@@ -642,6 +701,7 @@ def _replay_autocall(p: Autocall, ctx: _Ctx) -> Replay:
 
 _REPLAYS: dict[type, Callable[[Any, _Ctx], Replay]] = {
     VarianceSwap: _replay_variance_swap,
+    VarianceOption: _replay_variance_option,
     KnockOutVarianceSwap: _replay_ko_varswap,
     VolKnockOutPut: _replay_vko,
     AdditiveCliquet: _replay_cliquet,

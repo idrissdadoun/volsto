@@ -63,7 +63,13 @@ from volsto.products.seasoning import (
     season,
 )
 from volsto.products.vanilla import DigitalOption, EuropeanOption
-from volsto.products.variance import FVA, ForwardVarianceSwap, VarianceSwap, VolSwap
+from volsto.products.variance import (
+    FVA,
+    ForwardVarianceSwap,
+    VarianceOption,
+    VarianceSwap,
+    VolSwap,
+)
 from volsto.products.vko import VolKnockOutPut
 
 __all__ = [
@@ -107,6 +113,7 @@ __all__ = [
     "SettledCash",
     "StatisticLeg",
     "UpVar",
+    "VarianceOption",
     "VarianceSwap",
     "VolKnockOutPut",
     "VolSwap",

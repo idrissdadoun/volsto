@@ -37,6 +37,7 @@ from volsto.products import (
     Product,
     RealisedHistory,
     Settled,
+    VarianceOption,
     VarianceSwap,
     VolKnockOutPut,
     VolSwap,
@@ -85,7 +86,7 @@ def _payoffs(products: list[Product], model: BlackScholes, sim: SimConfig) -> li
 
 
 def _book(disc: DiscountCurve, spot: float = S0) -> dict[str, Product]:
-    """The M8b book (``StudyRunner.book``) and a daily variance swap."""
+    """The M8b book (``StudyRunner.book``), a daily variance swap and a put on variance."""
     prods: dict[str, Product] = dict(headline_products(disc, spot))
     prods["cliquet 1y"] = AdditiveCliquet.study(1.0, disc)
     prods["vko put 12m"] = VolKnockOutPut(
@@ -93,6 +94,7 @@ def _book(disc: DiscountCurve, spot: float = S0) -> dict[str, Product]:
     )
     prods["ko var 1y"] = KnockOutVarianceSwap(daily_schedule(1.0, 252), 1.1 * spot, 0.20, disc)
     prods["var swap 1y"] = VarianceSwap.daily(1.0, 0.04, disc, annualisation=252.0)
+    prods["put on var 1y"] = VarianceOption.daily(1.0, 0.20, disc, annualisation=252.0)
     return prods
 
 
@@ -137,6 +139,13 @@ STATE_DEFAULTS: dict[type, dict[str, Any]] = {
         "realised_count": 0,
         "seasoned": False,
     },
+    VarianceOption: {
+        "reference_fixing": None,
+        "realised_sum_sq": 0.0,
+        "realised_count": 0,
+        "inception": None,
+        "seasoned": False,
+    },
     AdditiveCliquet: {"reference_fixing": None, "accrued": 0.0, "seasoned": False},
     Autocall: {"knocked_in": False, "memory_coupons": 0.0, "seasoned": False},
 }
@@ -179,6 +188,13 @@ def test_explicit_state_defaults_are_the_fresh_product() -> None:
             disc,
             annualisation=252.0,
             **STATE_DEFAULTS[VarianceSwap],
+        ),
+        "put on var 1y": VarianceOption(
+            daily_schedule(1.0, 252),
+            0.20,
+            disc,
+            annualisation=252.0,
+            **STATE_DEFAULTS[VarianceOption],
         ),
     }
     assert set(STATE_DEFAULTS) == {type(p) for p in book.values()}
@@ -251,6 +267,35 @@ def test_variance_swap_half_way_equals_accrued_plus_closed_form(spot_move: float
     assert isinstance(day_before, VarianceSwap) and day_before.realised_count == 251
 
 
+def test_variance_option_seasons_like_the_variance_swap() -> None:
+    """The put on variance seasoned 126 days carries the variance swap's realised state (sum of
+    squares, count, reference close, inception); priced on common paths the seasoned call minus
+    the seasoned put is the seasoned variance swap to round-off; at the end of the life it settles
+    at its intrinsic value, paid on the last fixing."""
+    hist = _history(_path(127, 0.30, 21))
+    disc = _fc().rate_curve
+    put = VarianceOption.daily(1.0, 0.25, disc, annualisation=252.0)
+    call = VarianceOption.daily(1.0, 0.25, disc, cp=1, annualisation=252.0)
+    swap = VarianceSwap.daily(1.0, 0.0625, disc, annualisation=252.0)
+    as_of = hist.dates[126]
+    sp, sc, sv = (replay(x, hist, as_of).result for x in (put, call, swap))
+    assert isinstance(sp, VarianceOption) and isinstance(sc, VarianceOption)
+    assert isinstance(sv, VarianceSwap)
+    for attr in ("realised_sum_sq", "realised_count", "reference_fixing", "inception", "n_returns"):
+        assert getattr(sp, attr) == getattr(sv, attr), attr
+    fc = _fc(float(hist.closes[-1]))
+    res = MonteCarlo(_sim(4_000)).price_many([sc, sp, sv], BlackScholes(SIGMA, fc))
+    assert res[0].mean - res[1].mean == pytest.approx(res[2].mean, abs=1e-12)
+    long_hist = _history(
+        np.concatenate([hist.closes, _path(130, 0.3, 22, start=float(hist.closes[-1]))[1:]])
+    )
+    end = replay(put, long_hist, long_hist.dates[252])
+    assert isinstance(end.result, Settled) and end.result.value == 0.0
+    rv = float(np.sum(np.diff(np.log(np.asarray(long_hist.closes[:253]))) ** 2))
+    assert end.result.amount == pytest.approx(max(0.0625 - rv, 0.0), abs=1e-15)
+    assert [f.date for f in end.cash_flows] == [long_hist.dates[252]]
+
+
 # --------------------------------------------------------------------------------------------
 # knock-out variance swap
 # --------------------------------------------------------------------------------------------
@@ -283,6 +328,32 @@ def test_ko_variance_swap_breach_settles() -> None:
     # a live seasoned swap: the reference cannot sit beyond the barrier
     with pytest.raises(ValueError, match="beyond the barrier"):
         KnockOutVarianceSwap(daily_schedule(0.5, 252)[1:], 110.0, 0.2, disc, reference_fixing=111.0)
+
+
+def test_ko_variance_swap_settled_at_the_knock_out_pays_on_the_knock_out_date() -> None:
+    """Settled at the knock-out: a realised knock-out pays the same amount on the knock-out close
+    — a realised cash flow dated that day, nothing left to value — while a swap settled at
+    maturity keeps the amount to come; a live seasoned swap keeps the convention."""
+    disc = _fc().rate_curve
+    closes = np.concatenate([np.linspace(100.0, 109.0, 30), [111.0], np.linspace(108.0, 95.0, 40)])
+    hist = _history(closes)
+    tau = 30
+    kw = dict(notional=2.0, settlement="knock_out")
+    product = KnockOutVarianceSwap(daily_schedule(1.0, 252), 110.0, 0.20, disc, **kw)  # type: ignore[arg-type]
+    at_maturity = KnockOutVarianceSwap(daily_schedule(1.0, 252), 110.0, 0.20, disc, notional=2.0)
+    rep = replay(product, hist, hist.dates[60])
+    ref = replay(at_maturity, hist, hist.dates[60])
+    assert isinstance(rep.result, Settled) and isinstance(ref.result, Settled)
+    assert rep.result.amount == pytest.approx(ref.result.amount, rel=1e-15)
+    assert rep.result.pay_time == pytest.approx((tau - 60) / 252, abs=1e-12)
+    assert rep.result.value == 0.0  # paid on the knock-out date: nothing left to value
+    assert ref.result.value == pytest.approx(
+        ref.result.amount * np.exp(-R * (1.0 - 60 / 252)), rel=1e-12
+    )
+    assert len(rep.cash_flows) == 1 and rep.cash_flows[0].date == hist.dates[tau]
+    assert rep.cash_flows[0].amount == pytest.approx(ref.result.amount, rel=1e-15)
+    live = season(product, hist, hist.dates[tau - 1])
+    assert isinstance(live, KnockOutVarianceSwap) and live.settlement == "knock_out"
 
 
 def test_seasoned_ko_variance_swap_without_barrier_is_the_seasoned_variance_swap() -> None:

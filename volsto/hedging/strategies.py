@@ -37,7 +37,8 @@ digital's call spread, the cliquet's cap-call strip, a knock-in's in–out parit
 study can drop or add a leg).  Built from the product's structure:
 
 * vanilla / digital: ``delta`` (+ ``vega`` with a same-expiry ATM vanilla when ``vol_hedged``);
-  digital: ``delta`` + the call-spread replication (static, smoothing width ``digital_width``);
+  digital: ``delta`` + the call-spread replication (static, short, smoothing width
+  ``digital_width``);
 * forward-start option / straddle, FVA: before ``T1`` the delta is about zero (reported) — the
   forward-variance bucket ``[T1, T2]`` with a forward variance swap and the forward skew with a
   forward-start risk reversal (target ``skew_T:T2``, else ``dX1`` when tents are unavailable);
@@ -45,7 +46,10 @@ study can drop or add a leg).  Built from the product's structure:
   vanilla struck at the fixed ``S_{T1} m`` (the instrument family covers the forward-moneyness
   strikes, the closest one is used);
 * variance swap / vol swap: ``delta`` (the dollar-gamma exposure) + the log-contract vanilla strip
-  (static ``1/K²`` weights); the vol swap adds ``volga`` with the var-swap-vs-vol-swap spread;
+  (static, short, ``2/K²`` weights); the vol swap adds ``volga`` with the var-swap-vs-vol-swap
+  spread;
+* option on realised variance / vol: ``delta`` + a variance swap over the option's window sized
+  on ``vega`` (its variance delta); the study compares vol-of-vol overlays;
 * cliquet family: ``delta`` + the cap-call strip (static, ``q`` per period, the decomposition's 1
   by default) + a variance swap sized on ``vega`` (the net forward-variance exposure); the
   global-floor leg via the accumulated-sum put (static, from ``decompose()``).  ``q`` is a
@@ -60,18 +64,27 @@ study can drop or add a leg).  Built from the product's structure:
   (static);
 * knock-out variance swap: ``delta`` + variance swap + a call spread at the barrier in the solve
   (``delta``, ``gamma``, ``vega``); unwound on knock-out by the hedger;
-* VKO put: ``delta`` + the underlying vanilla put (static +1, from ``decompose()``) + a variance
-  swap on ``vega`` + ``vanna`` via a risk reversal;
+* VKO put: ``delta`` + the underlying vanilla put (static, short one per unit notional, from
+  ``decompose()``) + a variance swap on ``vega`` + ``vanna`` via a risk reversal;
 * autocall / Phoenix: per leg from ``decompose()``: call spreads at each observation level
   (smart-gap shifted levels when the note carries a smart gap), the knock-in put and a digital put
   at the barrier, all in the solve on ``delta``, ``gamma``, ``vega``; ``skew_T`` via an option
   strip when available; the bond leg is deterministic (no hedge); unwound at autocall;
-* barrier options: ``delta`` + the static replication where it exists (knock-in: in–out parity
-  legs) + a call spread at the barrier in the solve;
+* barrier options: ``delta`` + the static replication where it exists (knock-in: the in–out
+  parity vanilla, short) + a call spread at the barrier in the solve;
 * :class:`CustomStrategy`: a user callable ``(context) -> quantities``.
 
 Every preset is a :class:`GreekTargetStrategy`; unsupported targets in the pricing context are
 dropped with a note (never silently) so that every preset runs end to end on every context.
+
+**Static legs carry the hedge's sign.**  The hedger holds the product long and a static quantity is
+added to the product's exposure before the solve, so a leg that replicates a piece of the product
+is held SHORT that piece (the cliquet's cap calls, which the cliquet is short, are held long).
+Until 2026-09-27 the digital's call spread, the variance strip, the VKO's underlying put and the
+knock-in's parity vanilla carried the product's own sign, doubling the exposure they were meant to
+cancel (hedged / unhedged P&L std 2.06 and 2.12 for the variance swap and the VKO put under monthly
+Black–Scholes, recorded then as discrete-hedging noise); ``tests/test_hedging.py`` checks the sign
+of every replicating static leg.
 Checked by ``tests/test_hedging.py``.
 """
 
@@ -164,6 +177,10 @@ class GreekTargetStrategy:
     #: the keyword arguments the preset was built with (set by :func:`default_strategy`; recorded
     #: in ``HedgeResult.settings["preset_kwargs"]``)
     preset_kwargs: dict[str, Any] = field(default_factory=dict)
+    #: static legs held only until the product knocks in: zero on the paths whose hedge state
+    #: carries ``knocked = 1`` (a knock-in's knock-out replication, switched to the parity vanilla
+    #: at the barrier; :func:`volsto.hedging.comparison.barrier_static_strategy`)
+    unwind_on_knock: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.delta_regime not in DELTA_REGIMES:
@@ -174,6 +191,9 @@ class GreekTargetStrategy:
         for k in self.static:
             if k not in names:
                 raise ValueError(f"static leg {k!r} is not an instrument of the strategy")
+        for k in self.unwind_on_knock:
+            if k not in self.static:
+                raise ValueError(f"unwind_on_knock leg {k!r} is not a static leg of the strategy")
         if self.ridge < 0 or self.turnover < 0:
             raise ValueError("ridge and turnover must be non-negative")
 
@@ -201,6 +221,7 @@ class GreekTargetStrategy:
             self.name,
             list(self.notes),
             dict(self.preset_kwargs),
+            self.unwind_on_knock,
         )
 
     def without(self, *instrument_names: str) -> GreekTargetStrategy:
@@ -217,7 +238,17 @@ class GreekTargetStrategy:
             self.name,
             list(self.notes),
             dict(self.preset_kwargs),
+            tuple(k for k in self.unwind_on_knock if k in static),
         )
+
+    def knock_mask(self, state: Any, n_paths: int) -> FloatArray:
+        """``1 − knocked`` per path from the product's hedge state (ones when the state carries
+        no ``knocked`` feature, or none is given)."""
+        names = tuple(getattr(state, "names", ()) or ())
+        if state is None or "knocked" not in names:
+            return np.ones(n_paths)
+        k = np.asarray(state.features[:, names.index("knocked")], dtype=np.float64)
+        return np.asarray(1.0 - k, dtype=np.float64)
 
     def solve(
         self,
@@ -226,10 +257,13 @@ class GreekTargetStrategy:
         instrument_greeks: Sequence[Mapping[str, FloatArray]],
         active: Sequence[bool],
         q_prev: FloatArray | None = None,
+        *,
+        state: Any = None,
     ) -> HedgeSolution:
         """The quantities at ``t`` on every path (module docstring).  ``instrument_greeks[j]``
         holds the same keys as ``product_greeks`` for instrument ``j``; inactive instruments get
-        zero; static legs their given quantity."""
+        zero; static legs their given quantity (times ``1 − knocked`` for the
+        ``unwind_on_knock`` legs, from the product's hedge ``state``)."""
         n_paths = next(iter(product_greeks.values())).size
         names = [i.name for i in self.instruments]
         tn = self.target_names
@@ -237,9 +271,12 @@ class GreekTargetStrategy:
         b = np.column_stack([np.asarray(product_greeks[g], dtype=np.float64) for g in tn])
         if b.ndim == 1:
             b = b[:, None]
+        unknocked = self.knock_mask(state, n_paths) if self.unwind_on_knock else None
         for j, inst in enumerate(self.instruments):
             if inst.name in self.static and active[j]:
                 q[:, j] = self.static_quantity(inst.name, t)
+                if unknocked is not None and inst.name in self.unwind_on_knock:
+                    q[:, j] = q[:, j] * unknocked
                 for gi, g in enumerate(tn):
                     b[:, gi] = b[:, gi] + q[:, j] * np.asarray(instrument_greeks[j][g])
         solved = [
@@ -326,7 +363,7 @@ class CustomStrategy:
     def solved_instruments(self) -> list[HedgeInstrument]:
         return list(self.instruments)
 
-    def solve(self, t, product_greeks, instrument_greeks, active, q_prev=None):  # type: ignore[no-untyped-def]
+    def solve(self, t, product_greeks, instrument_greeks, active, q_prev=None, *, state=None):  # type: ignore[no-untyped-def]
         q = np.asarray(
             self.fn(t, product_greeks, instrument_greeks, active, q_prev), dtype=np.float64
         )
@@ -431,7 +468,8 @@ def preset_vanilla(
             name="call spread",
         )
         inst.append(cs)
-        static["call spread"] = float(product.notional)
+        # the digital is long the call spread: the hedge is short it
+        static["call spread"] = -float(product.notional)
     if vol_hedged or (isinstance(product, EuropeanOption) and vol_hedged):
         f = float(ctx.forward_curve.forward(T))
         inst.append(ctx.vanilla(f, T, 1, "atm vanilla"))
@@ -517,10 +555,11 @@ def preset_variance_swap(product: Any, ctx: PresetContext) -> GreekTargetStrateg
     )
     inst: list[HedgeInstrument] = [ctx.spot_instrument(), *strip]
     static: dict[str, float | Callable[[float], float]] = {}
-    # log-contract weights 2/K^2 dK per unit variance notional (annualised / T)
+    # log-contract weights 2/K^2 dK per unit variance notional (annualised / T): the swap is long
+    # the strip, the hedge is short it
     dk = np.diff(strikes).mean()
     for v in strip:
-        static[v.name] = float(product.notional) * 2.0 / (v.strike**2) * dk / T
+        static[v.name] = -float(product.notional) * 2.0 / (v.strike**2) * dk / T
     targets = [Target("delta")]
     if isinstance(product, _Vol):
         k_vol = ctx.atm_vol(T)
@@ -550,6 +589,20 @@ def cap_call_strip_name(q: Sequence[float] | float) -> str:
     return "cap-call strip q=[" + ",".join(f"{w:g}" for w in arr) + "]"
 
 
+def preset_variance_option(product: Any, ctx: PresetContext) -> GreekTargetStrategy:
+    """Option on realised variance or vol (module docstring): ``delta`` + a variance swap over the
+    option's window sized on ``vega`` — the option's first-order exposure to the level of implied
+    variance; its vol-of-vol (convexity in variance) is left open by this preset."""
+    T = float(product.maturity)
+    inst: list[HedgeInstrument] = [
+        ctx.spot_instrument(),
+        ctx.varswap(float(product.start), T, ctx.atm_vol(T), name="var swap"),
+    ]
+    return GreekTargetStrategy(
+        (Target("delta"), Target("vega")), inst, name="variance-option preset"
+    )
+
+
 def preset_cliquet(
     product: Any, ctx: PresetContext, *, q: Sequence[float] | float = 1.0
 ) -> GreekTargetStrategy:
@@ -564,7 +617,9 @@ def preset_cliquet(
     cl = (
         product
         if isinstance(product, AdditiveCliquet)
-        else product._inner() if isinstance(product, ReverseCliquet) else None
+        else product._inner()
+        if isinstance(product, ReverseCliquet)
+        else None
     )
     T = float(product.maturity)
     inst: list[HedgeInstrument] = [ctx.spot_instrument()]
@@ -662,8 +717,9 @@ def preset_vko(product: Any, ctx: PresetContext) -> GreekTargetStrategy:
         rr_call,
         rr_put,
     ]
+    # the VKO is long the underlying put (put − vol-knock-in put): the hedge is short it
     static: dict[str, float | Callable[[float], float]] = {
-        "underlying put": float(product.notional)
+        "underlying put": -float(product.notional)
     }
     targets = [Target("delta"), Target("vega"), Target("vanna")]
     return GreekTargetStrategy(tuple(targets), inst, static, name="VKO preset")
@@ -734,7 +790,8 @@ def preset_barrier(product: Any, ctx: PresetContext) -> GreekTargetStrategy:
     if isinstance(product, KnockInOption):
         van = ctx.vanilla(float(product.strike), T, int(product.cp), "parity vanilla")
         inst.append(van)
-        static["parity vanilla"] = float(product.notional)
+        # knock-in = vanilla − knock-out: the hedge is short the parity vanilla
+        static["parity vanilla"] = -float(product.notional)
     up = product.direction == "up"
     inst.append(
         Digital(
@@ -780,6 +837,7 @@ PRESETS: dict[str, Callable[..., GreekTargetStrategy]] = {
     "FVA": preset_forward_start,
     "VarianceSwap": preset_variance_swap,
     "VolSwap": preset_variance_swap,
+    "VarianceOption": preset_variance_option,
     "AdditiveCliquet": preset_cliquet,
     "ReverseCliquet": preset_cliquet,
     "Napoleon": preset_cliquet,
@@ -833,6 +891,7 @@ __all__ = [
     "preset_ko_variance",
     "preset_portfolio",
     "preset_vanilla",
+    "preset_variance_option",
     "preset_variance_swap",
     "preset_vko",
 ]
