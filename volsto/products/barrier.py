@@ -617,6 +617,7 @@ class _BarrierOption(_BarrierBase):
         seed: int = 0,
         notional: float = 1.0,
         gap: GapSpec | None = None,
+        seasoned: bool = False,
     ) -> None:
         super().__init__(
             barrier,
@@ -638,6 +639,13 @@ class _BarrierOption(_BarrierBase):
         self.cp = parse_cp(cp)
         self.rebate = float(rebate)
         self.rebate_timing = _validate_rebate(self.rebate, rebate_timing, self.knock)
+        #: set by :func:`volsto.products.seasoning.season` (dates count from the as-of date; the
+        #: realised monitoring dates did not knock)
+        self.seasoned = bool(seasoned)
+
+    @property
+    def is_seasoned(self) -> bool:
+        return self.seasoned
 
     def vanilla_payoff(self, paths: PathSet, idx: FixingIndex) -> FloatArray:
         """Undiscounted ``(cp (S_T − K))⁺`` per path."""
@@ -648,7 +656,15 @@ class _BarrierOption(_BarrierBase):
         """The European option the barrier is written on."""
         return EuropeanOption(self.strike, self.T, self.cp, self.discount, self.notional)
 
-    def _rebuild(self, cls: type[_BarrierOption], T: float, schedule: FloatArray) -> Product:
+    def _rebuild(
+        self,
+        cls: type[_BarrierOption],
+        T: float,
+        schedule: FloatArray,
+        *,
+        discount: DiscountCurve | None = None,
+        seasoned: bool | None = None,
+    ) -> Product:
         kw = self._kwargs()
         kw["fixing_times"] = schedule
         return cls(
@@ -657,10 +673,11 @@ class _BarrierOption(_BarrierBase):
             self.cp,
             self.barrier,
             self.direction,
-            self.discount,
+            self.discount if discount is None else discount,
             rebate=self.rebate,
             rebate_timing=self.rebate_timing,
             notional=self.notional,
+            seasoned=self.seasoned if seasoned is None else seasoned,
             **kw,  # type: ignore[arg-type]
         )
 
@@ -683,6 +700,7 @@ class _BarrierOption(_BarrierBase):
             rebate=self.rebate,
             rebate_timing=self.rebate_timing,
             notional=self.notional,
+            seasoned=self.seasoned,
             **kw,  # type: ignore[arg-type]
         )
 

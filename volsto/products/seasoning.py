@@ -34,7 +34,13 @@ flows after ``d`` only (ex-coupon at the payment date's close), so the P&L of ``
 ``V(d₁) − V(d₀) + Σ_{d₀ < d ≤ d₁} flows``.  Knock-outs and autocalls observed in the history are
 honoured, never dropped; an unsupported product raises with its class name.
 
-Supported (exact type): :class:`~volsto.products.variance.VarianceSwap` (fixing-realised),
+Supported (exact type): :class:`~volsto.products.variance.VarianceSwap` (fixing-realised) and
+:class:`~volsto.products.variance.VarianceOption`,
+:class:`~volsto.products.conditional_variance.ConditionalVarianceSwap` (the up / down variance:
+the realised in-region sum and count),
+:class:`~volsto.products.barrier.KnockOutOption` / :class:`~volsto.products.barrier.KnockInOption`
+(discrete monitoring on the daily closes; a breach settles the knock-out and turns the knock-in
+into its vanilla; continuous monitoring and the smart gap raise ``NotImplementedError``),
 :class:`~volsto.products.conditional_variance.KnockOutVarianceSwap`,
 :class:`~volsto.products.vko.VolKnockOutPut`, :class:`~volsto.products.cliquet.AdditiveCliquet`
 and :class:`~volsto.products.autocall.Autocall` (European knock-in, or the discrete American
@@ -65,9 +71,11 @@ from volsto.engine.grid import FixingIndex
 from volsto.engine.paths import PathSet
 from volsto.market.curves import DiscountCurve
 from volsto.products.autocall import Autocall
+from volsto.products.barrier import KnockInOption, KnockOutOption, _BarrierOption, first_hit_index
 from volsto.products.base import Product
 from volsto.products.cliquet import AdditiveCliquet
-from volsto.products.conditional_variance import KnockOutVarianceSwap
+from volsto.products.conditional_variance import ConditionalVarianceSwap, KnockOutVarianceSwap
+from volsto.products.vanilla import EuropeanOption
 from volsto.products.variance import VarianceOption, VarianceSwap
 from volsto.products.vko import VolKnockOutPut
 
@@ -491,6 +499,134 @@ def _ko_like(
     )
 
 
+def _replay_conditional_varswap(p: ConditionalVarianceSwap, ctx: _Ctx) -> Replay:
+    """Up / down (conditional or corridor) variance swap: the realised in-region sum of squares
+    and count ``D`` folded into the seasoned product (the reference close decides the next
+    return's ``"prev"`` indicator); settled once every fixing is realised."""
+    fix = p.fixing_times
+    j, real = _split(ctx, fix)
+    remaining = fix[~real] - ctx.elapsed
+    kw: dict[str, Any] = {
+        "strict": p.strict,
+        "daily_cap": p.daily_cap,
+        "annualisation": p.annualisation,
+        "notional": p.notional,
+        "seasoned": True,
+    }
+    if not real.any():  # a forward-start swap before its start
+        raise NotImplementedError("a forward-start conditional variance swap before its start")
+    closes = ctx.history.closes_at(j[real])
+    ls = np.log(closes)[None, :]
+    ind = p.indicators(ls)[0]
+    r2 = p.squared_returns(ls)[0]
+    sum_in = float(np.sum(r2 * ind))
+    d_in = int(np.sum(ind))
+    state: dict[str, Any] = {
+        "realised_returns": int(r2.size),
+        "realised_sum_sq_in": sum_in,
+        "realised_in_count": d_in,
+    }
+    if real.all():
+        n = int(r2.size)
+        accrued = p.annualisation / n * sum_in
+        k2 = p.strike_vol**2 * (d_in / n if p.convention == "conditional" else 1.0)
+        return ctx.settled(
+            p.notional * (accrued - k2),
+            float(fix[-1]) - ctx.elapsed,
+            "every fixing realised",
+            int(j[-1]),
+            f"{p.side}-variance swap settlement",
+            accrued=accrued,
+            **state,
+        )
+    seasoned = ConditionalVarianceSwap(
+        remaining,
+        p.barrier,
+        p.side,
+        p.indicator,
+        p.convention,
+        p.strike_vol,
+        ctx.discount,
+        reference_fixing=float(closes[-1]),
+        realised_sum_sq=sum_in,
+        realised_count=int(r2.size),
+        realised_in_count=d_in,
+        **kw,
+    )
+    return Replay(ctx.as_of, ctx.elapsed, seasoned, (), state)
+
+
+def _replay_barrier_option(p: _BarrierOption, ctx: _Ctx) -> Replay:
+    """Discretely monitored knock-out / knock-in option on the daily closes: a breach in the
+    history settles the knock-out (its rebate, at the hit or at maturity) and turns the knock-in
+    into its vanilla; otherwise the seasoned option monitors the remaining dates (the as-of close,
+    realised and not breached, stays at ``t = 0`` like an aged product's); settled once the
+    expiry is realised."""
+    if p.monitoring != "discrete":
+        raise NotImplementedError(
+            "a continuously monitored barrier option: the history holds the daily closes only"
+        )
+    if p.gap is not None and p.gap.smart:
+        raise NotImplementedError("a smart-gap barrier option (the gap shifts the priced level)")
+    sched = p.schedule
+    j, real = _split(ctx, sched)
+    j_T = int(ctx.history.trading_indices(np.array([p.T]))[0])
+    maturity_left = p.T - ctx.elapsed
+    hit = int(real.sum())
+    if real.any():
+        closes = ctx.history.closes_at(j[real])
+        hit = int(
+            first_hit_index(
+                np.log(closes)[None, :], p.ln_barrier, p.direction, strict=bool(p.strict)
+            )[0]
+        )
+    knocked = hit < int(real.sum())
+    state: dict[str, Any] = {"knocked": knocked, "realised_monitoring_dates": int(real.sum())}
+
+    def vanilla_amount() -> float:
+        s_T = float(ctx.history.closes_at(np.array([j_T]))[0])
+        return float(p.notional * max(p.cp * (s_T - p.strike), 0.0))
+
+    if knocked:
+        j_hit = int(j[real][hit])
+        reason = f"barrier breached at monitoring date {hit} ({ctx.history.dates[j_hit]})"
+        if p.knock == "out":
+            at_hit = p.rebate_timing == "hit"
+            return ctx.settled(
+                p.notional * p.rebate,
+                (float(sched[real][hit]) - ctx.elapsed) if at_hit else maturity_left,
+                reason,
+                j_hit if at_hit else j_T,
+                "knock-out rebate",
+                **state,
+            )
+        if j_T <= ctx.n:
+            return ctx.settled(
+                vanilla_amount(),
+                maturity_left,
+                reason + "; expiry realised",
+                j_T,
+                "knock-in settlement",
+                **state,
+            )
+        van = EuropeanOption(p.strike, maturity_left, p.cp, ctx.discount, p.notional, seasoned=True)
+        return Replay(ctx.as_of, ctx.elapsed, van, (), {**state, "reason": reason})
+    if j_T <= ctx.n:
+        amount = vanilla_amount() if p.knock == "out" else float(p.notional * p.rebate)
+        return ctx.settled(
+            amount,
+            maturity_left,
+            "expiry realised, never breached",
+            j_T,
+            f"knock-{p.knock} settlement",
+            **state,
+        )
+    at_origin = np.array([0.0]) if (j[real] == ctx.n).any() else np.array([])
+    remaining = np.concatenate([at_origin, sched[~real] - ctx.elapsed])
+    seasoned = p._rebuild(type(p), maturity_left, remaining, discount=ctx.discount, seasoned=True)
+    return Replay(ctx.as_of, ctx.elapsed, seasoned, (), state)
+
+
 def _replay_vko(p: VolKnockOutPut, ctx: _Ctx) -> Replay:
     fix = p.fixing_times
     j, real = _split(ctx, fix)
@@ -702,6 +838,9 @@ def _replay_autocall(p: Autocall, ctx: _Ctx) -> Replay:
 _REPLAYS: dict[type, Callable[[Any, _Ctx], Replay]] = {
     VarianceSwap: _replay_variance_swap,
     VarianceOption: _replay_variance_option,
+    ConditionalVarianceSwap: _replay_conditional_varswap,
+    KnockOutOption: _replay_barrier_option,
+    KnockInOption: _replay_barrier_option,
     KnockOutVarianceSwap: _replay_ko_varswap,
     VolKnockOutPut: _replay_vko,
     AdditiveCliquet: _replay_cliquet,

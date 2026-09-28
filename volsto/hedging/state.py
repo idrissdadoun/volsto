@@ -254,15 +254,18 @@ def hedge_state(product: Product, paths: PathSet, idx: FixingIndex, t: float) ->
             ("accumulated", "u_period"),
         )
     if isinstance(product, ConditionalVarianceSwap):
-        done = _fixings_up_to(product.fixing_times, t)
-        if done.size < 2:
-            feats = np.zeros((n, 2))
+        ref = product.reference_fixing
+        ls = _done_log_spots(paths, idx, product.fixing_times, t, ref)
+        acc0, d0 = product.realised_sum_sq, float(product.realised_in_count)
+        if ls.shape[1] < 2:
+            feats = np.column_stack([np.full(n, acc0), np.full(n, d0)])
         else:
-            ls = paths.log_spot_at(idx.indices(done))
             ind = product.indicators(ls)
             r2 = product.squared_returns(ls)
-            feats = np.column_stack([np.sum(r2 * ind, axis=1), np.sum(ind, axis=1)])
-        start = _u_period(paths, idx, product.fixing_times, t)
+            feats = np.column_stack(
+                [acc0 + np.sum(r2 * ind, axis=1), d0 + np.sum(ind, axis=1)]
+            )
+        start = _u_period(paths, idx, product.fixing_times, t, ref)
         return HedgeState(
             t,
             np.column_stack([feats, start]),

@@ -50,7 +50,15 @@ monthly, cap 2%, global floor 0), ``vko_put`` (strike ``moneyness`` × spot, ``v
 fixings, notional 1/spot), ``ko_var`` (up barrier ``barrier`` × spot) and ``var_swap``, both with
 ``strike: vs_strip`` (the inception surface's log-contract strike at the maturity) or a strike
 vol, variance notional ``1 / (2 K_vol)`` (values in vol units of vega notional 1; M8b's KO var
-had strike 0 in variance units instead).  Coupons are per annum: the autocall pays ``c · T_i``
+had strike 0 in variance units instead); ``ko_var`` takes the optional ``settlement``
+(``maturity`` by default, ``knock_out``: paid at the knock-out close, the desk's convention).
+The payoff study's kinds (2026-09-27): ``uo_call`` / ``do_put`` / ``di_put`` (strike
+``moneyness`` × spot, barrier ``barrier`` × spot, daily-close monitoring, strict, notional
+1/spot: % of the inception spot), ``var_put`` (put on realised variance ``(K² − RV)⁺`` struck at
+``strike_ratio`` times the ``strike`` rule's vol, variance notional ``1 / (2 K_vol)``),
+``up_var`` / ``down_var`` (corridor variance swaps above / below ``barrier`` × spot, the desk
+indicators ``prev`` / ``curr``, struck by the ``strike`` rule, variance notional
+``1 / (2 K_vol)``).  Coupons are per annum: the autocall pays ``c · T_i``
 at observation ``i`` and the Phoenix ``c · (T_i − T_{i−1})`` per period, which are the M6 float
 coupons when the observations are annual.  Every fixing
 lies on the 252-day trading grid of :mod:`volsto.products.seasoning` (checked at load).  Values
@@ -386,11 +394,17 @@ from volsto.market.varswap import varswap_strike
 from volsto.models.leverage import LeverageFunction
 from volsto.models.lsv import LSV
 from volsto.products.autocall import Autocall, Phoenix
+from volsto.products.barrier import KnockInOption, KnockOutOption
 from volsto.products.base import Product, daily_schedule
 from volsto.products.cliquet import AdditiveCliquet
-from volsto.products.conditional_variance import KnockOutVarianceSwap
+from volsto.products.conditional_variance import (
+    SETTLEMENTS,
+    DownVar,
+    KnockOutVarianceSwap,
+    UpVar,
+)
 from volsto.products.seasoning import TRADING_DAYS_PER_YEAR, RealisedHistory, Replay, replay
-from volsto.products.variance import VarianceSwap
+from volsto.products.variance import VarianceOption, VarianceSwap
 from volsto.products.vko import VolKnockOutPut
 from volsto.risk.attribution import (
     DETAILS,
@@ -474,7 +488,25 @@ TRADE_KEYS: dict[str, tuple[str, ...]] = {
     "vko_put": ("vol_ko", "moneyness"),
     "ko_var": ("barrier", "strike"),
     "var_swap": ("strike",),
+    "uo_call": ("moneyness", "barrier"),
+    "do_put": ("moneyness", "barrier"),
+    "di_put": ("moneyness", "barrier"),
+    "var_put": ("strike", "strike_ratio"),
+    "up_var": ("barrier", "strike"),
+    "down_var": ("barrier", "strike"),
 }
+#: Optional keys of a trade: ``ko_var.settlement`` (``maturity``, the default, or ``knock_out``,
+#: the desk's convention); left out of the normalised mapping at its default, so a config without
+#: it hashes exactly as before the key existed.
+TRADE_OPTIONAL: dict[str, tuple[str, ...]] = {"ko_var": ("settlement",)}
+#: The barrier-option kinds: (payoff, direction, knock) — daily-close monitoring, strict.
+BARRIER_KINDS: dict[str, tuple[int, str, str]] = {
+    "uo_call": (1, "up", "out"),
+    "do_put": (-1, "down", "out"),
+    "di_put": (-1, "down", "in"),
+}
+#: The variance kinds (struck at ``vs_strip`` or a strike vol, variance notional 1/(2 K_vol)).
+VARIANCE_KINDS: tuple[str, ...] = ("ko_var", "var_swap", "var_put", "up_var", "down_var")
 #: Each product's unit and scale: the study reports ``scale × value`` in that unit — % of
 #: notional (notes, cliquet), % of the inception spot (VKO), vol points of vega notional
 #: (variance swaps) — and never adds two units (P2).
@@ -485,6 +517,12 @@ TRADE_UNITS: dict[str, tuple[str, float]] = {
     "vko_put": ("% of inception spot", 100.0),
     "ko_var": ("vol pts (vega notional 1)", 100.0),
     "var_swap": ("vol pts (vega notional 1)", 100.0),
+    "uo_call": ("% of inception spot", 100.0),
+    "do_put": ("% of inception spot", 100.0),
+    "di_put": ("% of inception spot", 100.0),
+    "var_put": ("vol pts (vega notional 1)", 100.0),
+    "up_var": ("vol pts (vega notional 1)", 100.0),
+    "down_var": ("vol pts (vega notional 1)", 100.0),
 }
 #: Store layout.
 HEADER_NAME = "backtest.json"
@@ -827,13 +865,20 @@ class TradeSpec:
     moneyness: float | None = None
     barrier: float | None = None
     strike: float | str | None = None
+    strike_ratio: float | None = None
+    settlement: str | None = None
 
     @classmethod
     def from_mapping(cls, data: Any, where: str) -> TradeSpec:
         if not isinstance(data, Mapping) or "kind" not in data:
             raise ConfigError(f"{where}: a trade is a mapping with a kind, got {data!r}")
         kind = _choice(data["kind"], tuple(TRADE_KEYS), f"{where}.kind")
-        d = _mapping(data, ("id", "kind", "maturity", *TRADE_KEYS[kind]), where)
+        d = _mapping(
+            data,
+            ("id", "kind", "maturity", *TRADE_KEYS[kind]),
+            where,
+            optional=TRADE_OPTIONAL.get(kind, ()),
+        )
         tid = d["id"]
         if not isinstance(tid, str) or not tid or not all(c.isalnum() or c in "_-" for c in tid):
             raise ConfigError(f"{where}.id: {tid!r} must match [A-Za-z0-9_-]+")
@@ -854,9 +899,28 @@ class TradeSpec:
         if kind == "vko_put":
             kw["vol_ko"] = _num(d["vol_ko"], f"{where}.vol_ko", positive=True)
             kw["moneyness"] = _num(d["moneyness"], f"{where}.moneyness", positive=True)
-        if kind == "ko_var":
+        if kind in ("ko_var", "up_var", "down_var"):
             kw["barrier"] = _num(d["barrier"], f"{where}.barrier", positive=True)
-        if kind in ("ko_var", "var_swap"):
+        if kind == "ko_var" and "settlement" in d:
+            kw["settlement"] = _choice(d["settlement"], SETTLEMENTS, f"{where}.settlement")
+        if kind in BARRIER_KINDS:
+            kw["moneyness"] = _num(d["moneyness"], f"{where}.moneyness", positive=True)
+            kw["barrier"] = _num(d["barrier"], f"{where}.barrier", positive=True)
+            _, direction, _ = BARRIER_KINDS[kind]
+            beyond = (
+                kw["barrier"] > kw["moneyness"]
+                if direction == "up"
+                else (kw["barrier"] < kw["moneyness"])
+            )
+            if not beyond or (direction == "up") != (kw["barrier"] > 1.0):
+                raise ConfigError(
+                    f"{where}: a {kind} needs its barrier beyond the strike on the knock side and "
+                    f"of the spot ({direction}), got barrier {kw['barrier']:g} and moneyness "
+                    f"{kw['moneyness']:g}"
+                )
+        if kind == "var_put":
+            kw["strike_ratio"] = _num(d["strike_ratio"], f"{where}.strike_ratio", positive=True)
+        if kind in VARIANCE_KINDS:
             s = d["strike"]
             kw["strike"] = VS_STRIP if s == VS_STRIP else _num(s, f"{where}.strike", positive=True)
         return cls(tid, kind, maturity, **kw)
@@ -865,6 +929,9 @@ class TradeSpec:
         out: dict[str, Any] = {"id": self.id, "kind": self.kind, "maturity": self.maturity}
         for k in TRADE_KEYS[self.kind]:
             out[k] = getattr(self, k)
+        # an optional key at its default is left out (the hash of a config without it)
+        if self.settlement is not None and self.settlement != "maturity":
+            out["settlement"] = self.settlement
         return out
 
     @property
@@ -1473,16 +1540,57 @@ def build_product(
         k = spec.moneyness * float(spot)
         prod = VolKnockOutPut(k, T, spec.vol_ko, daily, discount, notional=1.0 / float(spot))
         return BuiltTrade(prod, unit, scale, k, spec.vol_ko)
+    if spec.kind in BARRIER_KINDS:
+        assert spec.moneyness is not None and spec.barrier is not None
+        cp, direction, knock = BARRIER_KINDS[spec.kind]
+        k = spec.moneyness * float(spot)
+        cls = KnockOutOption if knock == "out" else KnockInOption
+        prod = cls(
+            k,
+            T,
+            cp,
+            spec.barrier * float(spot),
+            direction,
+            discount,
+            monitoring="discrete",
+            fixing_times=daily,
+            strict=True,
+            notional=1.0 / float(spot),
+        )
+        return BuiltTrade(prod, unit, scale, k)
     k_vol = (
         math.sqrt(float(varswap_strike(surface, T)))
         if spec.strike == VS_STRIP
         else float(spec.strike)  # type: ignore[arg-type]
     )
+    if spec.kind == "var_put":
+        assert spec.strike_ratio is not None
+        k_vol *= spec.strike_ratio
     notional = 1.0 / (2.0 * k_vol)
     if spec.kind == "ko_var":
         assert spec.barrier is not None
         prod = KnockOutVarianceSwap(
-            daily, spec.barrier * float(spot), k_vol, discount, notional=notional
+            daily,
+            spec.barrier * float(spot),
+            k_vol,
+            discount,
+            settlement=spec.settlement or "maturity",
+            notional=notional,
+        )
+        return BuiltTrade(prod, unit, scale, k_vol)
+    if spec.kind == "var_put":
+        prod = VarianceOption(daily, k_vol, discount, cp=-1, notional=notional, annualisation=252.0)
+        return BuiltTrade(prod, unit, scale, k_vol)
+    if spec.kind in ("up_var", "down_var"):
+        assert spec.barrier is not None
+        maker = UpVar if spec.kind == "up_var" else DownVar
+        prod = maker(
+            daily,
+            spec.barrier * float(spot),
+            k_vol,
+            discount,
+            convention="corridor",
+            notional=notional,
         )
         return BuiltTrade(prod, unit, scale, k_vol)
     prod = VarianceSwap(daily, k_vol * k_vol, discount, notional)
@@ -6853,7 +6961,7 @@ def _setup_results(
     status_of = {d: str(dones[d].get("status")) for d in dates}
     marked = [d for d in dates if status_of[d] in ("ok", "incomplete")]
     skipped = [d for d in dates if status_of[d] == "skipped"]
-    variance = [t for t in (*cfg.fixed, *cfg.rolling) if t.kind in ("var_swap", "ko_var")]
+    variance = [t for t in (*cfg.fixed, *cfg.rolling) if t.kind in VARIANCE_KINDS]
     fit_cfg = cfg.stability_fit_config()
     fit_text = ", ".join(
         f"{k} {cfg.section('stability')['fit'][k]}" for k in STABILITY_FIT_REQUIRED
@@ -6915,6 +7023,7 @@ def variance_strike_rule(trades: Sequence[TradeSpec]) -> str:
                 if not isinstance(t.strike, (int, float))
                 else f"a {100.0 * float(t.strike):g}% strike vol"
             )
+            + ("" if t.strike_ratio is None else f" times {t.strike_ratio:g}")
             for t in trades
         }
     )
@@ -8712,8 +8821,7 @@ def narrative(results: Results) -> str:
             else "no realised return yet (inception date only)"
         )
         parts.append(
-            f"- `{r}`: {realised} against the {ko:.1f} vol pts barrier; realised outcome "
-            f"{outcome}."
+            f"- `{r}`: {realised} against the {ko:.1f} vol pts barrier; realised outcome {outcome}."
         )
     parts += [
         "",

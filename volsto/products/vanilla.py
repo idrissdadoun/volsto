@@ -27,6 +27,8 @@ class EuropeanOption(Product):
         cp: int | str,
         discount: DiscountCurve,
         notional: float = 1.0,
+        *,
+        seasoned: bool = False,
     ) -> None:
         super().__init__(discount, notional)
         if strike <= 0 or maturity <= 0:
@@ -34,6 +36,12 @@ class EuropeanOption(Product):
         self.strike = float(strike)
         self.T = float(maturity)
         self.cp = parse_cp(cp)
+        #: set by :func:`volsto.products.seasoning.season` (a knocked-in barrier option's vanilla)
+        self.seasoned = bool(seasoned)
+
+    @property
+    def is_seasoned(self) -> bool:
+        return self.seasoned
 
     @property
     def fixing_times(self) -> FloatArray:
@@ -46,7 +54,12 @@ class EuropeanOption(Product):
 
     def aged(self, dt: float) -> Product:
         return EuropeanOption(
-            self.strike, float(shift_times([self.T], dt)[0]), self.cp, self.discount, self.notional
+            self.strike,
+            float(shift_times([self.T], dt)[0]),
+            self.cp,
+            self.discount,
+            self.notional,
+            seasoned=self.seasoned,
         )
 
     def __repr__(self) -> str:

@@ -45,6 +45,8 @@ from volsto.products import (
     replay,
     season,
 )
+from volsto.products.barrier import KnockInOption, KnockOutOption
+from volsto.products.conditional_variance import ConditionalVarianceSwap, DownVar, UpVar
 from volsto.products.gap import GapSpec
 from volsto.products.seasoning import SUPPORTED
 from volsto.risk.engine import product_key
@@ -95,7 +97,22 @@ def _book(disc: DiscountCurve, spot: float = S0) -> dict[str, Product]:
     prods["ko var 1y"] = KnockOutVarianceSwap(daily_schedule(1.0, 252), 1.1 * spot, 0.20, disc)
     prods["var swap 1y"] = VarianceSwap.daily(1.0, 0.04, disc, annualisation=252.0)
     prods["put on var 1y"] = VarianceOption.daily(1.0, 0.20, disc, annualisation=252.0)
+    prods.update(_payoff_study_barriers(disc, spot))
+    prods["up var 1y"] = UpVar(daily_schedule(1.0, 252), spot, 0.2, disc, convention="corridor")
     return prods
+
+
+def _payoff_study_barriers(disc: DiscountCurve, spot: float = S0) -> dict[str, Product]:
+    """The payoff study's barrier options: daily-close monitoring, 6m."""
+    kw: dict[str, Any] = {
+        "monitoring": "discrete",
+        "fixing_times": daily_schedule(0.5, 252),
+        "strict": True,
+    }
+    return {
+        "uoc 6m": KnockOutOption(spot, 0.5, 1, 1.2 * spot, "up", disc, **kw),
+        "dip 6m": KnockInOption(spot, 0.5, -1, 0.8 * spot, "down", disc, **kw),
+    }
 
 
 # --------------------------------------------------------------------------------------------
@@ -148,6 +165,15 @@ STATE_DEFAULTS: dict[type, dict[str, Any]] = {
     },
     AdditiveCliquet: {"reference_fixing": None, "accrued": 0.0, "seasoned": False},
     Autocall: {"knocked_in": False, "memory_coupons": 0.0, "seasoned": False},
+    ConditionalVarianceSwap: {
+        "reference_fixing": None,
+        "realised_sum_sq": 0.0,
+        "realised_count": 0,
+        "realised_in_count": 0,
+        "seasoned": False,
+    },
+    KnockOutOption: {"seasoned": False},
+    KnockInOption: {"seasoned": False},
 }
 
 
@@ -195,6 +221,40 @@ def test_explicit_state_defaults_are_the_fresh_product() -> None:
             disc,
             annualisation=252.0,
             **STATE_DEFAULTS[VarianceOption],
+        ),
+        "uoc 6m": KnockOutOption(
+            S0,
+            0.5,
+            1,
+            1.2 * S0,
+            "up",
+            disc,
+            monitoring="discrete",
+            fixing_times=daily_schedule(0.5, 252),
+            strict=True,
+            **STATE_DEFAULTS[KnockOutOption],
+        ),
+        "dip 6m": KnockInOption(
+            S0,
+            0.5,
+            -1,
+            0.8 * S0,
+            "down",
+            disc,
+            monitoring="discrete",
+            fixing_times=daily_schedule(0.5, 252),
+            strict=True,
+            **STATE_DEFAULTS[KnockInOption],
+        ),
+        "up var 1y": ConditionalVarianceSwap(
+            daily_schedule(1.0, 252),
+            S0,
+            "up",
+            "prev",
+            "corridor",
+            0.2,
+            disc,
+            **STATE_DEFAULTS[ConditionalVarianceSwap],
         ),
     }
     assert set(STATE_DEFAULTS) == {type(p) for p in book.values()}
@@ -686,6 +746,88 @@ def test_unsupported_and_invalid_inputs_raise() -> None:
 # --------------------------------------------------------------------------------------------
 
 
+def test_conditional_variance_seasoned_statistics_equal_the_full_path() -> None:
+    """Up (``"prev"``) and down (``"curr"``) variance, corridor and conditional: the seasoned
+    swap's statistics on the future equal the fresh swap's on the realised closes followed by the
+    same future, path by path; a fully realised swap settles at its realised statistics."""
+    disc = _fc().rate_curve
+    closes = _path(90, 0.3, 17)
+    hist = _history(closes)
+    n = 89
+    for side, conv in (("up", "corridor"), ("down", "corridor"), ("up", "conditional")):
+        maker = UpVar if side == "up" else DownVar
+        fresh = maker(daily_schedule(1.0, 252), 101.0, 0.2, disc, convention=conv)
+        seasoned = season(fresh, hist, hist.dates[n])
+        assert isinstance(seasoned, ConditionalVarianceSwap) and seasoned.is_seasoned
+        assert seasoned.realised_count == n and 0 < seasoned.realised_in_count < n
+        fut, fidx = _future_paths(float(closes[n]), 252 - n, 0.25, seed=5)
+        full, full_idx = _full_paths(closes, fut, fidx)
+        a, b = seasoned.statistics(fut, fidx), fresh.statistics(full, full_idx)
+        for key in ("accrued", "count"):
+            np.testing.assert_allclose(a[key], b[key], rtol=1e-12, err_msg=f"{side} {conv}")
+        assert "realised returns in the region" in repr(seasoned)
+    whole = _path(253, 0.3, 19)
+    fresh = UpVar(daily_schedule(1.0, 252), 100.0, 0.2, disc, convention="corridor")
+    done = season(fresh, _history(whole), _history(whole).dates[252])
+    assert isinstance(done, Settled)
+    r = np.diff(np.log(whole))
+    ind = whole[:-1] > 100.0
+    expected = 252.0 / 252 * float(np.sum(r * r * ind)) - 0.04
+    assert done.amount == pytest.approx(expected, rel=1e-12)
+
+
+def test_barrier_option_history() -> None:
+    """Daily-close barrier options: a history breaching the barrier settles the knock-out at its
+    (zero) rebate and turns the knock-in into its vanilla; an unbreached history seasons the
+    option (the remaining dates, the as-of close at ``t = 0``) with a knock state equal to the
+    fresh option's on the full path; an expired history settles at the realised payoff."""
+    disc = _fc().rate_curve
+    book = _payoff_study_barriers(disc)
+    closes = np.full(40, 99.0)
+    closes[0] = S0
+    closes[20] = 79.0  # below the 80 barrier of the down-and-in put
+    hist = _history(closes)
+    dip = book["dip 6m"]
+    van = season(dip, hist, hist.dates[30])
+    assert isinstance(van, EuropeanOption) and van.is_seasoned
+    assert pytest.approx(0.5 - 30 / 252) == van.T and van.strike == S0 and van.cp == -1
+    dop = KnockOutOption(
+        S0,
+        0.5,
+        -1,
+        80.0,
+        "down",
+        disc,
+        monitoring="discrete",
+        fixing_times=daily_schedule(0.5, 252),
+        strict=True,
+    )
+    rep = replay(dop, hist, hist.dates[30])
+    assert rep.settled and isinstance(rep.result, Settled) and rep.result.amount == 0.0
+    assert rep.state["knocked"] and "breached at monitoring date 20" in rep.result.reason
+    # unbreached: the up-and-out call seasoned 40 days in, knock state = the full path's
+    uoc = book["uoc 6m"]
+    path = _path(41, 0.2, 23)
+    h2 = _history(path)
+    seasoned = season(uoc, h2, h2.dates[40])
+    assert isinstance(seasoned, KnockOutOption) and seasoned.is_seasoned
+    assert pytest.approx(0.5 - 40 / 252) == seasoned.T and seasoned.schedule[0] == 0.0
+    fut, fidx = _future_paths(float(path[40]), 126 - 40, 0.3, seed=9)
+    full, full_idx = _full_paths(path, fut, fidx)
+    np.testing.assert_array_equal(seasoned.monitor(fut, fidx)[0], uoc.monitor(full, full_idx)[0])
+    assert np.any(seasoned.monitor(fut, fidx)[0] == 0.0)
+    # expired: settled at the realised vanilla payoff (never breached)
+    flat = _history(np.full(127, 110.0))
+    out = season(uoc, flat, flat.dates[126])
+    assert isinstance(out, Settled) and out.amount == pytest.approx(10.0)
+    with pytest.raises(NotImplementedError, match="continuously monitored"):
+        season(
+            KnockOutOption(S0, 0.5, 1, 120.0, "up", disc, monitoring="continuous"),
+            hist,
+            hist.dates[3],
+        )
+
+
 def _future_paths(spot: float, horizon: int, vol: float, seed: int) -> tuple[PathSet, FixingIndex]:
     """Black–Scholes paths from ``spot`` recorded on every trading day of ``horizon``."""
     model = BlackScholes(vol, _fc(spot))
@@ -754,6 +896,14 @@ def test_hedge_state_of_seasoned_products() -> None:
             0.45,
         ),
         ("cliquet", AdditiveCliquet.study(1.0, disc), base, 30, 0.25),
+        (
+            "down var",
+            DownVar(daily_schedule(1.0, 252), 102.0, 0.2, disc, convention="corridor"),
+            base,
+            100,
+            0.25,
+        ),
+        ("uoc", _payoff_study_barriers(disc)["uoc 6m"], base, 40, 0.25),
         ("phoenix knocked", _phoenix_quarterly(disc), dip, 70, 0.2),
         ("autocall", headline_products(disc, S0)["autocall 3y"], base, 100, 0.25),
     ]

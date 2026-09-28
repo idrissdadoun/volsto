@@ -26,10 +26,12 @@ simulation grid.
 
 Seasoned products (M10 Part 3, SPEC §6.10; :func:`volsto.products.seasoning.season`): the
 schedule carries ``reference_fixing`` (the last realised close, prepended to the path's fixings
-as a constant column), ``realised_sum_sq`` (``Σ r_i²``, capped, over the realised returns) and
-``realised_count``; ``N`` counts every return of the life.  The knock-out swap's ``τ`` is then
-``realised_count`` plus the stopping index of the remaining returns (a realised knock-out is a
-settled trade, never a live seasoned one).  The defaults are the fresh products bit for bit.
+as a constant column), ``realised_sum_sq`` (``Σ r_i²``, capped, over the realised returns — for
+the conditional / corridor swap the in-region sum ``Σ r_i² I_i``, with ``realised_in_count`` the
+realised ``D``) and ``realised_count``; ``N`` counts every return of the life.  The knock-out
+swap's ``τ`` is then ``realised_count`` plus the stopping index of the remaining returns (a
+realised knock-out is a settled trade, never a live seasoned one).  The defaults are the fresh
+products bit for bit.
 
 Fair strikes are ratios of expectations (``K² = A E[Σ r_i² I_i] / E[D]`` for the conditional
 convention, ``A E[Σ_{i≤τ} r_i²] / E[τ]`` for the knock-out swap, ``(A/N) E[Σ r_i² I_i]`` for the
@@ -213,10 +215,32 @@ class ConditionalVarianceSwap(RealisedVarianceSchedule):
         daily_cap: float | None = None,
         annualisation: float = 252.0,
         notional: float = 1.0,
+        reference_fixing: float | None = None,
+        realised_sum_sq: float = 0.0,
+        realised_count: int = 0,
+        realised_in_count: int = 0,
+        seasoned: bool = False,
     ) -> None:
-        super().__init__(fixing_times, discount, notional, annualisation, daily_cap)
+        super().__init__(
+            fixing_times,
+            discount,
+            notional,
+            annualisation,
+            daily_cap,
+            reference_fixing=reference_fixing,
+            realised_sum_sq=realised_sum_sq,
+            realised_count=realised_count,
+            seasoned=seasoned,
+        )
         if barrier <= 0:
             raise ValueError("barrier must be positive")
+        if int(realised_in_count) != realised_in_count or not (
+            0 <= realised_in_count <= self.realised_count
+        ):
+            raise ValueError("realised_in_count must be an integer in [0, realised_count]")
+        # seasoned: realised_sum_sq is the in-region sum of the realised squared returns and
+        # realised_in_count their in-region count D (the module docstring's seasoned products)
+        self.realised_in_count = int(realised_in_count)
         if side not in SIDES or indicator not in INDICATORS or convention not in CONVENTIONS:
             raise ValueError(
                 f"side in {SIDES}, indicator in {INDICATORS}, convention in {CONVENTIONS}"
@@ -245,8 +269,15 @@ class ConditionalVarianceSwap(RealisedVarianceSchedule):
         ls = self.log_spots(paths, idx)
         ind = self.indicators(ls)
         n = self.n_returns
-        accrued = self.annualisation / n * np.sum(self.squared_returns(ls) * ind, axis=1)
-        return {"accrued": accrued, "count": np.sum(ind, axis=1) / n}
+        accrued = (
+            self.annualisation
+            / n
+            * (self.realised_sum_sq + np.sum(self.squared_returns(ls) * ind, axis=1))
+        )
+        return {"accrued": accrued, "count": (self.realised_in_count + np.sum(ind, axis=1)) / n}
+
+    def state_kwargs(self) -> dict[str, Any]:
+        return {**super().state_kwargs(), "realised_in_count": self.realised_in_count}
 
     def payoff(self, paths: PathSet, idx: FixingIndex) -> FloatArray:
         st = self.statistics(paths, idx)
@@ -270,6 +301,7 @@ class ConditionalVarianceSwap(RealisedVarianceSchedule):
             daily_cap=self.daily_cap,
             annualisation=self.annualisation,
             notional=self.notional,
+            **self.state_kwargs(),
         )
 
     def __repr__(self) -> str:
@@ -280,6 +312,12 @@ class ConditionalVarianceSwap(RealisedVarianceSchedule):
             f"({self.indicator}), {self.n_returns} returns to {self.maturity:g}y, strike "
             f"{self.strike_vol * 100:.4g}% vol, A = {self.annualisation:g}{cap}, "
             f"variance notional {self.notional:g}"
+            + self._seasoned_repr()
+            + (
+                f", {self.realised_in_count} realised returns in the region"
+                if self.reference_fixing is not None
+                else ""
+            )
         )
 
 
