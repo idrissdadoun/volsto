@@ -955,6 +955,34 @@ Study D — (from `outputs/m8b/m8b_table_D.csv`, re-run 2026-09-16: 10 tasks, 29
 
 **S6 / S7 on the new anchor — what moved (`volsto-study rerun`, 2026-09-23).** The stored studies (commit 0394a98, plain-SSVI anchor) re-executed against the re-run artefacts: S6 `outputs/studies/s6_shadow_rotation/rerun/20260923T113624Z/diff.md` — 432 of 927 numbers moved beyond 2 stderr (the M7 greek's LV rotation −0.0917 → −0.1059, the cliquet's P1 level 1.547 → 1.708 % of notional, table C's 3 contaminated rows, the static and recalibrated shadows of every product); S7 `outputs/studies/s7_hedging/rerun/<utc>/diff.md` — 160 of 417 before the pure-LV fix (table A's standard deviations and two `rank_decided` flags, table B's same-world reserves: autocall q05 −11.47 → −10.22, Phoenix std 6.65 → 5.82), re-diffed after study B's pure-LV rows were recomputed with the corrected pricer. The rerun's rule takes the two runs as the same computation (errors not added in quadrature), which overstates the count where the anchor changed the calibration; the diff files carry every pair.
 
+**Desk fit — M8b re-run (2026-09-27/30; `outputs/m8b/m8b_table_{A,B,C,D}.csv`, recalibrated: yes;
+the pre-desk artefacts in `outputs/m8b/pre_desk_2026-09-27`, the details in
+`outputs/m8b/what_moved_A_B_2026-09-30.txt`).** Run after the M7 P1 re-marking under the desk's fit
+(`--fit desk`, 708 s) with the merged payoff-study code (static-leg sign fix, `NettedPortfolio`):
+A, B and 7 of C on 2026-09-27 (interrupted by the laptop sleeping), the rest on 2026-09-30 (6.5 h:
+B's three VKO rows re-run with the fixed sign, 38 C rows, D). *A*: the LV-priced rows are identical;
+2F cliquet delta only 1.835 → 1.724 (z −5.1), the FVA forward-start preset + skew 7.80 → 8.65 (z +6.8).
+*B*: autocall 8.44 → 10.11 (same world), 5.73 → 7.89 (pure LV); cliquet 1.11 → 1.79; VKO (desk fit
+and fixed sign; the sign-bug rows in `outputs/m8b/B_vko_pre_signfix_2026-09-30`) same world 5.89 →
+6.82, mean +0.49 → −0.60 — shorting the underlying put makes the VKO hedge worse, as the payoff study
+measures (§8.3: no tested hedge beats the unhedged VKO); Phoenix ν×1.5 6.13 → **74.2 ± 36.5**, all
+from ONE world path (7016 of 2·10⁴, autocalled at 2y) whose per-path solve went near-singular (total
+P&L −10 410 % of notional, every leg exploding: spot −3995, call spread AC2 −2156, var swap −854);
+without it 9.13 — open item: a condition check / quantity cap on the per-path solve. *C*: the refit
+correlation cap now binds in 0–4 refits per row (144 of 164 before: the SABRW step 0 removed the
+degenerate targets), fallbacks 0–5; autocall `recal_none` 8.48 → 10.16 (z +7), the sticky rows lower
+(10.96 → 9.77 at +1); the cliquet rows rise (1.18 → 1.83 at +1, `recal_none`); the KO var's
+recalibration P&L deepens (+2 `sabr_linked` −0.181 → −0.691); the VKO rows 3.9–4.5 → 6.6–7.8 (desk fit
+and fixed sign together). *D*: the minimum-variance hedge is the best of five again — vanilla 4.79 →
+1.874 (sticky strike 2.274, model 3.209), autocall 9.99 → 7.04 — but its benchmark check still fails
+(`mv_valid` False, z −4.95 / +12.1): the deferred min-variance item stays open. S6 and S7 re-rendered
+(exit 0, recalibrated: no); the backtest PoC's five dates recomputed (`--force`, 24.5 min); S5 needs
+the default grid's 36 desk-fit marking points (`volsto-precompute --grid configs/grids/default.yaml
+--only marking:...`, the VM queue). The M7 rotation records under the desk fit: both policies' desk-P&L
+shadows negative (sabr_linked −0.000522 ± 0.000071, z −7.3; sticky_breakeven −0.000483 ± 0.000092,
+z −5.2), their ordering undecided (difference −0.000038, quadrature bound ± 0.000116) — the deck's
+ordering (measured ~1.4 before) is not reproduced; the recorded-study test awaits the owner.
+
 ### 8.3 The payoff study (owner's request of 2026-09-27; branch `payoff-study`)
 
 **Request.** Up-and-out call, down-and-out and down-and-in puts, put on realised variance, knock-out
