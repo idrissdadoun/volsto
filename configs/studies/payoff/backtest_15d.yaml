@@ -1,0 +1,17 @@
+# The payoff study's rolling backtest (owner's request of 2026-09-27, "the 15 date window
+# first"): stage 2, rendered from the per-date store that
+# `volsto-backtest run configs/backtest/payoff_2022h2_15d.yaml` writes (stage 1, which
+# calibrates).  This study reads that store and never calibrates; a missing date prints the exact
+# `volsto-backtest run ... --only-dates ...` line and exits 2.
+name: payoff_backtest_15d
+runner: volsto.studies.backtest
+question: "Over the first 15 trading days of 2022 H2, how do the payoff study's products move day by day, which risks explain their P&L, and what does the settle-at-knock-out KO var do when it knocks?"
+grid: null
+store: outputs/store
+cache: cache
+outputs: outputs
+mode: full
+seeds: {pricing: 2024}          # must equal the backtest config's pricing seed (checked)
+params:
+  backtest: configs/backtest/payoff_2022h2_15d.yaml
+  store: backtest/payoff_2022h2_15d   # relative to `outputs`

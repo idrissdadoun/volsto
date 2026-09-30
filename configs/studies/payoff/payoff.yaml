@@ -1,0 +1,14 @@
+# The payoff study (owner's request of 2026-09-27), stage 2: the report, rendered from the tables
+# that `scripts/payoff_study.py` (stage 1, which calibrates) writes under outputs/payoff/.  This
+# study reads them and never calibrates; a missing table prints the stage-1 command and exits 2.
+# The rolling backtest of the same products is configs/studies/payoff/backtest_15d.yaml.
+name: payoff_study
+runner: volsto.studies.payoff_report
+grid: null
+store: outputs/store
+cache: cache
+outputs: outputs
+mode: full
+seeds: {}                     # nothing is simulated here: stage 1 used seed 2024
+params:
+  dir: payoff                 # stage 1's output directory, relative to outputs
