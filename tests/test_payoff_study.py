@@ -155,6 +155,9 @@ def _synthetic_stage1(root) -> None:  # type: ignore[no-untyped-def]
         }
     )
     pd.DataFrame(g).to_csv(d / "greeks.csv", index=False)
+    pd.DataFrame(
+        [{"key": "spot", "value": 4000.0}, {"key": "hedge_paths", "value": 20000.0}]
+    ).to_csv(d / "setup.csv", index=False)
     dl = []
     for (ssr, eps), shift in (((1.0, 0.10), 0.0), ((1.5, 0.10), 0.05), ((1.0, 0.05), -0.02)):
         for name, fam, unit in prods:
@@ -193,14 +196,16 @@ def _synthetic_stage1(root) -> None:  # type: ignore[no-untyped-def]
             ("preset", "2F", 1.3),
             ("delta", "LV", 0.8),
         ):
+            # the knock-out swap: no strategy beats the unhedged std (the VKO case)
+            unhedged = 0.5 if name.startswith("ko var") else 1.6
             row = {
                 "product": name,
                 "strategy": strat,
                 "world": world,
                 "regime": "model",
                 "unit": unit,
-                "product_std": 1.6,
-                "std_ratio_zc": std / 1.6,
+                "product_std": unhedged,
+                "std_ratio_zc": std / unhedged,
                 "costs_mean": 0.05,
                 "wall_s": 10.0,
             }
@@ -240,6 +245,15 @@ def test_report_renders_from_the_stage1_tables(tmp_path) -> None:  # type: ignor
         fig.draw(res)
     text = rep.narrative(res)
     assert "Lowest hedged P&L std without costs: **delta**" in text
+    assert "56% below the unhedged 1.6" in text
+    assert "No strategy lowers the P&L std below the unhedged product's (0.5)" in text
+    assert "Worse than unhedged: delta (0.7), preset (1.3)" in text
+    assert "Reserve (the delta hedge's mean P&L in the pure-LV world" in text
+    rows = res.rows("greeks_uoc")
+    assert "delta: delta (model) per 1% spot" in rows
+    v, _ = res.value("greeks_uoc", "delta: delta (model) per 1% spot", "value")
+    assert v == pytest.approx(0.3 * 100 * 0.01 * 4000.0)
+    assert res.value("setup", "spot", "value")[0] == 4000.0
     assert "{{table:hedge_uoc}}" in text and "{{figure:hedge_std}}" in text
     v, _ = res.value("dials_pct", "uoc 6m 110", "ssr 1.5 eps 0.1")
     assert v == pytest.approx(0.05)

@@ -45,7 +45,7 @@ REQUIRED_PARAMS: tuple[str, ...] = ("dir",)
 OPTIONAL_PARAMS: tuple[str, ...] = ()
 COMMAND = ".venv/bin/python scripts/payoff_study.py --parts {part}"
 PART_FILES: dict[str, tuple[str, ...]] = {
-    "prices": ("prices.csv", "model_risk.csv"),
+    "prices": ("prices.csv", "model_risk.csv", "setup.csv"),
     "greeks": ("greeks.csv",),
     "dials": ("dials.csv",),
     "rotation": ("rotation.csv", "rotation_greek.csv"),
@@ -143,8 +143,14 @@ def compute(ctx: StudyContext) -> Results:
     dials = _read(ctx, "dials.csv")
     rot = _read(ctx, "rotation_greek.csv")
     hedge = _read(ctx, "hedge.csv")
+    setup = _read(ctx, "setup.csv")
     fam = dict(zip(prices["product"], prices["family"], strict=False))
     d = ctx.params["dir"]
+    sv = {str(k): float(v) for k, v in zip(setup["key"], setup["value"], strict=True)}
+    spot = sv["spot"]
+    for k, v in sv.items():
+        if math.isfinite(v):
+            b.add_exact("setup", k, "value", v, unit="", source=f"artefact:{d}/setup.csv")
     src = {k: f"artefact:{d}/{k}.csv" for k in ("prices", "model_risk", "greeks", "dials")}
     src |= {"rotation": f"artefact:{d}/rotation_greek.csv", "hedge": f"artefact:{d}/hedge.csv"}
     b.add_exact(
@@ -219,13 +225,20 @@ def compute(ctx: StudyContext) -> Results:
                     source=src["greeks"],
                 )
                 continue
+            # the engine's delta / gamma are per unit (per unit²) of the index: shown per 1% spot
+            # move — delta × 1% S, gamma × (1% S)² (the change of the 1% delta over a 1% move)
+            conv = 1.0
+            if grp == "delta":
+                conv, row = 0.01 * spot, f"{row} per 1% spot"
+            elif grp == "gamma":
+                conv, row = (0.01 * spot) ** 2, f"{row} per (1% spot)^2"
             _mc(
                 b,
                 f"greeks_{f}",
                 row,
                 "value",
-                scale * float(r["value"]),
-                scale * float(r["stderr"]),
+                conv * scale * float(r["value"]),
+                conv * scale * float(r["stderr"]),
                 unit,
                 source=src["greeks"],
                 axes={"product": str(p)},
@@ -544,19 +557,79 @@ THEORY: dict[str, str] = {
 }
 
 
+def _rows_2f(results: Results, table: str) -> list[str]:
+    return [r for r in results.rows(table) if "world]" not in r]
+
+
 def _best(results: Results, table: str, col: str) -> tuple[str, float, float] | None:
+    """The best 2F-world row by ``col`` (std: lowest; expected shortfall: least negative)."""
     best = None
-    for row in results.rows(table):
-        if "world]" in row:
+    for row in _rows_2f(results, table):
+        try:
+            v, se = results.value(table, row, col)
+        except KeyError:
+            continue
+        key = v if col.startswith("std") else -v
+        if best is None or key < best[0]:
+            best = (key, row, v, se)
+    return None if best is None else (best[1], best[2], best[3])
+
+
+def _ties(results: Results, table: str, col: str, best: tuple[str, float, float]) -> list[str]:
+    """The other rows within 2 combined stderrs of the best."""
+    out = []
+    for row in _rows_2f(results, table):
+        if row == best[0]:
             continue
         try:
             v, se = results.value(table, row, col)
         except KeyError:
             continue
-        key = abs(v) if col.startswith("std") else -v  # std: lowest; ES: least negative
-        if best is None or key < best[0]:
-            best = (key, row, v, se)
-    return None if best is None else (best[1], best[2], best[3])
+        if abs(v - best[1]) <= 2.0 * math.hypot(se, best[2]):
+            out.append(row)
+    return out
+
+
+def hedge_findings(results: Results, table: str) -> list[str]:
+    """The measured comparison of one family, read from the results (narrative lines)."""
+    lines: list[str] = []
+    b1 = _best(results, table, "std_zc")
+    if b1 is None:
+        return lines
+    unhedged = results.value(table, b1[0], "product std")[0]
+    tied = _ties(results, table, "std_zc", b1)
+    if b1[1] >= unhedged:
+        lines.append(
+            f"No strategy lowers the P&L std below the unhedged product's ({unhedged:.4g}); the "
+            f"least bad is **{b1[0]}**, {b1[1]:.4g} ± {b1[2]:.2g}."
+        )
+    else:
+        tie = f" (tied within 2 stderr: {', '.join(tied)})" if tied else ""
+        lines.append(
+            f"Lowest hedged P&L std without costs: **{b1[0]}**, {b1[1]:.4g} ± {b1[2]:.2g}, "
+            f"{100 * (1 - b1[1] / unhedged):.0f}% below the unhedged {unhedged:.4g}{tie}."
+        )
+    b2 = _best(results, table, "es01_tc")
+    if b2 is not None:
+        lines.append(
+            f"Best 1% expected shortfall with costs: **{b2[0]}**, {b2[1]:.4g} ± {b2[2]:.2g}."
+        )
+    worse = [
+        f"{r} ({results.value(table, r, 'std_zc')[0]:.3g})"
+        for r in _rows_2f(results, table)
+        if results.value(table, r, "std_zc")[0] > unhedged
+    ]
+    if worse:
+        lines.append(f"Worse than unhedged: {', '.join(worse)}.")
+    lv = [r for r in results.rows(table) if r == "delta [LV world]"]
+    if lv:
+        m, se = results.value(table, lv[0], "mean_zc")
+        lines.append(
+            f"Reserve (the delta hedge's mean P&L in the pure-LV world, 2F pricing): {m:+.4g} ± "
+            f"{se:.2g} — the model's mispricing realised by a hedged book when the world is local "
+            "vol."
+        )
+    return lines
 
 
 def narrative(results: Results) -> str:
@@ -581,17 +654,7 @@ def narrative(results: Results) -> str:
         h = f"hedge_{slug(f)}"
         if h in results.tables():
             lines += [f"{{{{table:{h}}}}}", ""]
-            b1 = _best(results, h, "std_zc")
-            b2 = _best(results, h, "es01_tc")
-            if b1 is not None:
-                lines.append(
-                    f"Lowest hedged P&L std without costs: **{b1[0]}**, {b1[1]:.4g} ± {b1[2]:.2g}."
-                )
-            if b2 is not None:
-                lines.append(
-                    f"Best 1% expected shortfall with costs: **{b2[0]}**, "
-                    f"{b2[1]:.4g} ± {b2[2]:.2g}."
-                )
+            lines += hedge_findings(results, h)
             lines.append("")
     if "ko_probability" in have:
         lines += ["{{table:ko_probability}}", ""]

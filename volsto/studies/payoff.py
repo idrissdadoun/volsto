@@ -717,11 +717,33 @@ class PartResult:
     notes: list[str] = field(default_factory=list)
 
 
+def setup_table(env: PayoffEnvironment) -> pd.DataFrame:
+    """The run's setup (the spot converts the per-unit-spot delta and gamma of the report to a
+    1% spot move)."""
+    c = env.cfg
+    rows = [
+        ("spot", env.spot),
+        ("n_particles", c.n_particles),
+        ("seed", c.seed),
+        ("price_paths", c.price_paths),
+        ("greek_paths", c.greek_paths),
+        ("hedge_paths", c.hedge_paths),
+        ("world_paths", c.world_paths),
+        ("hedge_cost_spot_bps", HEDGE_COSTS.spot_bps),
+        ("hedge_cost_vol_points", HEDGE_COSTS.vol_points),
+    ]
+    return pd.DataFrame(
+        [{"key": k, "value": float(v)} for k, v in rows]
+        + [{"key": "marking_fit", "value": np.nan, "text": str(c.marking_fit)}]
+    )
+
+
 def run_part(env: PayoffEnvironment, part: str) -> PartResult:
     """Run one part and write its table(s) (a part whose table exists is skipped; the hedge
-    part resumes task by task)."""
+    part resumes task by task); ``setup.csv`` is (re)written with every part."""
     out = env.cfg.out
     out.mkdir(parents=True, exist_ok=True)
+    setup_table(env).to_csv(out / "setup.csv", index=False)
     n_cal0 = len(env.calibrated)
     t0 = time.perf_counter()
     target = out / f"{part}.csv"
@@ -779,5 +801,6 @@ __all__ = [
     "rotation_greek",
     "run_hedge_task",
     "run_part",
+    "setup_table",
     "strategy_names",
 ]
