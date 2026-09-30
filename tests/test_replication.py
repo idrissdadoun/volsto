@@ -143,6 +143,26 @@ def test_put_call_symmetry_replication_under_black_scholes(kind: str, carry: boo
     print(f"{kind} carry={carry}: replication {v0:.5f} vs RR {rr:.5f}; on the barrier {on_b:+.2e}")
 
 
+def test_static_package_costs_its_net_vega() -> None:
+    """The replication is traded as one structure: its half-spread is on the package's net vega,
+    far below the leg-by-leg sum of the digital spreads' vegas."""
+    from volsto.market.bs import black_vega
+
+    fc = _market(0.02, 0.01)
+    rep = barrier_replication(_barrier("dop", fc, monitoring="discrete"), _ctx(fc))
+    leg = rep.instrument(fc.rate_curve, name="PCS replication", cost=0.25)
+    leg.reference_vol = VOL
+    spot = np.array([100.0])
+    cost = float(leg.transaction_cost(np.array([1.0]), 0.0, spot, fc, fc.rate_curve)[0])
+    f = float(fc.forward(1.0))
+    vegas = np.array(
+        [float(black_vega(f, k, 1.0, VOL, float(fc.rate_curve.df(1.0)))) for k in rep.strikes]
+    )
+    w = np.asarray(rep.weights)
+    assert cost == pytest.approx(0.25 * 0.01 * abs(float(np.sum(w * vegas))), rel=1e-12)
+    assert cost < 0.1 * 0.25 * 0.01 * float(np.sum(np.abs(w) * vegas))
+
+
 def test_barrier_replication_continuity_and_scope() -> None:
     """Discrete monitoring moves the replicated barrier to the BGK level (down: lower, up:
     higher); the regular barriers raise."""

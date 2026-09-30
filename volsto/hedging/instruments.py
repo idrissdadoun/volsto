@@ -18,7 +18,9 @@ is always reported next to the costed one by the hedger):
   rebalancing date, remaining maturity, the instrument's ``reference_vol`` — the pricing surface's
   implied vol of the strike at inception when the hedger has a surface, else 20% with a note);
 * variance-type swaps: ``vol_points × 0.01 × 2 K_vol × |Δq| × DF(T) × remaining fraction`` of the
-  variance window (``dVar/dσ = 2σ``); vol swaps ``vol_points × 0.01 × |Δq| × DF(T) × remaining``.
+  variance window (``dVar/dσ = 2σ``); vol swaps ``vol_points × 0.01 × |Δq| × DF(T) × remaining``;
+* static portfolios (the replications of :mod:`volsto.hedging.replication`): ``vol_points × 0.01
+  × |Δq| × |net vega|``, the package quoted as one structure (:class:`StaticPortfolio`).
 
 **Roll rules.**  ``"fixed"`` (default): the product is dated at inception and dies at its expiry.
 ``"constant_maturity"``: a new instrument of the same tenor and forward moneyness is opened every
@@ -475,7 +477,10 @@ class StaticPortfolio(HedgeInstrument):
     corridor's ``2/K²`` strip, a knock-out variance swap's stopped log contract).  ``strikes``,
     ``weights`` (units of each option per unit of the leg) and ``cps`` (+1 call, −1 put) are
     parallel; one unit of the leg pays ``Σ_i w_i (cp_i (S_T − K_i))⁺`` at ``maturity``.  ``cost``
-    in vol points on every option: ``Σ_i |w_i| × vega_i`` per unit traded."""
+    in vol points on the package's **net** vega ``|Σ_i w_i vega_i|`` per unit traded: the package
+    is quoted as one structure, its legs' vegas offsetting — leg-by-leg half-spreads would charge
+    a digital spread ``2/width`` times a vanilla's (measured: 6.3% of the spot on the 6m 90%
+    down-and-out put's replication at 0.25 vol point, against a hedged P&L std of 0.85%)."""
 
     strikes: tuple[float, ...] = ()
     weights: tuple[float, ...] = ()
@@ -520,10 +525,13 @@ class StaticPortfolio(HedgeInstrument):
         )
 
     def transaction_cost(self, dq, t, spot, fc, discount):  # type: ignore[no-untyped-def]
-        out = np.zeros_like(np.asarray(spot, dtype=np.float64))
+        tau = max(self.maturity - t, 1e-6)
+        f_t = np.asarray(spot, dtype=np.float64) * float(fc.forward(self.maturity) / fc.forward(t))
+        df = float(discount.df(self.maturity))
+        net = np.zeros_like(f_t)
         for k, w in zip(self.strikes, self.weights, strict=True):
-            out = out + _vega_cost(self, k, self.maturity, dq, t, spot, fc, discount, abs(w))
-        return out
+            net = net + w * black_vega(f_t, k, tau, self._ref_vol(), df)
+        return np.asarray(self.cost * 0.01 * np.abs(dq) * np.abs(net), dtype=np.float64)
 
 
 # --------------------------------------------------------------------------------------------
