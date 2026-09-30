@@ -91,9 +91,11 @@ from volsto.calibration.stability import PARAM_COLUMNS, flag_unidentified
 from volsto.config import CalibrationSpec, ConfigError, CurveConfig, MarketConfig, SimConfig
 from volsto.config import load_yaml as load_config_yaml
 from volsto.market.curves import DiscountCurve
+from volsto.products.barrier import KnockInOption, KnockOutOption
 from volsto.products.base import Product
+from volsto.products.conditional_variance import ConditionalVarianceSwap, KnockOutVarianceSwap
 from volsto.products.seasoning import RealisedHistory, replay
-from volsto.products.variance import VarianceSwap
+from volsto.products.variance import VarianceOption, VarianceSwap
 from volsto.risk.attribution import explain
 from volsto.risk.engine import BSBuilder, LSVBuilder, RiskEngine, RiskState, product_key, surface_of
 from volsto.studies import backtest as bt
@@ -340,6 +342,53 @@ def test_three_year_term_sheets_are_the_m6_headline_products() -> None:
     assert isinstance(var.product, VarianceSwap)
     assert var.product.strike == pytest.approx(var.strike**2, rel=1e-14)
     assert var.product.notional == pytest.approx(1.0 / (2.0 * var.strike), rel=1e-14)
+
+
+def test_payoff_study_trade_kinds() -> None:
+    """The payoff study's kinds (2026-09-27): the barrier options (daily-close monitoring,
+    notional 1/spot), the put on variance at a ratio of the strike rule, the corridor up / down
+    variance and the knock-out variance swap's optional settlement — absent at its default, so a
+    config without it hashes as before; a barrier on the wrong side is refused."""
+    spec = load_config_yaml(REFERENCE_SPEC, CalibrationSpec)
+    surface = surface_of(RiskState(spec))
+    disc = surface.forward_curve.rate_curve
+    cfg = bt.load_backtest_config(ROOT / "configs" / "backtest" / "payoff_2022h2_15d.yaml")
+    assert cfg.rolling == () or not cfg.rolling
+    built = {t.id: bt.build_product(t, 100.0, surface, disc) for t in cfg.fixed}
+    uoc, dop, dip = (built[k].product for k in ("uoc_6m_110", "dop_6m_90", "dip_6m_90"))
+    assert isinstance(uoc, KnockOutOption) and uoc.direction == "up" and uoc.cp == 1
+    assert uoc.barrier == pytest.approx(110.0) and uoc.monitoring == "discrete" and uoc.strict
+    assert isinstance(dop, KnockOutOption) and dop.direction == "down" and dop.cp == -1
+    assert isinstance(dip, KnockInOption) and dip.barrier == pytest.approx(90.0)
+    assert uoc.notional == pytest.approx(0.01) and built["uoc_6m_110"].unit == "% of inception spot"
+    p100, p80 = built["var_put_1y_100"], built["var_put_1y_80"]
+    assert isinstance(p100.product, VarianceOption) and p100.product.cp == -1
+    assert p80.strike == pytest.approx(0.8 * p100.strike, rel=1e-14)
+    assert p80.product.notional == pytest.approx(1.0 / (2.0 * p80.strike), rel=1e-14)
+    ko = built["ko_var_3m_103"].product
+    assert isinstance(ko, KnockOutVarianceSwap) and ko.settlement == "knock_out"
+    assert ko.barrier == pytest.approx(103.0)
+    up, down = built["up_var_1y"].product, built["down_var_1y"].product
+    assert isinstance(up, ConditionalVarianceSwap) and up.side == "up" and up.indicator == "prev"
+    assert isinstance(down, ConditionalVarianceSwap) and down.indicator == "curr"
+    assert up.convention == down.convention == "corridor"
+    # the optional settlement: present only when not the default
+    by_id = {t.id: t for t in cfg.fixed}
+    assert by_id["ko_var_3m_103"].to_mapping()["settlement"] == "knock_out"
+    plain = bt.TradeSpec.from_mapping(
+        {"id": "k", "kind": "ko_var", "maturity": 1.0, "barrier": 1.1, "strike": "vs_strip"}, "t"
+    )
+    assert plain.settlement is None and "settlement" not in plain.to_mapping()
+    at_maturity = bt.TradeSpec.from_mapping({**plain.to_mapping(), "settlement": "maturity"}, "t")
+    assert at_maturity.to_mapping() == plain.to_mapping()
+    with pytest.raises(ConfigError, match="must be one of"):
+        bt.TradeSpec.from_mapping({**plain.to_mapping(), "settlement": "early"}, "t")
+    with pytest.raises(ConfigError, match="barrier beyond the strike"):
+        bt.TradeSpec.from_mapping(
+            {"id": "u", "kind": "uo_call", "maturity": 0.5, "moneyness": 1.0, "barrier": 0.9}, "t"
+        )
+    with pytest.raises(ConfigError, match="unknown keys"):
+        bt.TradeSpec.from_mapping({**plain.to_mapping(), "kind": "var_swap"}, "t")
 
 
 def test_only_dates_takes_dates_and_ranges() -> None:

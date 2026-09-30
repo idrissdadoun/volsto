@@ -1,0 +1,91 @@
+# The payoff study's rolling backtest (owner's request of 2026-09-27: "you can use the 15 date
+# window first for the backtest"): the first 15 trading days of the HistoricalData.net 2022 H2 SPX
+# sample, 2022-07-01..2022-07-22, the study's products struck on 2022-07-01 and marked daily with
+# the P&L attribution (volsto.studies.backtest; SPEC §15 Part 3 and the payoff study).
+# The marking, calibration, pricing, SSR and stability sections are those of hdn_2022h2_poc.yaml
+# (the desk's marking fit, 800k particles, horizon 3y — so the leverages its recompute cached for
+# 2022-07-01..07-08 are cache hits), the ladders on the pillars up to the book's 1y.
+# The book (volsto.studies.backtest TRADE_KEYS; values x100 in % of the inception spot for the
+# barrier options and the VKO, in vol points of vega notional 1 for the variance products):
+#   * the reverse barriers at 6m, daily-close monitoring: up-and-out call 110%, down-and-out and
+#     down-and-in puts 90%, strike 100%;
+#   * the put on realised variance at 1y, struck at the inception log-contract strike (the VS
+#     vol) and at 80% of it;
+#   * the knock-out variance swaps of the owner's range (barriers 101% to 105%, maturities up to
+#     1y): 3m at 103% and 6m at 105%, close to close, settled at the knock-out (owner, 2026-09-27),
+#     struck at the VS strike;
+#   * the up and down (corridor) variance swaps at 1y above / below 100%, struck at the VS strike;
+#   * the 12m VKO put (vol barrier 30%), as in hdn_2022h2.
+# Stage 1: `volsto-backtest run configs/backtest/payoff_2022h2_15d.yaml` (calibrates the dates
+# the cache lacks); stage 2: `volsto-study run configs/studies/payoff/backtest_15d.yaml`.
+# Variance products (var_put, ko_var, up_var, down_var) have variance notional 1/(2 K_vol) with
+# the strike rule vs_strip: vega notional 1, values in vol points x 100.
+name: payoff_2022h2_15d
+data:
+  vendor: hdn
+  root: data/hdn_sample/options_sample_2022H2
+  underlying: SPX
+  missing_close: fail
+dates:
+  start: "2022-07-01"
+  end: "2022-07-22"        # the 15 trading days; not hashed
+surface:
+  essvi: true
+  calendar_repair: true
+marking:
+  ssr_target: 1.0
+  skew_eps: 0.10
+  stage3: false
+  fit: desk
+calibration:
+  base_spec: configs/studies/lsv_reference_2f.yaml
+  n_particles: 800000
+  horizon: 3.0
+pricing:
+  n_paths: 20000
+  chunk_size: 20000
+  seed: 2024
+book:
+  fixed:
+    - {id: uoc_6m_110, kind: uo_call, maturity: 0.5, moneyness: 1.0, barrier: 1.10}
+    - {id: dop_6m_90, kind: do_put, maturity: 0.5, moneyness: 1.0, barrier: 0.90}
+    - {id: dip_6m_90, kind: di_put, maturity: 0.5, moneyness: 1.0, barrier: 0.90}
+    - {id: var_put_1y_100, kind: var_put, maturity: 1.0, strike: vs_strip, strike_ratio: 1.0}
+    - {id: var_put_1y_80, kind: var_put, maturity: 1.0, strike: vs_strip, strike_ratio: 0.8}
+    - {id: ko_var_3m_103, kind: ko_var, maturity: 0.25, barrier: 1.03, strike: vs_strip,
+       settlement: knock_out}
+    - {id: ko_var_6m_105, kind: ko_var, maturity: 0.5, barrier: 1.05, strike: vs_strip,
+       settlement: knock_out}
+    - {id: up_var_1y, kind: up_var, maturity: 1.0, barrier: 1.0, strike: vs_strip}
+    - {id: down_var_1y, kind: down_var, maturity: 1.0, barrier: 1.0, strike: vs_strip}
+    - {id: vko_put_12m, kind: vko_put, maturity: 1.0, vol_ko: 0.30, moneyness: 1.0}
+  rolling:
+    every: none
+    mark: inception
+    products: []
+attribution:
+  mode: sticky_leverage
+  detail: ladders
+  trades: fixed
+  pillars: [0.25, 0.5, 1.0]
+  bump: 0.01
+  max_halvings: 6
+ssr:
+  window: 20
+  pillars: [0.25, 0.5, 1.0]
+stability:
+  window_vol: 60
+  window_ssr: 60
+  share: 0.5
+  band: 1.0
+  fit:
+    pillars: [0.25, 0.5, 1.0, 2.0, 3.0]
+    mat_min: 0.25
+    k2: 0.2
+    skew_mode: soft
+    skew_eps: 0.10
+    nu_cap: 3.5
+paths:
+  out: outputs/backtest/payoff_2022h2_15d
+  cache: cache
+  snapshots: outputs/backtest/payoff_2022h2_15d/snapshots

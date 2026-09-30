@@ -617,6 +617,7 @@ class _BarrierOption(_BarrierBase):
         seed: int = 0,
         notional: float = 1.0,
         gap: GapSpec | None = None,
+        seasoned: bool = False,
     ) -> None:
         super().__init__(
             barrier,
@@ -638,6 +639,13 @@ class _BarrierOption(_BarrierBase):
         self.cp = parse_cp(cp)
         self.rebate = float(rebate)
         self.rebate_timing = _validate_rebate(self.rebate, rebate_timing, self.knock)
+        #: set by :func:`volsto.products.seasoning.season` (dates count from the as-of date; the
+        #: realised monitoring dates did not knock)
+        self.seasoned = bool(seasoned)
+
+    @property
+    def is_seasoned(self) -> bool:
+        return self.seasoned
 
     def vanilla_payoff(self, paths: PathSet, idx: FixingIndex) -> FloatArray:
         """Undiscounted ``(cp (S_T − K))⁺`` per path."""
@@ -648,7 +656,15 @@ class _BarrierOption(_BarrierBase):
         """The European option the barrier is written on."""
         return EuropeanOption(self.strike, self.T, self.cp, self.discount, self.notional)
 
-    def _rebuild(self, cls: type[_BarrierOption], T: float, schedule: FloatArray) -> Product:
+    def _rebuild(
+        self,
+        cls: type[_BarrierOption],
+        T: float,
+        schedule: FloatArray,
+        *,
+        discount: DiscountCurve | None = None,
+        seasoned: bool | None = None,
+    ) -> Product:
         kw = self._kwargs()
         kw["fixing_times"] = schedule
         return cls(
@@ -657,16 +673,36 @@ class _BarrierOption(_BarrierBase):
             self.cp,
             self.barrier,
             self.direction,
-            self.discount,
+            self.discount if discount is None else discount,
             rebate=self.rebate,
             rebate_timing=self.rebate_timing,
             notional=self.notional,
+            seasoned=self.seasoned if seasoned is None else seasoned,
             **kw,  # type: ignore[arg-type]
         )
 
     def aged(self, dt: float) -> Product:
         T, schedule = self._aged_times(dt)
         return self._rebuild(type(self), T, schedule)
+
+    def with_barrier(self, barrier: float) -> Product:
+        """The same contract with its barrier level at ``barrier`` (the monitoring, shift, gap and
+        rebate conventions kept): the barrier bump of :func:`volsto.risk.product_risk.
+        barrier_sensitivity` and the barrier-shift reserve."""
+        kw = self._kwargs()
+        return type(self)(
+            self.strike,
+            self.T,
+            self.cp,
+            float(barrier),
+            self.direction,
+            self.discount,
+            rebate=self.rebate,
+            rebate_timing=self.rebate_timing,
+            notional=self.notional,
+            seasoned=self.seasoned,
+            **kw,  # type: ignore[arg-type]
+        )
 
     def _repr(self, kind: str) -> str:
         opt = "Call" if self.cp > 0 else "Put"

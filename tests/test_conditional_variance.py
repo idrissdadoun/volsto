@@ -27,8 +27,10 @@ from volsto.products import (
     DownVar,
     KnockOutVarianceSwap,
     UpVar,
+    VarianceOption,
     VarianceSwap,
     VolKnockOutPut,
+    VolSwap,
     daily_schedule,
 )
 
@@ -165,6 +167,77 @@ def test_knock_out_swap_payoffs_and_limits(
         KnockOutVarianceSwap(times, 110.0, 0.2, discount, monitoring="continuous")
     with pytest.raises(NotImplementedError):
         KnockOutVarianceSwap(times, 110.0, 0.2, discount, variant="a")
+
+
+def test_knock_out_swap_settled_at_the_knock_out(discount: DiscountCurve) -> None:
+    """``settlement="knock_out"`` (the desk's convention, owner 2026-09-27): the same accrued
+    amount paid at the knock-out close ``t_τ`` and discounted from it — path by path the
+    maturity-settled payoff times ``DF(t_τ)/DF(T)``, identical when the swap never knocks; the
+    default stays at maturity; seasoning, ageing and rebinding carry the convention; other values
+    raise."""
+    times = np.array([0.0, 0.25, 0.5, 0.75, 1.0])
+    spots = np.array(
+        [[100.0, 105.0, 112.0, 108.0, 120.0], [115.0, 105.0, 112.0, 108.0, 120.0], [100.0] * 5]
+    )
+    ps = _paths(spots, times)
+    idx = FixingIndex(times)
+    at_t = KnockOutVarianceSwap(times, 110.0, 0.2, discount, annualisation=4.0)
+    at_ko = KnockOutVarianceSwap(
+        times, 110.0, 0.2, discount, annualisation=4.0, settlement="knock_out"
+    )
+    assert at_t.settlement == "maturity"
+    np.testing.assert_allclose(at_ko.pay_time(ps, idx), [0.5, 0.0, 1.0])
+    ratio = np.array([discount.df(0.5), discount.df(0.0), discount.df(1.0)]) / discount.df(1.0)
+    np.testing.assert_allclose(at_ko.payoff(ps, idx), at_t.payoff(ps, idx) * ratio, atol=1e-15)
+    assert float(discount.df(0.5)) != float(discount.df(1.0))  # the curve discounts
+    daily = KnockOutVarianceSwap(daily_schedule(1.0), 110.0, 0.2, discount, settlement="knock_out")
+    assert daily.aged(0.5 / 252).settlement == "knock_out"  # type: ignore[attr-defined]
+    assert at_ko.with_discount(discount).settlement == "knock_out"  # type: ignore[attr-defined]
+    assert "settled at the knock-out" in repr(at_ko) and "settled" not in repr(at_t)
+    with pytest.raises(ValueError, match="settlement"):
+        KnockOutVarianceSwap(times, 110.0, 0.2, discount, settlement="hit")
+
+
+def test_variance_option_payoffs_and_parity(
+    discount: DiscountCurve, rng: np.random.Generator
+) -> None:
+    """The option on realised variance (the desk's put on variance): path by path the put pays
+    ``DF(T) max(K² − RV, 0)`` with the variance swap's ``RV``, the call minus the put is the
+    variance swap on the same strike, and on realised vol the vol swap; about half the paths end
+    in the money (a non-degenerate check); ageing and rebinding keep the terms; bad terms raise."""
+    times = daily_schedule(1.0)
+    ps = _random_paths(rng, 400, times)
+    idx = FixingIndex(times)
+    k = 0.19  # the paths' daily steps of 1.2% realise about 19% vol
+    put = VarianceOption(times, k, discount, annualisation=252.0)
+    call = VarianceOption(times, k, discount, cp=1, annualisation=252.0)
+    vs = VarianceSwap(times, k * k, discount, annualisation=252.0)
+    rv = vs.realised_variance(ps, idx)
+    df = float(discount.df(1.0))
+    np.testing.assert_allclose(put.payoff(ps, idx), df * np.maximum(k * k - rv, 0.0), atol=1e-15)
+    np.testing.assert_allclose(
+        call.payoff(ps, idx) - put.payoff(ps, idx), vs.payoff(ps, idx), atol=1e-15
+    )
+    itm = float(np.mean(put.payoff(ps, idx) > 0.0))
+    assert 0.25 < itm < 0.75, itm
+    vput = VarianceOption(times, k, discount, underlying="vol", annualisation=252.0)
+    vcall = VarianceOption(times, k, discount, cp=1, underlying="vol", annualisation=252.0)
+    vol_swap = VolSwap(times, k, discount, annualisation=252.0)
+    np.testing.assert_allclose(
+        vcall.payoff(ps, idx) - vput.payoff(ps, idx), vol_swap.payoff(ps, idx), atol=1e-15
+    )
+    assert put.strike == pytest.approx(k * k) and vput.strike == pytest.approx(k)
+    aged = put.aged(0.5 / 252)
+    assert isinstance(aged, VarianceOption) and aged.cp == -1 and aged.underlying == "variance"
+    assert put.with_discount(discount).strike_vol == k  # type: ignore[attr-defined]
+    assert repr(put).startswith("Put on realised variance") and "Call on realised vol" in repr(
+        vcall
+    )
+    for bad in ({"cp": 0}, {"underlying": "vega"}):
+        with pytest.raises(ValueError):
+            VarianceOption(times, k, discount, **bad)  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        VarianceOption(times, -0.1, discount)
 
 
 def test_vko_payoffs_decomposition_and_running(

@@ -3,9 +3,11 @@ breakdowns, the attribution of the hedged P&L and the residual-exposure report, 
 table format with an Excel export.
 
 * **Distribution**: mean (with its standard error), std (its standard error from the fourth
-  moment), quantiles 1 / 5 / 50 / 95 / 99% (standard errors by a 200-draw bootstrap with a
-  fixed seed), the worst ``n_worst`` paths with their realised vol, spot return, factor state at
-  the end and termination date — for the costed and the zero-cost totals.
+  moment), quantiles 1 / 5 / 50 / 95 / 99% and the expected shortfalls ``es01`` / ``es05`` — the
+  mean P&L of the worst 1% / 5% of paths, negative for a loss like the quantiles (standard
+  errors by a 200-draw bootstrap with a fixed seed), the worst ``n_worst`` paths with their
+  realised vol, spot return, factor state at the end and termination date — for the costed and
+  the zero-cost totals.
 * **Regimes**: by realised-vol tercile of the world paths, by the realised skew-proxy change
   (the world's factor-state move when the world has factors, else the realised-vol change
   between the two halves of the life, noted), by early termination / barrier event.
@@ -36,6 +38,8 @@ from volsto.hedging.hedger import HedgeResult
 
 FloatArray = NDArray[np.float64]
 QUANTILES = (0.01, 0.05, 0.50, 0.95, 0.99)
+#: the expected-shortfall levels (the tail mean of the P&L below the quantile)
+ES_LEVELS = (0.01, 0.05)
 BOOTSTRAP = 200
 BOOTSTRAP_SEED = 2718
 
@@ -62,6 +66,23 @@ def _quantiles_with_se(x: FloatArray, qs: tuple[float, ...] = QUANTILES) -> pd.D
     return pd.DataFrame({"quantile": qs, "value": base, "stderr": boots.std(axis=0, ddof=1)})
 
 
+def expected_shortfall(x: FloatArray, level: float) -> float:
+    """The mean of the worst ``ceil(level · n)`` values of ``x`` (the P&L's lower tail mean,
+    negative for a loss)."""
+    k = max(int(np.ceil(level * x.size)), 1)
+    return float(np.mean(np.partition(x, k - 1)[:k]))
+
+
+def _es_with_se(x: FloatArray, levels: tuple[float, ...] = ES_LEVELS) -> pd.DataFrame:
+    rng = np.random.default_rng(BOOTSTRAP_SEED)
+    base = [expected_shortfall(x, a) for a in levels]
+    boots = np.empty((BOOTSTRAP, len(levels)))
+    for b in range(BOOTSTRAP):
+        xb = rng.choice(x, size=x.size, replace=True)
+        boots[b] = [expected_shortfall(xb, a) for a in levels]
+    return pd.DataFrame({"level": levels, "value": base, "stderr": boots.std(axis=0, ddof=1)})
+
+
 def distribution_table(x: FloatArray, label: str) -> pd.DataFrame:
     rows = [
         {"series": label, "statistic": "mean", "value": float(np.mean(x)), "stderr": _se_mean(x)},
@@ -77,6 +98,15 @@ def distribution_table(x: FloatArray, label: str) -> pd.DataFrame:
             {
                 "series": label,
                 "statistic": f"q{round(float(rec['quantile']) * 100):02d}",
+                "value": float(rec["value"]),
+                "stderr": float(rec["stderr"]),
+            }
+        )
+    for rec in _es_with_se(x).to_dict(orient="records"):
+        rows.append(
+            {
+                "series": label,
+                "statistic": f"es{round(float(rec['level']) * 100):02d}",
                 "value": float(rec["value"]),
                 "stderr": float(rec["stderr"]),
             }
@@ -326,10 +356,12 @@ def hedge_report(result: HedgeResult) -> HedgeReport:
 
 __all__ = [
     "BOOTSTRAP",
+    "ES_LEVELS",
     "QUANTILES",
     "HedgeReport",
     "attribution_table",
     "distribution_table",
+    "expected_shortfall",
     "hedge_report",
     "realised_vol",
     "regime_table",

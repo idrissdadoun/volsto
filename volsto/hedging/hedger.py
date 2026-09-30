@@ -101,6 +101,7 @@ from volsto.hedging.pricing import (
     ObjectPayoffs,
     union_grid,
 )
+from volsto.hedging.state import NettedPortfolio
 from volsto.hedging.strategies import (
     DELTA_REGIMES,
     MIN_VARIANCE_REGIME,
@@ -115,7 +116,7 @@ from volsto.market.surface import ArbitrageError
 from volsto.models.base import Model, ModelState
 from volsto.models.bergomi import BergomiSV
 from volsto.models.lsv import LSV
-from volsto.products.base import Portfolio, Product
+from volsto.products.base import Product
 from volsto.risk.engine import BSBuilder, LSVBuilder, LVBuilder, RiskState, surface_of
 from volsto.risk.greeks import _spot_state
 from volsto.risk.ladders import PILLARS as RISK_PILLARS
@@ -1302,16 +1303,19 @@ class Hedger:
         # linear, so netting before the regression makes the hedged Greeks' noise that of the net
         # payoff (tiny for a static replication) instead of the sum of the legs' regression
         # noises (measured on the study cliquet: the strip + put legs regressed separately left
-        # the residual delta noise at 3x the delta-only P&L under local vol)
+        # the residual delta noise at 3x the delta-only P&L under local vol); the net object is
+        # fitted on the product's alive paths only (NettedPortfolio)
         net_index: int | None = None
         net_legs: list[int] = []
         net_weights: list[float] = []
+        knock_legs = set(getattr(strategy, "unwind_on_knock", ()))
         for j, inst in enumerate(instruments):
             if inst.name not in strategy.static or inst.product is None:
                 continue
             v = strategy.static[inst.name]
             whole_life = inst.start <= _TOL and inst.expiry >= T - _TOL
-            if callable(v) or inst.roll != "fixed" or not whole_life:
+            # a leg unwound at the knock-in is not constant across paths: regressed on its own
+            if callable(v) or inst.roll != "fixed" or not whole_life or inst.name in knock_legs:
                 continue
             net_legs.append(j)
             net_weights.append(float(v))
@@ -1319,7 +1323,7 @@ class Hedger:
         if net_legs:
             net_index = len(objects)
             objects.append(
-                Portfolio(
+                NettedPortfolio(
                     [product] + [instruments[j].product for j in net_legs],  # type: ignore[misc]
                     [1.0, *net_weights],
                 )
@@ -1746,7 +1750,7 @@ class Hedger:
                     }
                 )
             # strategy
-            sol: HedgeSolution = strategy.solve(t, prod, inst_g, active, q_prev)
+            sol: HedgeSolution = strategy.solve(t, prod, inst_g, active, q_prev, state=hs)
             q = sol.quantities
             q[~alive] = 0.0  # unwind after termination
             dq = q - q_prev

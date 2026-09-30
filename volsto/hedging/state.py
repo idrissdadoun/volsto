@@ -38,6 +38,8 @@ product                                 extra features / termination
                                         to the discrete schedule with a note)
 ``Portfolio``                           the settled legs' discounted cash (one feature) plus the
                                         live legs' features de-duplicated; alive when any leg is
+``NettedPortfolio``                     the portfolio's features; alive where its first leg (the
+                                        hedged product) is
 ``CashFlow``                            none
 ======================================  ================================================
 
@@ -72,12 +74,31 @@ from numpy.typing import NDArray
 
 from volsto.engine.grid import FixingIndex
 from volsto.engine.paths import PathSet
+from volsto.market.curves import DiscountCurve
 from volsto.products.base import CashFlow, Portfolio, Product
 from volsto.products.variance import with_reference
 
 FloatArray = NDArray[np.float64]
 BoolArray = NDArray[np.bool_]
 _TOL = 1e-9
+
+
+class NettedPortfolio(Portfolio):
+    """The hedged product (first leg) and its constant static hedge legs as ONE regression object
+    (:class:`~volsto.hedging.hedger.Hedger`: least squares is linear, so netting before the
+    regression leaves the Greeks the noise of the net payoff).  Its hedge state is the
+    portfolio's features with the **product's** alive mask: the net Greeks are read only while
+    the product is alive (the hedger unwinds every leg once it has terminated), so a knocked-out
+    product's paths — where the net payoff is the settled amount plus the legs still running —
+    must not enter the fit (measured on the put-call-symmetry replication of a down-and-out
+    put: the portfolio's any-leg-alive mask kept every path in and biased the alive paths'
+    delta).  For a product that never terminates early it is the plain portfolio."""
+
+    def with_discount(self, discount: DiscountCurve) -> Product:
+        return NettedPortfolio([leg.with_discount(discount) for leg in self.legs], self.weights)
+
+    def aged(self, dt: float) -> Product:
+        return NettedPortfolio([leg.aged(dt) for leg in self.legs], self.weights)
 
 
 @dataclass
@@ -178,7 +199,7 @@ def hedge_state(product: Product, paths: PathSet, idx: FixingIndex, t: float) ->
     )
     from volsto.products.forward_start import ForwardStartOption, ForwardStartStraddle
     from volsto.products.vanilla import DigitalOption, EuropeanOption
-    from volsto.products.variance import FVA, VarianceSwap, VolSwap
+    from volsto.products.variance import FVA, VarianceOption, VarianceSwap, VolSwap
     from volsto.products.vko import VolKnockOutPut
 
     n = paths.n_paths
@@ -201,7 +222,7 @@ def hedge_state(product: Product, paths: PathSet, idx: FixingIndex, t: float) ->
         return HedgeState(
             t, feats, np.ones(n, dtype=bool), np.full(n, np.nan), ("started", "u_start")
         )
-    if isinstance(product, VarianceSwap | VolSwap):
+    if isinstance(product, VarianceSwap | VolSwap | VarianceOption):
         ref = product.reference_fixing
         acc = _accrued_sq(paths, idx, product.fixing_times, t, ref, product.realised_sum_sq)
         start = _u_period(paths, idx, product.fixing_times, t, ref)
@@ -233,15 +254,18 @@ def hedge_state(product: Product, paths: PathSet, idx: FixingIndex, t: float) ->
             ("accumulated", "u_period"),
         )
     if isinstance(product, ConditionalVarianceSwap):
-        done = _fixings_up_to(product.fixing_times, t)
-        if done.size < 2:
-            feats = np.zeros((n, 2))
+        ref = product.reference_fixing
+        ls = _done_log_spots(paths, idx, product.fixing_times, t, ref)
+        acc0, d0 = product.realised_sum_sq, float(product.realised_in_count)
+        if ls.shape[1] < 2:
+            feats = np.column_stack([np.full(n, acc0), np.full(n, d0)])
         else:
-            ls = paths.log_spot_at(idx.indices(done))
             ind = product.indicators(ls)
             r2 = product.squared_returns(ls)
-            feats = np.column_stack([np.sum(r2 * ind, axis=1), np.sum(ind, axis=1)])
-        start = _u_period(paths, idx, product.fixing_times, t)
+            feats = np.column_stack(
+                [acc0 + np.sum(r2 * ind, axis=1), d0 + np.sum(ind, axis=1)]
+            )
+        start = _u_period(paths, idx, product.fixing_times, t, ref)
         return HedgeState(
             t,
             np.column_stack([feats, start]),
@@ -320,41 +344,13 @@ def hedge_state(product: Product, paths: PathSet, idx: FixingIndex, t: float) ->
             )
         settled = _terminated(paths, idx, product, alive, t)
         return HedgeState(t, np.zeros((n, 0)), alive, settled, (), notes)
-    if isinstance(product, Portfolio):
-        # the settled legs (every fixing <= t) are a known cash amount per path: one feature; the
-        # live legs contribute their own features, identical columns de-duplicated (a straddle's
-        # call and put share u_start); alive when any leg is alive
-        settled_sum = np.zeros(n)
-        cols: list[FloatArray] = []
-        names: list[str] = []
-        pnotes: list[str] = []
-        alive = np.zeros(n, dtype=bool)
-        any_live = False
-        for i, (w, leg) in enumerate(zip(product.weights, product.legs, strict=True)):
-            fx = np.asarray(leg.fixing_times, dtype=np.float64)
-            if fx.size and float(fx.max()) <= t + _TOL:
-                settled_sum += float(w) * leg.payoff(paths, idx)
-                continue
-            any_live = True
-            p_ = hedge_state(leg, paths, idx, t)
-            alive |= p_.alive
-            pnotes += [nn for nn in p_.notes if nn not in pnotes]
-            for jj, nm in enumerate(p_.names):
-                column = p_.features[:, jj]
-                if any(np.array_equal(column, c) for c in cols):
-                    continue
-                cols.append(column)
-                names.append(f"leg{i}:{nm}")
-        if not any_live:
-            alive = np.ones(n, dtype=bool)
-        feats = np.column_stack([settled_sum, *cols]) if cols else settled_sum[:, None]
-        names = ["settled", *names]
-        if len(names) > 8:
-            pnotes.append(
-                f"Portfolio hedge state with {len(names)} features: the regression basis is large"
-            )
+    if isinstance(product, NettedPortfolio):
+        hs = _portfolio_state(product, paths, idx, t)
+        alive = hedge_state(product.legs[0], paths, idx, t).alive
         settled = _terminated(paths, idx, product, alive, t)
-        return HedgeState(t, feats, alive, settled, tuple(names), tuple(pnotes))
+        return HedgeState(t, hs.features, alive, settled, hs.names, hs.notes)
+    if isinstance(product, Portfolio):
+        return _portfolio_state(product, paths, idx, t)
     return _empty(
         n,
         t,
@@ -363,6 +359,45 @@ def hedge_state(product: Product, paths: PathSet, idx: FixingIndex, t: float) ->
             "regressed on the spot and factor state only",
         ),
     )
+
+
+def _portfolio_state(product: Portfolio, paths: PathSet, idx: FixingIndex, t: float) -> HedgeState:
+    """A portfolio's hedge state (module docstring)."""
+    n = paths.n_paths
+    # the settled legs (every fixing <= t) are a known cash amount per path: one feature; the
+    # live legs contribute their own features, identical columns de-duplicated (a straddle's
+    # call and put share u_start); alive when any leg is alive
+    settled_sum = np.zeros(n)
+    cols: list[FloatArray] = []
+    names: list[str] = []
+    pnotes: list[str] = []
+    alive = np.zeros(n, dtype=bool)
+    any_live = False
+    for i, (w, leg) in enumerate(zip(product.weights, product.legs, strict=True)):
+        fx = np.asarray(leg.fixing_times, dtype=np.float64)
+        if fx.size and float(fx.max()) <= t + _TOL:
+            settled_sum += float(w) * leg.payoff(paths, idx)
+            continue
+        any_live = True
+        p_ = hedge_state(leg, paths, idx, t)
+        alive |= p_.alive
+        pnotes += [nn for nn in p_.notes if nn not in pnotes]
+        for jj, nm in enumerate(p_.names):
+            column = p_.features[:, jj]
+            if any(np.array_equal(column, c) for c in cols):
+                continue
+            cols.append(column)
+            names.append(f"leg{i}:{nm}")
+    if not any_live:
+        alive = np.ones(n, dtype=bool)
+    feats = np.column_stack([settled_sum, *cols]) if cols else settled_sum[:, None]
+    names = ["settled", *names]
+    if len(names) > 8:
+        pnotes.append(
+            f"Portfolio hedge state with {len(names)} features: the regression basis is large"
+        )
+    settled = _terminated(paths, idx, product, alive, t)
+    return HedgeState(t, feats, alive, settled, tuple(names), tuple(pnotes))
 
 
 def state_features(
@@ -378,4 +413,4 @@ def state_features(
     return np.asarray(feats, dtype=np.float64), hs
 
 
-__all__ = ["HedgeState", "hedge_state", "state_features"]
+__all__ = ["HedgeState", "NettedPortfolio", "hedge_state", "state_features"]

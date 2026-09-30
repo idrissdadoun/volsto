@@ -18,15 +18,20 @@ simulation grid.
   same schedule; ``decompose()`` returns the two legs.
 * :class:`KnockOutVarianceSwap`: close-to-close monitoring, ``j = min{i : S_i > B}`` (``S_i <
   B`` for ``direction = "down"``), ``τ = min(j, N)``; variant (b): ``N_var [ (A/N) Σ_{i≤τ} r_i² −
-  K² τ/N ]`` where the knock-out day's own return accrues.  Continuous monitoring and variants
-  (a)/(c) raise ``NotImplementedError``.
+  K² τ/N ]`` where the knock-out day's own return accrues.  ``settlement`` (default
+  ``"maturity"``: paid at the last fixing, discounted from there) or ``"knock_out"``: paid at the
+  knock-out close ``t_τ`` and discounted from it — the desk's convention (owner, 2026-09-27); an
+  unknocked swap pays at maturity either way.  Continuous monitoring and variants (a)/(c) raise
+  ``NotImplementedError``.
 
 Seasoned products (M10 Part 3, SPEC §6.10; :func:`volsto.products.seasoning.season`): the
 schedule carries ``reference_fixing`` (the last realised close, prepended to the path's fixings
-as a constant column), ``realised_sum_sq`` (``Σ r_i²``, capped, over the realised returns) and
-``realised_count``; ``N`` counts every return of the life.  The knock-out swap's ``τ`` is then
-``realised_count`` plus the stopping index of the remaining returns (a realised knock-out is a
-settled trade, never a live seasoned one).  The defaults are the fresh products bit for bit.
+as a constant column), ``realised_sum_sq`` (``Σ r_i²``, capped, over the realised returns — for
+the conditional / corridor swap the in-region sum ``Σ r_i² I_i``, with ``realised_in_count`` the
+realised ``D``) and ``realised_count``; ``N`` counts every return of the life.  The knock-out
+swap's ``τ`` is then ``realised_count`` plus the stopping index of the remaining returns (a
+realised knock-out is a settled trade, never a live seasoned one).  The defaults are the fresh
+products bit for bit.
 
 Fair strikes are ratios of expectations (``K² = A E[Σ r_i² I_i] / E[D]`` for the conditional
 convention, ``A E[Σ_{i≤τ} r_i²] / E[τ]`` for the knock-out swap, ``(A/N) E[Σ r_i² I_i]`` for the
@@ -56,6 +61,8 @@ if TYPE_CHECKING:
 FloatArray = NDArray[np.float64]
 
 SIDES = ("up", "down")
+#: when a knock-out variance swap pays (:class:`KnockOutVarianceSwap`)
+SETTLEMENTS = ("maturity", "knock_out")
 INDICATORS = ("prev", "curr", "both")
 CONVENTIONS = ("conditional", "corridor")
 
@@ -208,10 +215,32 @@ class ConditionalVarianceSwap(RealisedVarianceSchedule):
         daily_cap: float | None = None,
         annualisation: float = 252.0,
         notional: float = 1.0,
+        reference_fixing: float | None = None,
+        realised_sum_sq: float = 0.0,
+        realised_count: int = 0,
+        realised_in_count: int = 0,
+        seasoned: bool = False,
     ) -> None:
-        super().__init__(fixing_times, discount, notional, annualisation, daily_cap)
+        super().__init__(
+            fixing_times,
+            discount,
+            notional,
+            annualisation,
+            daily_cap,
+            reference_fixing=reference_fixing,
+            realised_sum_sq=realised_sum_sq,
+            realised_count=realised_count,
+            seasoned=seasoned,
+        )
         if barrier <= 0:
             raise ValueError("barrier must be positive")
+        if int(realised_in_count) != realised_in_count or not (
+            0 <= realised_in_count <= self.realised_count
+        ):
+            raise ValueError("realised_in_count must be an integer in [0, realised_count]")
+        # seasoned: realised_sum_sq is the in-region sum of the realised squared returns and
+        # realised_in_count their in-region count D (the module docstring's seasoned products)
+        self.realised_in_count = int(realised_in_count)
         if side not in SIDES or indicator not in INDICATORS or convention not in CONVENTIONS:
             raise ValueError(
                 f"side in {SIDES}, indicator in {INDICATORS}, convention in {CONVENTIONS}"
@@ -240,8 +269,15 @@ class ConditionalVarianceSwap(RealisedVarianceSchedule):
         ls = self.log_spots(paths, idx)
         ind = self.indicators(ls)
         n = self.n_returns
-        accrued = self.annualisation / n * np.sum(self.squared_returns(ls) * ind, axis=1)
-        return {"accrued": accrued, "count": np.sum(ind, axis=1) / n}
+        accrued = (
+            self.annualisation
+            / n
+            * (self.realised_sum_sq + np.sum(self.squared_returns(ls) * ind, axis=1))
+        )
+        return {"accrued": accrued, "count": (self.realised_in_count + np.sum(ind, axis=1)) / n}
+
+    def state_kwargs(self) -> dict[str, Any]:
+        return {**super().state_kwargs(), "realised_in_count": self.realised_in_count}
 
     def payoff(self, paths: PathSet, idx: FixingIndex) -> FloatArray:
         st = self.statistics(paths, idx)
@@ -265,6 +301,7 @@ class ConditionalVarianceSwap(RealisedVarianceSchedule):
             daily_cap=self.daily_cap,
             annualisation=self.annualisation,
             notional=self.notional,
+            **self.state_kwargs(),
         )
 
     def __repr__(self) -> str:
@@ -275,6 +312,12 @@ class ConditionalVarianceSwap(RealisedVarianceSchedule):
             f"({self.indicator}), {self.n_returns} returns to {self.maturity:g}y, strike "
             f"{self.strike_vol * 100:.4g}% vol, A = {self.annualisation:g}{cap}, "
             f"variance notional {self.notional:g}"
+            + self._seasoned_repr()
+            + (
+                f", {self.realised_in_count} realised returns in the region"
+                if self.reference_fixing is not None
+                else ""
+            )
         )
 
 
@@ -371,7 +414,8 @@ class ConvexitySpread(Product):
 
 
 class KnockOutVarianceSwap(RealisedVarianceSchedule):
-    """Knock-out variance swap, close-to-close monitoring, variant (b) (module docstring)."""
+    """Knock-out variance swap, close-to-close monitoring, variant (b), paid at maturity or at the
+    knock-out close (``settlement``; module docstring)."""
 
     def __init__(
         self,
@@ -384,6 +428,7 @@ class KnockOutVarianceSwap(RealisedVarianceSchedule):
         strict: bool = True,
         monitoring: str = "close",
         variant: str = "b",
+        settlement: str = "maturity",
         daily_cap: float | None = None,
         annualisation: float = 252.0,
         notional: float = 1.0,
@@ -405,6 +450,8 @@ class KnockOutVarianceSwap(RealisedVarianceSchedule):
         )
         if barrier <= 0 or strike_vol < 0:
             raise ValueError("barrier must be positive and strike_vol non-negative")
+        if settlement not in SETTLEMENTS:
+            raise ValueError(f"settlement must be one of {SETTLEMENTS}")
         if direction not in SIDES:
             raise ValueError(f"direction in {SIDES}")
         if monitoring != "close":
@@ -417,6 +464,7 @@ class KnockOutVarianceSwap(RealisedVarianceSchedule):
         self.strict = bool(strict)
         self.monitoring = monitoring
         self.variant = variant
+        self.settlement = settlement
         if self.reference_fixing is not None and bool(
             self.beyond_barrier(np.array([np.log(self.reference_fixing)]))[0]
         ):
@@ -455,10 +503,23 @@ class KnockOutVarianceSwap(RealisedVarianceSchedule):
             "tau": tau_life.astype(np.float64),
         }
 
+    def pay_time(self, paths: PathSet, idx: FixingIndex) -> FloatArray:
+        """Per path, when the swap pays: the maturity, or the knock-out close ``t_τ`` under
+        ``settlement = "knock_out"`` (the maturity when it never knocks)."""
+        ls = self.log_spots(paths, idx)
+        if self.settlement == "maturity":
+            return np.full(ls.shape[0], float(self.maturity))
+        cols = self._fixings if self.reference_fixing is None else np.r_[0.0, self._fixings]
+        return np.asarray(cols[self.stopping_index(ls)], dtype=np.float64)
+
     def payoff(self, paths: PathSet, idx: FixingIndex) -> FloatArray:
         st = self.statistics(paths, idx)
         cf = st["accrued"] - self.strike_vol**2 * st["count"]
-        return np.asarray(self.notional * float(self.df(self.maturity)) * cf, dtype=np.float64)
+        if self.settlement == "maturity":
+            df = np.full(cf.shape, float(self.df(self.maturity)))
+        else:
+            df = np.asarray(self.df(self.pay_time(paths, idx)), dtype=np.float64)
+        return np.asarray(self.notional * df * cf, dtype=np.float64)
 
     def aged(self, dt: float) -> Product:
         return KnockOutVarianceSwap(
@@ -468,6 +529,7 @@ class KnockOutVarianceSwap(RealisedVarianceSchedule):
             self.discount,
             direction=self.direction,
             strict=self.strict,
+            settlement=self.settlement,
             daily_cap=self.daily_cap,
             annualisation=self.annualisation,
             notional=self.notional,
@@ -482,5 +544,7 @@ class KnockOutVarianceSwap(RealisedVarianceSchedule):
             f"Knock-out variance swap (close-to-close, variant b): out when S {op} "
             f"{self.barrier:g}, {self.n_returns} returns to {self.maturity:g}y, strike "
             f"{self.strike_vol * 100:.4g}% vol, A = {self.annualisation:g}, "
-            f"variance notional {self.notional:g}{self._seasoned_repr()}"
+            f"variance notional {self.notional:g}"
+            + (", settled at the knock-out" if self.settlement == "knock_out" else "")
+            + self._seasoned_repr()
         )
