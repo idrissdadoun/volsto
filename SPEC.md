@@ -955,6 +955,84 @@ Study D — (from `outputs/m8b/m8b_table_D.csv`, re-run 2026-09-16: 10 tasks, 29
 
 **S6 / S7 on the new anchor — what moved (`volsto-study rerun`, 2026-09-23).** The stored studies (commit 0394a98, plain-SSVI anchor) re-executed against the re-run artefacts: S6 `outputs/studies/s6_shadow_rotation/rerun/20260923T113624Z/diff.md` — 432 of 927 numbers moved beyond 2 stderr (the M7 greek's LV rotation −0.0917 → −0.1059, the cliquet's P1 level 1.547 → 1.708 % of notional, table C's 3 contaminated rows, the static and recalibrated shadows of every product); S7 `outputs/studies/s7_hedging/rerun/<utc>/diff.md` — 160 of 417 before the pure-LV fix (table A's standard deviations and two `rank_decided` flags, table B's same-world reserves: autocall q05 −11.47 → −10.22, Phoenix std 6.65 → 5.82), re-diffed after study B's pure-LV rows were recomputed with the corrected pricer. The rerun's rule takes the two runs as the same computation (errors not added in quadrature), which overstates the count where the anchor changed the calibration; the diff files carry every pair.
 
+### 8.3 The payoff study (owner's request of 2026-09-27; branch `payoff-study`)
+
+**Request.** Up-and-out call, down-and-out and down-and-in puts, put on realised variance, knock-out
+variance swap, VKO put, up and down variance swaps: every line of the study catalogue (prices LV / 1F /
+2F on the desk mark and model risk; Greeks and ladders; marking dials; the rotation greek with the P1
+parameters held; hedging P&L — reserve, regimes; the rolling backtest; reports), the theoretical risk
+decomposition of each product and a comparison of hedges.  KO var terms (owner): barriers 101%–105%,
+maturities to 1y, close to close, the knock-out day's return counts, **settled at the knock-out**.
+Risk convention (owner, 2026-09-27): the P1 parameters are held for the week; after a market move only
+the leverage (the local-vol component) is recalibrated so the vanillas reprice — the risk engine's
+`"recalibrate"` mode; a refit of P1 is a re-mark, not a risk.
+
+**Library additions.**
+* Products: `KnockOutVarianceSwap(settlement="knock_out")` (paid at the knock-out close, discounted from
+  it; maturity stays the default); `VarianceOption` (call / put on realised variance or vol, seasoned
+  like the variance swap); seasoning of discretely monitored barrier options on the daily closes (a
+  breach settles the knock-out at its rebate and turns the knock-in into its seasoned vanilla) and of the
+  up / down variance swaps (realised in-region sum and count as state inputs); `barrier_sensitivity`
+  and `barrier_shift_table` for barrier options (the barrier-shift reserve).
+* Hedging (`volsto/hedging/`): **static legs carry the hedge's sign** (the digital's call spread, the
+  variance strip, the VKO's put and the knock-in's parity vanilla had the product's — deviation (7c)'s
+  correction); the product and its constant static legs are regressed as one `NettedPortfolio` **on the
+  product's alive paths** (the portfolio's any-leg-alive mask mixed knocked-out paths into the fit);
+  `replication.py` — the put-call-symmetry replication of the reverse barriers with the carry power
+  `p = 1 − 2μ/σ²` and the Broadie–Glasserman–Kou barrier for the reflection (the terminal payoff keeps the
+  monitored level: a terminal payoff truncated at the corrected level paid `K − S_T` on paths ending
+  between the two levels, which the product had knocked out), the Carr–Lewis corridor strip, the knock-out
+  variance swap's stopped log contract; `StaticPortfolio` (one leg, costed on its **net** vega — leg by
+  leg the digital spreads were charged `2/width` times a vanilla: 6.3% of spot on the 6m 90% down-and-out
+  put against a hedged std of 0.85%); `unwind_on_knock` static legs (a knock-in's replication dropped at
+  the knock-in); `comparison.py` — the named hedge sets per product (the four-target vanna-volga sets
+  behind `unstable=True`); expected shortfall `es01` / `es05` in the distribution table.
+* Backtest kinds `uo_call`, `do_put`, `di_put`, `var_put`, `up_var`, `down_var` and the optional
+  `ko_var.settlement` (absent at its default: existing configs hash as before).
+
+**Measured under Black–Scholes** (pricing = world, carry 1%, daily monitoring and rebalancing, 10⁴
+paths; P&L std): the static replication held alone is the best barrier hedge — 0.43 (carry, BGK) and
+0.51 (symmetric) against 0.80 with the spot on the net delta, 1.05 with a vega leg added, 0.72 delta
+alone and 1.38 for the library's barrier preset on the down-and-out put; up-and-out call 0.57 / 0.81 /
+1.36 / 1.69 / 1.33 / 4.82, **the preset worse than unhedged (4.26)**.  The net delta of product and
+replication is a regression estimate of a quantity the replication zeroes: trading it adds noise.  The
+regressed vanna and volga make the four-target vanna-volga solve unstable (std 13.6 and 19.3 against
+the unhedged 1.6 and 4.3; 796 bp against 26 bp on the put on variance) — a property of the estimator,
+not of the hedge.  The variance strips need pricing paths: the corridor strip's std fell from 43 to 24
+bp between 5·10³ and 2·10⁴ pricing paths (delta 30, the variance swap on the vega 11).
+
+**The study.**  Stage 1 `scripts/payoff_study.py` (`volsto/studies/payoff.py`; calibrates, resumable):
+the 26-product book on the SPX 2022-12-30 desk mark (`--marking-fit` the regenerated
+`m7_p1_marking/spx_ssr1_eps0.1.yaml`); parts `prices` (Black–Scholes at the ATM vol of the maturity,
+LV, a one-factor LSV — the library's reference one-factor parameters ν = 1.5, κ = 1.5, ρ = −0.7 with
+its leverage calibrated to the same surface, *not* a marked model — and the 2F desk mark; 10⁵ paths),
+`greeks` (`risk_report` of one product per family in the recalibrate mode, pillars 3m / 6m / 1y, six
+halvings; no one-day theta for the daily-fixing variance products — their next fixing lies inside the
+roll window; the backtest attribution's seasoned theta covers it), `dials` (the desk fit at the
+`(ssr_target, skew_eps)` cross (0.75 / 1.25 / 1.5, 0.10) and (1.0, 0.05 / 0.20)), `rotation` (P1 held,
+rota ±1 / ±2), `hedge` (the comparison sets under the 2F pricing model, daily, half-spreads 1 bp /
+0.25 vp; the 2F world for every strategy, the pure-LV world for the baselines and the static hedges;
+the delta regimes).  Stage 2 `configs/studies/payoff/payoff.yaml` (`volsto/studies/payoff_report.py`)
+renders the report; `configs/studies/payoff/backtest_15d.yaml` renders the 15-date backtest
+(`configs/backtest/payoff_2022h2_15d.yaml`, 2022-07-01..07-22).
+
+**Prices and model risk** (2026-09-29, 10⁵ paths, ×100; % of spot for the options on the spot, vol
+points of vega notional 1 for the variance products; stderrs ≤ 0.04): up-and-out call 6m 110% BS
+0.28 / LV 0.40 / 1F 0.62 / 2F 0.56; 1y 120% 0.99 / 1.66 / 2.40 / 2.14 — the forward skew and the
+vol-of-vol move the knock-out region's price by 40–60% of it.  Down-and-out put 6m 90%: LV 0.22,
+2F 0.15.  **Knock-out variance swaps (struck at the VS vol, settled at the knock-out): local vol prices
+them about twice the 2F mark** — 1y 105% LV 2.12 / 1F 0.77 / 2F 1.04, 3m 103% 1.44 / 0.94 / 0.78 (2F
+− LV −0.52 to −1.08 across the grid).  Put on variance 1y at the VS vol: LV 3.17, 2F 3.22, 1F 4.30
+(the reference 1F's vol-of-vol).  Up / down variance 1y at 100%: −8.50 / −3.60 under the 2F, within
+0.1 across models (the corridor strike is the full VS vol; the skew makes the down side worth more).
+VKO put 12m: LV 2.17, 1F 2.66, 2F 2.00.
+
+**Rolling backtest** (2022-07-01..07-22, 15/15 dates, desk sign): SPX +3.56%, realised vol 18.4%;
+the 3m 103% KO var knocked out on the 13th date and settled there (desk P&L 2.68 ± 0.05 vol pts,
+settlement −0.776 ± 0.023); the 6m 105% survived (1.88 ± 0.04); the puts on variance lost the desk
+0.40 / 0.26 vol pts (realised variance accruing below the strikes); the down-and-in put 1.86 ± 0.04%
+of spot (the rally).
+
 ## 9. Viewers
 
 `viewers/precompute.py` builds grids into the cache: default grid `ω ∈ {0, 0.5, 1, 1.5, 2, 2.5, 3}`, `ρ1 ∈ {−0.9, −0.7, −0.5, −0.3, 0}`, `k1 ∈ {0.5, 1.5, 4}`, 2F presets (a few `(θ, k1, k2, ρ12)` combinations including the SSR ≈ 1.2 fit), always including the 1F degenerate points so the old studies are recoverable. Precompute is a CLI with resume support. Owner additions (recorded at the M4c review, for M9): the precompute CLI takes an explicit list of grid points and a worker count, so a grid can be sharded across cores or machines and resumed — `volsto-precompute --shard i/n` runs the i-th of n interleaved shards of the point list; the cache is relocatable (relative paths only, manifest-driven), so grids can be computed on a rented multi-core VM and synced to a laptop; production entries use 8·10⁵ particles (§11).
@@ -1738,6 +1816,10 @@ Built inline (the phase-1 agent workflow failed on the account's spend limit; it
 - 2026-09-17 M10 follow-up: §10.3 storage round 5 (all refusals before any write, one `computed_under_another_config` judgement, a journalled migration under a store-root flock, unsettled verdicts, foreign pointer versions refused, date locks as a flock on the date directory with `dir_fd` operations, record version 2 with the leverage content digest, `VOLSTO_BACKTEST_REQUIRE_PATHS`); §7.12.1 / §10.3 `cum_pnl_stderr` and paired group errors with the `aggregate()` helper, per-unit books and per-trade units; §10.2 `EXACT_KINDS` declarations with walker enforcement, z-scores with stderr 1, delta-method error stderrs, S1's per-window put-wing verdicts, S5's `marking_fit` helper, S6's `ratio_stderr_bound`, S7's repaired-history gate and rank decided flags; §8.2 the world-(ii) gate on the repaired discriminator run with the pre-repair run as fallback; §13.1 the second-pass comparison stored and cited; the slow Part 0 gate test; docs and CONTRIBUTING updated; round 6: blank path overrides refused, version-1 records done with `legacy_unverified` (status, study.md, manifest) and never re-adopted over a version-2 attempt, `DateLock.still_at`, migration refusals up front (headerless foreign stores, interrupted migrations of another config, unreadable journals kept), `gc` on read-only stores, one printed-command builder with a walking test, paired theta carry and roll-down (volsto/risk/greeks.py), the shared test build lock (`tests/_locks.py`), an environment-isolation fixture, S5's window-keyed spot skew and S7's whole-set headline flag.
 - 2026-09-27: §15 Part 3 options: the note's bounds (`nu_cap=None`, `PRODUCTION_BOUNDS`), `volvar_target="direct"`, `engine="mlp"` (the note's closed forms in the fit, `MlpMaps`, `MlpPillar`).
 - 2026-09-27: §15 Part 3 `sigma0_maturity` (option; the owner: `σ_0` at 3M).
+- 2026-09-27/29: §8.3 the payoff study — settle-at-knock-out KO var, `VarianceOption`, seasoning of
+  barrier options and up / down variance, the static-leg sign fix, `NettedPortfolio`, the static
+  replications and comparison sets, net-vega package costs, expected shortfall, the backtest kinds,
+  stage 1 / stage 2 of the study and the 15-date backtest.
 - 2026-09-27: §15 Part 3 errata of the desk's note re-derived step by step (eqs. 27–33 exact by Gaussian conditioning; six slips in the algebra after them, corrected).
 - 2026-09-27: §15 Part 3 the owner keeps the sub-3M pillars; the note's printed `∂η`, `∂γ` shown to be misprints (scored on the 35 simulated sets); the engine evaluation extended to the ATMF refits.
 - 2026-09-27: §15 Part 3 the note's section 5 (implied-vol pillars below 3M removed from the calibration's market data; volsto drops target pillars only) and eq. 43's missing `1/T`.
