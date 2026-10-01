@@ -4,7 +4,8 @@ served by :mod:`volsto.viewers.app` through ``st.navigation``.
 
 Page convention (every page file): a module docstring stating what it shows and which test
 renders it, ``def render(cfg: ViewerConfig) -> None`` doing all the work from the read API
-(:mod:`volsto.viewers.api`) — never calibrating, never simulating —, and the module-level guard
+(:mod:`volsto.viewers.api`) — never calibrating, never simulating, except page 9 (What-if, the
+owner's decision of 2026-09-30, :mod:`volsto.viewers.whatif`) —, and the module-level guard
 ``run_if_streamlit(render)`` which calls ``render(ViewerConfig.from_env())`` only when a
 Streamlit script-run context exists (``streamlit run`` / ``st.navigation`` / ``AppTest``), so
 importing a page or type-checking it renders nothing.  The file names follow the Streamlit
@@ -32,6 +33,7 @@ PAGES: tuple[tuple[str, str, str], ...] = (
     ("6_product_grid.py", "Product grid", ":material/apps:"),
     ("7_marking.py", "Marking / calibration", ":material/tune:"),
     ("8_hedging.py", "Hedging", ":material/account_balance:"),
+    ("9_what_if.py", "What-if", ":material/science:"),
 )
 
 

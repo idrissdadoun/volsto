@@ -696,10 +696,12 @@ def test_two_tables_with_the_same_name_render(tmp_path: Path) -> None:
 
 
 def test_pages_registry() -> None:
-    """Eight pages in the owner's order, files present, titles unique, each exposing render()."""
+    """Nine pages in the owner's order, files present, titles unique, each exposing render();
+    the What-if page (owner's decision of 2026-09-30) computes through
+    :mod:`volsto.viewers.whatif`, never in its own source."""
     from volsto.viewers import app
 
-    assert len(PAGES) == 8
+    assert len(PAGES) == 9
     assert [t for _, t, _ in PAGES] == [
         "Surface & model",
         "Forward smile",
@@ -709,6 +711,7 @@ def test_pages_registry() -> None:
         "Product grid",
         "Marking / calibration",
         "Hedging",
+        "What-if",
     ]
     for path in page_paths():
         assert path.exists(), path
