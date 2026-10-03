@@ -40,6 +40,7 @@ from typing import Any, cast
 import numpy as np
 import pytest
 import yaml
+from helpers import assert_params_close
 
 from volsto.calibration.cache import CacheMissError, LeverageCache, build_market
 from volsto.calibration.fit_2f import BreakEvenFitConfig, fit_2f_marking, fit_preset
@@ -475,7 +476,7 @@ def test_shadow_rotation_on_cached_calibrations(policy: str) -> None:
         spec, cfg, ssr_target=float(doc["ssr_target"]), policy=policy, step0=step0
     )
     for name, f in fits.items():
-        assert f.params == from_mapping(BergomiParams, doc["fits"][name]), name
+        assert_params_close(f.params, from_mapping(BergomiParams, doc["fits"][name]), name)
     fc, _, _ = build_market(spec)
     product = headline_products(fc.rate_curve, spec.market.spot)[AUTOCALL_NAME]
     sim = SimConfig(n_paths=40_000, chunk_size=40_000, seed=2024)

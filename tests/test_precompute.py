@@ -144,6 +144,8 @@ def test_dry_run_projects_without_computing(
     and one row per tier — the light tier twice, at the configured 3-bucket fwd-var ladder (the
     owner's grid decision) and at the 20-bucket alternative, so the owner can choose.  It writes nothing into the store and
     **calibrates nothing**: the repository cache manifest is byte-identical afterwards."""
+    if not (REPO_CACHE / "manifest.parquet").is_file():
+        pytest.skip(f"no leverage-cache manifest at {REPO_CACHE / 'manifest.parquet'}")
     store = tmp_path / "store"
     keys_before = _cache_keys(REPO_CACHE)
     manifest_before = (REPO_CACHE / "manifest.parquet").read_bytes()

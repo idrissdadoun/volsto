@@ -24,7 +24,7 @@ of the figure, counted in a caption and kept as written in the table) and the st
 missing from the table altogether (an ``st.info`` naming the column and the producing command, no
 figure, the table still exported — a ``KeyError`` mid-render before the guard).
 
-One test walks the eight pages' declared ``(value, stderr)`` pairs (their ``MC_PAIRS``) against
+One test walks the eight read-only pages' declared ``(value, stderr)`` pairs (their ``MC_PAIRS``) against
 what the read API actually returns for the synthetic artefacts and for the repository's real
 store, cache and outputs: the API's stderr pairing was rewritten under the pages once
 (``reattach_stderr_names`` renamed study C's ``recal_se`` twin to ``recal_pnl_desk_stderr`` while
@@ -876,7 +876,7 @@ def _api_frames(cfg: ViewerConfig) -> dict[str, list[pd.DataFrame]]:
 
 
 def test_page_twin_names_match_api(synthetic: dict[str, object]) -> None:
-    """Every ``<value>_stderr`` name the eight pages hard-code is the name the read API emits.
+    """Every ``<value>_stderr`` name the eight read-only pages hard-code is the name the read API emits.
 
     The pages declare their ``(value, stderr)`` pairs per API frame (``MC_PAIRS``); this walks
     them against what the API returns for the synthetic store / outputs and — when the
@@ -892,7 +892,10 @@ def test_page_twin_names_match_api(synthetic: dict[str, object]) -> None:
     if (ROOT / "outputs").is_dir():
         sources["repository"] = _api_frames(ViewerConfig())
     pages = {path.name: _load_page(path) for path in page_paths()}
-    assert len(pages) == 8
+    assert len(pages) == 9
+    # page 9 (What-if) computes its own frames and reads none from the API: no pairs to walk
+    assert not hasattr(pages["9_what_if.py"], "MC_PAIRS")
+    del pages["9_what_if.py"]
     unresolved: list[tuple[str, str]] = []
     checked = 0
     for name, mod in sorted(pages.items()):

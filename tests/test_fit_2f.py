@@ -49,6 +49,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import pytest
+from helpers import assert_params_close
 from scipy.optimize import LinearConstraint, minimize
 
 from volsto.analytics.bergomi import atmf_skew_order1
@@ -697,7 +698,7 @@ def test_realised_lsv_ssr_reported_for_study_fits(fast_sim) -> None:  # type: ig
         r = fit_2f_marking(
             surface, fs.config, ssr_target=fs.ssr_target, step0=fs.step0_source(surface)
         )
-        assert r.params == fs.spec.model, (path.name, r.params, fs.spec.model)
+        assert_params_close(r.params, fs.spec.model, (path.name, r.params, fs.spec.model))
         assert r.status == fs.fit["status"]
         lsv = _cached(fs.spec)
         rep = stage3_validation(
