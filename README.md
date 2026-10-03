@@ -37,6 +37,33 @@ Python 3.12 or later is required (numpy ≥ 2.5 dropped 3.11; mypy strict runs a
 uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python -e ".[dev]"
 ```
 
+## Setup on a new machine
+
+1. **Python 3.12.13** (`.python-version`; any 3.12.x works, 3.12.13 is the version the lock was
+   frozen on). Install it with `uv python install 3.12.13` or Homebrew `python@3.12`.
+2. **Install**, pinned to the frozen environment of `requirements-lock.txt` (every package of the
+   working `.venv`, including the `viewers`, `data`, `studies` and `dev` extras):
+
+   ```bash
+   uv venv --python 3.12.13 .venv
+   uv pip install --python .venv/bin/python -r requirements-lock.txt -e .
+   ```
+
+   To resolve fresh instead of from the lock: `uv pip install --python .venv/bin/python -e ".[dev,viewers,data,studies]"`.
+3. **Tests**: `.venv/bin/python -m pytest -n auto -m "not slow"` (fast suite; drop the marker for the
+   full-size tests). Tests never calibrate: a test whose leverage is not in `cache/` skips with the
+   reason, and a test needing the vendor sample skips when `data/hdn_sample/` is absent.
+4. **Git-ignored data** (none of it is in the repository; restore it from the local archive
+   `volsto-local-data.tar.gz`, extracted at the repository root):
+
+   | Path | Contents |
+   |---|---|
+   | `data/hdn_sample/` | the HistoricalData.net option-chain sample 2022 H2 (licensed, local only) |
+   | `data/history/` | yfinance and Cboe daily closes (`scripts/fetch_history.py` re-downloads them) |
+   | `cache/` | the content-addressed leverage cache (hours to days of calibration) |
+   | `outputs/` | the results store, study outputs and reports |
+   | `docs/Stochastic_Volatility_Modeling.pdf` | Bergomi's book, copyrighted: place your own copy |
+
 ## Quickstart
 
 ### Command line: precompute a toy grid, run study S1, open the viewer

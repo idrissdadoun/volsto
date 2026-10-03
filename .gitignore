@@ -22,3 +22,6 @@ data/
 
 # macOS
 .DS_Store
+
+# Claude desktop app launch config (machine-specific paths)
+.claude/
