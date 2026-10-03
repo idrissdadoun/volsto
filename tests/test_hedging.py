@@ -1001,7 +1001,11 @@ def _rule_for(policy: str = "sabr_linked", **kw: object) -> RecalibrationRule:
 
     cfg = BreakEvenFitConfig(pillars=_RULE_PILLARS, mat_min=0.0, skew_pillars=(1.0, 3.0))
     return RecalibrationRule(
-        pillars=_RULE_PILLARS, fit_config=cfg, policy=policy, ssr_target=1.0, **kw  # type: ignore[arg-type]
+        pillars=_RULE_PILLARS,
+        fit_config=cfg,
+        policy=policy,
+        ssr_target=1.0,
+        **kw,  # type: ignore[arg-type]
     )
 
 
@@ -1251,8 +1255,9 @@ def test_strip_surfaces_bit_identical_own_path_count_and_read_first() -> None:
         ss = h.strip_surfaces(dates, rule)
         old_w, old_t = _full_strip_pricers(h, dates, rule)
         for k, t in enumerate(dates):
-            a, at = h._state_surface(old_w, k, float(t), rule), h._state_surface(
-                old_t, k, float(t), rule
+            a, at = (
+                h._state_surface(old_w, k, float(t), rule),
+                h._state_surface(old_t, k, float(t), rule),
             )
             for f in ("atf", "skew", "curv"):
                 assert np.array_equal(getattr(a, f), getattr(ss.world[k], f)), (label, k, f)
@@ -1348,28 +1353,30 @@ class _NoCalibrationBuilder:
 def test_named_pinning_case_and_the_rebuilt_refit() -> None:
     """The named M8b study-C pinning case (autocall 3y, +1 rota, ``sabr_linked``, the refit at
     ``t = 0.9615`` — rebalancing date 50 — on the production task's hedger, 2·10⁴ pricing and
-    world paths, seed 2024), on the strip at FORWARD moneyness (fix of 2026-09-16; the base fit
-    on the strip's stencil, ``RecalibrationRule.marking_targets``):
+    world paths, seed 2024), on the strip at forward moneyness, the base fit on the strip's
+    stencil with step 0 from the snapshot's SABRW fits (``RecalibrationRule.step0_for``), under
+    the desk's marking fit (the default since 17c9de4; re-pinned 2026-09-30):
 
-    * at **2·10⁴ strip paths** the world's state surface reads curvature −1.2211 / −0.4806 /
-      −0.2518, step 0's radicand guard fires at every pillar and clips ``Corr_SABR`` to −1, and
-      the plain marking targets land on the collapsed set ``ρ12 = +1, ρ_SX1 = ρ_SX2 = −1``
-      (ν = 2.404628218584923); the rebuilt refit on the same surface records the step-0 flags
-      and ``fallback_applied`` (the base fit's −0.8953 / −0.8967 / −0.9010 held) and is not
-      pinned (ρ_SX1 −0.9567, ρ_SX2 −0.8268, ρ12 +0.7310; ``k1`` unchanged: step 2 untouched);
-    * at **8·10⁴ strip paths** (study C's rule) the curvature reads −0.6090 / +0.2019 / +0.7154,
-      no pillar is guarded, nothing falls back or caps (3M ``Corr_BE`` −0.9655) and the fit is
-      regular (ρ_SX1 −0.7026, ρ_SX2 −0.4160, ρ12 −0.3483).
+    * base targets ``Corr_BE`` −0.7573 / −0.8250 / −0.7166 (binding);
+    * at **2·10⁴ strip paths** the state surface reads curvature −0.6612 / −0.2510 / +0.0693, **no
+      pillar is guarded** (step 0 reads the SABRW source moved with the surface), nothing falls
+      back or caps, and the refit lands with ``ρ_SX1`` on its −0.99 bound (ρ_SX2 −0.7376, ρ12
+      +0.6359) — the first-order fit's recorded limitation (SPEC §15 Part 3), not the collapse;
+    * at **8·10⁴ strip paths** (study C's rule) curvature −0.1489 / +0.2914 / +0.8852, no guard,
+      no fallback, ``ρ_SX1`` again at −0.99 (ρ_SX2 −0.5613, ρ12 +0.4401).
 
-    Before the fix (spot-relative strikes ``e^{k}``, base fit on the M7 stencil) the same case
-    read −1.2194 / −0.5288 / −0.3430 (ν of the pinned set 2.397492534477822; rebuilt ρ_SX1
-    −0.9627, ρ_SX2 −0.8253, ρ12 +0.7385) and −0.5852 / +0.1876 / +0.7086 (ρ_SX1 −0.7027, ρ_SX2
-    −0.4242, ρ12 −0.3397): the diagnosis's qualitative picture is unchanged.
+    What moved: under the previous marking fit (surface step 0, plain SSVI anchor, 2026-09-16)
+    the same case read base targets −0.8953 / −0.8967 / −0.9010; at 2·10⁴ strip paths curvature
+    −1.2211 / −0.4806 / −0.2518, the radicand guard firing at every pillar, the plain targets on
+    the collapsed set ``ρ12 = +1, ρ_SX1 = ρ_SX2 = −1`` (ν 2.404628218584923) and the rebuilt refit
+    holding the base correlation by the guarded fallback (ρ_SX1 −0.9567, ρ_SX2 −0.8268, ρ12
+    +0.7310); at 8·10⁴ curvature −0.6090 / +0.2019 / +0.7154, regular (ρ_SX1 −0.7026).  The
+    SABRW step 0 removes the pinning mechanism; the refit's ρ_SX1 now sits on its bound instead.
 
     Leverages from the cache (skipped when absent); nothing calibrated — the refit's model
     rebuild is stubbed.  No wall-clock assertion (measured about 15 s + 20 s)."""
     from volsto.calibration.fit_2f import fit_2f, fit_2f_marking
-    from volsto.hedging.hedger import degenerate_correlations, step0_degenerate_pillars
+    from volsto.hedging.hedger import step0_degenerate_pillars
     from volsto.market.varswap import xi0_curve
     from volsto.studies import m8b
 
@@ -1397,22 +1404,39 @@ def test_named_pinning_case_and_the_rebuilt_refit() -> None:
     t = float(dates[kdx])
     assert t == pytest.approx(0.9615384615384616, abs=1e-12)
     assert rule.curvature_h is None and rule.curvature_stencil == rule.h == 0.05
+    # the desk's fit reads the snapshot's SABRW fits: the source belongs to the pricing surface
+    # (the hedger sets it before its own base fit)
+    assert rule.step0 is not None
+    if rule.step0_surface is None:
+        rule.step0_surface = ctx.surface
     base = fit_2f_marking(
         ctx.surface,
         rule.config(),
         ssr_target=rule.ssr_target,
         h=rule.curvature_stencil,
         skew_h=rule.h,
+        step0=rule.step0_for(ctx.surface),
     )
-    assert base.targets.correl_target == pytest.approx([-0.8953, -0.8967, -0.9010], abs=5e-5)
+    assert base.targets.correl_target == pytest.approx(
+        [-0.75734003578042, -0.8249892327822594, -0.7165965327637377], abs=5e-5
+    )
     xi0 = xi0_curve(ctx.surface, float(min(ctx.surface.max_maturity, 3.0 + t)))
     rho = ("rho12", "rho_SX1", "rho_SX2")
 
     def params_of(p: object) -> dict[str, float]:
         return {k: float(getattr(p, k)) for k in ("nu", "theta", "k1", *rho)}
 
-    seen: dict[int, dict[str, float]] = {}
-    for n_strip in (20_000, m8b.STUDY_C_STRIP_PATHS):
+    expected = {
+        20_000: (
+            [-0.6611698453595318, -0.25103386002510786, 0.06934980533894329],
+            {"rho_SX2": -0.737558193133671, "rho12": 0.6358745816641711},
+        ),
+        m8b.STUDY_C_STRIP_PATHS: (
+            [-0.14894753379005263, 0.2914442923848736, 0.8851943387917472],
+            {"rho_SX2": -0.5612713187759658, "rho12": 0.4400646643513949},
+        ),
+    }
+    for n_strip, (curv, corr) in expected.items():
         r = dataclasses.replace(rule, strip_paths=n_strip, log_rows=[], base_fit=base)
         ss = h.strip_surfaces(dates, r, only=[kdx], twin=False)
         surf = ss.world[kdx]
@@ -1425,31 +1449,16 @@ def test_named_pinning_case_and_the_rebuilt_refit() -> None:
             f"{n_strip} strip paths: curv {surf.curv.round(6).tolist()}, guarded "
             f"{step0_degenerate_pillars(plain)}; pre-rebuild refit {old}; rebuilt {row}"
         )
-        seen[n_strip] = new
-        if n_strip == 20_000:
-            assert surf.curv == pytest.approx([-1.221058, -0.480572, -0.251784], abs=5e-7)
-            assert step0_degenerate_pillars(plain) == (0.25, 1.0, 3.0)
-            assert set(degenerate_correlations(old)) == set(rho)
-            assert old["nu"] == pytest.approx(2.404628218584923, rel=1e-9)
-            assert old["rho12"] > 0.9999999 and old["rho_SX1"] < -0.9999999
-            assert row["fallback_applied"] is True and row["corr_capped"] is False
-            assert row["step0_flags"].count("radicand guard fired") == 3
-            assert row["step0_flags"].count("clipped") == 3
-            assert row["at_bound"] == ""
-            assert not degenerate_correlations(new)
-            assert new["rho_SX1"] == pytest.approx(-0.956740052562423, rel=1e-6)
-            assert new["rho_SX2"] == pytest.approx(-0.826772238468473, rel=1e-6)
-            assert new["rho12"] == pytest.approx(0.7310232729932535, rel=1e-6)
-            assert new["k1"] == pytest.approx(old["k1"], rel=1e-9)
-        else:
-            assert surf.curv == pytest.approx([-0.609042, 0.201888, 0.715385], abs=5e-7)
-            assert step0_degenerate_pillars(plain) == ()
-            assert row["fallback_applied"] is False and row["corr_capped"] is False
-            assert row["step0_flags"].count("radicand guard") == 0 and row["at_bound"] == ""
-            assert {k: new[k] for k in old} == pytest.approx(old, rel=1e-12)
-            assert new["rho_SX1"] == pytest.approx(-0.7026253089227829, rel=1e-6)
-            assert new["rho_SX2"] == pytest.approx(-0.4160203466178672, rel=1e-6)
-            assert new["rho12"] == pytest.approx(-0.3482838541931257, rel=1e-6)
+        assert surf.curv == pytest.approx(curv, abs=5e-7)
+        assert step0_degenerate_pillars(plain) == ()
+        assert "moved with the surface" in row["step0_flags"]
+        assert row["step0_flags"].count("radicand guard") == 0
+        assert row["fallback_applied"] is False and row["corr_capped"] is False
+        assert row["at_bound"] == ""
+        # no fallback: the rebuilt refit is the plain one
+        assert {k: new[k] for k in old} == pytest.approx(old, rel=1e-12)
+        assert new["rho_SX1"] == pytest.approx(-0.99, abs=1e-5)  # the correlation box's edge
+        assert {k: new[k] for k in corr} == pytest.approx(corr, rel=1e-6)
 
 
 @pytest.mark.slow

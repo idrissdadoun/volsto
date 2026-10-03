@@ -67,6 +67,9 @@ GRIDS = ROOT / "configs" / "grids"
 # 2026-09-22: the two SPX marking specs the M7 P1 run rewrote on the repaired eSSVI anchor with
 # the new importer's market section carry re-recorded keys (spx_ssr1.5_eps0.05: was 6d5f…;
 # spx_ssr1_eps0.1: was 9b5e…); every other key is unchanged.
+# 2026-09-29: the M7 P1 run of 2026-09-27 under the desk's marking fit (`--fit desk`, the default
+# switch 17c9de4) rewrote the same two specs' parameters: re-recorded (spx_ssr1.5_eps0.05: was
+# 77b5f64a…; spx_ssr1_eps0.1: was d4c3335f…), both calibrated into the cache by that run.
 ESSVI_SPECS: frozenset[str] = frozenset(
     {"m7_p1_marking/spx_ssr1.5_eps0.05.yaml", "m7_p1_marking/spx_ssr1_eps0.1.yaml"}
 )
@@ -85,13 +88,13 @@ RECORDED_SPEC_KEYS: dict[str, str] = {
         "2f14cad8e868274de720d632fdbf7794111a388347c365a1d7994b7e4e68cdb9"
     ),
     "m7_p1_marking/spx_ssr1.5_eps0.05.yaml": (
-        "77b5f64ab3695d00e336a759c20acb23b97413540e1e32909b1965a488b657d1"
+        "07af0dcbcdcd713ad71c102cdb31ac6cb8af1213d6ce9ab863e3e3b0d14b39e2"
     ),
     "m7_p1_marking/spx_ssr1.75_eps0.2.yaml": (
         "1b76d7538370e4e9454b5f2d5f72c25d17e63cf5d89ee0b0036f3dff95dad20e"
     ),
     "m7_p1_marking/spx_ssr1_eps0.1.yaml": (
-        "d4c3335fc372d7bc18de3a62f385da33e7dfd80c40c032e2111b0d2b4ee8ef60"
+        "2e8a8e416d3060ae7e2bad22c8ee8ae1362f8dbff26f9219042a1f372ad26bac"
     ),
 }
 """``spec_key`` of the committed calibration specs (a whole-file spec, or the ``spec`` section of
