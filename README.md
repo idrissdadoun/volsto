@@ -50,7 +50,10 @@ uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python -e ".[de
 3. **Tests**: `.venv/bin/python -m pytest -n auto -m "not slow"` (fast suite; drop the marker for the
    full-size tests). Tests never calibrate: a test whose leverage is not in `cache/` skips with the
    reason, and a test needing the vendor sample skips when `data/hdn_sample/` is absent.
-4. **Git-ignored data** (none of it is in the repository; restore it from the local archive
+4. **Tectonic** (`brew install tectonic`) compiles the study runner's `study.pdf`; a full TeX
+   distribution is not needed. Without it the LaTeX check and its tests skip. Its first compile
+   downloads the TeX package bundle and needs network access.
+5. **Git-ignored data** (none of it is in the repository; restore it from the local archive
    `volsto-local-data.tar.gz`, extracted at the repository root):
 
    | Path | Contents |
