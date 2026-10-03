@@ -1,0 +1,73 @@
+{
+  // Interpreter: the repository's own virtual environment (README "Setup on a new machine").
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+  "python.terminal.activateEnvironment": true,
+
+  // Tests: pytest only. Options (testpaths, markers, addopts) come from pyproject.toml.
+  // The fast suite is `pytest -m "not slow"`; slow tests stay discoverable but run on demand.
+  "python.testing.pytestEnabled": true,
+  "python.testing.unittestEnabled": false,
+  "python.testing.pytestArgs": ["tests"],
+  "python.testing.cwd": "${workspaceFolder}",
+
+  // Formatting matches CONTRIBUTING.md: black (line length 100, configured in pyproject.toml)
+  // and ruff with the "I" (isort) rules for import order. Both tools are taken from .venv so the
+  // editor uses exactly the versions pinned by the project's dev extras.
+  "[python]": {
+    "editor.defaultFormatter": "ms-python.black-formatter",
+    "editor.formatOnSave": true,
+    "editor.codeActionsOnSave": {
+      "source.organizeImports.ruff": "explicit"
+    }
+  },
+  "black-formatter.importStrategy": "fromEnvironment",
+  "ruff.importStrategy": "fromEnvironment",
+  "ruff.organizeImports": true,
+
+  // Notebooks run from the repository root with the "volsto" kernel.
+  "jupyter.notebookFileRoot": "${workspaceFolder}",
+
+  // Keep git-ignored data, caches and build output out of search and the file watcher.
+  // data/ and study_archive/ hold licensed vendor data and large archives; cache/ and outputs/
+  // hold library artefacts (.npz, .parquet) that can be very large.
+  "search.exclude": {
+    "**/.venv": true,
+    "**/__pycache__": true,
+    "**/.pytest_cache": true,
+    "**/.mypy_cache": true,
+    "**/.ruff_cache": true,
+    "**/*.egg-info": true,
+    "**/build": true,
+    "**/dist": true,
+    "data/**": true,
+    "cache/**": true,
+    "study_archive/**": true,
+    "outputs/**": true,
+    "**/*.npz": true,
+    "**/*.parquet": true
+  },
+  "files.watcherExclude": {
+    "**/.git/objects/**": true,
+    "**/.git/subtree-cache/**": true,
+    "**/.venv/**": true,
+    "**/__pycache__/**": true,
+    "**/.pytest_cache/**": true,
+    "**/.mypy_cache/**": true,
+    "**/.ruff_cache/**": true,
+    "**/*.egg-info/**": true,
+    "**/build/**": true,
+    "**/dist/**": true,
+    "data/**": true,
+    "cache/**": true,
+    "study_archive/**": true,
+    "outputs/**": true
+  },
+  // Hide only generated noise from the explorer; data/ stays browsable.
+  "files.exclude": {
+    "**/__pycache__": true,
+    "**/.pytest_cache": true,
+    "**/.mypy_cache": true,
+    "**/.ruff_cache": true,
+    "**/*.egg-info": true
+  }
+}

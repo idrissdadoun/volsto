@@ -1,0 +1,20 @@
+{
+  // Extensions used for volsto development. VS Code offers to install the missing ones when the
+  // folder is opened. black-formatter is listed because the repository formats with black
+  // (CONTRIBUTING.md, pyproject.toml [tool.black]); the workspace settings point to it.
+  "recommendations": [
+    "ms-python.python",
+    "ms-python.vscode-pylance",
+    "ms-python.black-formatter",
+    "ms-toolsai.jupyter",
+    "charliermarsh.ruff",
+    "James-Yu.latex-workshop",
+    "GitHub.vscode-pull-request-github",
+    "eamodio.gitlens",
+    "tamasfe.even-better-toml",
+    "redhat.vscode-yaml",
+    "mechatroner.rainbow-csv",
+    "ms-toolsai.datawrangler",
+    "anthropic.claude-code"
+  ]
+}
