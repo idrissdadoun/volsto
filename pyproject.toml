@@ -67,6 +67,9 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["E501"]
+# the stage-2 report modules carry long table captions and row labels
+"volsto/studies/barrier_vs_vanilla_report.py" = ["E501"]
+"volsto/studies/dispersion_report.py" = ["E501"]
 
 [tool.mypy]
 python_version = "3.12"

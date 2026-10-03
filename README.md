@@ -23,7 +23,10 @@ analytics, and a 1F LSV ADI PDE cross-check (M6). Smile dynamics, SSR estimators
 marking calibration by SABR break-evens (M7); the hedging framework and the M8b hedging studies
 (M8); the sharded precompute, results store and Streamlit viewers (M9); the certified eSSVI
 calendar repair, the study runner with LaTeX output, the study catalogue S1–S7 and the rolling
-backtest (M10). Methodology: [docs/methodology.md](docs/methodology.md); studies:
+backtest (M10). The barrier-versus-vanilla and dispersion decision frameworks of 2026-10-03 (vanilla structures,
+the multi-asset layer `volsto/multi/`, the statistical layer on cached price histories): SPEC §8.4–8.5,
+[docs/barrier_vs_vanilla.md](docs/barrier_vs_vanilla.md), [docs/dispersion_palladium.md](docs/dispersion_palladium.md).
+Methodology: [docs/methodology.md](docs/methodology.md); studies:
 [docs/studies.md](docs/studies.md).
 
 ## Install

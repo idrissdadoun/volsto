@@ -585,3 +585,42 @@ Both stages need the HistoricalData.net 2022 H2 sample under
   pillars, rolling book priced at inception only, 127 dates) at 18.35 h in one process, 9.21 h
   on 2 shards and 4.71 h on 4. The configuration first written (ladders on 9 pillars, rolling
   book marked daily, no ξ₀ memo) projected 25.9 h.
+
+---
+
+## The barrier-versus-vanilla study (2026-10-03)
+
+**Question.** When does a call ratio or a call fly beat an up-and-out call (daily or
+continuous), and a put ratio or put fly a down-and-out put, by pure-vol, market and
+statistical metrics?  Theory and the decision rule: [barrier_vs_vanilla.md](barrier_vs_vanilla.md);
+design record SPEC §8.4.
+
+**Reads.** Stage 1 (`scripts/barrier_vs_vanilla_study.py`, may calibrate) writes
+`outputs/barrier_vs_vanilla/` from the SPX 2022-12-30 desk mark, the 127 snapshots of 2022 H2
+and `data/history/` (`scripts/fetch_history.py`); stage 2 reads those tables only.
+
+```bash
+.venv/bin/python scripts/fetch_history.py                 # once: the daily histories
+caffeinate -is .venv/bin/python scripts/barrier_vs_vanilla_study.py
+volsto-study run configs/studies/barrier_vs_vanilla/study.yaml
+```
+
+**Runs today:** yes (stage 1's tables are in the repository's `outputs/`).
+
+## The dispersion study (2026-10-03)
+
+**Question.** Given the market's parameters and a view on their realised counterparts, when
+is the palladium (call on dispersion) the better trade than single-name straddles against a
+basket straddle?  Theory: [dispersion_palladium.md](dispersion_palladium.md); design record
+SPEC §8.5.
+
+**Reads.** Stage 1 (`scripts/dispersion_study.py`, no calibration) writes
+`outputs/dispersion/` from `data/history/` (the ten-name basket, Cboe COR3M); stage 2 reads
+those tables only.
+
+```bash
+.venv/bin/python scripts/dispersion_study.py
+volsto-study run configs/studies/dispersion/study.yaml
+```
+
+**Runs today:** yes.

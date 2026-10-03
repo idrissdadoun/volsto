@@ -1,0 +1,15 @@
+# The barrier-versus-vanilla study (owner's question of 2026-10-03), stage 2: the report,
+# rendered from the tables that `scripts/barrier_vs_vanilla_study.py` (stage 1, which may
+# calibrate) writes under outputs/barrier_vs_vanilla/.  This study reads them and never
+# calibrates; a missing table prints the stage-1 command and exits 2.  The theory is
+# docs/barrier_vs_vanilla.md.
+name: barrier_vs_vanilla
+runner: volsto.studies.barrier_vs_vanilla_report
+grid: null
+store: outputs/store
+cache: cache
+outputs: outputs
+mode: full
+seeds: {}                     # nothing is simulated here: stage 1 used seed 2024
+params:
+  dir: barrier_vs_vanilla     # stage 1's output directory, relative to outputs

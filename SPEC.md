@@ -1061,6 +1061,150 @@ settlement −0.776 ± 0.023); the 6m 105% survived (1.88 ± 0.04); the puts on 
 0.40 / 0.26 vol pts (realised variance accruing below the strikes); the down-and-in put 1.86 ± 0.04%
 of spot (the rally).
 
+### 8.4 The barrier-versus-vanilla study (owner's question of 2026-10-03; branch `barrier-vanilla-dispersion`)
+
+**Question.** A framework deciding, from pure-vol, market and statistical metrics, whether and when
+to trade a call ratio or a call fly instead of an up-and-out call (daily or continuous observation),
+and a put ratio or put fly instead of a down-and-out put.  Theory and the decision rule:
+`docs/barrier_vs_vanilla.md`; stage 1 `scripts/barrier_vs_vanilla_study.py`
+(`volsto/studies/barrier_vs_vanilla.py`, parts `anchor`, `map`, `greeks`, `hedge`, `daily`,
+`history`; outputs under `outputs/barrier_vs_vanilla/`); stage 2
+`configs/studies/barrier_vs_vanilla/study.yaml` (`volsto/studies/barrier_vs_vanilla_report.py`,
+rendered to `outputs/studies/barrier_vs_vanilla/`).
+
+**Library additions.**
+* `volsto/products/structures.py`: `VanillaStructure` (a `Portfolio` of same-expiry European
+  options with a model-free `surface_price`), the constructors `call_spread`, `put_spread`,
+  `call_ratio`, `put_ratio`, `call_fly`, `put_fly`, `straddle`; premium matching —
+  `ratio_for_premium` (closed form), `fly_wing_for_premium` (outer wing by bisection),
+  `fly_width_for_premium` (the symmetric fly whose width matches: always solvable, because a
+  fly spanning the strike-to-barrier range with its inner strike held is worth at least the
+  European knock-out, hence never as cheap as a knock-out); `european_knock_out` (the barrier
+  observed at expiry only) and its model-free price `spread − (B − K) · digital` with the
+  skew-adjusted digital `surface_digital` (centred strike difference).
+* `volsto/studies/history_stats.py` (data from `scripts/fetch_history.py` → `data/history/`,
+  yfinance daily closes 1990–2026 of SPX, VIX, VIX3M, VVIX, SKEW and ten large caps, plus Cboe's
+  COR1M / COR3M CSVs): barrier path statistics (strict daily-close touch, the *regret*
+  indicator `touched ∧ alive at T ∧ in the money`, the structures' payoffs per unit spot),
+  regime frequency tables with block standard errors (`n / horizon` effective samples), the
+  filtered historical simulation (returns standardised by the trailing EWMA vol, the
+  standardised series normalised to unit variance — the EWMA lags on real data — rescaled to
+  a target vol, block-resampled, demeaned by default; the drift-included variant reported
+  apart), dispersion statistics of a basket.
+* Tests: `tests/test_structures.py`, `tests/test_history_stats.py`,
+  `tests/test_barrier_vs_vanilla.py`.
+
+**The framework.** `UOC = EKO − R`: the European knock-out (model-free: call spread minus the
+cliff) minus the *regret value* `R = E[(S_T − K)⁺ 1{S_T < B} 1{touched}]`, the value of the
+touch-and-return paths; the *regret share* `R/EKO` is the fraction of the European value the
+path condition destroys.  The premium-matched alternatives are the ratio (closed form) and the
+width-matched symmetric fly.  Three metric families: pure vol (ATM level, implied minus
+realised, distance to the barrier in standard deviations, 90–110 skew, fly curvature, term
+slope, the LV / 1F / 2F model spread, the regret share), market (hedging P&L std and costs,
+model-risk reserve, listed-vanilla liquidity, daily-versus-continuous convention) and
+statistical (regime-conditional 1990–2026 frequencies; the filtered historical simulation at
+the chosen vol; the P-minus-Q touch and regret gaps; the expected payoff per unit premium of
+each structure).  Decision: `edge = E^P[UOC]/P − E^P[fly]/P`; the knock-out when the edge
+exceeds the model band plus the hedging-cost share, the fly when negative, the ratio only for a
+buyer of the unbounded upside loss.
+
+**Measured (SPX 2022-12-30 desk mark, 10⁵ paths, ×100 % of spot, strike 100%, notional
+1/spot; 2026-10-03).**
+* Regret share under the 2F mark: calls 3% (3m 120%) → 72% (1y 110%); puts 22% (3m 80%) →
+  92% (1y 90%).  It falls with the distance and rises with the maturity.
+* 6m 110% up-and-out call: 2F 0.564 ± 0.005, LV 0.400, 1F 0.616, BS 0.285, continuous 0.478;
+  EKO 1.290 (surface) / 1.305 ± 0.009 (2F); the midpoint fly 100/105/110 costs 0.631 (1.1×
+  the knock-out), the premium-matched symmetric fly tops out at 109.5% of spot, the matched
+  call ratio is 1×1.45 (break-even 116%).  6m 90% down-and-out put: 2F 0.152 ± 0.003, LV
+  0.225, BS 0.365 — the model risk has opposite signs on the two sides (the up barrier is
+  reached in a low-vol state, the down barrier in a high-vol one).  The continuous twin is
+  10–50% cheaper than the daily barrier.
+* The spot × time map: the fly-to-knock-out price ratio for the 6m 110% call rises from 0.63
+  (10% below the barrier, 6m left) to 4.9 at the barrier; for the 6m 90% put from 0.4 (1m
+  left, at the barrier … ) to 13 (6m left, 10% above) — the switch point of a holder.
+* Hedging (2F world, daily, 2·10⁴ paths): 6m 110% call unhedged std 1.74, delta 1.32, the
+  put-call-symmetry replication alone 0.78, the premium-matched fly held short alone 1.32 (0.99
+  in the LV world), fly + delta 1.09; 6m 90% put unhedged 0.86, delta 0.67, PCS alone 0.32,
+  fly proxy alone 0.79, ratio proxy + delta 0.60; the fly's own delta hedge 0.79 of 1.26
+  unhedged; the 1×2 ratio's 2.50 of 5.35.
+* 2022 H2 day by day (each day's Dupire local vol, 2·10⁴ paths): the regret share of the 6m
+  110% call ran 62–77% (mean 71%), of the 6m 90% put 70–79%; the correlation of the regret
+  share with the distance in standard deviations −0.90 to −0.97, with implied-minus-realised
+  3m vol +0.70 to +0.81 (both through the implied vol level, which sets the distance).
+* Statistical layer: the 1990–2026 daily-close touch frequency of the 110% barrier over 3m is
+  15.9% against 32.3% under the 2F mark (6m: 41% vs 53%; the 90% put side 13.7% vs 32.2% at
+  3m); the demeaned FHS at the implied ATM vol touches 29% (3m 110%) and 28% (3m 90%) — the
+  drift, not the path shape, explains most of the history's gap.  Verdicts against the
+  premium-matched fly (18 barriers): FHS at implied ATM — barrier 9, fly 9 (the drift-free
+  layers favour the fly on every call-side barrier and the knock-out on every put-side one: the
+  mark's down-and-out puts are cheap against a drift-free path distribution, its up-and-out
+  calls are not); the raw history — barrier 11, fly 4, indifferent 3 (the equity drift).
+
+### 8.5 The dispersion study (owner's question of 2026-10-03; branch `barrier-vanilla-dispersion`)
+
+**Question.** A framework deciding, from parameters and market expectations, whether to buy a
+palladium — the call on dispersion `(Σ_i w_i |r_i − r_B| − K)⁺` (the owner's definition: the
+weighted sum of the names' absolute performances against the basket's) — rather than
+single-name straddles against a basket straddle.  Theory: `docs/dispersion_palladium.md`;
+stage 1 `scripts/dispersion_study.py` (`volsto/studies/dispersion.py`, parts
+`sensitivities`, `expectations`, `history`; outputs under `outputs/dispersion/`); stage 2
+`configs/studies/dispersion/study.yaml` (`volsto/studies/dispersion_report.py`, rendered to
+`outputs/studies/dispersion/`).
+
+**Library additions — the multi-asset layer `volsto/multi/`** (SPEC §3.1 allowed a second
+underlying without touching product code: it lives in a second container).
+`CorrelatedDraws` (one CRN stream per asset, seed `+ 7919 · i`, Cholesky mixing: a
+correlation bump leaves the names' draws unchanged, antithetics preserved); `MultiAssetModel`
+(factor-free single-asset kernels — Black–Scholes or Dupire local vol per name, each with its
+own skew — on correlated Brownians; stochastic-vol names are refused); `MultiPathSet`;
+`MultiAssetMonteCarlo` (the engine's chunking and stderrs); products `Palladium`,
+`BasketOption`, `BasketStraddle`, `SingleNameStraddles`, `dispersion_straddles` (`Σ w_i|r_i| −
+λ_B |r_B|`), `VarianceDispersion` (`Σ w_i RV_i − RV_B` on the fixing schedule), `MultiPortfolio`;
+Gaussian closed forms (`basket_vol`, `implied_correlation`, `gaussian_palladium_forward`
+`= √(2T/π) Σ w_i σ_{i−B}`, `gaussian_straddle_dispersion` `= √(2T/π)(Σ w_i σ_i − σ_B)`, the
+folded-normal product moments behind `gaussian_dispersion_moments` and the Bachelier
+`gaussian_palladium_call`).  The study's `World` adds the departures the question turns on on a
+one-factor equicorrelation simulator: local correlation `ρ_t = ρ − λ (B_t − 1)`, an uncertain
+realised correlation `ρ ± ρ_sd`, idiosyncratic jumps `(p_J, μ_J, σ_J)` on the terminal
+performances.  Tests: `tests/test_multi.py`, `tests/test_dispersion.py`.
+
+**The framework.** Path by path `Σ w_i|r_i| − |r_B| ≤ D ≤ Σ w_i|r_i| + |r_B|`: the straddle
+dispersion trade is the palladium's lower bound, the gap being the names that move *against*
+the basket — the palladium is a call on relative moves, the straddle package on excess
+absolute moves.  Equal vols and a constant `ρ`: palladium forward `≈ σ√(1−ρ)√(2T/π)`,
+straddle dispersion `≈ σ(1−√ρ)√(2T/π)` (2.4× at ρ = 0.5); the call struck near the forward is
+convex in the correlation's uncertainty, the forward concave.  The decision compares the
+expected P&L per unit premium of each trade bought at the market world's prices and realised
+under the expectation world (realised correlation `ρ_impl ± 0.2`, realised vols `× 0.8–1.2`,
+`λ ∈ {0, 3}`, `ρ_sd ∈ {0, 0.2}`, `p_J ∈ {0, 0.2}`; 120 cells).
+
+**Market world and its stated inputs.** Ten large caps (AAPL, MSFT, AMZN, NVDA, JPM, XOM, JNJ,
+PG, HD, UNH), equal weights, 3m; single-name implied vols = trailing 1y realised at
+2022-12-30 × 1.15 (**an input**, single-name implied vols are not in the repository);
+correlation = Cboe COR3M of 2022-12-30 (44.7%; the basket's realised 1y correlation 43.1%);
+the call's strike 80% of the forward dispersion.
+
+**Measured (10⁵ paths; per unit of basket notional; 2026-10-03).**
+* Market world: palladium forward 0.1185 ± 0.0002 (Gaussian 0.1189), call 0.0282 ± 0.0001,
+  basket straddle 0.1125 ± 0.0004, single straddles 0.1571, straddle package 0.0446, variance
+  dispersion 0.0985; the forward is 2.7× the package.  Against the correlation (0.25 → 0.65):
+  forward 0.134 → 0.100, call 0.042 → 0.015, package 0.066 → 0.027, basket straddle 0.091 →
+  0.131; per 0.1 of correlation the package loses 22% of its premium, the call 16%, the forward
+  7%.  All forwards are linear in the vol level and scale with `√T`.
+* Departures at the implied parameters (P&L per unit premium): idiosyncratic events (p 0.2,
+  10% shock) palladium call +0.14, package +0.08, basket straddle +0.01; local correlation
+  λ = 3: call +0.12, package +0.06, basket straddle −0.02; correlation uncertainty ± 0.2:
+  forward −0.01, call +0.01, package +0.04.
+* The expectations grid: at the implied vols the palladium call is the best trade per unit
+  premium when the realised correlation is at or below the implied one, the basket straddle
+  when above; with the vols 20% below implied the straddle package replaces the call
+  (vol-level loss on the call); over the 120 cells palladium call 53, basket straddle 35,
+  straddle package 32 (the zero-premium package and the variance dispersion are not ranked).
+* History 2006–2026 (3m windows): COR3M averaged 41% against a realised 29% (high-VIX tercile
+  54% vs 33%); realised dispersion 0.104 against a straddle-package payoff 0.041; the
+  palladium-to-package ratio is largest when the basket is flat (−3..3%: 0.092 vs 0.078) and
+  smallest in large moves (> 10%: 0.129 vs 0.017; < −10%: 0.136 vs 0.029).
+
 ## 9. Viewers
 
 `viewers/precompute.py` builds grids into the cache: default grid `ω ∈ {0, 0.5, 1, 1.5, 2, 2.5, 3}`, `ρ1 ∈ {−0.9, −0.7, −0.5, −0.3, 0}`, `k1 ∈ {0.5, 1.5, 4}`, 2F presets (a few `(θ, k1, k2, ρ12)` combinations including the SSR ≈ 1.2 fit), always including the 1F degenerate points so the old studies are recoverable. Precompute is a CLI with resume support. Owner additions (recorded at the M4c review, for M9): the precompute CLI takes an explicit list of grid points and a worker count, so a grid can be sharded across cores or machines and resumed — `volsto-precompute --shard i/n` runs the i-th of n interleaved shards of the point list; the cache is relocatable (relative paths only, manifest-driven), so grids can be computed on a rented multi-core VM and synced to a laptop; production entries use 8·10⁵ particles (§11).
