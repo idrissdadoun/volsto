@@ -55,6 +55,9 @@ RENDER_TIMEOUT_S = 300
 #: ``(store, page)`` pairs that cannot show a figure by construction — asserted on their
 #: notices instead (see ``test_every_page_renders``).
 NO_FIGURE_BY_CONSTRUCTION: frozenset[tuple[str, str]] = frozenset({("toy", "6_product_grid.py")})
+#: Pages that compute on demand: rendered headless they show their form and a notice, and no
+#: table, figure or export until **Run** is pressed (page 9, see ``tests/test_viewers_whatif.py``).
+COMPUTES_ON_RUN: frozenset[str] = frozenset({"9_what_if.py"})
 
 
 # --------------------------------------------------------------------------------------------
@@ -194,6 +197,13 @@ def test_every_page_renders(env: StoreEnv, page: str, monkeypatch: pytest.Monkey
     print(f"\n[{env.name}] {page}: {wall:.2f} s, {n_df} tables, {n_fig} figures")
     assert not at.exception, [e.value for e in at.exception]
     assert [t.value for t in at.title] == [PAGE_TITLES[page]]
+    if page in COMPUTES_ON_RUN:
+        assert (n_df, n_fig) == (0, 0), "nothing is computed before Run"
+        assert any(b.label == "Run" for b in at.button)
+        assert any("No run yet" in i.value for i in at.info), [i.value for i in at.info]
+        if env.cfg.cache_root.exists():
+            assert _file_snapshot(env.cfg.cache_root) == before, "the cache changed during a render"
+        return
     assert n_df >= 1, "at least one dataframe per page"
     labels = [b.label for b in at.get("download_button")]
     assert any(lbl.startswith("Excel:") for lbl in labels), labels
@@ -430,10 +440,13 @@ def test_check_pages_in_process(synthetic: StoreEnv, tmp_path: Path) -> None:
     results = app.check_pages(synthetic.cfg, timeout=RENDER_TIMEOUT_S)
     assert {k: os.environ.get(k) for k in ENV_VARS.values()} == env_before
     assert [r.page for r in results] == PAGE_NAMES
-    assert all(r.ok and r.n_dataframes >= 1 and r.n_figures >= 1 for r in results), results
+    assert all(r.ok for r in results), results
+    assert all(
+        r.n_dataframes >= 1 and r.n_figures >= 1 for r in results if r.page not in COMPUTES_ON_RUN
+    ), results
     assert app.exit_code(results) == 0
     report = app.format_checks(results)
-    assert report.count(" ok ") == 8 and "all pages rendered" in report
+    assert report.count(" ok ") == 9 and "all pages rendered" in report
     print("\n" + report)
     broken = tmp_path / "9_broken.py"
     broken.write_text('"""A page that raises."""\nraise RuntimeError("boom from the page")\n')
@@ -474,7 +487,7 @@ def test_viewer_check_cli(toy: StoreEnv, tmp_path: Path) -> None:
         assert any(
             line.startswith(page) and " ok " in line for line in out.stdout.splitlines()
         ), page
-    assert "check: 8 pages, all pages rendered" in out.stdout
+    assert "check: 9 pages, all pages rendered" in out.stdout
     assert "store: 4 points" in out.stdout and "grid 'toy'" in out.stdout
     assert _file_snapshot(t.cfg.cache_root) == before
     empty = _cli(
