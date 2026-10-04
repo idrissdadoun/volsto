@@ -2205,7 +2205,11 @@ def test_round2_store_is_migrated_in_place(
     # P5: bound because a fresh import of each day file reproduced the snapshot
     assert sorted(log_[0]["snapshots_bound"]) == list(b.dates)
     assert log_[0]["snapshots_unbound"] == {}
-    assert len(list(b.snapshots_root.glob("*.import.json"))) == len(b.dates)
+    records = sorted(b.snapshots_root.glob("*.import.json"))
+    assert len(records) == len(b.dates)
+    for rec in records:  # the binding note states the measured surface difference
+        how = json.loads(rec.read_text())["bound_by"]
+        assert how.startswith("migration (fresh import reproduced") and "vol points" in how, how
     code, text = run_cli(
         ["run", str(TOY_CONFIG), "--no-calibrate", "--resume", *b.path_args()], capsys
     )

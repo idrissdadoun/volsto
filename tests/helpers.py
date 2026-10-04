@@ -41,11 +41,15 @@ def assert_params_close(
     assert dataclasses.asdict(got) == pytest.approx(dataclasses.asdict(want), rel=rel), msg
 
 
-#: Relative tolerance of what a marking fit is judged on — spot/vol covariance, vol-of-vol
-#: variance, skew, first-order SSR — between a refit and its stored record.  Measured 2026-10-03
-#: on the five study specs across two Macs: 6.8e-14 at most on the covariance, the skew and the
-#: SSR, 5.7e-5 on the vol variance of the one fit at the correlation boundary (2.1e-8 elsewhere).
-FIT_JUDGED_RTOL = 1e-3
+#: Relative tolerances of what a marking fit is judged on — spot/vol covariance, vol variance,
+#: skew, first-order SSR — between a refit and its stored record (owner's decision 2026-10-03).
+#: Measured that day on the five study specs across two Macs (SPEC §13.3):
+#: interior fits (three specs): 2.1e-08 at most (vol variance; 6.8e-14 on the covariance, the
+#: skew and the SSR);
+FIT_JUDGED_RTOL_INTERIOR = 1e-6
+#: fits flagged at the boundary (two specs): 5.7e-05 at most (the vol variance of
+#: ``reference_ssr1.5_eps0.05``; 9.7e-10 on the other; 7.8e-16 on the covariance, skew and SSR).
+FIT_JUDGED_RTOL_BOUNDARY = 1e-3
 #: A fit with a correlation within this of ±1 is at the boundary (owner's decision 2026-10-03).
 BOUNDARY_CORRELATION = 1e-3
 #: ... and so is a fit whose ν is within this relative distance of its cap.
@@ -73,10 +77,12 @@ def assert_fit_judged_close(
     xi0: Any,
     pillars: Iterable[float],
     msg: object = "",
-    rel: float = FIT_JUDGED_RTOL,
+    *,
+    rel: float,
 ) -> None:
     """The first-order break-evens (spot/vol covariance, vol variance, skew) and SSR of ``got``
-    equal those of ``want`` within ``rel`` at every pillar and at the 1Y and 5Y skew points."""
+    equal those of ``want`` within ``rel`` (:data:`FIT_JUDGED_RTOL_INTERIOR` or
+    :data:`FIT_JUDGED_RTOL_BOUNDARY`) at every pillar and at the 1Y and 5Y skew points."""
     for T in sorted({*(float(t) for t in pillars), *SKEW_PILLARS}):
         a, b = first_order_breakevens(got, xi0, T), first_order_breakevens(want, xi0, T)
         for name in ("spot_vol_covar", "vol_var", "skew"):

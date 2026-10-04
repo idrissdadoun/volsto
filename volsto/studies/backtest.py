@@ -381,7 +381,7 @@ from volsto.config import (
 )
 from volsto.engine.grid import TimeGrid
 from volsto.engine.mc import MonteCarlo
-from volsto.market.compare import snapshot_difference
+from volsto.market.compare import SURFACE_TOL_VP, snapshot_diff_vp, snapshot_difference
 from volsto.market.curves import DiscountCurve, ForwardCurve
 from volsto.market.import_hdn import (
     DEFAULT_CALENDAR_REPAIR,
@@ -3981,8 +3981,10 @@ def _bind_migrated_snapshots(
     day file reproduces the snapshot — equal in everything but floats and the same surface
     within :data:`volsto.market.compare.SURFACE_TOL_VP` vol points
     (:func:`~volsto.market.compare.snapshot_difference`; until 2026-10-03 the content digests
-    had to be equal, which only the machine that wrote the store could meet) — about 1 s per
-    date; dates already bound are skipped, so an interrupted binding resumes."""
+    had to be equal, which only the machine that wrote the store could meet); the import record's
+    ``bound_by`` states the measured surface difference — about 1 s per date; dates already
+    bound are skipped, so an interrupted binding resumes.
+    """
     bound: list[str] = []
     unbound: dict[str, str] = {}
     for d in dates:
@@ -4020,12 +4022,15 @@ def _bind_migrated_snapshots(
             # not by digest: a fresh import on another machine differs in the last bits of
             # every fitted number (CONTRIBUTING.md, "Machine-dependent arithmetic")
             why = snapshot_difference(snap, Path(tmp) / snap.name)
+            diff_vp = float("nan") if why else snapshot_diff_vp(snap, Path(tmp) / snap.name)
         if why is not None:
             unbound[d] = f"a fresh import of its day file gives another snapshot ({why})"
             continue
-        bind_snapshot(
-            ledger.cfg, snap, source, manifest, "migration (fresh import reproduced)", digest
+        how = (
+            f"migration (fresh import reproduced: the same import, surfaces within "
+            f"{diff_vp:.3g} vol points, tolerance {SURFACE_TOL_VP:g})"
         )
+        bind_snapshot(ledger.cfg, snap, source, manifest, how, digest)
         bound.append(d)
     for d, why in unbound.items():
         log.warning("%s: snapshot left unbound (%s): the date will be recomputed if needed", d, why)

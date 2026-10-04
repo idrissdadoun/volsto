@@ -57,7 +57,8 @@ whose Accelerate gives other last bits — SPEC §13.3.)
   same test walks `volsto/` and `scripts/` for a second caller of the fitter.
 - **A fit is compared on what it is judged on** (break-evens, skew, SSR), and on its parameters
   only where it is interior: a fit with ν at its cap or a correlation within 1e-3 of ±1 is
-  flagged and its parameters are not compared (`tests/helpers.py`).
+  flagged and its parameters are not compared. Judged quantities: 1e-6 for an interior fit,
+  1e-3 for a flagged one (`tests/helpers.py`, with the measured maxima beside the constants).
 - **A golden store carries the bytes its records name** (`tests/golden/`), so a record is
   verified against stored bytes.
 - **Known gap** (planned, SPEC §13.3): the leverage cache key hashes fitted parameters, which

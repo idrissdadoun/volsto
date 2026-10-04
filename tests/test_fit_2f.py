@@ -49,7 +49,13 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import pytest
-from helpers import assert_fit_judged_close, assert_params_close, fit_at_boundary
+from helpers import (
+    FIT_JUDGED_RTOL_BOUNDARY,
+    FIT_JUDGED_RTOL_INTERIOR,
+    assert_fit_judged_close,
+    assert_params_close,
+    fit_at_boundary,
+)
 from scipy.optimize import LinearConstraint, minimize
 
 from volsto.analytics.bergomi import atmf_skew_order1
@@ -682,7 +688,8 @@ def test_tables_yaml_and_fit_spec(spx_fits, tmp_path) -> None:  # type: ignore[n
 def test_realised_lsv_ssr_reported_for_study_fits(fast_sim) -> None:  # type: ignore[no-untyped-def]
     """The cached study fits of ``scripts/m7_p1_marking.py`` (``configs/studies/m7_p1_marking``;
     skipped when absent): the recorded fit is reproduced by the fitter with the entry's config and
-    step-0 source — its break-evens, skew and SSR within ``FIT_JUDGED_RTOL`` on every spec, its
+    step-0 source — its break-evens, skew and SSR on every spec (within ``FIT_JUDGED_RTOL_INTERIOR`` = 1e-6,
+    or ``FIT_JUDGED_RTOL_BOUNDARY`` = 1e-3 for a fit flagged at the boundary), its
     parameters within ``FIT_RTOL`` where the fit is interior (a fit with ``ν`` at its cap or a
     correlation within 1e-3 of ±1 is flagged and its parameters are not compared: they are not
     identified to the last digits there) — the cached leverage is read (never calibrated), stage 3 reports the calibrated LSV's
@@ -703,9 +710,10 @@ def test_realised_lsv_ssr_reported_for_study_fits(fast_sim) -> None:  # type: ig
         )
         # what the fit is judged on is reproduced on every machine; its parameters only where
         # the fit is interior (owner's decision 2026-10-03, SPEC §13.3)
-        assert_fit_judged_close(r.params, fs.spec.model, r.xi0, r.table["T"], path.name)
         boundary = fit_at_boundary(fs.spec.model, fs.config.nu_cap)
         assert fit_at_boundary(r.params, fs.config.nu_cap) == boundary, path.name
+        rel = FIT_JUDGED_RTOL_BOUNDARY if boundary else FIT_JUDGED_RTOL_INTERIOR
+        assert_fit_judged_close(r.params, fs.spec.model, r.xi0, r.table["T"], path.name, rel=rel)
         if boundary:
             print(f"{path.name}: at the boundary ({boundary}) — parameters not compared")
         else:
