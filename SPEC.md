@@ -38,6 +38,8 @@ volsto/
     config.py            # dataclasses + YAML loading/validation for every config object
     market/
       import_hdn.py      # HistoricalData.net EOD chain importer (§13)
+      store.py           # read API over the vendor Parquet store (§18.5)
+      compare.py         # "the same surface within X vol points" (§13.3)
       curves.py          # discount factors, forward curve (r, q) — piecewise-flat and interpolated
       surface.py         # ImpliedSurface ABC; SSVISurface; GridSurface (market slices)
       dupire.py          # local vol from total-variance surface (Gatheral formula)
@@ -1441,7 +1443,7 @@ M8. Hedging framework; port the cliquet and FVA hedging studies as regression te
 M9. Precompute CLI + Streamlit viewers + Excel export. **Done and accepted 2026-09-16** (§9.2; grid on the light tier with the 3-bucket forward-variance ladder; the full default grid runs on an owner-provisioned VM, `docs/vm_grid_run.md`).
 M10. Study runner with LaTeX output; regenerate the original paper's tables; backtest study on the market history (§15 Part 4). **Built and committed 2026-09-16/17 (0aa8dcb and its 2026-09-17 follow-up; pending owner review; open items in §10.3):** Part 0 eSSVI calendar repair (§13.1–13.2), the study runner (§10.1), the catalogue S1–S7 (§10.2), the rolling backtest with seasoning and sticky-leverage attribution (§10.3, §6.10, §7.12.1), `docs/methodology.md`, `docs/studies.md`.
 
-M11. Vendor data store and ORATS importer (§18). **In progress (2026-10-03):** Part 0 (the one-day sample inspected, `docs/m11_part0.md`) and Part 1 (data roots, raw manifest and calendar check, `fetch`, the `volsto-data` CLI, `docs/data_runbook.md`) built; Part 2a (the layout measured) and Part 2b (`convert`, `verify`, `extract`, `sql`; §18.3–18.4) built; Parts 3–5 follow, one PR per part, with the stored fit records (§13.3) before Part 4.
+M11. Vendor data store and ORATS importer (§18). **In progress (2026-10-03):** Part 0 (the one-day sample inspected, `docs/m11_part0.md`) and Part 1 (data roots, raw manifest and calendar check, `fetch`, the `volsto-data` CLI, `docs/data_runbook.md`) built; Part 2a (the layout measured) and Part 2b (`convert`, `verify`, `extract`, `sql`; §18.3–18.4) built; Part 3 (the read API `volsto/market/store.py`, §18.5) built; Parts 4–5 follow, one PR per part, with the stored fit records (§13.3) before Part 4.
 
 Open items for the owner: the original study archive (SSVI parameters, seeds, tables) — the M4 cliquet baseline is ≈ 10–16% above the study at every ω with ratios across ω agreeing to 1%, consistent with a surface difference; the paid EOD archive for a multi-year backtest.
 
@@ -1941,6 +1943,7 @@ Built inline (the phase-1 agent workflow failed on the account's spend limit; it
 ---
 
 ## 17. Change log v1.1 → v2.0
+- 2026-10-04 M11 Part 3: §18.5 the read API over the vendor store (`available_dates`, `load_chain`, `load_range`; missing data raises with the exact `volsto-data` command).
 - 2026-10-03 M11 Parts 2a–2b: §18.3 (the layout table, the owner's choice, scaled integers as a later option), §18.4 (the store: convert, verify, extract, sql, measured throughput).
 - 2026-10-03 M11 Parts 0–1: §18 (new) — the ORATS one-day sample as measured, the owner's decisions, the data roots, `volsto-data status / fetch / verify-raw`, the raw manifest; §1 layout (`volsto/data/`); §12 M11.
 - 2026-10-03 machine portability (stage A): §13.3 (new) — the cross-machine measurements, the invariant, the one surface comparator, stored SABRW fits as data, the golden store with its snapshots, the migration's binding rule, the fit test on judged quantities, the planned fit records; §10.3 binding wording.
@@ -2146,5 +2149,32 @@ SPX extract: 1.09 MiB per day at the sample's size (about 5 GB for the archive).
 
 **Tests** (`tests/test_data_store.py`, 13, ≈ 5 s; the sample test skips when the sample is absent, the DuckDB test when DuckDB is not installed; sizes and times are printed, never asserted). On the synthetic fixture: a faithful, typed, sorted copy equal value for value to the CSV text, with the third Friday's two roots, the layout and the provenance metadata; row groups prune on the ticker; idempotence, the stale-raw refusal, a removed file, `--force`, a layout change; atomicity (a death between the write and the rename leaves no file and no temporary, and the run resumes); every loud failure (drift, blank SPX symbols, an ISO date, a `trade_date` mismatch, a non-numeric count, a raw file edited with size and mtime kept); `cOpra` violations and two files for one date; the free-space and unmounted-volume refusals; `verify` catching a changed value, a null, a dropped row, an orphan, an unconverted date and two swapped rows; the extract's content, row groups, binding and staleness; the DuckDB view; the CLI's exit codes.
 
-**Not built yet.** The read API (Part 3), the importer (Part 4), the second-vendor plan (Part 5).
+### 18.5 Part 3 — the read API (as built, 2026-10-04)
+
+`volsto/market/store.py`, on `pyarrow.dataset`; `tests/test_market_store.py`.
+
+- `available_dates(vendor)` — the ISO trade dates of the store manifest, ascending (empty without a store).
+- `load_chain(vendor, date, ticker, *, columns=None)` — the ticker's rows of that trade date from the day file (the row groups pruned on the ticker statistics), in (expirDate, strike, cOpra) order.
+- `load_range(vendor, ticker, start, end, columns=None)` — the ticker's rows on every stored date from `start` to `end`, both included, from the per-ticker extract (row groups pruned on the trade date), in (trade_date, expirDate, strike, cOpra) order.
+- `chain_entry(vendor, date)` — the store manifest's entry of a date (raw file, raw sha256, schema version, rows), for provenance.
+
+All return pandas frames with the vendor's own column names and types — nothing renamed, nothing derived; dates are `datetime.date`. `attrs` carry the provenance: vendor, ticker, the store file, and for `load_chain` the raw file, its sha256 and the schema version (for `load_range` the store digest the extract was built from). The store is found through `DataRoots` (`VOLSTO_DATA_STORE`, else the default); `store=` overrides it. Dates are ISO text or date objects; anything else raises.
+
+**Nothing here downloads, converts, extracts or fits, and nothing is written** (tested: the tree is byte-for-byte unchanged after the calls, and the module imports no fetch, importer, calibration or DuckDB code). What is missing raises `StoreMissing`, whose message ends with the exact command (also in `.command`):
+
+| missing | command |
+|---|---|
+| a date whose raw file is verified but not converted | `volsto-data convert --vendor orats` |
+| a date with no verified raw file | `volsto-data fetch --vendor orats --profile <aws profile> --bucket <bucket> --prefix <prefix> && volsto-data verify-raw --vendor orats && volsto-data convert --vendor orats` |
+| a day file the manifest names but the disk does not hold | `volsto-data verify --vendor orats` |
+| a ticker's extract, absent or built from another state of the store | `volsto-data extract --vendor orats --tickers <TICKER>` |
+| a ticker with no row on a stored date | none — the vendor's file does not list it, and the message says so |
+
+With `store=` the printed commands carry `--store <path>` (shell-quoted). The convert and extract commands are executed as printed in the tests and produce what was missing. An unknown column is refused with the vendor's column list.
+
+**Measured on the sample day** (store on the internal SSD, warm cache): `load_chain` of SPX (10,519 rows, 39 columns) and `load_range` over the one stored date return the same frame; the roots read back as SPXW 7,241 and SPX 3,278 with 1,590 rows duplicating an (expiry, strike) key.
+
+**Tests** (`tests/test_market_store.py`, 5, ≈ 4 s; the sample test skips when the sample is absent).
+
+**Not built yet.** The importer (Part 4), the second-vendor plan (Part 5).
 
