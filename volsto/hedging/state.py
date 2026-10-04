@@ -262,9 +262,7 @@ def hedge_state(product: Product, paths: PathSet, idx: FixingIndex, t: float) ->
         else:
             ind = product.indicators(ls)
             r2 = product.squared_returns(ls)
-            feats = np.column_stack(
-                [acc0 + np.sum(r2 * ind, axis=1), d0 + np.sum(ind, axis=1)]
-            )
+            feats = np.column_stack([acc0 + np.sum(r2 * ind, axis=1), d0 + np.sum(ind, axis=1)])
         start = _u_period(paths, idx, product.fixing_times, t, ref)
         return HedgeState(
             t,

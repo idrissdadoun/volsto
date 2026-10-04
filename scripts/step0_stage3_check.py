@@ -39,8 +39,7 @@ from volsto.calibration.fit_2f import (
     stage3_validation,
 )
 from volsto.config import CalibrationSpec, SimConfig, load_yaml
-from volsto.market import import_hdn as ih
-from volsto.market.loaders import load_step0_source, snapshot_spec
+from volsto.market.loaders import load_sabrw_fits, load_step0_source, snapshot_spec
 from volsto.market.sabrw import SabrwTermStructure
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -130,10 +129,11 @@ def main() -> None:
         _, surf, _ = build_market(spec)
         ts = None
         if {"sabrw", "new"} & set(a.variants):
-            _cfg, _fit, points, _chain = ih.import_day(a.root, date)
-            ts = SabrwTermStructure.from_fits(
-                ih.sabrw_fits(points, t_min=0.05, t_max=3.1), _atm_of(surf)
-            )
+            # the snapshot's stored fits (data: read back, never fitted a second time)
+            stored = load_sabrw_fits(SNAPSHOTS / f"spx_{date}.yaml")
+            if stored is None:
+                raise SystemExit(f"spx_{date}.yaml has no sabrw section: re-import it")
+            ts = SabrwTermStructure.from_fits(stored, _atm_of(surf))
         base = {
             "today": ({"skew_eps": 0.10}, None),
             "surface_k2": ({"skew_eps": 0.10, "k2_bounds": K2_BOUNDS}, None),

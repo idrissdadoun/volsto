@@ -53,12 +53,17 @@ uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python -e ".[de
 3. **Tests**: `.venv/bin/python -m pytest -n auto -m "not slow"` (fast suite; drop the marker for the
    full-size tests). Tests never calibrate: a test whose leverage is not in `cache/` skips with the
    reason, and a test needing the vendor sample skips when `data/hdn_sample/` is absent.
-4. **Git-ignored data** (none of it is in the repository; restore it from the local archive
+4. **Tectonic** (`brew install tectonic`) compiles the study runner's `study.pdf`; a full TeX
+   distribution is not needed. Without it the LaTeX check and its tests skip. Its first compile
+   downloads the TeX package bundle and needs network access.
+5. **Git-ignored data** (none of it is in the repository; restore it from the local archive
    `volsto-local-data.tar.gz`, extracted at the repository root):
 
    | Path | Contents |
    |---|---|
    | `data/hdn_sample/` | the HistoricalData.net option-chain sample 2022 H2 (licensed, local only) |
+   | `data/orats_sample/` | the ORATS free one-day sample (`ORATS_SMV_Strikes_20240103.zip`; re-download: `docs/m11_part0.md`) |
+   | `data/raw/`, `data/store/` | vendor archives as delivered and the Parquet store built from them (`VOLSTO_DATA_RAW`, `VOLSTO_DATA_STORE`; see "Vendor data") |
    | `data/history/` | yfinance and Cboe daily closes (`scripts/fetch_history.py` re-downloads them) |
    | `cache/` | the content-addressed leverage cache (hours to days of calibration) |
    | `outputs/` | the results store, study outputs and reports |
@@ -330,6 +335,51 @@ log-contract strip; skew / curvature bumps use a saturating profile; the cliquet
 cross-check is an approximation even under Black–Scholes — the exact independent-legs reference
 is `bs_cliquet_value_mc`).  `scripts/m5_budget.py` runs the full report under the reference LSV
 and prints the recalibration count and wall clock (the viewer precompute budget).
+
+The second vendor, ORATS, goes through the same steps from the Parquet store (see "Vendor
+data"); its snapshots are written under the store, never under `configs/`:
+
+```bash
+volsto-import --vendor orats --date 2024-01-03 --underlying SPX   # -> $VOLSTO_DATA_STORE/orats/snapshots/
+```
+
+## Vendor data (M11)
+
+Vendor archives never enter git. Two roots, each overridable by an environment variable or a
+flag of `volsto-data`:
+
+| Root | Variable | Default | Contents |
+|---|---|---|---|
+| raw | `VOLSTO_DATA_RAW` (`--raw`) | `data/raw` | vendor zips exactly as delivered (may be an external volume) |
+| store | `VOLSTO_DATA_STORE` (`--store`) | `data/store` | the typed Parquet store derived from raw |
+
+```bash
+volsto-data status                                   # roots, free space, raw files, manifest
+volsto-data fetch --vendor orats --profile <aws profile> --bucket <bucket> --prefix <prefix> --dry-run
+volsto-data fetch --vendor orats --profile <aws profile> --bucket <bucket> --prefix <prefix>
+volsto-data verify-raw --vendor orats                # raw manifest, trading-calendar and OPRA checks
+volsto-data convert --vendor orats                   # one typed Parquet file per trading day
+volsto-data verify --vendor orats                    # every Parquet file against its raw file
+volsto-data extract --tickers SPX                    # one Parquet file per ticker, all dates
+volsto-data sql "select count(*) from strikes"       # optional, DuckDB (pip install -e ".[data]")
+```
+
+Reading the store from Python (vendor-native columns; a missing date or ticker raises with the
+exact `volsto-data` command that produces it; nothing is downloaded, converted or fitted):
+
+```python
+from volsto.market.store import available_dates, load_chain, load_range
+
+available_dates("orats")                                   # ['2024-01-03', ...]
+spx = load_chain("orats", "2024-01-03", "SPX")             # one day, one ticker
+hist = load_range("orats", "SPX", "2024-01-01", "2024-12-31", columns=["trade_date", "strike", "cBidPx"])
+```
+
+`fetch` wraps `aws s3 sync` and takes the *name* of an AWS profile you configured; the code
+never sees a credential. The store is a faithful typed copy (every vendor column, float64,
+zstd 9), rebuildable from raw; both roots may sit on external volumes. `docs/data_runbook.md` is the download-day procedure; SPEC §18 has the
+design and the measurements. Tests that need the ORATS one-day sample skip when
+`data/orats_sample/` is absent.
 
 ## Development
 

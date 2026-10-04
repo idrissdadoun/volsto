@@ -2150,8 +2150,10 @@ GOLDEN_R2 = ROOT / "tests" / "golden" / "backtest_store_r2.tar.gz"
 
 def flat_store(build: BacktestBuild) -> dict[str, bytes]:
     """Replace the build's store by the round-2 golden (the flat layout written by the
-    volsto-backtest of 2026-09-16 on the same 5 toy dates) and unbind the snapshots; returns the
-    golden's files."""
+    volsto-backtest of 2026-09-16 on the same 5 toy dates) with the snapshots its records name
+    (``snapshots/spx_<date>.yaml`` in the archive: stored bytes, not this machine's import —
+    ``tests/test_snapshot_portability.py`` checks the two against each other) and unbind them;
+    returns the golden's files."""
     import tarfile
 
     shutil.rmtree(build.store_root / "dates")
@@ -2203,7 +2205,11 @@ def test_round2_store_is_migrated_in_place(
     # P5: bound because a fresh import of each day file reproduced the snapshot
     assert sorted(log_[0]["snapshots_bound"]) == list(b.dates)
     assert log_[0]["snapshots_unbound"] == {}
-    assert len(list(b.snapshots_root.glob("*.import.json"))) == len(b.dates)
+    records = sorted(b.snapshots_root.glob("*.import.json"))
+    assert len(records) == len(b.dates)
+    for rec in records:  # the binding note states the measured surface difference
+        how = json.loads(rec.read_text())["bound_by"]
+        assert how.startswith("migration (fresh import reproduced") and "vol points" in how, how
     code, text = run_cli(
         ["run", str(TOY_CONFIG), "--no-calibrate", "--resume", *b.path_args()], capsys
     )
@@ -3995,3 +4001,109 @@ def test_backtest_fixture_goes_through_the_shared_build(
     with pytest.raises(pytest.fail.Exception, match="RuntimeError: boom"):
         got.require()
     assert (tmp_path / "raises" / "toy_backtest" / "lock").is_dir()  # kept: one build per run
+
+
+# --------------------------------------------------------------------------------------------
+# stored fit records (SPEC §13.4): the marking parameters are read, not fitted again
+# --------------------------------------------------------------------------------------------
+
+
+def test_marking_reads_the_fit_record(
+    build_copy: BacktestBuild, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The build wrote one fit record per date beside its cache (``<cache>/fits``).  Marking a
+    date again reads it — the fit is not called — and gives the stored parameters, hence the
+    leverage key the store was computed under, whatever a fit on this machine would return."""
+    from volsto.calibration import fit_records as fr
+
+    b = build_copy
+    cfg = cfg_at(b)
+    records = fr.FitRecords.of_cache(b.cache_root)
+    assert len(records.keys()) == len(b.dates)
+
+    def no_fit(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("a recorded marking fit was fitted again")
+
+    monkeypatch.setattr(bt, "fit_2f_marking", no_fit)
+    run = bt.BacktestRun(cfg, allow_calibrate=False)
+    for d in b.dates:
+        st = run._mark(d)
+        stored = json.loads(current(b.store_root, d, "fit.json").read_text())
+        assert st.fit.source == "record" and st.fit.result is None
+        assert bt.state_params(st.fit.params) == bt.state_params(stored["params"])
+        assert st.key == json.loads(current(b.store_root, d, "done.json").read_text())["cache_key"]
+        assert run.cache.has_key(st.key)
+        for name in ("status", "messages", "breakeven", "ssr_first_order", "pillars"):
+            assert st.record[name] == stored[name], (d, name)
+    # the whole store stays done and a resume computes nothing, without a single fit
+    code, text = run_cli(
+        ["run", str(TOY_CONFIG), "--no-calibrate", "--resume", *b.path_args()], capsys
+    )
+    assert code == 0 and "nothing to compute" in text, text
+    # without its record a date is fitted (and recorded) again
+    shutil.rmtree(records.root)
+    with pytest.raises(AssertionError, match="fitted again"):
+        bt.BacktestRun(cfg, allow_calibrate=False)._mark(b.dates[0])
+
+
+def test_fit_records_migrate_from_a_backtest_store(
+    build_copy: BacktestBuild, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A store computed before the records existed (here: the records removed from a private
+    copy) is migrated from its own ``fit.json`` files: one record per date holding the stored
+    parameters, every leverage found in the copy's cache, nothing fitted, nothing calibrated,
+    the store untouched; afterwards marking reads the records."""
+    from volsto.calibration import fit_records as fr
+
+    b = build_copy
+    records = fr.FitRecords.of_cache(b.cache_root)
+    shutil.rmtree(records.root)
+    store_before = tree_state(b.store_root)
+
+    def no_fit(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("the migration fitted")
+
+    monkeypatch.setattr(bt, "fit_2f_marking", no_fit)
+    argv = [
+        "migrate",
+        "--cache",
+        str(b.cache_root),
+        "--backtest-config",
+        str(TOY_CONFIG),
+        "--backtest-store",
+        str(b.store_root),
+        "--backtest-snapshots",
+        str(b.snapshots_root),
+    ]
+    assert fr.main([*argv, "--dry-run"]) == 0 and not records.root.exists()
+    assert f"records written {len(b.dates)}" in capsys.readouterr().out
+    assert fr.main(argv) == 0
+    out = capsys.readouterr().out
+    assert f"records written {len(b.dates)}, already present 0, skipped 0" in out
+    assert f"leverages found in the cache {len(b.dates)}, not found 0" in out
+    assert tree_state(b.store_root) == store_before, "the migration wrote to the store"
+    assert len(records.keys()) == len(b.dates)
+    run = bt.BacktestRun(cfg_at(b), allow_calibrate=False)
+    for d in b.dates:
+        st = run._mark(d)
+        stored = json.loads(current(b.store_root, d, "fit.json").read_text())
+        assert st.fit.source == "record"
+        assert bt.state_params(st.fit.params) == bt.state_params(stored["params"])
+        assert run.cache.has_key(st.key)
+    assert fr.main(argv) == 0
+    assert f"records written 0, already present {len(b.dates)}" in capsys.readouterr().out
+    assert {v.status for v in bt.Ledger.of(cfg_at(b)).verdicts().values()} == {"done"}
+    # a date whose fit inputs cannot be re-derived is skipped with the reason, never a crash:
+    # under a fit that reads the snapshot's SABRW fits, a snapshot without the section
+    desk = raw_config()
+    desk["marking"]["fit"] = "desk"
+    desk_path = write_config(b.base, desk, "desk.yaml")
+    snap = b.snapshots_root / f"spx_{b.dates[0]}.yaml"
+    doc = yaml.safe_load(snap.read_text())
+    doc.pop("sabrw")
+    snap.write_text(yaml.safe_dump(doc, sort_keys=False))
+    rep = fr.migrate_backtest_store(
+        desk_path, b.store_root, b.snapshots_root, b.cache_root, dry_run=True
+    )
+    assert list(rep.skipped) == [b.dates[0]] and "no sabrw section" in rep.skipped[b.dates[0]]
+    assert len(rep.written) == len(b.dates) - 1

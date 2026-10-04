@@ -362,12 +362,17 @@ from volsto.calibration.fit_2f import (
     fit_2f_marking,
     fit_preset,
 )
+from volsto.calibration.fit_records import (
+    FitRecords,
+    RecordedFit,
+    fit_summary,
+    recorded_marking_fit,
+)
 from volsto.calibration.history import (
     DEFAULT_PILLARS,
     MIN_INCREMENTS,
     SurfaceHistory,
     SurfacePillarSource,
-    hdn_available_dates,
 )
 from volsto.calibration.particle import CALIBRATION_CODE_TAG
 from volsto.calibration.stability import PARAM_COLUMNS, flag_unidentified, rolling_fit
@@ -381,16 +386,18 @@ from volsto.config import (
 )
 from volsto.engine.grid import TimeGrid
 from volsto.engine.mc import MonteCarlo
+from volsto.market.compare import SURFACE_TOL_VP, snapshot_diff_vp, snapshot_difference
 from volsto.market.curves import DiscountCurve, ForwardCurve
 from volsto.market.import_hdn import (
     DEFAULT_CALENDAR_REPAIR,
     IMPORTER_TAG,
-    import_day,
     write_snapshot,
 )
 from volsto.market.loaders import sabrw_fits_from_config, snapshot_spec, step0_source
 from volsto.market.surface import ArbitrageError, ImpliedSurface, surface_from_config
 from volsto.market.varswap import varswap_strike
+from volsto.market.vendor import ABSENT as VENDOR_ABSENT
+from volsto.market.vendor import SOURCES, VendorError, VendorSource, vendor_source
 from volsto.models.leverage import LeverageFunction
 from volsto.models.lsv import LSV
 from volsto.products.autocall import Autocall, Phoenix
@@ -472,7 +479,7 @@ PROBE_ATTEMPTS: Final[int] = 6
 #: timing exists: measured 2026-09-16 on 2022-07-27 (1.11 s, repair on, single process).
 IMPORT_S_FALLBACK: Final[float] = 1.1
 #: Vendors with an importer.
-VENDORS: tuple[str, ...] = ("hdn",)
+VENDORS: tuple[str, ...] = tuple(SOURCES)
 #: Rolling-book schedules and marking policies.
 ROLLING_EVERY: tuple[str, ...] = ("month", "none")
 ROLLING_MARK: tuple[str, ...] = ("daily", "inception")
@@ -1209,6 +1216,13 @@ class BacktestConfig:
     def data_root(self) -> Path:
         return _resolve(self.section("data")["root"])
 
+    def data_source(self) -> VendorSource:
+        """A fresh vendor source of ``data.vendor`` at ``data.root`` — the one object that knows
+        the vendor's files (:mod:`volsto.market.vendor`, SPEC §18.9): its calendar, day loading,
+        checksums and rate curve.  Fresh on every call, so it reads the vendor's manifest as it
+        is now; :class:`InputIndex` keeps one for its lifetime."""
+        return vendor_source(str(self.section("data")["vendor"]), self.data_root)
+
     @property
     def underlying(self) -> str:
         return str(self.section("data")["underlying"])
@@ -1364,19 +1378,15 @@ def calendar(cfg: BacktestConfig) -> list[str]:
     not silently shift the fixing grid: ``data.missing_close`` decides what it does).  A day
     that is neither present nor listed is invisible — the manifest is the only exchange
     calendar the importer has."""
-    dates = set(hdn_available_dates(cfg.data_root))
-    try:
-        listed = json.loads(manifest_file(cfg).read_text(encoding="utf-8")).get(
-            "trading_days_missing", []
-        )
-    except (DateFailure, OSError, ValueError, AttributeError):
-        listed = []
-    dates.update(str(d) for d in listed if isinstance(d, str))
+    source = cfg.data_source()
+    dates = set(source.available_dates())
+    dates.update(source.missing_dates())
     return sorted(d for d in dates if cfg.start <= d <= cfg.end)
 
 
 def source_file(cfg: BacktestConfig, date: str) -> Path:
-    return cfg.data_root / "day_by_date" / f"{date}_options.csv"
+    """The vendor file the chain of ``date`` is read from (the source's, for messages)."""
+    return cfg.data_source().day_file(date)
 
 
 def shard_block(dates: Sequence[str], index: int, count: int) -> list[str]:
@@ -2172,21 +2182,9 @@ class RefusedError(RuntimeError):
     leverage under ``--no-calibrate``."""
 
 
-def manifest_file(cfg: BacktestConfig) -> Path:
-    """The vendor manifest the importer reads (its Treasury curve gives every date's rates):
-    ``day_by_date/manifest.json``, else ``manifest.json`` at the data root (the importer's
-    search order)."""
-    for cand in (
-        cfg.data_root / "day_by_date" / "manifest.json",
-        cfg.data_root / "manifest.json",
-    ):
-        if cand.is_file():
-            return cand
-    raise DateFailure(f"no manifest.json under {cfg.data_root}")
-
-
-#: The checksum of a calendar date whose day file does not exist.
-ABSENT = "absent"
+#: The checksum of a calendar date whose day file does not exist
+#: (:data:`volsto.market.vendor.ABSENT`).
+ABSENT = VENDOR_ABSENT
 
 
 class InputIndex:
@@ -2202,34 +2200,25 @@ class InputIndex:
     def __init__(self, cfg: BacktestConfig, vendor_dates: Sequence[str]) -> None:
         self.cfg = cfg
         self.dates = list(vendor_dates)
+        #: the vendor source, kept for the index's lifetime (it reads its manifest once)
+        self.source = cfg.data_source()
         self._sha: dict[str, str] = {}
-        self._manifest: dict[str, Any] | None = None
         self._entries: dict[str, str] = {}
         self._digests: dict[str, str] = {}
 
     def file_sha(self, date: str) -> str:
         """The day file's SHA-256, or ``"absent"`` for a calendar date without a file."""
         if date not in self._sha:
-            src = source_file(self.cfg, date)
-            self._sha[date] = _file_sha256(src) if src.is_file() else ABSENT
+            self._sha[date] = self.source.day_digest(date)
         return self._sha[date]
 
     def manifest_sha(self, date: str) -> str:
         """The SHA-256 of the manifest entry the import of ``date`` reads."""
         if date not in self._entries:
-            if self._manifest is None:
-                try:
-                    data = json.loads(manifest_file(self.cfg).read_text(encoding="utf-8"))
-                except (OSError, ValueError) as exc:
-                    raise DateFailure(f"unreadable vendor manifest: {exc}") from exc
-                self._manifest = dict(data) if isinstance(data, dict) else {}
-            m = self._manifest
-            name = source_file(self.cfg, date).name
-            entry = {
-                "product": m.get("product"),
-                "rates": (m.get("rates") or {}).get(date),
-                "file": next((f for f in m.get("files", []) if f.get("name") == name), None),
-            }
+            try:
+                entry = self.source.import_entry(date)
+            except VendorError as exc:
+                raise DateFailure(str(exc)) from exc
             self._entries[date] = hashlib.sha256(_canonical(_jsonable(entry)).encode()).hexdigest()
         return self._entries[date]
 
@@ -3579,8 +3568,7 @@ def import_snapshot(
     returns the snapshot digest of the bytes written."""
     surf = cfg.section("surface")
     try:
-        cfg_map, _, _, _ = import_day(
-            cfg.data_root,
+        cfg_map, _, _, _ = cfg.data_source().import_day(
             date,
             cfg.underlying,
             essvi=bool(surf["essvi"]),
@@ -3853,8 +3841,9 @@ def migrate_store(store: BacktestStore, ledger: Ledger) -> dict[str, dict[str, A
     that ranks below a published one never becomes current); only then are the flat files
     removed — those no attempt holds are moved to ``quarantine/``; leftovers are renamed
     ``*.imported`` before their removal.  The snapshots of the migrated dates whose results
-    verify are then bound only if a fresh import of the day file reproduces their content
-    digest; otherwise they stay unbound (the date is recomputed) and the mismatch is recorded."""
+    verify are then bound only if a fresh import of the day file reproduces them (the same
+    import within the surface tolerance, :func:`_bind_migrated_snapshots`); otherwise they stay
+    unbound (the date is recomputed) and the mismatch is recorded."""
     why = migration_refusal(store, ledger)
     if why:
         raise RefusedError(why)
@@ -3976,8 +3965,13 @@ def _bind_migrated_snapshots(
     ledger: Ledger, dates: Sequence[str]
 ) -> tuple[list[str], dict[str, str]]:
     """Bind the snapshot of each migrated date whose results verify, when a fresh import of its
-    day file reproduces the snapshot's content digest (about 1 s per date; dates already bound
-    are skipped, so an interrupted binding resumes)."""
+    day file reproduces the snapshot — equal in everything but floats and the same surface
+    within :data:`volsto.market.compare.SURFACE_TOL_VP` vol points
+    (:func:`~volsto.market.compare.snapshot_difference`; until 2026-10-03 the content digests
+    had to be equal, which only the machine that wrote the store could meet); the import record's
+    ``bound_by`` states the measured surface difference — about 1 s per date; dates already
+    bound are skipped, so an interrupted binding resumes.
+    """
     bound: list[str] = []
     unbound: dict[str, str] = {}
     for d in dates:
@@ -4008,16 +4002,22 @@ def _bind_migrated_snapshots(
             continue
         with tempfile.TemporaryDirectory(prefix="volsto-bind-") as tmp:
             try:
-                fresh = import_snapshot(ledger.cfg, d, source, manifest, Path(tmp) / snap.name)
+                import_snapshot(ledger.cfg, d, source, manifest, Path(tmp) / snap.name)
             except DateFailure as exc:
                 unbound[d] = str(exc)
                 continue
-        if fresh != digest:
-            unbound[d] = "a fresh import of its day file gives another snapshot"
+            # not by digest: a fresh import on another machine differs in the last bits of
+            # every fitted number (CONTRIBUTING.md, "Machine-dependent arithmetic")
+            why = snapshot_difference(snap, Path(tmp) / snap.name)
+            diff_vp = float("nan") if why else snapshot_diff_vp(snap, Path(tmp) / snap.name)
+        if why is not None:
+            unbound[d] = f"a fresh import of its day file gives another snapshot ({why})"
             continue
-        bind_snapshot(
-            ledger.cfg, snap, source, manifest, "migration (fresh import reproduced)", digest
+        how = (
+            f"migration (fresh import reproduced: the same import, surfaces within "
+            f"{diff_vp:.3g} vol points, tolerance {SURFACE_TOL_VP:g})"
         )
+        bind_snapshot(ledger.cfg, snap, source, manifest, how, digest)
         bound.append(d)
     for d, why in unbound.items():
         log.warning("%s: snapshot left unbound (%s): the date will be recomputed if needed", d, why)
@@ -4072,7 +4072,7 @@ class DateState:
     spec: CalibrationSpec
     surface: ImpliedSurface
     forward_curve: ForwardCurve
-    fit: FitResult
+    fit: RecordedFit
     record: dict[str, Any]
     timings: dict[str, float]
     #: :func:`snapshot_digest` and SHA-256 of the snapshot bytes the state was parsed from
@@ -4140,36 +4140,9 @@ def _snapshot_ok(
 
 
 def fit_record(r: FitResult) -> dict[str, Any]:
-    """The JSON record of a marking fit (parameters, status, messages, the per-pillar SSR)."""
-    p, b, f, s = r.params, r.breakeven, r.first, r.second
-    se = {
-        "k1": f.k1_se,
-        "lambda1": f.lambda1_se,
-        "lambda2": f.lambda2_se,
-        "omega1": s.stderr.get("omega1", float("nan")),
-        "omega2": s.stderr.get("omega2", float("nan")),
-        "chi": s.stderr.get("chi", float("nan")),
-    }
-    tbl = r.table
-    return {
-        "status": r.status,
-        "messages": list(r.messages),
-        "notes": [*r.notes, *f.notes, *s.notes],
-        "params": {k: float(getattr(p, k)) for k in PARAMS},
-        "breakeven": {k: float(getattr(b, k)) for k in PARAM_COLUMNS},
-        "se": se,
-        "pillars": [float(x) for x in tbl["T"]],
-        "ssr_first_order": [float(x) for x in tbl["ssr_first_order"]],
-        "ssr_target": [float(x) for x in r.targets.ssr_target],
-        "skew_market": [float(x) for x in tbl["skew_market"]],
-        "skew_naked": [float(x) for x in tbl["skew_naked"]],
-        "active": list(f.active),
-        "bound_flags": list(s.bound_flags),
-        "k1_at_bound": bool(f.k1_at_bound),
-        "first_objective": float(f.objective),
-        "second_objective": float(s.objective),
-        "wall_seconds": float(r.wall_seconds),
-    }
+    """The JSON record of a marking fit: :func:`volsto.calibration.fit_records.fit_summary` (the
+    one implementation since the stored fit records, SPEC §13.4)."""
+    return fit_summary(r)
 
 
 def pillar_quantities(surface: ImpliedSurface) -> dict[str, list[float]]:
@@ -4285,6 +4258,8 @@ class BacktestRun:
         self.snapshots_used: dict[str, str | None] = {}
         self.leverage_used: dict[str, str | None] = {}
         self.cache: LeverageCache = _RecordingCache(cfg.path("cache"), self.leverage_used)
+        #: the stored marking fits that travel with the cache (``<cache>/fits``)
+        self.fit_records = FitRecords.of_cache(cfg.path("cache"))
         self.snapshots = snapshots if snapshots is not None else cfg.path("snapshots")
         self.base = cfg.base_spec()
         self.sim = cfg.sim(self.base)
@@ -4501,19 +4476,32 @@ class BacktestRun:
         cfg = self.cfg.fit_config()
         parsed = yaml.safe_load(data)
         step0 = None
+        fits = None
         if cfg.step0 is not None:
             # the date's SABRW fits, from the bytes just verified (never a second read)
             fits = sabrw_fits_from_config(parsed)
             if fits is None:
                 raise DateFailure(f"{date}: the snapshot has no sabrw section: re-import it")
             step0 = step0_source(fits, surface)
-        fit = fit_2f_marking(surface, cfg, ssr_target=float(m["ssr_target"]), step0=step0)
+        # the fitted parameters are a stored record keyed by the fit's inputs: read when it
+        # exists, fitted (and recorded) only when it does not, so the leverage key is the same
+        # on every machine that holds the record (SPEC §13.4)
+        ssr = float(m["ssr_target"])
+        fit = recorded_marking_fit(
+            spec,
+            cfg,
+            ssr_target=ssr,
+            sabrw_fits=fits,
+            records=self.fit_records,
+            fit=lambda: fit_2f_marking(surface, cfg, ssr_target=ssr, step0=step0),
+            origin=f"backtest {self.cfg.name} {date}",
+        )
         fit_s = time.perf_counter() - t0
         if fit.status == "infeasible":
             raise DateFailure(f"{date}: the marking fit is infeasible: {'; '.join(fit.messages)}")
         spec = dataclasses.replace(spec, model=fit.params)
         t1 = time.perf_counter()
-        record = fit_record(fit)
+        record = dict(fit.summary)
         record["history"] = pillar_quantities(surface)
         if spec.market.close is None:
             raise DateFailure(f"{date}: the snapshot has no market.close: re-import it")

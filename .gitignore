@@ -19,6 +19,8 @@ outputs/
 
 # vendor market data samples (licensed, local only)
 data/
+# ... but not the data-layer package (code only; M11)
+!/volsto/data/
 
 # macOS
 .DS_Store

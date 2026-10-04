@@ -39,6 +39,53 @@ work is done. Every rule here was set by the owner and each has a reason recorde
   the viewers layer that calibrates, and it says so in its log and manifest.
 - **Production particle count is 8·10⁵** (SPEC §11).
 
+## Vendor data
+
+- **Vendor data never enters git**: raw files, Parquet, or anything that reproduces vendor
+  quotes in bulk. `data/` and `*.parquet` are ignored, and
+  `tests/test_data_layer.py::test_no_tracked_file_under_the_data_roots` fails on a tracked file
+  under the data roots. Ask the owner before committing anything derived from vendor data.
+- **Code never handles credentials.** `volsto-data fetch` takes the name of an AWS profile the
+  owner configured; no key in code, logs, tests or the repository.
+- **Raw is read-only and stays zipped.** Nothing modifies a delivered file or unzips an archive
+  to disk in bulk; every bulk write checks free space first and refuses when short.
+- **Measure before you assert.** No tolerance goes into a test until the measured number has
+  been reported and the owner has agreed the constant. (Owner's rules, M11, 2026-10-03.)
+
+## Machine-dependent arithmetic
+
+**Nothing may depend on the bit pattern of a number that came out of LAPACK or an iterative
+solver. Identities (digests, cache keys, bindings) are computed from inputs and from stored
+bytes, never from a recomputation on the current machine. Comparisons of fitted numbers use
+one tolerance, in vol points.** (Owner's rule, 2026-10-03; the third occurrence, after the fit
+tolerance and the cache-absent skips of `fix/test-portability`: 11 tests failed on a new Mac
+whose Accelerate gives other last bits — SPEC §13.3.)
+
+- **One comparator**: `volsto/market/compare.py` — "the same surface within `SURFACE_TOL_VP`
+  = 1e-4 vol points" on a fixed (maturity, log-moneyness) grid. Every test that compares a
+  committed snapshot with a fresh import uses it, and so does the backtest migration's binding
+  rule. `tests/test_snapshot_portability.py` walks every tracked snapshot against it.
+- **Stored fits are data.** The SABRW fits in a snapshot are read back, never fitted a second
+  time and compared (the fit moves by up to 3.7 vol points under a few ulps of input noise); the
+  same test walks `volsto/` and `scripts/` for a second caller of the fitter.
+- **A fit is compared on what it is judged on** (break-evens, skew, SSR), and on its parameters
+  only where it is interior: a fit with ν at its cap or a correlation within 1e-3 of ±1 is
+  flagged and its parameters are not compared. Judged quantities: 1e-6 for an interior fit,
+  1e-3 for a flagged one (`tests/helpers.py`, with the measured maxima beside the constants).
+- **A golden store carries the bytes its records name** (`tests/golden/`), so a record is
+  verified against stored bytes.
+- **Fitted parameters are stored records** (SPEC §13.4, `volsto/calibration/fit_records.py`):
+  a marking fit is a record keyed by its inputs (the snapshot's market, surface and SABRW fits,
+  the fit config, the SSR target, `FIT_CODE_TAG`), kept beside the leverage cache
+  (`<cache>/fits`). A pipeline reads the record when it exists and fits only when it does not,
+  so the leverage key is the same on every machine that holds the record; there is no rounding
+  inside keys. Bump `FIT_CODE_TAG` when a change moves any marking fit (guarded by
+  `fit_guard.json`).
+- **Known gap**: the backtest reads the records; the precompute's marking points, the hedger's
+  recalibration rule and the rotation states still fit in place (declared in
+  `tests/test_fit_records.py::NOT_YET_RECORDED`), and the golden backtest store is regenerated
+  on the machine that runs its tests.
+
 ## Code
 
 - `black` (line length 100), `ruff`, `mypy --strict` clean on every file touched.
@@ -82,9 +129,15 @@ Applied since (M10, 2026-09-16/17):
   snapshot binding (2026-09-22: 25 proof-of-concept dates read `done` under a changed importer)
   were three occurrences. One place: `IMPORTER_TAG` in `volsto/market/import_hdn.py`, written into
   every snapshot's provenance, checked by the store's verdict and by `snapshot_bound`, and hashed
-  against the importer, surface and curve sources (`importer_guard.json`,
+  against the importer, surface, curve and (since 2026-10-04) SABRW sources (`importer_guard.json`,
   `test_importer_tag_guard`). Bump it when a change moves any snapshot; re-record the hash without
   a bump only for a change proven not to, and say so in the commit.
+- **Vendor source (2026-10-04):** nothing outside a vendor source knows where a vendor's days
+  live, how a day becomes a chain, what its checksums are or where its prior rate curve comes
+  from — the backtest, the surface history and the raw history each hard-coded the HDN layout.
+  One place: `volsto/market/vendor.py` (`VendorSource`, `HdnSource`, the registry);
+  `tests/test_vendor_source.py` walks `volsto/` and `scripts/` for the layout and the loaders
+  outside the vendor modules and runs one contract test over every registered source.
 - **Studies:** every catalogue study declares its exact (error-free) numbers by kind in
   `EXACT_KINDS`; the walker in `volsto/studies/catalogue/_common.py` (run by
   `tests/test_catalogue_s1_s4.py` over every fast config) refuses any undeclared exact number, and
