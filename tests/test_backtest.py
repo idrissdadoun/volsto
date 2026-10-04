@@ -2150,8 +2150,10 @@ GOLDEN_R2 = ROOT / "tests" / "golden" / "backtest_store_r2.tar.gz"
 
 def flat_store(build: BacktestBuild) -> dict[str, bytes]:
     """Replace the build's store by the round-2 golden (the flat layout written by the
-    volsto-backtest of 2026-09-16 on the same 5 toy dates) and unbind the snapshots; returns the
-    golden's files."""
+    volsto-backtest of 2026-09-16 on the same 5 toy dates) with the snapshots its records name
+    (``snapshots/spx_<date>.yaml`` in the archive: stored bytes, not this machine's import —
+    ``tests/test_snapshot_portability.py`` checks the two against each other) and unbind them;
+    returns the golden's files."""
     import tarfile
 
     shutil.rmtree(build.store_root / "dates")
@@ -2203,7 +2205,11 @@ def test_round2_store_is_migrated_in_place(
     # P5: bound because a fresh import of each day file reproduced the snapshot
     assert sorted(log_[0]["snapshots_bound"]) == list(b.dates)
     assert log_[0]["snapshots_unbound"] == {}
-    assert len(list(b.snapshots_root.glob("*.import.json"))) == len(b.dates)
+    records = sorted(b.snapshots_root.glob("*.import.json"))
+    assert len(records) == len(b.dates)
+    for rec in records:  # the binding note states the measured surface difference
+        how = json.loads(rec.read_text())["bound_by"]
+        assert how.startswith("migration (fresh import reproduced") and "vol points" in how, how
     code, text = run_cli(
         ["run", str(TOY_CONFIG), "--no-calibrate", "--resume", *b.path_args()], capsys
     )
