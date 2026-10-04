@@ -39,6 +39,8 @@ volsto/
     market/
       import_hdn.py      # HistoricalData.net EOD chain importer (§13)
       store.py           # read API over the vendor Parquet store (§18.5)
+      chain.py           # the canonical option chain every vendor loader returns (§18.6)
+      import_orats.py    # ORATS loader and importer for SPX (§18.6)
       compare.py         # "the same surface within X vol points" (§13.3)
       curves.py          # discount factors, forward curve (r, q) — piecewise-flat and interpolated
       surface.py         # ImpliedSurface ABC; SSVISurface; GridSurface (market slices)
@@ -1443,7 +1445,7 @@ M8. Hedging framework; port the cliquet and FVA hedging studies as regression te
 M9. Precompute CLI + Streamlit viewers + Excel export. **Done and accepted 2026-09-16** (§9.2; grid on the light tier with the 3-bucket forward-variance ladder; the full default grid runs on an owner-provisioned VM, `docs/vm_grid_run.md`).
 M10. Study runner with LaTeX output; regenerate the original paper's tables; backtest study on the market history (§15 Part 4). **Built and committed 2026-09-16/17 (0aa8dcb and its 2026-09-17 follow-up; pending owner review; open items in §10.3):** Part 0 eSSVI calendar repair (§13.1–13.2), the study runner (§10.1), the catalogue S1–S7 (§10.2), the rolling backtest with seasoning and sticky-leverage attribution (§10.3, §6.10, §7.12.1), `docs/methodology.md`, `docs/studies.md`.
 
-M11. Vendor data store and ORATS importer (§18). **In progress (2026-10-03):** Part 0 (the one-day sample inspected, `docs/m11_part0.md`) and Part 1 (data roots, raw manifest and calendar check, `fetch`, the `volsto-data` CLI, `docs/data_runbook.md`) built; Part 2a (the layout measured) and Part 2b (`convert`, `verify`, `extract`, `sql`; §18.3–18.4) built; Part 3 (the read API `volsto/market/store.py`, §18.5) built; Parts 4–5 follow, one PR per part, with the stored fit records (§13.3) before Part 4.
+M11. Vendor data store and ORATS importer (§18). **In progress (2026-10-03):** Part 0 (the one-day sample inspected, `docs/m11_part0.md`) and Part 1 (data roots, raw manifest and calendar check, `fetch`, the `volsto-data` CLI, `docs/data_runbook.md`) built; Part 2a (the layout measured) and Part 2b (`convert`, `verify`, `extract`, `sql`; §18.3–18.4) built; Part 3 (the read API `volsto/market/store.py`, §18.5) built and merged; Part 4 (the ORATS importer for SPX, §18.6, with the Part 5 plan §18.7 and the single-stock report §18.8) built, pending review.
 
 Open items for the owner: the original study archive (SSVI parameters, seeds, tables) — the M4 cliquet baseline is ≈ 10–16% above the study at every ω with ratios across ω agreeing to 1%, consistent with a surface difference; the paid EOD archive for a multi-year backtest.
 
@@ -1451,7 +1453,7 @@ Open items for the owner: the original study archive (SSVI parameters, seeds, ta
 
 ## 13. Market data import (M3b, implemented)
 
-`market/import_hdn.py`: importer for the HistoricalData.net EOD option-chain CSV (34 columns, one file per trading day; the free `options_sample_2022H2.zip` in `./data/hdn_sample/`, git-ignored, uses the paid format). Pipeline: `load_day` (SPX and SPXW roots for the index surface, both quotes required, AM/PM settlement in the time-to-expiry convention, manifest Treasury curve); `implied_forward` (regression of C − P on K near the money; the vendor's parity forward as cross-check — their iv and Greeks are never inputs, since quotes across contracts are not synchronised snapshots); `to_grid_surface` (OTM mids, liquidity filter using iv_bid/iv_ask, butterfly and calendar pruning); `fit_ssvi` (θ at the SPEC pillars by isotonic least squares, global (ρ, η, γ) constrained; **eSSVI per-pillar ρ is the default for imported surfaces**, `--ssvi` opts out); `snapshot_config` (dated YAML with provenance: vendor, checksum, filters). CLI `volsto-import --vendor hdn --date … --underlying SPX`. Slices are grouped by (root, expiration) because SPX AM and SPXW PM share dates; fits use expiries from 3 weeks and |k| ≤ 0.25, vega-weighted; expiries under 3m are reported outside the acceptance region. `scripts/capture_yfinance.py` writes today's SPX/SPY chain in the same layout for daily accumulation.
+`market/import_hdn.py` (its steps 2–5 are vendor-independent and read the canonical chain of `market/chain.py`; the ORATS loader is §18.6): importer for the HistoricalData.net EOD option-chain CSV (34 columns, one file per trading day; the free `options_sample_2022H2.zip` in `./data/hdn_sample/`, git-ignored, uses the paid format). Pipeline: `load_day` (SPX and SPXW roots for the index surface, both quotes required, AM/PM settlement in the time-to-expiry convention, manifest Treasury curve); `implied_forward` (regression of C − P on K near the money; the vendor's parity forward as cross-check — their iv and Greeks are never inputs, since quotes across contracts are not synchronised snapshots); `to_grid_surface` (OTM mids, liquidity filter using iv_bid/iv_ask, butterfly and calendar pruning); `fit_ssvi` (θ at the SPEC pillars by isotonic least squares, global (ρ, η, γ) constrained; **eSSVI per-pillar ρ is the default for imported surfaces**, `--ssvi` opts out); `snapshot_config` (dated YAML with provenance: vendor, checksum, filters). CLI `volsto-import --vendor hdn --date … --underlying SPX`. Slices are grouped by (root, expiration) because SPX AM and SPXW PM share dates; fits use expiries from 3 weeks and |k| ≤ 0.25, vega-weighted; expiries under 3m are reported outside the acceptance region. `scripts/capture_yfinance.py` writes today's SPX/SPY chain in the same layout for daily accumulation.
 
 Measured on 2022-09-15: implied forwards within 0.7 bp (≤ 6m) / 3.5 bp (2y) of the vendor's; SSVI RMS 0.20 vp inside ±20% from 3m; eSSVI RMS 0.17 / 0.08 vp (3m–2y / 6m–2y); 1–2m weeklies 1–4 vp off under SSVI; ≈ 1 s per day.
 
@@ -1963,6 +1965,7 @@ Built inline (the phase-1 agent workflow failed on the account's spend limit; it
 ---
 
 ## 17. Change log v1.1 → v2.0
+- 2026-10-04 M11 Part 4: §18.6 the canonical chain and the ORATS importer for SPX with the 2024-01-03 measurements and the same-machine proof that no HDN snapshot moved; §18.7 the vendor-source plan; §18.8 the single-stock report; §13 wording.
 - 2026-10-04 stored fit records: §13.4 (new) — the fit key, the record store beside the leverage cache, the backtest reading records, the migration, the sites not wired.
 - 2026-10-04 M11 Part 3: §18.5 the read API over the vendor store (`available_dates`, `load_chain`, `load_range`; missing data raises with the exact `volsto-data` command).
 - 2026-10-03 M11 Parts 2a–2b: §18.3 (the layout table, the owner's choice, scaled integers as a later option), §18.4 (the store: convert, verify, extract, sql, measured throughput).
@@ -2197,5 +2200,88 @@ With `store=` the printed commands carry `--store <path>` (shell-quoted). The co
 
 **Tests** (`tests/test_market_store.py`, 5, ≈ 4 s; the sample test skips when the sample is absent).
 
-**Not built yet.** The importer (Part 4), the second-vendor plan (Part 5).
+### 18.6 Part 4 — the ORATS importer for SPX (as built, 2026-10-04; pending review)
+
+Code: `volsto/market/chain.py` (the canonical chain), `volsto/market/import_orats.py`, the vendor-neutral edits of `volsto/market/import_hdn.py`; `tests/test_import_orats.py`.
+
+**What is vendor-specific and what is not.** The canonical chain (`chain.py`: `CHAIN_COLUMNS`, `CHAIN_ATTRS`, `validate_chain`) is the one frame both loaders return and steps 2–5 of the importer read: one row per contract with both quotes positive and T > 0; `contract`, `root`, `expiration`, `expiry` = `<root>|<expiration>`, `quote_date`, `cp`, `strike`, `bid`, `ask`, `mid` (index points), `T` (years), `r` and `df` (the vendor's prior rate: a cross-check and a fallback), `underlying_close` (the official close: the fixing reference and the centre of the near-the-money band), `iv_bid` / `iv_ask` (the vendor's one-sided vols where the loader trusts them for the spread filter, else NaN), `iv` / `iv_flag` (cross-checks); attrs `quote_date`, `underlying`, `file`, `rate_tenors`, `rate_zeros`, `spot`, and the optional `spot_async_check`. `import_hdn.load_day` already produced it (now tested with `validate_chain`). Only the loader and the vendor's provenance entries are vendor-specific: `snapshot_config` (HDN) and `import_orats.import_day` both end in the new `snapshot_document(chain, fit, points, filters, source=…)`.
+
+**The ORATS loader** (`import_orats.load_day(date, underlying, store=, closes=)`) reads the ticker's rows of the day through the read API (§18.5) and returns the canonical chain: the call and the put of each vendor row melt into two contract rows; the root is the contract's own OPRA root; slices are (root, expiration); a contract is kept only when its own bid and ask are both positive. The decisions of §18.1 as implemented: (1) `T` from (trade date, expiry, root) with `time_to_expiry` — one day less for the AM root `SPX` (`AM_ROOTS`); `yte` is carried as a cross-check. (2) `iv_bid` / `iv_ask` are NaN, so the spread filter inverts the bid and ask prices with our forward and discount factor; the vendor's mid vol goes to `iv`. (3) Nothing is inferred: the loader reads the typed store. (4) `spot_px` is not read; `underlying_close` is the official close of `data/history/<underlying>.csv` (`official_close`; a missing file or date fails loudly) and `spot_async_check` is false, so implied spot minus close is recorded without a warning and without the asynchronous flag. (5) `stkPx` is used by `forward_crosscheck` only. (6) `r` is the file's `iRate` at each slice and `rate_tenors` / `rate_zeros` are those values at the slices' maturities — the prior the funding fit reports its spread against. (8) A ticker row without `cOpra` or `pOpra` fails loudly, and so does a root outside the underlying's known roots (`INDEX_ROOTS`).
+
+**The two vendors' spread filters differ** (decision 2): both drop a retained OTM quote whose (ask vol − bid vol) / mid vol exceeds `max_rel_spread_vol` = 0.25, but the HDN path takes the vendor's `iv_bid` / `iv_ask` where present and its own inversion elsewhere, while the ORATS path always inverts the bid and ask prices with our implied forward and discount factor. The HDN path is unchanged.
+
+**Provenance and where snapshots go.** `provenance` starts with the vendor's entries — `vendor: orats`, `product`, `file` (the raw zip), `file_sha256` (its sha256), `store_schema_version`, `snapshot_time` ("the vendor's claim (about 14 minutes before the close); not verified: the file has no timestamp"), `close_source`, `prior_rate_curve` — then the importer's own (filters, counts, fit, forwards, spot, funding, `importer_tag`). `volsto-import --vendor orats --date 2024-01-03 --underlying SPX [--store …]` writes `<store>/orats/snapshots/spx_<date>.yaml`: ORATS-derived snapshots live under the store, never under `configs/`, and none is committed.
+
+**The HDN path did not move (same-machine proof, 2026-10-04).** Every snapshot the importer writes from the HDN sample — 127 dates × eSSVI and plain SSVI, 254 files, 8.8 MB — was generated on this Mac by `main`'s code (a git worktree) and by this branch's, 51 s each on 12 processes: **254 of 254 byte-identical** apart from the `created_utc` line. `IMPORTER_TAG` is therefore **not bumped** (2026-09-27) and `importer_guard.json` is re-recorded for the changed source (CONTRIBUTING: re-record without a bump only for a change proven not to move any snapshot). (Owner's decision 2026-10-04: no bump — re-recording the guard for a change proven not to move any snapshot is the rule.)
+
+**Measured on 2024-01-03** (SPX; import 2.3 s; no Monte Carlo, no calibration). 10,519 vendor rows = 21,038 contracts, of which 19,833 (94.3 %) have both quotes; 59 slices; 6,491 retained points on 52 expiries (35 SPXW, 17 SPX) to T = 2.96 y; dropped: 9,494 not OTM, 399 beyond |k| 0.6, 1,907 butterfly, 68 calendar, 4 slices outside 7 days–3 years, none by the spread filter or the minimum bid.
+
+*(a) Parity forward against `stkPx · exp(iRate · T)`.* Forward standard errors 0.01–0.08 bp to one year. |difference|: median 1.05 bp and at most 10.0 bp to 6 months (43 slices; the 10.0 is SPXW 2024-06-28), median 1.7 bp and at most 10.7 bp from 6 months to 1 year (8 slices; SPXW 2024-12-31), 3–43 bp beyond one year (5 slices on 9–38 pairs). For the 17 AM slices the median difference is −0.30 bp with our T (one day less) and −1.82 bp with the vendor's `yte`: ORATS's own forward for the AM root is consistent with the shorter T. *Against HDN* (§13: 0.7 bp to 6 months, 3.5 bp at 2 years against the vendor's closest-strike forward): the same order to 6 months; worse beyond one year, where this chain has 9–38 two-sided pairs per slice.
+
+*(b) Implied spot against the official close.* 4710.17 against 4704.81: **+11.4 bp, standard error 0.39 bp (29 standard errors)**, from 30 expiries within 45 days; window carry 1.32 %. Recorded as a measurement, not flagged. *Against HDN* (127 days: median +2.1 bp, range −92 to +36 bp, standard error median 0.45 bp): the same precision; the offset here is the index's move between the snapshot and the close, where HDN's was the 16:00 close against 16:15 quotes.
+
+*Funding curve.* Zero rates 5.98 / 5.69 / 5.44 / 4.99 / 4.34 / 3.77 % at 1m / 3m / 6m / 1y / 2y / 3y; minus the `iRate` prior: +52 / +29 / +32 / +25 / +2 / −31 bp (HDN medians against Treasury: +16 / +24 / +49 / +35 / +30 / −1 bp); weighted RMS of the per-expiry implied rates 9.6 bp, largest residual beyond one month 70 bp, 56 expiries.
+
+*(c) Our mid implied vols against the vendor's*, retained OTM quotes within |k| ≤ 0.05, median |ours − vendor| in vol points:
+
+| maturity | n | `smoothSmvVol` (mean signed) | the quote's own side (`cMidIv` for calls, `pMidIv` for puts) |
+|---|---|---|---|
+| < 1m | 1,393 | 0.215 (+0.14) | 0.071 |
+| 1m–3m | 812 | 0.429 (+0.31) | 0.203 |
+| 3m–6m | 435 | 0.854 (+0.87) | 0.551 |
+| 6m–1y | 154 | 1.329 (+1.27) | 1.089 |
+| 1y–2y | 44 | 1.510 (+1.54) | 1.600 |
+| > 2y | 5 | 2.675 (+2.72) | 2.186 |
+
+Our vols sit above the vendor's by an amount that grows with maturity, on puts and calls alike. No convention I tried reconciles them: with the parity forward and the regression's discount, with `exp(−iRate·yte)`, or with a forward carried at `iRate ± residualRateData`, the median gap to `smoothSmvVol` stays +0.05 vp at 16 days, +0.2 at 43 days, +0.5 at 71 days, +1.2 at 6–12 months and +1.7 to +1.8 at 1.5–2 years. The vendor's put vol at a call's strike is off by 3–9 vp (its call and put vols are not parity-consistent with each other, §18.1). *Against HDN* (our inversion reproduces HDN's `iv` to a median 0.1 vp): **different** — the ORATS vols are another convention, unknown, and confirm decision 2 (never inputs). The question goes to ORATS.
+
+*(d) Fit residuals*, |k| ≤ 0.2, vol points (RMS / max):
+
+| region | eSSVI (default) | plain SSVI | HDN, for comparison |
+|---|---|---|---|
+| 3m–2y | 0.188 / 1.46 | 0.256 / 1.47 | 2022-09-15: eSSVI 0.17, SSVI 0.20 |
+| 6m–2y | 0.154 / 0.50 | 0.313 / 1.14 | 2022-09-15: eSSVI 0.08 |
+| 3m–3y | 0.188 / 1.46 | 0.257 / 1.47 | 127-day medians: eSSVI 0.130 / 0.507, SSVI 0.190 / 0.753 |
+| 1m–3m | 0.496 / 3.23 | 0.567 / 3.24 | 1–2 month weeklies 1–7 vp off (maxima) |
+
+Calendar: the unrepaired eSSVI violated (smallest `∂_T w` −2.9e-4 on |k| ≤ 3); the repair ran 6 solves and no cut; the result is **proven** `∂_T w ≥ 1e-4` on |k| ≤ 3 (certificate lower bound 1.0008e-4), no fallback. *Against HDN*: the same class of fit — RMS inside the range of the 127 HDN days, the 3m–2y maximum (1.46 vp) worse than the HDN median maximum.
+
+*(e) VIX-style 30-day strip* (`varswap_strike` at 30/365, the log-contract replication, as √K): 13.16 from the eSSVI surface, 13.00 from plain SSVI, 13.89 from the grid of retained quotes, against the VIX close 14.04 (−0.88 / −1.04 / −0.15 vol points). The snapshot precedes the close, so this is a sanity check: the quotes agree with the VIX to 0.15; the fitted surfaces are 0.7–0.9 lower at 30 days, the short-end limit of the parametrisation already recorded for HDN (expiries under 3 months sit outside the acceptance region; the eSSVI ATM vol at 30 days is 11.53 against 11.98 on the grid).
+
+**Where ORATS is better, worse or different.** *Better:* one synchronised snapshot — no asynchrony between the close and the quotes to correct for, and the implied spot is measured to 0.4 bp; the OPRA root gives AM/PM directly; 55 SPX expiry dates. *Worse:* no timestamp, so the snapshot time is the vendor's word; the prior rate is a step function, 25–50 bp below the implied funding to one year; beyond one year the chain has 9–38 two-sided pairs per slice against HDN's denser long end, and the forward cross-check loosens to tens of bp. *Different:* the vendor's vols follow an unknown convention 0.2–2.7 vp below ours near the money; the close is not in the file and comes from our own history.
+
+**OPRA fallback — plan only** (decision 8; nothing implemented). If a year of the archive lacks `cOpra` / `pOpra`: (i) on dates where a (ticker, expirDate, strike) key is never duplicated, assign PM to every expiry except the standard monthly (third Friday, or the preceding Thursday when that Friday is a holiday), which is AM — a calendar rule, to be checked against a year that has the symbols before it is trusted; (ii) on third Fridays where both roots list, the two rows of a key cannot be told apart by the calendar: the candidate discriminator is the vendor's own per-root `stkPx` (the AM forward is the PM forward of one day less), which must first be validated on years that carry the symbols; (iii) until both are validated the importer keeps failing loudly. `verify-raw` reports which years this concerns.
+
+**Tests** (`tests/test_import_orats.py`, 6, ≈ 7 s). On the synthetic fixture: the loader returns a canonical chain (the melt, the per-contract quote filter, the roots, the AM day, every decision's column and attr); its loud failures (a missing day with the `volsto-data` command, a missing close, a blank OPRA symbol, an unknown root); the parity regression recovers the fixture's forward to 0.002 bp and its discount factor to 0.06 bp per (root, expiry) slice and the cross-check frame; `import_day` and the CLI write a snapshot under the store with the ORATS provenance, the implied spot, the fixture's flat funding rate, no asynchrony warning, and the fitted ATM vol at 6 months within 0.01 vp of the fixture's. The HDN loader returns a canonical chain. The real sample day imports (structure only; its numbers are printed and reported above — no tolerance on vendor data is asserted before the owner agrees a constant).
+
+### 18.7 Part 5 — a second vendor in the backtest and history: the plan (not implemented in Part 4)
+
+`volsto/studies/backtest.py`, `volsto/calibration/history.py` and `volsto/calibration/raw_history.py` each hard-code the HDN layout: the third occurrence of "a consumer knows a vendor's files".
+
+**Invariant.** Nothing outside a vendor source knows where a vendor's days live, how a day becomes a chain, what its checksums are or where its prior rate curve comes from.
+
+**The single place: a vendor source** (`volsto/market/vendor.py`), one object per (vendor, location, underlying) that owns:
+- the *calendar*: the dates it holds, and the dates it knows to be missing;
+- *day loading*: the canonical chain of a date (§18.6), and the whole import of a date into a snapshot document;
+- the *checksums*: the digest of a date's own input and the digest of whatever else its import reads (HDN: the manifest's rates entry; ORATS: the store entry's raw sha256 and schema version, and the close it read);
+- the *rate curve*: the vendor's prior curve of a date.
+`HdnSource(root)` wraps today's functions unchanged; `OratsSource(store, closes)` wraps §18.5–18.6; `vendor_source(name, …)` is the registry the backtest's `data.vendor` selects from.
+
+**Touched sites.** `backtest.py`: `VENDORS` (l. 482) and the `data.vendor` choice (l. 1013); `data_root` (l. 1216); the calendar `hdn_available_dates(cfg.data_root)` (l. 1374); the day path `day_by_date/<date>_options.csv` (l. 1386); the manifest lookup (l. 2184–2192); `InputIndex.file_sha` / `manifest_sha` and the inputs chain (l. 2217–2247); `import_snapshot` → `import_day` (l. 3583–3600); `_snapshot_ok`'s provenance keys (l. 4135–4154); the "no day files" message (l. 4272). `history.py`: `hdn_available_dates`, `build_hdn_history`. `raw_history.py`: `raw_day` and `raw_pillar_frame` (`load_day`, `load_manifest`, the `day_by_date` path). Scripts that walk the HDN layout themselves (`essvi_calendar_gate.py`, `m7_hdn_history.py`, `step0_sabrw_study.py`, `add_sabrw_sections.py`).
+
+**The walking test.** (i) A walk of `volsto/` and `scripts/` for the vendor's layout literals (`day_by_date`, `_options.csv`, the data `manifest.json`) and for direct calls of a vendor loader outside the vendor modules: empty. (ii) One contract test run over every registered source (HDN on its sample, ORATS on the synthetic fixture): the calendar is sorted and unique; every date loads a canonical chain; the digests change when, and only when, an input changes; the import's provenance names the source's digests.
+
+**Proof that HDN does not move:** the same-machine comparison of §18.6, extended to the toy backtest store's rows.
+
+### 18.8 Report only — the Part 4 importer, unchanged, on single stocks (2024-01-03)
+
+AAPL, JPM and XOM through `import_orats.import_day` with no change. **Nothing raises; the output is wrong in three ways.**
+
+1. **American exercise breaks the parity regression.** The slope of C − P on K is no longer −DF: the "implied rate" of the regression is −60 % (AAPL, 2 days), −959 % (JPM, 2 days), −24 % to −39 % at 16 days, and only approaches the prior beyond six months (AAPL −5 % to +2 %, 300–500 bp below `iRate` out to a year). The funding curve fitted to those discounts is nonsense — 1-month zero rate −12.7 % (AAPL), −8.5 % (JPM), 3-month −6.9 % (XOM) — and the importer logs it (1,820 / 1,393 / 1,220 bp from the prior). The carry curve inherits it: −15 % a year at two weeks for AAPL.
+2. **Dividends.** The forward against `stkPx · exp(iRate · T)` shows them as steps the importer has no place for: JPM −38 bp at 2 days and −53 to −66 bp to 10 weeks (the $1.05 dividend, ex 2024-01-05), −105 to −514 bp from 3 months to 2 years; XOM flat (+2 to +4 bp) to 37 days then −49 bp at 44 days and −96 bp at 72 days (ex-dividend between them), −640 bp at 2 years; AAPL −3 bp at 16 days to −170 bp at 2 years. A continuous carry curve through these forwards is not a dividend model.
+3. **The close history is dividend-adjusted.** `data/history/<name>.csv` holds adjusted closes: AAPL 182.03 against `stkPx` 184.24, JPM 161.57 against 171.55, XOM 94.39 against 103.52. The "implied spot against the close" is therefore +128 / +581 / +967 bp — the adjustment, not the market. The index history has no such problem.
+
+*Also:* 6–22 two-sided pairs per expiry near the money, most often 4–8 (the forward's standard error is 0.2–72 bp); the surfaces fit (eSSVI RMS 0.28 / 0.46 / 0.43 vp inside |k| ≤ 0.2) but to vols inverted with a wrong discount factor and a European formula. Borrow cannot be separated from dividends and early exercise in these numbers. A single-stock importer needs: a de-Americanisation (or a forward from deep pairs where early exercise is negligible), explicit dividends, unadjusted closes, and a funding curve taken from the index, not from the stock's own parity.
+
+**Not built yet.** The vendor source (the plan of §18.7).
 
