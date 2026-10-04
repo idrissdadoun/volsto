@@ -80,30 +80,42 @@ class GaussianDraws:
             return p0 // 2, p1 // 2
         return p0, p1
 
+    def _fill_normals(self, step: int, q0: int, n: int, out: FloatArray) -> None:
+        """Write the normals of one step, generator paths ``[q0, q0 + n)``, into ``out`` (shape
+        ``(n, n_brownians)``, or ``(2n, n_brownians)`` with antithetics).
+
+        The generator still produces ``STRIDE_BROWNIAN`` outputs per path (the position of a
+        normal is fixed by the addressing scheme), but only the ``n_brownians`` columns used are
+        converted to uniforms; ``ndtri`` writes straight into the rows of the independent paths
+        and the antithetic rows are their negation.  Bit for bit the numbers of the earlier
+        layout, which converted every column and copied twice
+        (``tests/test_engine.py::test_lean_draws_equal_the_reference_layout``)."""
+        raw = self._raw(step * STRIDE_STEP + q0 * STRIDE_BROWNIAN, n * STRIDE_BROWNIAN)
+        used = raw.reshape(n, STRIDE_BROWNIAN)[:, : self.n_brownians]
+        u = ((used >> np.uint64(11)).astype(np.float64) + 0.5) * _TWO_M53
+        if self.antithetic:
+            ndtri(u, out=out[0::2])
+            np.negative(out[0::2], out=out[1::2])
+        else:
+            ndtri(u, out=out)
+
     def normals(self, step: int, p0: int, p1: int) -> FloatArray:
         """Normals for one step, paths ``[p0, p1)``: shape ``(p1 - p0, n_brownians)``."""
         if not 0 <= step < self.n_steps:
             raise ValueError("step out of range")
         q0, q1 = self._rng_range(p0, p1)
-        n = q1 - q0
-        raw = self._raw(step * STRIDE_STEP + q0 * STRIDE_BROWNIAN, n * STRIDE_BROWNIAN)
-        u = ((raw >> np.uint64(11)).astype(np.float64) + 0.5) * _TWO_M53
-        z = ndtri(u.reshape(n, STRIDE_BROWNIAN)[:, : self.n_brownians])
-        z = np.asarray(z, dtype=np.float64)
-        if self.antithetic:
-            out = np.empty((2 * n, self.n_brownians))
-            out[0::2] = z
-            out[1::2] = -z
-            return out
-        return z
+        out = np.empty((p1 - p0, self.n_brownians))
+        self._fill_normals(step, q0, q1 - q0, out)
+        return out
 
     def block(self, step0: int, step1: int, p0: int, p1: int) -> FloatArray:
         """Normals for steps ``[step0, step1)``: shape ``(p1 - p0, step1 - step0, n_brownians)``."""
         if not 0 <= step0 < step1 <= self.n_steps:
             raise ValueError("step range out of bounds")
+        q0, q1 = self._rng_range(p0, p1)
         out = np.empty((p1 - p0, step1 - step0, self.n_brownians))
         for j, s in enumerate(range(step0, step1)):
-            out[:, j, :] = self.normals(s, p0, p1)
+            self._fill_normals(s, q0, q1 - q0, out[:, j, :])
         return out
 
     def __repr__(self) -> str:
@@ -139,6 +151,16 @@ class CoarsenedDraws(GaussianDraws):
         m = self.factor
         z = self.fine.block(step * m, (step + 1) * m, p0, p1)
         return np.asarray(z.sum(axis=1) / np.sqrt(m), dtype=np.float64)
+
+    def block(self, step0: int, step1: int, p0: int, p1: int) -> FloatArray:
+        """Coarse normals for steps ``[step0, step1)``, one :meth:`normals` call per coarse step
+        (the base class fills its block from the generator, which a coarsened stream has not)."""
+        if not 0 <= step0 < step1 <= self.n_steps:
+            raise ValueError("step range out of bounds")
+        out = np.empty((p1 - p0, step1 - step0, self.n_brownians))
+        for j, s in enumerate(range(step0, step1)):
+            out[:, j, :] = self.normals(s, p0, p1)
+        return out
 
     def __repr__(self) -> str:
         return f"CoarsenedDraws(factor={self.factor}, fine={self.fine!r})"

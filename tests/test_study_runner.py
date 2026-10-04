@@ -1054,7 +1054,14 @@ def test_particle_kernel_reached_only_through_calibrate_leverage() -> None:
     reusable = {"kernel_regression"}
     assert "step_lsv_block" not in _names(funcs["kernel_regression"])
     helpers = set(funcs) - {"calibrate_leverage"} - reusable
-    assert helpers == {"conditional_variance_estimate", "leverage_grid_config"}
+    # _sorted_regression and _finish_estimate are the two stages conditional_variance_estimate
+    # was split into (binned-estimator change): pure regressions, checked below like the others
+    assert helpers == {
+        "conditional_variance_estimate",
+        "_sorted_regression",
+        "_finish_estimate",
+        "leverage_grid_config",
+    }
     # inside particle.py: the particle step and the helpers are used by calibrate_leverage only
     for name, fn in funcs.items():
         if name == "calibrate_leverage":

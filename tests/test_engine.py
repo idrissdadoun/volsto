@@ -4,9 +4,18 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from scipy.special import ndtri
 
 from volsto.config import SimConfig
-from volsto.engine import GaussianDraws, MonteCarlo, PathSet, TimeGrid, VanillaControl
+from volsto.engine import (
+    CoarsenedDraws,
+    GaussianDraws,
+    MonteCarlo,
+    PathSet,
+    TimeGrid,
+    VanillaControl,
+)
+from volsto.engine.rng import _TWO_M53, STRIDE_BROWNIAN, STRIDE_STEP
 from volsto.market import DiscountCurve, ForwardCurve, bs_price, bs_vega, norm_cdf
 from volsto.models import BlackScholes
 from volsto.products import DigitalOption, EuropeanOption
@@ -30,6 +39,94 @@ def test_draws_are_crn_exact() -> None:
     # re-reading earlier positions (generator rewinds) gives identical numbers
     np.testing.assert_array_equal(a.normals(4, 0, 8), za[:, 4, :])
     np.testing.assert_array_equal(a.normals(1, 2, 6), za[2:6, 1, :])
+
+
+class _ReferenceDraws(GaussianDraws):
+    """``normals`` and ``block`` exactly as they stood before the lean layout (every one of the 8
+    generated columns converted to a uniform, ``ndtri`` on the used ones, the antithetic rows
+    filled by two copies, a third copy into the block).  The two method bodies are that source,
+    unedited; the generator and the position addressing are the library's."""
+
+    def normals(self, step: int, p0: int, p1: int) -> np.ndarray:
+        """Normals for one step, paths ``[p0, p1)``: shape ``(p1 - p0, n_brownians)``."""
+        if not 0 <= step < self.n_steps:
+            raise ValueError("step out of range")
+        q0, q1 = self._rng_range(p0, p1)
+        n = q1 - q0
+        raw = self._raw(step * STRIDE_STEP + q0 * STRIDE_BROWNIAN, n * STRIDE_BROWNIAN)
+        u = ((raw >> np.uint64(11)).astype(np.float64) + 0.5) * _TWO_M53
+        z = ndtri(u.reshape(n, STRIDE_BROWNIAN)[:, : self.n_brownians])
+        z = np.asarray(z, dtype=np.float64)
+        if self.antithetic:
+            out = np.empty((2 * n, self.n_brownians))
+            out[0::2] = z
+            out[1::2] = -z
+            return out
+        return z
+
+    def block(self, step0: int, step1: int, p0: int, p1: int) -> np.ndarray:
+        """Normals for steps ``[step0, step1)``: shape ``(p1 - p0, step1 - step0, n_brownians)``."""
+        if not 0 <= step0 < step1 <= self.n_steps:
+            raise ValueError("step range out of bounds")
+        out = np.empty((p1 - p0, step1 - step0, self.n_brownians))
+        for j, s in enumerate(range(step0, step1)):
+            out[:, j, :] = self.normals(s, p0, p1)
+        return out
+
+
+def _same_bits(a: np.ndarray, b: np.ndarray) -> None:
+    """Equal values, equal sign bits (``-0.0`` is not ``0.0`` here), same shape and layout."""
+    assert a.shape == b.shape and a.dtype == b.dtype == np.float64
+    np.testing.assert_array_equal(a, b)
+    np.testing.assert_array_equal(np.signbit(a), np.signbit(b))
+    assert a.flags.c_contiguous == b.flags.c_contiguous
+
+
+@pytest.mark.parametrize("antithetic", [True, False])
+@pytest.mark.parametrize("n_brownians", [1, 3, 8])
+def test_lean_draws_equal_the_reference_layout(antithetic: bool, n_brownians: int) -> None:
+    """The lean layout (only the used columns converted, ``ndtri`` written into the independent
+    rows, the antithetic rows their negation) gives the numbers of the earlier layout bit for
+    bit: whole blocks, chunked path ranges, multi-step blocks, single steps, rewinds, and
+    through a coarsened stream."""
+    n_paths, n_steps, seed = 96, 12, 11
+    lean = GaussianDraws(seed, n_paths, n_steps, n_brownians, antithetic)
+    ref = _ReferenceDraws(seed, n_paths, n_steps, n_brownians, antithetic)
+    whole = ref.block(0, n_steps, 0, n_paths)
+    _same_bits(lean.block(0, n_steps, 0, n_paths), whole)
+    # chunked path ranges (even-aligned, as antithetic pairs require) and multi-step blocks
+    for p0, p1 in ((0, 10), (10, 64), (64, 96), (30, 32)):
+        for s0, s1 in ((0, 12), (0, 1), (3, 7), (11, 12)):
+            _same_bits(lean.block(s0, s1, p0, p1), ref.block(s0, s1, p0, p1))
+            np.testing.assert_array_equal(lean.block(s0, s1, p0, p1), whole[p0:p1, s0:s1, :])
+    # single steps, read backwards and out of order: the generator rewinds
+    for step in (11, 4, 4, 0, 9, 2):
+        for p0, p1 in ((0, n_paths), (20, 48)):
+            _same_bits(lean.normals(step, p0, p1), ref.normals(step, p0, p1))
+    _same_bits(lean.block(2, 5, 0, n_paths), ref.block(2, 5, 0, n_paths))
+    # a coarsened stream over each: its own normals and its own block
+    for factor in (2, 3):
+        c_lean = CoarsenedDraws(
+            GaussianDraws(seed, n_paths, n_steps, n_brownians, antithetic), factor
+        )
+        c_ref = CoarsenedDraws(
+            _ReferenceDraws(seed, n_paths, n_steps, n_brownians, antithetic), factor
+        )
+        _same_bits(
+            c_lean.block(0, n_steps // factor, 0, n_paths),
+            c_ref.block(0, n_steps // factor, 0, n_paths),
+        )
+        _same_bits(c_lean.normals(1, 16, 40), c_ref.normals(1, 16, 40))
+        np.testing.assert_array_equal(
+            c_lean.block(1, 3, 16, 40)[:, 0, :], c_lean.normals(1, 16, 40)
+        )
+    # the same errors as before
+    for bad in (lambda d: d.normals(n_steps, 0, 2), lambda d: d.block(0, n_steps + 1, 0, 2)):
+        with pytest.raises(ValueError):
+            bad(lean)
+    if antithetic:
+        with pytest.raises(ValueError, match="even-aligned"):
+            lean.block(0, 1, 1, 3)
 
 
 def test_antithetic_pairs_and_distribution() -> None:
