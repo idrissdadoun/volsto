@@ -333,6 +333,13 @@ cross-check is an approximation even under Black–Scholes — the exact indepen
 is `bs_cliquet_value_mc`).  `scripts/m5_budget.py` runs the full report under the reference LSV
 and prints the recalibration count and wall clock (the viewer precompute budget).
 
+The second vendor, ORATS, goes through the same steps from the Parquet store (see "Vendor
+data"); its snapshots are written under the store, never under `configs/`:
+
+```bash
+volsto-import --vendor orats --date 2024-01-03 --underlying SPX   # -> $VOLSTO_DATA_STORE/orats/snapshots/
+```
+
 ## Vendor data (M11)
 
 Vendor archives never enter git. Two roots, each overridable by an environment variable or a

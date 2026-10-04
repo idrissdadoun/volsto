@@ -362,6 +362,12 @@ from volsto.calibration.fit_2f import (
     fit_2f_marking,
     fit_preset,
 )
+from volsto.calibration.fit_records import (
+    FitRecords,
+    RecordedFit,
+    fit_summary,
+    recorded_marking_fit,
+)
 from volsto.calibration.history import (
     DEFAULT_PILLARS,
     MIN_INCREMENTS,
@@ -4066,7 +4072,7 @@ class DateState:
     spec: CalibrationSpec
     surface: ImpliedSurface
     forward_curve: ForwardCurve
-    fit: FitResult
+    fit: RecordedFit
     record: dict[str, Any]
     timings: dict[str, float]
     #: :func:`snapshot_digest` and SHA-256 of the snapshot bytes the state was parsed from
@@ -4134,36 +4140,9 @@ def _snapshot_ok(
 
 
 def fit_record(r: FitResult) -> dict[str, Any]:
-    """The JSON record of a marking fit (parameters, status, messages, the per-pillar SSR)."""
-    p, b, f, s = r.params, r.breakeven, r.first, r.second
-    se = {
-        "k1": f.k1_se,
-        "lambda1": f.lambda1_se,
-        "lambda2": f.lambda2_se,
-        "omega1": s.stderr.get("omega1", float("nan")),
-        "omega2": s.stderr.get("omega2", float("nan")),
-        "chi": s.stderr.get("chi", float("nan")),
-    }
-    tbl = r.table
-    return {
-        "status": r.status,
-        "messages": list(r.messages),
-        "notes": [*r.notes, *f.notes, *s.notes],
-        "params": {k: float(getattr(p, k)) for k in PARAMS},
-        "breakeven": {k: float(getattr(b, k)) for k in PARAM_COLUMNS},
-        "se": se,
-        "pillars": [float(x) for x in tbl["T"]],
-        "ssr_first_order": [float(x) for x in tbl["ssr_first_order"]],
-        "ssr_target": [float(x) for x in r.targets.ssr_target],
-        "skew_market": [float(x) for x in tbl["skew_market"]],
-        "skew_naked": [float(x) for x in tbl["skew_naked"]],
-        "active": list(f.active),
-        "bound_flags": list(s.bound_flags),
-        "k1_at_bound": bool(f.k1_at_bound),
-        "first_objective": float(f.objective),
-        "second_objective": float(s.objective),
-        "wall_seconds": float(r.wall_seconds),
-    }
+    """The JSON record of a marking fit: :func:`volsto.calibration.fit_records.fit_summary` (the
+    one implementation since the stored fit records, SPEC §13.4)."""
+    return fit_summary(r)
 
 
 def pillar_quantities(surface: ImpliedSurface) -> dict[str, list[float]]:
@@ -4279,6 +4258,8 @@ class BacktestRun:
         self.snapshots_used: dict[str, str | None] = {}
         self.leverage_used: dict[str, str | None] = {}
         self.cache: LeverageCache = _RecordingCache(cfg.path("cache"), self.leverage_used)
+        #: the stored marking fits that travel with the cache (``<cache>/fits``)
+        self.fit_records = FitRecords.of_cache(cfg.path("cache"))
         self.snapshots = snapshots if snapshots is not None else cfg.path("snapshots")
         self.base = cfg.base_spec()
         self.sim = cfg.sim(self.base)
@@ -4495,19 +4476,32 @@ class BacktestRun:
         cfg = self.cfg.fit_config()
         parsed = yaml.safe_load(data)
         step0 = None
+        fits = None
         if cfg.step0 is not None:
             # the date's SABRW fits, from the bytes just verified (never a second read)
             fits = sabrw_fits_from_config(parsed)
             if fits is None:
                 raise DateFailure(f"{date}: the snapshot has no sabrw section: re-import it")
             step0 = step0_source(fits, surface)
-        fit = fit_2f_marking(surface, cfg, ssr_target=float(m["ssr_target"]), step0=step0)
+        # the fitted parameters are a stored record keyed by the fit's inputs: read when it
+        # exists, fitted (and recorded) only when it does not, so the leverage key is the same
+        # on every machine that holds the record (SPEC §13.4)
+        ssr = float(m["ssr_target"])
+        fit = recorded_marking_fit(
+            spec,
+            cfg,
+            ssr_target=ssr,
+            sabrw_fits=fits,
+            records=self.fit_records,
+            fit=lambda: fit_2f_marking(surface, cfg, ssr_target=ssr, step0=step0),
+            origin=f"backtest {self.cfg.name} {date}",
+        )
         fit_s = time.perf_counter() - t0
         if fit.status == "infeasible":
             raise DateFailure(f"{date}: the marking fit is infeasible: {'; '.join(fit.messages)}")
         spec = dataclasses.replace(spec, model=fit.params)
         t1 = time.perf_counter()
-        record = fit_record(fit)
+        record = dict(fit.summary)
         record["history"] = pillar_quantities(surface)
         if spec.market.close is None:
             raise DateFailure(f"{date}: the snapshot has no market.close: re-import it")

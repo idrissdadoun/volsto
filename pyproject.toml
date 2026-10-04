@@ -27,6 +27,7 @@ volsto-viewer = "volsto.viewers.app:main"
 volsto-study = "volsto.studies.runner:main"
 volsto-backtest = "volsto.studies.backtest:main"
 volsto-data = "volsto.data.cli:main"
+volsto-fit-records = "volsto.calibration.fit_records:main"
 
 [project.optional-dependencies]
 viewers = ["plotly>=5.18", "streamlit>=1.30", "openpyxl>=3.1", "kaleido"]
