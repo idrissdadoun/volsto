@@ -26,6 +26,7 @@ from typing import Any
 for _v in ("OMP_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "NUMBA_NUM_THREADS", "MKL_NUM_THREADS"):
     os.environ.setdefault(_v, "1")
 
+import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -35,6 +36,9 @@ from volsto.studies import barrier_history as bh  # noqa: E402
 
 OUTCOMES = bh.RESULTS / "outcomes"
 SOLD_AT_TOUCH = ("C7", "C8", "C9_7_1", "C9_7_2", "C9_8_1", "C9_8_2")
+#: Positions whose daily book P&L is kept (spec §6.4), on the standard-deviation barriers.
+BOOK = ("A1", "A2", "B3", "B4", "B5_2", "B6", "E13")
+BOOKS = bh.RESULTS / "books"
 
 
 def assemble_entry(entry: str) -> dict[str, Any]:
@@ -65,6 +69,7 @@ def assemble_entry(entry: str) -> dict[str, Any]:
         by_cell = {c: g.sort_values("date") for c, g in daily.groupby("cell")}
         rows: list[dict[str, Any]] = []
         cells: list[dict[str, Any]] = []
+        book: list[pd.DataFrame] = []
         e2 = 2.0 * bh.BUMP
         for r in ent.itertuples():
             side, K, B, expiry = int(r.side), float(r.K), float(r.B), str(r.expiry)
@@ -136,6 +141,35 @@ def assemble_entry(entry: str) -> dict[str, Any]:
                         n_life=n,
                     )
                     rec.update({k: x / K for k, x in out.items()})
+                    if name in BOOK and str(r.barrier).startswith("s"):
+                        u, h = bh.position_paths(
+                            v,
+                            delta,
+                            F,
+                            DF,
+                            premium=premium,
+                            df0=float(r.DF0),
+                            terminal=terminal,
+                            closing_forward=closing,
+                            n_hedge=n_hedge,
+                        )
+                        # the path's points are the snapshots held, then the end date
+                        end = live_dates[n_hedge] if n_hedge < n else expiry
+                        when = [*live_dates[1:n_hedge], end] if n_hedge > 0 else []
+                        if when:
+                            book.append(
+                                pd.DataFrame(
+                                    {
+                                        "date": when,
+                                        "months": r.months,
+                                        "side": side,
+                                        "barrier": r.barrier,
+                                        "position": name,
+                                        "du": np.diff(u) / K,
+                                        "dh": np.diff(h) / K,
+                                    }
+                                )
+                            )
                     rec["delta0"] = float(delta[0] * F[0] * DF[0] / S[0])  # spot delta at entry
                     rec["delta0_f"] = float(delta[0])
                 if extra:
@@ -197,6 +231,9 @@ def assemble_entry(entry: str) -> dict[str, Any]:
         pos.to_parquet(OUTCOMES / f"{entry}.parquet", index=False)
         cell_frame = ent.drop(columns=["legs"]).merge(pd.DataFrame(cells), on="cell", how="left")
         cell_frame.to_parquet(OUTCOMES / f"{entry}.cells.parquet", index=False)
+        if book:
+            BOOKS.mkdir(parents=True, exist_ok=True)
+            pd.concat(book, ignore_index=True).to_parquet(BOOKS / f"{entry}.parquet", index=False)
         return {"date": entry, "positions": len(pos)}
     except Exception as exc:
         return {
@@ -231,6 +268,21 @@ def main() -> None:
     pos.to_parquet(bh.RESULTS / "positions.parquet", index=False)
     cells.to_parquet(bh.RESULTS / "cells.parquet", index=False)
     print(f"positions {len(pos)}, cells {len(cells)} ({int(cells['finished'].sum())} finished)")
+    files = sorted(BOOKS.glob("*.parquet")) if BOOKS.exists() else []
+    if files:
+        keys = ["date", "months", "side", "barrier", "position"]
+        total: pd.DataFrame | None = None
+        for i in range(0, len(files), 50):  # in batches: the sum of the trades' daily P&L
+            part = pd.concat([pd.read_parquet(p) for p in files[i : i + 50]], ignore_index=True)
+            part = part.groupby(keys, as_index=False)[["du", "dh"]].sum()
+            total = (
+                part
+                if total is None
+                else (pd.concat([total, part]).groupby(keys, as_index=False)[["du", "dh"]].sum())
+            )
+        assert total is not None
+        total.to_parquet(bh.RESULTS / "book.parquet", index=False)
+        print(f"book: {len(total)} rows (date x maturity x side x barrier x position)")
 
 
 if __name__ == "__main__":

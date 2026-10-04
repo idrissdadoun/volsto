@@ -1094,6 +1094,33 @@ def bs_legs_value(legs: Sequence[Leg], side: int, spot: float, vol: float, T: fl
 # --------------------------------------------------------------------------------------------
 
 
+def position_paths(
+    value: FloatArray,
+    delta_f: FloatArray,
+    forward: FloatArray,
+    df: FloatArray,
+    *,
+    premium: float,
+    df0: float,
+    terminal: float,
+    closing_forward: float,
+    n_hedge: int,
+) -> tuple[FloatArray, FloatArray]:
+    """``(unhedged, hedged)`` running P&L of a position (arguments of
+    :func:`position_outcome`): one point per snapshot held (``n_hedge`` of them, the entry
+    first: the mark over the discount factor minus the premium carried to expiry, plus — for
+    the hedged one — the hedge P&L accrued so far) and a last point at the end (``terminal``).
+    The daily P&L of a book is the sum over its trades of the differences of these paths."""
+    cost = premium / df0
+    pnl_u = terminal - cost
+    if n_hedge <= 0:
+        return np.array([pnl_u]), np.array([pnl_u])
+    h = hedge_pnl(delta_f[:n_hedge], forward[:n_hedge], closing_forward)
+    cum = np.concatenate(([0.0], np.cumsum(h)))  # hedge P&L accrued before snapshot i
+    mtm = value[:n_hedge] / df[:n_hedge] - cost
+    return np.append(mtm, pnl_u), np.append(mtm + cum[:n_hedge], pnl_u + float(cum[-1]))
+
+
 def position_outcome(
     value: FloatArray,
     delta_f: FloatArray,
@@ -1118,16 +1145,22 @@ def position_outcome(
     Returns ``pnl_u`` (``terminal − premium / df0``), ``pnl_h`` (plus the hedge), the hedged
     running P&L at 25 / 50 / 75 % of the life and its best and worst, and ``hedge`` (the sum of
     the hedge P&L).  Everything in the units of ``value``."""
-    cost = premium / df0
-    pnl_u = terminal - cost
+    pnl_u = terminal - premium / df0
+    _, path = position_paths(
+        value,
+        delta_f,
+        forward,
+        df,
+        premium=premium,
+        df0=df0,
+        terminal=terminal,
+        closing_forward=closing_forward,
+        n_hedge=n_hedge,
+    )
+    final = float(path[-1])
     if n_hedge <= 0:
         flat = {f"run_{q}": pnl_u for q in (25, 50, 75)}
         return {"pnl_u": pnl_u, "pnl_h": pnl_u, "hedge": 0.0, "best": pnl_u, "worst": pnl_u, **flat}
-    h = hedge_pnl(delta_f[:n_hedge], forward[:n_hedge], closing_forward)
-    cum = np.concatenate(([0.0], np.cumsum(h)))  # hedge P&L accrued before snapshot i
-    running = value[:n_hedge] / df[:n_hedge] - cost + cum[:n_hedge]
-    final = pnl_u + float(cum[-1])
-    path = np.append(running, final)  # the snapshots held, then the end
 
     def at(q: float) -> float:
         i = round(q * n_life)
@@ -1136,7 +1169,7 @@ def position_outcome(
     return {
         "pnl_u": float(pnl_u),
         "pnl_h": final,
-        "hedge": float(cum[-1]),
+        "hedge": final - float(pnl_u),
         "best": float(path.max()),
         "worst": float(path.min()),
         "run_25": at(0.25),

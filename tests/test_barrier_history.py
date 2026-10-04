@@ -389,3 +389,10 @@ def test_position_outcome() -> None:
         n_life=4,
     )
     assert none["pnl_h"] == none["pnl_u"] == pytest.approx(1.0 - 3.0 / df0)
+    # the paths behind the summary: the differences of a path are the daily P&L of the trade
+    u, hgd = bh.position_paths(
+        v, delta, fwd, df, premium=3.0, df0=df0, terminal=0.0, closing_forward=98.0, n_hedge=2
+    )
+    assert u.size == hgd.size == 3 and u[0] == pytest.approx(0.0) and hgd[0] == u[0]
+    assert u[-1] == pytest.approx(ko["pnl_u"]) and hgd[-1] == pytest.approx(ko["pnl_h"])
+    assert hgd[1] == pytest.approx(run1) and np.diff(hgd).sum() == pytest.approx(ko["pnl_h"])
