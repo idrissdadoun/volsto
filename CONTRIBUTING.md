@@ -39,6 +39,19 @@ work is done. Every rule here was set by the owner and each has a reason recorde
   the viewers layer that calibrates, and it says so in its log and manifest.
 - **Production particle count is 8·10⁵** (SPEC §11).
 
+## Vendor data
+
+- **Vendor data never enters git**: raw files, Parquet, or anything that reproduces vendor
+  quotes in bulk. `data/` and `*.parquet` are ignored, and
+  `tests/test_data_layer.py::test_no_tracked_file_under_the_data_roots` fails on a tracked file
+  under the data roots. Ask the owner before committing anything derived from vendor data.
+- **Code never handles credentials.** `volsto-data fetch` takes the name of an AWS profile the
+  owner configured; no key in code, logs, tests or the repository.
+- **Raw is read-only and stays zipped.** Nothing modifies a delivered file or unzips an archive
+  to disk in bulk; every bulk write checks free space first and refuses when short.
+- **Measure before you assert.** No tolerance goes into a test until the measured number has
+  been reported and the owner has agreed the constant. (Owner's rules, M11, 2026-10-03.)
+
 ## Code
 
 - `black` (line length 100), `ruff`, `mypy --strict` clean on every file touched.
