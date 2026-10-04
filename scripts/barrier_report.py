@@ -212,7 +212,9 @@ class Report:
         self.sample = sample
         (out / "tables").mkdir(parents=True, exist_ok=True)
         (out / "figures").mkdir(parents=True, exist_ok=True)
-        self.cells_all, self.pos = load()
+        self.cells_all, pos = load()
+        is_lsv = pos["model"] == "lsv"
+        self.pos, self.pos_lsv = pos[~is_lsv].copy(), pos[is_lsv].copy()
         self.c = self.cells_all[self.cells_all[sample]].copy()
         self.fin = self.c[self.c["finished"].fillna(False).astype(bool)].copy()
         self.pnl_u = wide(self.pos, "pnl_u")
@@ -363,10 +365,14 @@ class Report:
 
     # -- 3 unhedged outcomes -----------------------------------------------------------------
 
-    def outcomes(self, hedged: bool) -> None:
+    def outcomes(self, hedged: bool, percent: bool = False) -> None:
         src = self.pnl_h if hedged else self.pnl_u
         assert src is not None
-        f = self.fin[self.fin["barrier"].isin(SD)]
+        f = (
+            self.fin[~self.fin["barrier"].isin(SD)]
+            if percent
+            else self.fin[self.fin["barrier"].isin(SD)]
+        )
         if hedged:
             f = f[f["marks_complete"].fillna(False).astype(bool)]
         rows = []
@@ -383,7 +389,7 @@ class Report:
             rows.append(row)
         label = "delta-hedged" if hedged else "unhedged"
         self.table(
-            f"outcomes_{label.replace('-', '_')}",
+            f"outcomes_{label.replace('-', '_')}" + ("_percent" if percent else ""),
             pd.DataFrame(rows),
             f"Mean {label} P&L of buying each structure, % of spot ± block standard error "
             "(valued at expiry). KO premiums are the local-vol ones. " + self.sample_note(f),
@@ -714,6 +720,123 @@ class Report:
             index=False,
         )
 
+    def lsv_study(self) -> None:
+        """Step 6: every output that depends on the knock-out's model, under the LSV (SSR 1.2)
+        beside local vol, on the part of the history the LSV daily series covers."""
+        if self.pos_lsv.empty or "pnl_h" not in self.pos_lsv:
+            return
+        lsv = self.pos_lsv.dropna(subset=["pnl_h"]).set_index(["cell", "position"])
+        lv = self.pos[self.pos["position"].isin(["A1", "A2"])].set_index(["cell", "position"])
+        both = lsv.join(lv, lsuffix="_lsv", rsuffix="_lv", how="inner").reset_index()
+        both = both.merge(self.fin[["cell", "entry", "months", "side", "barrier"]], on="cell")
+        both = both[both["barrier"].isin(SD)]
+        if both.empty:
+            return
+        lo, hi = both["entry"].min(), both["entry"].max()
+        self.add("## 4b. The LSV study: knock-outs marked and hedged under the LSV (SSR 1.2)\n")
+        self.add(
+            f"Coverage of the LSV daily series: {both['entry'].nunique()} entry dates from {lo} to "
+            f"{hi} ({both['cell'].nunique()} knock-out trades with complete daily marks under both "
+            "models). The leverage is recalibrated every day on the day's surface and on each "
+            "bumped surface; the parameters are re-marked on the first trading day of each week.\n"
+        )
+        rows = []
+        for (m, side, b, p), g in both.groupby(["months", "side", "barrier", "position"]):
+            g = g.sort_values("entry")
+            row: dict[str, Any] = {
+                "maturity": f"{m}m",
+                "side": SIDE[side],
+                "barrier": b,
+                "KO": NAMES[p],
+            }
+            for tag in ("lv", "lsv"):
+                mu, su, _, _ = stat(g[f"pnl_u_{tag}"], int(m))
+                mh, sh, _, _ = stat(g[f"pnl_h_{tag}"], int(m))
+                row[f"premium {tag.upper()}"] = f"{100 * g[f'premium_{tag}'].mean():.3f}"
+                row[f"unhedged {tag.upper()}"] = fmt(mu, su)
+                row[f"hedged {tag.upper()}"] = fmt(mh, sh)
+                row[f"hedged sd {tag.upper()}"] = f"{100 * g[f'pnl_h_{tag}'].std():.3f}"
+                row[f"delta at entry {tag.upper()}"] = f"{g[f'delta0_{tag}'].mean():.3f}"
+            row["LSV re-mark days' P&L"] = f"{100 * g['remark_pnl'].mean():.3f}"
+            row["n"] = len(g)
+            rows.append(row)
+        self.table(
+            "lsv_hedged",
+            pd.DataFrame(rows),
+            "The same knock-out trades under the two models: entry premium, mean unhedged and "
+            "delta-hedged P&L (% of spot ± block standard error), the dispersion of the hedged P&L, "
+            "the spot delta at entry, and the part of the LSV hedged P&L that arrives on parameter "
+            "re-mark days. Each model's P&L uses its own premium, marks and sticky-strike delta.",
+            index=False,
+        )
+        # the touch-and-return piece under each model
+        rows = []
+        a1 = both[both["position"] == "A1"].set_index("cell")
+        fin = self.fin.set_index("cell")
+        for (m, side, b), g in a1.groupby(["months", "side", "barrier"]):
+            g = g.sort_values("entry")
+            b6 = fin.loc[g.index, "P_B6"]
+            paid = (self.terminal["B6"].reindex(g.index) - g["terminal_lv"]) * fin.loc[
+                g.index, "DF0"
+            ]
+            row = {"maturity": f"{m}m", "side": SIDE[side], "barrier": b, "n": len(g)}
+            for tag in ("lv", "lsv"):
+                price = b6 - g[f"premium_{tag}"]
+                me, se, _, _ = stat(price - paid, int(m))
+                row[f"TR price {tag.upper()}"] = f"{100 * price.mean():.3f}"
+                row[f"TR priced−realised {tag.upper()}"] = fmt(me, se)
+            rows.append(row)
+        self.table(
+            "lsv_ladder",
+            pd.DataFrame(rows),
+            "The touch-and-return piece (tight limit minus knock-out), the only model-dependent "
+            "piece of the ladder, priced under each model against its realised payoff.",
+            index=False,
+        )
+
+    def limits(self) -> None:
+        self.add("## 10. Limits\n")
+        self.add(
+            "- **Mid prices.** Every vanilla structure is priced at the mid of the day's eSSVI "
+            "surface, not at market mids: on the pilot window the surface is within 0.1 vol point "
+            "of the quoted mid at the strike, 0.2–0.6 at the barrier and up to 1.2 at the far fly "
+            "strike, more than the quoted half-spread in almost every cell. The cost table adds "
+            "half the quoted bid-ask; it does not correct this.\n"
+            "- **Model prices for the knock-out.** No market price of the knock-out exists: its "
+            "premium is the local-vol price (and the LSV price at three marks); the break-even "
+            "premium says how far a dealer's price may be from it before the conclusion changes.\n"
+            "- **Snapshot against close.** Strikes, marks and deltas use the vendor's snapshot "
+            "(about 14 minutes before the close); barrier observation and the payoff use the "
+            "official close, high and low. The knock day's hedge is closed at the official close.\n"
+            "- **Weekly parameter re-marks.** The LSV parameters change on the first trading day of "
+            "each week; the P&L of those days is reported apart.\n"
+            "- **The hedge** is a forward to the trade's expiry, rebalanced once a day at the "
+            "snapshot, with the sticky-strike delta; no transaction cost on the hedge.\n"
+            "- **Settlement flags.** Before 2011 the settlement of the non-monthly SPX expiries is a "
+            "rule (Friday expiries AM before 2010-12-01, quarter ends PM), December 2010 is flagged "
+            "uncertain; from 2017-05-10 to 2021-05-27 the settlement of each monthly comes from the "
+            "open interest.\n"
+            "- **Surface quality.** The strict sample drops the entries whose eSSVI residual exceeds "
+            "the agreed tolerances: 72 % of the entries, but 33–46 % of those of 2017-05 to 2021-05.\n"
+            "- **Particles.** LSV leverages use 100,000 particles with a 1 % regression floor "
+            "(pilot check 9: prices and deltas within tolerance of 200,000 on 216 cells).\n"
+            "- **Monte Carlo.** 100,000 antithetic paths per (day, bump), the European knock-out as "
+            "control variate; error at most 1 % of the value or 0.5 bp of spot on the pilot cells.\n"
+            "- **Inference.** About 236 independent one-month windows and 78 three-month ones; 39 "
+            "six-month and 19 one-year ones: the long maturities are indicative only.\n"
+        )
+        self.add("## References\n")
+        self.add(
+            "Brown, Hobson, Rogers (2001), Robust hedging of barrier options. Carr, Ellis, Gupta "
+            "(1998), Static hedging of exotic options. Derman, Ergener, Kani (1995), Static options "
+            "replication. Nalholm, Poulsen (2006), Static hedging of barrier options under general "
+            "asset dynamics. Maruhn, Nalholm, Fengler (2011), Static hedges for reverse barrier "
+            "options with robustness against skew risk. Broadie, Glasserman, Kou (1997), A continuity "
+            "correction for discrete barrier options. Bergomi (2009), Smile dynamics IV. Bakshi, "
+            "Madan, Panayotov (2010), Returns of claims on the upside and the viability of U-shaped "
+            "pricing kernels. Hu, Liu (2022), on the returns of upside claims.\n"
+        )
+
     def strategy(self) -> None:
         path = bh.RESULTS / "book.parquet"
         if not path.exists():
@@ -981,6 +1104,7 @@ class Report:
         if self.has_hedge:
             self.add("## 4. Delta-hedged outcomes (local-vol sticky-strike delta)\n")
             self.outcomes(hedged=True)
+            self.lsv_study()
             self.along()
             self.residual()
         self.conditions(PRIMARY, "7. Conditions at entry: primary", "conditions_primary")
@@ -996,6 +1120,11 @@ class Report:
         self.events()
         self.decision_map()
         self.today()
+        self.limits()
+        self.add("## Appendix: percent barriers\n")
+        self.outcomes(hedged=False, percent=True)
+        if self.has_hedge:
+            self.outcomes(hedged=True, percent=True)
         (self.out / "report.md").write_text("\n".join(self.md))
 
     def pdf(self) -> dict[str, Any]:

@@ -67,6 +67,15 @@ def assemble_entry(entry: str) -> dict[str, Any]:
                 parts.append(day[day["cell"].str.startswith(entry + "|")])
         daily = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=["cell"])
         by_cell = {c: g.sort_values("date") for c, g in daily.groupby("cell")}
+        # the LSV daily series (step 6), where it exists
+        lparts = []
+        for d in dates:
+            p = run.LSV_DAILY / f"{d}.parquet"
+            if p.exists():
+                day = pd.read_parquet(p)
+                lparts.append(day[day["cell"].str.startswith(entry + "|")])
+        lsv = pd.concat(lparts, ignore_index=True) if lparts else pd.DataFrame(columns=["cell"])
+        lsv_by_cell = {c: g.sort_values("date") for c, g in lsv.groupby("cell")}
         rows: list[dict[str, Any]] = []
         cells: list[dict[str, Any]] = []
         book: list[pd.DataFrame] = []
@@ -196,6 +205,38 @@ def assemble_entry(entry: str) -> dict[str, Any]:
                     if early and complete:
                         closing = float(F[m] * level / S[m])
                 account(name, "lv", float(prem), payoff, closing, m, col)
+                # the same trade marked and hedged under the LSV (SSR 1.2)
+                lg = lsv_by_cell.get(r.cell)
+                if complete and lg is not None and list(lg["date"]) == live_dates:
+                    v = lg[f"lsv_{col}"].to_numpy(float)
+                    delta = (
+                        lg[f"lsv_{col}_up"].to_numpy(float) - lg[f"lsv_{col}_dn"].to_numpy(float)
+                    ) / scale
+                    args = {
+                        "premium": float(v[0]),
+                        "df0": float(r.DF0),
+                        "terminal": payoff,
+                        "closing_forward": closing,
+                        "n_hedge": m,
+                    }
+                    out = bh.position_outcome(v, delta, F, DF, n_life=n, **args)
+                    _, path = bh.position_paths(v, delta, F, DF, **args)
+                    steps = np.diff(path)  # the P&L arriving on live_dates[1:m] and the end
+                    remark = lg["is_remark_day"].to_numpy(bool)[1:m]
+                    rec = {
+                        "cell": r.cell,
+                        "position": name,
+                        "model": "lsv",
+                        "premium": float(v[0]) / K,
+                        "terminal": payoff / K,
+                        **{k: x / K for k, x in out.items()},
+                        "delta0": float(delta[0] * F[0] * DF[0] / S[0]),
+                        "delta0_f": float(delta[0]),
+                        "remark_pnl": float(steps[: len(remark)][remark].sum()) / K,
+                        "remark_days": int(remark.sum()),
+                        "carried_parameters": int(lg["carried_parameters"].sum()),
+                    }
+                    rows.append(rec)
             # the vanilla structures
             m1, early1 = end_of(tau1)
             for name in bh.STRUCTURES:
