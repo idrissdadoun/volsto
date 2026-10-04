@@ -22,6 +22,7 @@ import yaml
 
 from volsto.config import to_mapping
 from volsto.market import import_hdn as ih
+from volsto.market.vendor import HdnSource
 
 ROOT = Path(__file__).resolve().parents[1]
 DIRS = (
@@ -30,7 +31,7 @@ DIRS = (
 )
 
 
-def add_section(path: Path, root: Path, manifest: dict[str, object]) -> int | None:
+def add_section(path: Path, source: HdnSource) -> int | None:
     """Append the section to ``path``; the number of fits, ``None`` when it already has one."""
     text = path.read_text(encoding="utf-8")
     raw = yaml.safe_load(text)
@@ -40,7 +41,9 @@ def add_section(path: Path, root: Path, manifest: dict[str, object]) -> int | No
     f = ih.HdnFilters()
     if to_mapping(asdict(f)) != prov["filters"]:
         raise SystemExit(f"{path}: imported under other filters: {prov['filters']}")
-    chain = ih.load_day(root / "day_by_date" / prov["file"], prov["underlying"], manifest=manifest)
+    chain = source.load_chain(prov["quote_date"], prov["underlying"])
+    if source.day_file(prov["quote_date"]).name != prov["file"]:
+        raise SystemExit(f"{path}: imported from {prov['file']}, not the source's day file")
     fwds = ih.implied_forwards(chain, max_years=f.max_years, band=f.near_atm_band)
     _, points = ih.to_grid_surface(chain, fwds, f)
     got = (len(points.table), int(points.table["expiry"].nunique()), dict(points.dropped))
@@ -60,12 +63,12 @@ def main() -> None:
     ap.add_argument("--root", default=str(ROOT / "data/hdn_sample/options_sample_2022H2"))
     a = ap.parse_args()
     root = Path(a.root)
-    manifest = ih.load_manifest(root)
+    source = HdnSource(root)
     t0 = time.perf_counter()
     done = skipped = 0
     for d in a.dirs:
         for path in sorted(Path(d).glob("spx_*.yaml")):
-            n = add_section(path, root, manifest)
+            n = add_section(path, source)
             if n is None:
                 skipped += 1
                 continue

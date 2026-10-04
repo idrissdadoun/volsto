@@ -41,9 +41,9 @@ import pandas as pd
 
 from volsto.calibration.fit_2f import BreakEvenFitConfig, fit_2f_marking, fit_preset
 from volsto.calibration.targets import DEFAULT_ATF_REF
-from volsto.market import import_hdn as ih
 from volsto.market.loaders import sabrw_fits_from_config
 from volsto.market.sabrw import SabrwTermStructure
+from volsto.market.vendor import HdnSource
 
 K2_BOUNDS = (0.05, 5.0)
 BAND4 = (0.25, 0.5, 1.0, 3.0)
@@ -86,7 +86,7 @@ def run_date(
     sab: list[dict] = []
     t0 = time.time()
     try:
-        cfg, fit, _points, _chain = ih.import_day(root, date)
+        cfg, fit, _points, _chain = HdnSource(root).import_day(date)
         surface = fit.surface
         # the fits the import itself stored (data: read back, never fitted a second time)
         fits = tuple(f for f in sabrw_fits_from_config(cfg) or () if t_min <= f.T <= t_max)
@@ -264,9 +264,7 @@ def main() -> None:
     ap.add_argument("--variants", nargs="*", default=list(VARIANTS), choices=list(VARIANTS))
     a = ap.parse_args()
     root = Path(a.root)
-    dates = a.dates or sorted(
-        p.name.split("_")[0] for p in (root / "day_by_date").glob("*_options.csv")
-    )
+    dates = a.dates or HdnSource(root).available_dates()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     t0 = time.time()

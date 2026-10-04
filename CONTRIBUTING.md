@@ -125,6 +125,12 @@ Applied since (M10, 2026-09-16/17):
   against the importer, surface and curve sources (`importer_guard.json`,
   `test_importer_tag_guard`). Bump it when a change moves any snapshot; re-record the hash without
   a bump only for a change proven not to, and say so in the commit.
+- **Vendor source (2026-10-04):** nothing outside a vendor source knows where a vendor's days
+  live, how a day becomes a chain, what its checksums are or where its prior rate curve comes
+  from — the backtest, the surface history and the raw history each hard-coded the HDN layout.
+  One place: `volsto/market/vendor.py` (`VendorSource`, `HdnSource`, the registry);
+  `tests/test_vendor_source.py` walks `volsto/` and `scripts/` for the layout and the loaders
+  outside the vendor modules and runs one contract test over every registered source.
 - **Studies:** every catalogue study declares its exact (error-free) numbers by kind in
   `EXACT_KINDS`; the walker in `volsto/studies/catalogue/_common.py` (run by
   `tests/test_catalogue_s1_s4.py` over every fast config) refuses any undeclared exact number, and

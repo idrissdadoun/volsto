@@ -41,10 +41,9 @@ from volsto.market.import_hdn import (
     HdnFilters,
     SurfacePoints,
     implied_forwards,
-    load_day,
-    load_manifest,
     to_grid_surface,
 )
+from volsto.market.vendor import HdnSource, VendorSource
 
 FloatArray = NDArray[np.float64]
 
@@ -130,31 +129,32 @@ def interpolate_pillars(
     return atm, skew
 
 
+def _source(root: str | Path | VendorSource) -> VendorSource:
+    """``root`` as a vendor source: a source as given, a path as the HistoricalData.net source
+    there (the layout is the source's, :mod:`volsto.market.vendor`)."""
+    return root if isinstance(root, VendorSource) else HdnSource(root)
+
+
 def raw_day(
-    root: str | Path,
+    root: str | Path | VendorSource,
     date: str,
     *,
     underlying: str = "SPX",
     fit_band: float = FIT_BAND,
-    manifest: dict[str, Any] | None = None,
     filters: HdnFilters | None = None,
 ) -> tuple[list[SliceFit], float, SurfacePoints]:
     """Importer pipeline for one date up to the retained quotes, then the slice fits.
-    Returns ``(fits, spot, points)``."""
-    root = Path(root)
+    ``root`` is a vendor source, or the directory of a HistoricalData.net one.  Returns
+    ``(fits, spot, points)``."""
     f = filters or HdnFilters()
-    chain = load_day(
-        root / "day_by_date" / f"{date}_options.csv",
-        underlying,
-        manifest=manifest or load_manifest(root),
-    )
+    chain = _source(root).load_chain(date, underlying)
     fwds = implied_forwards(chain, max_years=f.max_years, band=f.near_atm_band)
     _, points = to_grid_surface(chain, fwds, f)
     return slice_fits(points, fit_band), float(chain.attrs["spot"]), points
 
 
 def raw_pillar_frame(
-    root: str | Path,
+    root: str | Path | VendorSource,
     dates: list[str] | tuple[str, ...],
     pillars: tuple[float, ...] = RAW_PILLARS,
     *,
@@ -169,16 +169,13 @@ def raw_pillar_frame(
     dropped for all pillars and recorded in the diagnostics.  ``vs_vol`` is copied from
     ``ssvi_history`` (same date and pillar) when given, else equals ``atm_vol`` (module
     docstring).  About 1 s per date (the importer)."""
-    root = Path(root)
-    manifest = load_manifest(root)
+    source = _source(root)  # one source for the run: it reads the vendor's manifest once
     P = tuple(float(p) for p in pillars)
     rows: list[dict[str, float | str]] = []
     diag: list[dict[str, Any]] = []
     for date in dates:
         try:
-            fits, spot, _points = raw_day(
-                root, date, underlying=underlying, fit_band=fit_band, manifest=manifest
-            )
+            fits, spot, _points = raw_day(source, date, underlying=underlying, fit_band=fit_band)
         except (ValueError, FileNotFoundError) as exc:
             diag.append(
                 {

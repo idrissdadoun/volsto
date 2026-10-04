@@ -1943,6 +1943,7 @@ Built inline (the phase-1 agent workflow failed on the account's spend limit; it
 ---
 
 ## 17. Change log v1.1 → v2.0
+- 2026-10-04 M11 Part 5 (own branch): §18.9 the vendor source — the invariant, `volsto/market/vendor.py`, the sites moved, the walking and contract tests, the same-machine proof.
 - 2026-10-04 M11 Part 3: §18.5 the read API over the vendor store (`available_dates`, `load_chain`, `load_range`; missing data raises with the exact `volsto-data` command).
 - 2026-10-03 M11 Parts 2a–2b: §18.3 (the layout table, the owner's choice, scaled integers as a later option), §18.4 (the store: convert, verify, extract, sql, measured throughput).
 - 2026-10-03 M11 Parts 0–1: §18 (new) — the ORATS one-day sample as measured, the owner's decisions, the data roots, `volsto-data status / fetch / verify-raw`, the raw manifest; §1 layout (`volsto/data/`); §12 M11.
@@ -2177,4 +2178,18 @@ With `store=` the printed commands carry `--store <path>` (shell-quoted). The co
 **Tests** (`tests/test_market_store.py`, 5, ≈ 4 s; the sample test skips when the sample is absent).
 
 **Not built yet.** The importer (Part 4), the second-vendor plan (Part 5).
+
+### 18.9 Part 5 — the vendor source (as built on its own branch, 2026-10-04; pending review)
+
+`volsto/market/vendor.py`, `tests/test_vendor_source.py`. Built from `main`, before Part 4 is merged, so **only the HistoricalData.net source is registered**; the ORATS source (the store's calendar, `import_orats.load_day` / `import_day`, the store entry's raw sha256 and schema version and the close it read as its checksums) is a small addition once Part 4 is merged — it needs nothing more from the consumers.
+
+**Invariant.** Nothing outside a vendor source knows where a vendor's days live, how a day becomes a chain, what its checksums are or where its prior rate curve comes from. (The third occurrence: `studies/backtest.py`, `calibration/history.py` and `calibration/raw_history.py` each hard-coded the HDN layout.)
+
+**The single place.** `VendorSource` owns the calendar (`available_dates`, `missing_dates`), day loading (`load_chain`, `import_day`), the checksums (`day_digest` — the SHA-256 of the day's file, `absent` without one — and `import_entry`, what else the import of a date reads, hashed by the caller) and the rate curve (`prior_rate_curve`). `HdnSource(root)` wraps `import_hdn` unchanged; `SOURCES` is the registry and `vendor_source(name, location)` builds one. A source reads its manifest once in its lifetime; `BacktestConfig.data_source()` returns a fresh one, and `InputIndex` keeps one.
+
+**Sites moved.** `backtest.py`: `VENDORS` is the registry's names; `calendar` asks the source for its dates and the vendor's missing days; `source_file`, `InputIndex.file_sha` and `InputIndex.manifest_sha` ask the source (the entry is hashed exactly as before; a `VendorError` becomes the same `DateFailure` message); `import_snapshot` calls the source's `import_day`; `manifest_file` is gone. `history.py`: `build_history(source, …)` is the builder, `hdn_available_dates` and `build_hdn_history` are thin wrappers over `HdnSource`. `raw_history.py`: `raw_day` and `raw_pillar_frame` take a source or an HDN directory and load through it. Scripts: `essvi_calendar_gate.py`, `add_sabrw_sections.py`, `step0_sabrw_study.py`.
+
+**Walking test** (`test_no_site_outside_the_vendor_modules_knows_a_vendor_layout`): an AST walk of `volsto/` and `scripts/` for the layout literals (`day_by_date`, `_options.csv`) and for imports or calls of the HDN loaders (`load_day`, `load_manifest`, `import_day`, `rate_curve`) outside `import_hdn.py` and `vendor.py`. One declared exception: `scripts/capture_yfinance.py`, which writes a chain in the HDN layout. **Contract test** over every registered source: the calendar is sorted and unique; the day digest is the file's SHA-256; the chain carries what the importer's steps read; the prior curve is the chain's; the import names the source's digest; the entry changes when, and only when, what that date's import reads changes; an unreadable manifest is loud for the entry and silent for the missing-day list.
+
+**HDN did not move (same machine, 2026-10-04; `main` against this branch).** 24 digests of what the consumers produce from the sample are identical: the 127 available dates; the calendar, the day-file checksums, the manifest-entry checksums and the first and last inputs digests of the toy and the 127-date backtest configs; the snapshot digest of `import_snapshot`; four `build_hdn_history` snapshots and the history frame; the raw pillar frame, its diagnostics and a `raw_day`. The toy backtest store built by `main` and by this branch is compared date by date in the PR (snapshot digests, inputs digests, fitted parameters, leverage keys, rows).
 
