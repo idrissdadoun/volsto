@@ -3,9 +3,9 @@
 The plumbing runs on the synthetic ORATS-format fixture (``tests/_orats_fixture.py``: Black-76
 prices on a known forward, discount and smile, with the SPX and SPXW roots sharing the third
 Fridays) converted into a temporary store.  The test on the real sample day skips when
-``data/orats_sample/`` is absent and asserts structure only: every measured number is printed
-and reported in SPEC §18.6 — no tolerance on vendor data is asserted before the owner agrees
-the constant.
+``data/orats_sample/`` is absent and asserts the structure and the tolerances the owner agreed on
+2026-10-04 (the named constants below, each with its measured value); every other measured
+number is printed and reported in SPEC §18.6.
 """
 
 from __future__ import annotations
@@ -30,6 +30,15 @@ from volsto.market.store import StoreMissing
 SAMPLE = roots.REPO_ROOT / "data" / "orats_sample" / "ORATS_SMV_Strikes_20240103.zip"
 HDN_SAMPLE = roots.REPO_ROOT / "data" / "hdn_sample" / "options_sample_2022H2"
 DAY = dt.date(2024, 1, 3)
+
+# Tolerances asserted on the real sample day 2024-01-03 (owner's decision F, 2026-10-04), each
+# with the value measured that day beside it (SPEC §18.6).  Everything else is printed.
+#: |parity forward / (stkPx · exp(iRate · T)) − 1| over the slices up to one year, in bp:
+FORWARD_CROSSCHECK_MEDIAN_BP = 3.0  # measured: median 1.05 to 6 months, 1.7 from 6 to 12
+FORWARD_CROSSCHECK_MAX_BP = 15.0  # measured: 10.0 to 6 months, 10.7 from 6 to 12
+#: eSSVI RMS residual inside |k| <= 0.2, in vol points:
+ESSVI_RMS_3M_2Y_VP = 0.25  # measured 0.188
+ESSVI_RMS_6M_2Y_VP = 0.20  # measured 0.154
 ISO = DAY.isoformat()
 
 
@@ -222,7 +231,26 @@ def test_orats_sample_day_imports(tmp_path: Path) -> None:
     )
     assert cfg["provenance"]["vendor"] == "orats" and cfg["provenance"]["fit"]["essvi"] is True
     assert cfg["provenance"]["spot"]["asynchronous"] is False
-    assert cfg["provenance"]["fit"]["calendar_fallback"] is None  # the proven calendar invariant
+    # the forward cross-check up to one year (decision 5)
+    xc = io.forward_crosscheck(chain, ih.implied_forwards(chain, max_years=3.0, band=0.10))
+    year = xc[xc["T"] <= 1.0]["bp"].abs()
+    assert len(year) >= 50
+    assert year.median() <= FORWARD_CROSSCHECK_MEDIAN_BP, year.median()
+    assert year.max() <= FORWARD_CROSSCHECK_MAX_BP, year.max()
+    # the eSSVI residuals on the regions SPEC §13 reports
+    rms_3m, rms_6m = fit.rms_error(2.0, 0.2, 0.25), fit.rms_error(2.0, 0.2, 0.5)
+    assert rms_3m <= ESSVI_RMS_3M_2Y_VP and rms_6m <= ESSVI_RMS_6M_2Y_VP, (rms_3m, rms_6m)
+    # the calendar certificate is proven: no fallback, the full margin on the full Dupire range
+    cal = cfg["provenance"]["fit"]
+    assert cal["calendar_fallback"] is None
+    assert cal["calendar_floor"] == ih.DEFAULT_CALENDAR_REPAIR.margin
+    assert cal["calendar_k_abs"] == ih.DEFAULT_CALENDAR_REPAIR.k_max
+    assert cal["calendar_lower_bound"] >= cal["calendar_floor"]
+    print(
+        f"\nforward cross-check up to 1y: median {year.median():.2f} bp, max {year.max():.2f} bp "
+        f"({len(year)} slices); eSSVI RMS 3m-2y {rms_3m:.3f}, 6m-2y {rms_6m:.3f} vp; calendar "
+        f"lower bound {cal['calendar_lower_bound']:.6e}"
+    )
     sp = points.spot
     print(
         f"\nORATS 2024-01-03: {len(points.table)} points, {points.table['expiry'].nunique()} "
