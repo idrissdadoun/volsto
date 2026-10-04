@@ -13,8 +13,8 @@ The walking tests:
   ``pytest -n auto`` spreads them; skipped when the sample is absent);
 * every snapshot shipped in the golden backtest store is the one its record names (stored
   bytes against stored bytes, no sample needed) and a fresh import reproduces its surface;
-* the stored SABRW fits are data: only the importer and the script that back-fills the section
-  may fit them (:func:`fit_sabrw` moves by up to 3.7 vol points under a few ulps of input
+* the stored SABRW fits are data: only the importers (HDN, ORATS) and the script that
+  back-fills the section may fit them (:func:`fit_sabrw` moves by up to 3.7 vol points under a few ulps of input
   noise), so every other module of ``volsto/`` and ``scripts/`` reads them back.
 """
 
@@ -39,11 +39,12 @@ SNAPSHOTS = ROOT / "configs" / "surfaces" / "snapshots"
 HDN_SAMPLE = ROOT / "data" / "hdn_sample" / "options_sample_2022H2"
 GOLDEN_R2 = ROOT / "tests" / "golden" / "backtest_store_r2.tar.gz"
 TRACKED = sorted(SNAPSHOTS.rglob("spx_*.yaml"))
-#: The only modules that may fit SABRW smiles (the importer writes them into the snapshot; the
-#: script back-fills the section of snapshots imported before it existed).
+#: The only modules that may fit SABRW smiles (an importer writes them into the snapshot it
+#: produces; the script back-fills the section of snapshots imported before it existed).
 SABRW_WRITERS = (
     "volsto/market/sabrw.py",
     "volsto/market/import_hdn.py",
+    "volsto/market/import_orats.py",  # the second importer: it writes the section too
     "scripts/add_sabrw_sections.py",
 )
 

@@ -6,9 +6,9 @@ fit in one day. Everything below was built and measured on the free one-day samp
 (2024-01-03, 66.8 MB zipped); SPEC §18 holds the measurements.
 
 State on 2026-10-03 (M11 Part 2b): every step below is built and measured on the sample. The
-read API (Part 3) and the importer (Part 4) are not, and the stored fit records must land
-before any backtest calibration on ORATS data — the archive can be downloaded, verified and
-converted before those.
+read API (Part 3) is merged; the SPX importer (Part 4) and the stored fit records are built and
+await review, and the fit records must be merged before any backtest calibration on ORATS data
+— the archive can be downloaded, verified and converted before those.
 
 Conventions:
 
