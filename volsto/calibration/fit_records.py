@@ -10,10 +10,24 @@ again, so the leverage key is the same everywhere.
 
 **Key** (:func:`fit_key`): the SHA-256 of what the fit reads and nothing else — the market and
 surface configuration (an eSSVI's pillar ``rhos`` included), the perturbation layer, the
-snapshot's stored SABRW fits when step 0 reads them, the resolved fit configuration, the SSR
+snapshot's stored SABRW fits when step 0 reads them (:func:`stored_sabrw_fit`: the fields the
+snapshot holds, **not** the zone edges a loaded fit recomputes — those are machine-dependent in
+their last bits and the marking fit never reads them), the resolved fit configuration, the SSR
 target — and the fit code tag :data:`FIT_CODE_TAG`.  It is the content of the snapshot the fit
 depends on (not the digest of its bytes: provenance text does not move a fit), so the backtest
 and any other pipeline fitting the same surface share one record.
+
+**Canonical encoding** (what is hashed; :func:`canonical`).  The inputs are first brought to
+plain values by :func:`volsto.config.to_mapping` — a dataclass becomes a mapping of its fields,
+a tuple or an array a list, a numpy scalar a Python number — from the *loaded* objects, so a
+snapshot's bytes never reach the key: its key order, comments, number formatting (``0.1`` or
+``1.0e-1``; ``3`` where the field is a float) and provenance play no part.  The mapping
+``{"fit_code_tag": tag, "inputs": inputs}`` is then written as JSON with the keys sorted, the
+separators ``,`` and ``:`` and no other whitespace, every float as Python's shortest
+round-trip ``repr`` of its IEEE-754 double (two floats have the same text if and only if they
+are the same double, so a one-ulp change of any number the fit reads is another key), integers
+as integers, ``None`` as ``null``, and the SHA-256 is taken of its UTF-8 bytes.  Checked by
+``tests/test_fit_records.py::test_key_ignores_the_bytes_and_sees_every_ulp``.
 
 **Store** (:class:`FitRecords`): ``<root>/<key[:2]>/<key>.json`` — by convention
 ``<leverage cache>/fits``, so the records travel with the leverages they key.  A record holds the
@@ -63,6 +77,7 @@ import volsto
 from volsto.calibration.fit_2f import BreakEvenFitConfig, FitResult, load_fit_spec
 from volsto.calibration.stability import PARAM_COLUMNS
 from volsto.config import BergomiParams, CalibrationSpec, to_mapping
+from volsto.market.sabrw import PARAM_NAMES
 
 log = logging.getLogger(__name__)
 
@@ -89,8 +104,32 @@ MODEL_FIELDS: Final[tuple[str, ...]] = tuple(f.name for f in dataclasses.fields(
 # --------------------------------------------------------------------------------------------
 
 
-def _canonical(payload: Any) -> str:
+def canonical(payload: Any) -> str:
+    """The canonical JSON text of ``payload`` (module docstring, *Canonical encoding*)."""
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+
+
+_canonical = canonical
+
+
+def stored_sabrw_fit(fit: Any) -> dict[str, Any]:
+    """One SABRW fit as the snapshot stores it (:func:`volsto.market.import_hdn.sabrw_section`):
+    ``T``, ``n``, the seven parameters, the two fit errors, the held and at-bound slopes and the
+    flags — and nothing else.  **Not the zones**: a loaded :class:`~volsto.market.sabrw.SabrwFit`
+    carries zone edges recomputed at load time (``x_Tu`` by a root solver, ``x_Td`` through
+    ``norm.ppf``), which differ in their last bits between machines for one snapshot file
+    (measured on Linux: up to 10 ulp on 352 of 458 stored fits), and which the marking fit
+    never reads.  The key is made of what the file holds."""
+    return {
+        "T": float(fit.T),
+        "n": int(fit.n),
+        "params": {k: float(v) for k, v in zip(PARAM_NAMES, fit.params.as_array(), strict=True)},
+        "rms_vp": float(fit.rms_vp),
+        "weighted_rms": float(fit.weighted_rms),
+        "held": list(fit.held),
+        "at_bound": list(fit.at_bound),
+        "flags": list(fit.flags),
+    }
 
 
 def fit_inputs(
@@ -102,7 +141,8 @@ def fit_inputs(
     """What a marking fit reads, as a JSON-able mapping: the market and surface of ``spec`` with
     its perturbation layer (the model, particle and scheme settings play no part), the resolved
     fit configuration, the SSR target and — when the configuration's step 0 reads them — the
-    snapshot's stored SABRW fits (``None`` otherwise, whatever the snapshot holds)."""
+    snapshot's stored SABRW fits (:func:`stored_sabrw_fit`: what the file holds, never the zones
+    recomputed at load time; ``None`` otherwise, whatever the snapshot holds)."""
     reads_fits = cfg.step0 is not None
     if reads_fits and sabrw_fits is None:
         raise ValueError("the fit's step 0 reads the snapshot's SABRW fits: none given")
@@ -112,7 +152,7 @@ def fit_inputs(
         "perturbation": None if spec.perturbation is None else to_mapping(spec.perturbation),
         "fit": to_mapping(cfg),
         "ssr_target": float(ssr_target),
-        "sabrw": [to_mapping(f) for f in sabrw_fits or ()] if reads_fits else None,
+        "sabrw": [stored_sabrw_fit(f) for f in sabrw_fits or ()] if reads_fits else None,
     }
 
 
@@ -484,6 +524,13 @@ def migrate_backtest_store(
             fits = sabrw_fits_from_config(raw) if fit_cfg.step0 is not None else None
             if "params" not in summary or "status" not in summary:
                 raise ValueError("fit.json holds no fitted parameters (a skipped or failed date)")
+            if fit_cfg.step0 is not None and fits is None:
+                raise ValueError(
+                    "its snapshot has no sabrw section (imported before the importer stored "
+                    "the fits): the fit's inputs cannot be re-derived; re-import and recompute "
+                    "the date"
+                )
+            fit_inputs(spec, fit_cfg, ssr, fits)
         except Exception as exc:
             rep.skipped[date] = f"{type(exc).__name__}: {exc}"
             continue

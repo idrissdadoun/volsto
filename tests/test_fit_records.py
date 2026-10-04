@@ -274,3 +274,134 @@ def test_every_marking_fit_site_is_declared() -> None:
     src = (ROOT / "volsto/studies/backtest.py").read_text()
     assert found["volsto/studies/backtest.py"] == 1
     assert "fit=lambda: fit_2f_marking(surface, cfg, ssr_target=ssr, step0=step0)," in src
+
+
+def test_key_ignores_the_bytes_and_sees_every_ulp(tmp_path: Path) -> None:
+    """The canonical encoding (module docstring): two byte-different snapshots with the same
+    content give the same key, and a one-ulp change of any number the fit reads gives another."""
+    import numpy as np
+    import yaml
+
+    from volsto.config import CalibrationSpec, load_yaml
+    from volsto.market.loaders import snapshot_spec
+
+    base = load_yaml(ROOT / "configs" / "studies" / "lsv_reference_2f.yaml", CalibrationSpec)
+    cfg = fit_preset("desk", skew_eps=0.10)
+
+    def key_of(path: Path) -> str:
+        fits = load_sabrw_fits(path)
+        return fr.fit_key(fr.fit_inputs(snapshot_spec(base, path), cfg, 1.0, fits))
+
+    key = key_of(SNAPSHOT)
+    doc = yaml.safe_load(SNAPSHOT.read_text())
+    # (1) other bytes, same content: keys sorted, another provenance and timestamp, a comment,
+    # floats in another notation, an integer written where a float is expected
+    other = yaml.safe_load(SNAPSHOT.read_text())
+    other["provenance"] = {"vendor": "someone else", "created_utc": "2000-01-01T00:00:00+00:00"}
+    assert float(other["ssvi"]["max_maturity"]).is_integer()
+    other["ssvi"]["max_maturity"] = int(other["ssvi"]["max_maturity"])
+    text = "# a comment the loader never sees\n" + yaml.safe_dump(other, sort_keys=True)
+    spot = doc["market"]["spot"]
+    sci = f"{spot:.17e}"
+    assert float(sci) == spot and repr(spot) in text
+    text = text.replace(f"spot: {spot!r}", f"spot: {sci}", 1)
+    rewritten = tmp_path / "rewritten.yaml"
+    rewritten.write_text(text)
+    assert rewritten.read_bytes() != SNAPSHOT.read_bytes()
+    assert key_of(rewritten) == key
+    # (2) one ulp on every number the fit reads, one at a time
+    inputs = fr.fit_inputs(snapshot_spec(base, SNAPSHOT), cfg, 1.0, load_sabrw_fits(SNAPSHOT))
+    assert json.loads(fr.canonical(inputs)) == json.loads(json.dumps(inputs))  # JSON-able as is
+
+    def float_paths(node: Any, path: tuple[Any, ...] = ()) -> list[tuple[Any, ...]]:
+        if isinstance(node, dict):
+            return [p for k, v in node.items() for p in float_paths(v, (*path, k))]
+        if isinstance(node, list):
+            return [p for i, v in enumerate(node) for p in float_paths(v, (*path, i))]
+        return [path] if isinstance(node, float) else []
+
+    paths = float_paths(inputs)
+    assert len(paths) > 300, len(paths)
+    assert {p[0] for p in paths} == {"market", "surface", "fit", "ssr_target", "sabrw"}
+    seen = {key}
+    for path in paths:
+        moved = json.loads(json.dumps(inputs))
+        node = moved
+        for part in path[:-1]:
+            node = node[part]
+        value = float(node[path[-1]]) if path else float(moved)
+        if not np.isfinite(value):
+            continue
+        bumped = float(np.nextafter(value, np.inf))
+        if path:
+            node[path[-1]] = bumped
+        k = fr.fit_key(moved if path else bumped)
+        assert k not in seen, f"one ulp on {path} did not change the key"
+        seen.add(k)
+    # through the real objects too: one ulp on the spot, on a pillar rho, on the SSR target
+    spec = snapshot_spec(base, SNAPSHOT)
+    fits = load_sabrw_fits(SNAPSHOT)
+    up = dataclasses.replace(
+        spec,
+        market=dataclasses.replace(spec.market, spot=float(np.nextafter(spec.market.spot, 1e9))),
+    )
+    assert fr.fit_key(fr.fit_inputs(up, cfg, 1.0, fits)) != key
+    assert fr.fit_key(fr.fit_inputs(spec, cfg, float(np.nextafter(1.0, 2.0)), fits)) != key
+    assert spec.surface.rhos is not None
+    rhos = (float(np.nextafter(spec.surface.rhos[0], 0.0)), *spec.surface.rhos[1:])
+    up = dataclasses.replace(spec, surface=dataclasses.replace(spec.surface, rhos=rhos))
+    assert fr.fit_key(fr.fit_inputs(up, cfg, 1.0, fits)) != key
+
+
+def test_key_is_made_of_what_the_snapshot_stores_not_of_the_zones() -> None:
+    """A loaded SABRW fit carries zone edges recomputed at load time (a root solver, norm.ppf):
+    they differ in the last bits between machines for one snapshot file.  The key is made of the
+    stored fields only, so it does not move when the zones do — and it equals the key computed
+    from the file's own ``sabrw.fits`` entries."""
+    import numpy as np
+    import yaml
+
+    from volsto.config import CalibrationSpec, load_yaml
+    from volsto.market.loaders import snapshot_spec
+    from volsto.market.sabrw import SabrwZones
+
+    base = load_yaml(ROOT / "configs" / "studies" / "lsv_reference_2f.yaml", CalibrationSpec)
+    cfg = fit_preset("desk", skew_eps=0.10)
+    spec = snapshot_spec(base, SNAPSHOT)
+    fits = load_sabrw_fits(SNAPSHOT)
+    assert fits is not None
+    inputs = fr.fit_inputs(spec, cfg, 1.0, fits)
+    key = fr.fit_key(inputs)
+    # the inputs' sabrw part is the file's own list, field for field
+    stored = yaml.safe_load(SNAPSHOT.read_text())["sabrw"]["fits"]
+    assert inputs["sabrw"] == stored
+    assert all("zones" not in entry for entry in inputs["sabrw"])
+    # zones moved by one ulp (each edge, up and down) and by ten: the same key
+    for ulps in (1, -1, 10):
+
+        def nudge(x: float, ulps: int = ulps) -> float:
+            for _ in range(abs(ulps)):
+                x = float(np.nextafter(x, np.inf if ulps > 0 else -np.inf))
+            return x
+
+        moved = tuple(
+            dataclasses.replace(
+                f,
+                zones=SabrwZones(
+                    nudge(f.zones.x_exd),
+                    nudge(f.zones.x_td),
+                    nudge(f.zones.x_tu),
+                    nudge(f.zones.x_exu),
+                ),
+            )
+            for f in fits
+        )
+        assert moved != fits
+        assert fr.fit_key(fr.fit_inputs(spec, cfg, 1.0, moved)) == key
+    # ... while a stored field moved by one ulp is another key
+    f0 = fits[0]
+    params = dataclasses.replace(f0.params, nu=float(np.nextafter(f0.params.nu, np.inf)))
+    changed = (dataclasses.replace(f0, params=params), *fits[1:])
+    assert fr.fit_key(fr.fit_inputs(spec, cfg, 1.0, changed)) != key
+    changed = (dataclasses.replace(f0, n=f0.n + 1), *fits[1:])
+    assert fr.fit_key(fr.fit_inputs(spec, cfg, 1.0, changed)) != key
