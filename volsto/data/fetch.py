@@ -30,7 +30,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from volsto.data.roots import DataError, fmt_bytes, free_bytes, require_free_space
+from volsto.data.roots import DataError, ensure_dir, fmt_bytes, free_bytes, require_free_space
 
 AWS_INSTALL_HINT = "install the AWS CLI (brew install awscli) and configure a profile"
 _FORBIDDEN_EXTRA = ("--delete", "--profile", "--dryrun")
@@ -183,7 +183,7 @@ def fetch(
             say(f"WARNING: the sync would be refused — {exc}")
         return proc.returncode
     require_free_space(dest, needed, what="the download")
-    dest.mkdir(parents=True, exist_ok=True)
+    ensure_dir(dest)
     argv = sync_argv(aws, uri, dest, profile, include=include, extra=extra)
     say("sync: " + " ".join(argv))
     code = subprocess.run(argv).returncode

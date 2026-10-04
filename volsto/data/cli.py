@@ -6,6 +6,10 @@
 ``verify-raw``  hash and scan every raw zip, write the raw manifest, check the trading
                 calendar, schema and OPRA columns (:mod:`volsto.data.raw`); exit 1 on any
                 finding.
+``convert``     raw zips → one typed Parquet file per trading day (:mod:`volsto.data.store`).
+``verify``      every Parquet file against its raw file: rows, null counts, sums, equality.
+``extract``     one Parquet file per ticker across all dates (:mod:`volsto.data.extract`).
+``sql``         a DuckDB query over the store (optional; the ``data`` extra).
 
 Exit codes: 0 clean, 1 a check found something, 2 a refusal (:class:`DataError`).
 """
@@ -17,8 +21,11 @@ import logging
 import time
 from pathlib import Path
 
+from volsto.data import extract as extractmod
 from volsto.data import orats
 from volsto.data import raw as rawmod
+from volsto.data import sql as sqlmod
+from volsto.data import store as storemod
 from volsto.data.fetch import fetch
 from volsto.data.roots import (
     ENV_RAW,
@@ -84,6 +91,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="a raw manifest to compare with by name and sha256 (checks a second copy; "
         "implies --rehash)",
     )
+    cp = sub.add_parser("convert", help="raw zips -> one typed Parquet file per trading day")
+    cp.add_argument("--vendor", required=True, choices=VENDORS)
+    cp.add_argument("--workers", type=int, default=storemod.DEFAULT_WORKERS)
+    cp.add_argument("--force", action="store_true", help="convert again files that are up to date")
+
+    yp = sub.add_parser("verify", help="compare every Parquet file with its raw file")
+    yp.add_argument("--vendor", required=True, choices=VENDORS)
+    yp.add_argument("--workers", type=int, default=storemod.DEFAULT_WORKERS)
+
+    ep = sub.add_parser("extract", help="one Parquet file per ticker across all dates")
+    ep.add_argument("--vendor", default=orats.VENDOR, choices=VENDORS)
+    ep.add_argument("--tickers", required=True, help="comma-separated, e.g. SPX,AAPL")
+
+    qp = sub.add_parser("sql", help="a DuckDB query over the store (view: strikes)")
+    qp.add_argument("--vendor", default=orats.VENDOR, choices=VENDORS)
+    qp.add_argument("--max-rows", type=int, default=sqlmod.DEFAULT_MAX_ROWS)
+    qp.add_argument("query")
     return ap
 
 
@@ -111,7 +135,23 @@ def cmd_status(roots: DataRoots) -> int:
             if man["n_files"] != len(zips):
                 print(f"  the manifest is stale: volsto-data verify-raw --vendor {vendor}")
         store_dir = roots.store_dir(vendor)
-        print(f"  store {store_dir}: {'exists' if store_dir.is_dir() else 'absent'}")
+        if not (store_dir / storemod.MANIFEST_NAME).exists():
+            print(f"  store {store_dir}: no manifest (volsto-data convert --vendor {vendor})")
+            continue
+        files = storemod.read_manifest(store_dir)["files"]
+        size = sum(e["bytes"] for e in files.values())
+        span = f"{min(files)} .. {max(files)}" if files else "-"
+        print(f"  store {store_dir}: {len(files)} days, {span}, {fmt_bytes(size)}")
+        raw_dates = {e["trade_date"] for e in (man or {}).get("files", []) if e["trade_date"]}
+        if raw_dates - set(files):
+            print(
+                f"    {len(raw_dates - set(files))} raw dates not converted: "
+                f"volsto-data convert --vendor {vendor}"
+            )
+        for ticker, e in extractmod.read_manifest(store_dir)["tickers"].items():
+            state = extractmod.extract_state(store_dir, ticker)
+            hint = "" if state == "current" else f": volsto-data extract --tickers {ticker}"
+            print(f"    extract {ticker}: {e['rows']:,} rows, {e['n_dates']} dates, {state}{hint}")
     return 0
 
 
@@ -133,6 +173,46 @@ def cmd_verify_raw(roots: DataRoots, args: argparse.Namespace) -> int:
     return 1 if rep.findings() else 0
 
 
+def cmd_convert(roots: DataRoots, args: argparse.Namespace) -> int:
+    rep = storemod.convert(
+        roots.raw_dir(args.vendor),
+        roots.store_dir(args.vendor),
+        workers=args.workers,
+        force=args.force,
+    )
+    print(storemod.format_convert(rep))
+    return 0 if rep.clean else 1
+
+
+def cmd_verify(roots: DataRoots, args: argparse.Namespace) -> int:
+    rep = storemod.verify_store(
+        roots.raw_dir(args.vendor), roots.store_dir(args.vendor), workers=args.workers
+    )
+    print(storemod.format_verify(rep))
+    return 0 if rep.clean else 1
+
+
+def cmd_extract(roots: DataRoots, args: argparse.Namespace) -> int:
+    rep = extractmod.extract(roots.store_dir(args.vendor), args.tickers)
+    for ticker, e in rep.tickers.items():
+        print(
+            f"{ticker}: {e['rows']:,} rows on {e['n_dates']} dates ({e['first']} .. {e['last']}), "
+            f"{fmt_bytes(e['bytes'])} -> {extractmod.ticker_path(rep.store_dir, ticker)}"
+        )
+    for ticker in rep.missing:
+        print(f"FAILED {ticker}: on no date of the store (no file written)")
+    print(f"  {rep.dates} store dates read; wall clock {rep.wall_s:.1f} s")
+    return 1 if rep.missing else 0
+
+
+def cmd_sql(roots: DataRoots, args: argparse.Namespace) -> int:
+    frame = sqlmod.run_sql(roots.store_dir(args.vendor), args.query)
+    print(frame.head(args.max_rows).to_string(index=False))
+    if len(frame) > args.max_rows:
+        print(f"… {len(frame) - args.max_rows} more rows (--max-rows)")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -152,6 +232,14 @@ def main(argv: list[str] | None = None) -> int:
             )
         if args.command == "verify-raw":
             return cmd_verify_raw(roots, args)
+        if args.command == "convert":
+            return cmd_convert(roots, args)
+        if args.command == "verify":
+            return cmd_verify(roots, args)
+        if args.command == "extract":
+            return cmd_extract(roots, args)
+        if args.command == "sql":
+            return cmd_sql(roots, args)
     except DataError as exc:
         print(f"volsto-data: {exc}")
         return 2

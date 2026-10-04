@@ -5,9 +5,10 @@ S3 credentials expire 14 days after purchase: steps 1–5 are the ones that need
 fit in one day. Everything below was built and measured on the free one-day sample
 (2024-01-03, 66.8 MB zipped); SPEC §18 holds the measurements.
 
-State on 2026-10-03 (M11 Part 1): steps 0–5 are built. Steps 6–8 (`convert`, `verify`,
-`extract`) land with Part 2b; their commands, times and disk are filled in then and are marked
-**pending** here — do not buy before that part is merged.
+State on 2026-10-03 (M11 Part 2b): every step below is built and measured on the sample. The
+read API (Part 3) and the importer (Part 4) are not, and the stored fit records must land
+before any backtest calibration on ORATS data — the archive can be downloaded, verified and
+converted before those.
 
 Conventions:
 
@@ -139,18 +140,71 @@ it too, and the scan reads `*.zip` only, so it is never taken for a raw file.)
 
 After this step the credentials are no longer needed.
 
-## 6. Convert — pending Part 2b
+## 6. Convert
 
-`volsto-data convert --vendor orats`: one Parquet file per trading day under
-`$VOLSTO_DATA_STORE/orats/strikes/year=YYYY/`, read straight from the zips. Layout, time, peak
-memory and disk are measured in Part 2a/2b (Part 0 measured 99 MB per day at zstd-3, 1.5 × the
-zip, which is what Part 2a sets out to reduce).
+```bash
+caffeinate -i .venv/bin/volsto-data convert --vendor orats
+```
 
-## 7. Verify the store — pending Part 2b
+Reads each day's CSV straight from its zip and writes
+`$VOLSTO_DATA_STORE/orats/strikes/year=YYYY/YYYY-MM-DD.parquet` (zstd 9, dictionary off, row
+groups of 131,072, every vendor column, float64, the full universe), then
+`store_manifest.json`. Needs the raw manifest of step 4; each zip's sha256 is checked again as
+it is read. Refuses before writing if the store volume is short of 1.14 × the zips to convert
+plus 10 GiB. Interrupted: run it again, finished days are skipped.
 
-`volsto-data verify --vendor orats`: row counts, per-column null counts and sums equal between
-raw and Parquet, for every file.
+- Time (measured, 16 sample-sized days): 2.3 days/s on the default 8 workers → about 36 min
+  for 4,970 days; 16 workers 29 min, 4 workers 55 min. If raw is on a spinning disk the read
+  (300 GB at 150 MB/s ≈ 35 min) is the floor.
+- Memory: 0.8–1.1 GiB per worker at the sample's size → 7–9 GiB on 8 workers.
+- Disk: 1.14 × the zips: 229–400 GB for the 200–350 GB estimate. If raw and store share one
+  disk, they need 430–750 GB together.
+- Exit 1 lists every file that failed (`FAILED <file>: <reason>`) — schema drift, a value that
+  does not parse, a `trade_date` mismatch, an SPX row without an OPRA symbol — and every day
+  whose `cOpra` is not unique. A failed day is not in the store; send me the list.
 
-## 8. Extract — pending Part 2b
+## 7. Verify the store
 
-`volsto-data extract --tickers SPX,…`: one Parquet per ticker across all dates, for backtests.
+```bash
+caffeinate -i .venv/bin/volsto-data verify --vendor orats
+```
+
+Re-reads every raw file and its Parquet file: the raw sha256 against the manifest, the row
+count, per column the null count and the sum, then the whole tables for equality. Lists raw
+dates not converted and Parquet files without a manifest entry. Exit 0 only when every file is
+a faithful copy.
+
+- Time (measured): 5.3 days/s on 8 workers → about 16 min for 4,970 days.
+- Memory: about 1.2 GiB per worker. Disk: none.
+
+## 8. Extract
+
+```bash
+caffeinate -i .venv/bin/volsto-data extract --tickers SPX
+```
+
+One Parquet file per ticker across all dates, `$VOLSTO_DATA_STORE/orats/by_ticker/SPX.parquet`
+(one row group per trade date), bound to the store manifest: after any later `convert` the
+extract reads as stale in `volsto-data status` and the same command rebuilds it.
+
+- Time (measured): 0.08 s per store day for three tickers → about 7 min for 4,970 days.
+- Disk: SPX is about 1.1 MiB per day at the sample's size → about 5 GB for the archive.
+
+## Afterwards
+
+```bash
+.venv/bin/volsto-data status
+```
+
+```bash
+.venv/bin/volsto-data sql "select year, count(*) as rows, count(distinct ticker) as tickers from strikes group by year order by year"
+```
+
+`sql` is optional (DuckDB, the `data` extra); the view `strikes` is every day file plus `year`.
+
+## External volumes
+
+Raw and store may both sit on external volumes; nothing assumes the internal disk. Temporary
+files are written beside their destination (same volume) and renamed. If a root points below
+`/Volumes/<name>` and that volume is not mounted, every command refuses instead of creating the
+directory on the internal disk. macOS's `._*` companion files on non-APFS volumes are ignored.
