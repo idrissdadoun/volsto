@@ -1665,6 +1665,36 @@ The plain-SSVI set: ρ 2.9e-09, η 3.9e-08, γ 4.8e-09, the rest as above. First
 
 **Not wired — a question for the owner.** Three sites still fit in place and their parameters reach leverage keys: `viewers/grid.py::marking_fit` (the precompute's marking points, S5, the payoff study), `hedging/hedger.py` (the recalibration rule's refits on moved surfaces) and `risk/shadow_rotation.py` (the rotation states). They consume the full `FitResult` (targets, tables, constraints), which a record does not hold, and two of them fit on perturbed surfaces inside a run. `tests/test_fit_records.py::test_every_marking_fit_site_is_declared` walks `volsto/` and fails on any caller not declared there. Options: (a) store the per-pillar table and constraint table in the record and give these sites a result rebuilt from it; (b) fit as today but replace the parameters by the record's when one exists (the diagnostics then describe this machine's fit); (c) leave them, since their leverages are bumps and study points that are recomputed per machine anyway.
 
+### 13.5 SABRW: the exact zone edge (owner's decision I, 2026-10-04; pending review)
+
+**The defect (stage B, measured 2026-10-04).** `fit_sabrw` moved its smile by up to 3.5 vol points at the quotes under 1e-15 relative noise on its inputs (1,519 of the 4,711 fits of the 127 HDN days by more than 0.01 vp), which is how one machine's fits differed from another's (§13.3). Of four candidate mechanisms — early termination, the zone edge moving with the parameters, unidentified wing slopes, a flat ρ–ν valley — **the zone edge dominates**: the upside edge `x_Tu`, the minimum of the plain SABR smile, was found inside every residual evaluation by a bounded scalar minimiser accurate to about 1e-8 relative (1.7e-7 at worst), the size of the finite-difference step of the Jacobian. Tighter solver tolerances changed nothing (408 of 412 unstable fits on a 32-day subsample stayed unstable); an exact edge alone fixed 402 of them; the remainder is the weakly identified wing slopes (the weakest singular direction of the Jacobian lies in the wing slopes on 1,162 of 1,187 fits; condition number median 1.2e4, at most 4e6), and the ρ–ν block is well conditioned (at most 260). A staged fit (core on the central zone, then the wings) is stable to 1e-5 vp but fits worse on 1,139 of 1,187 and moves ρ by a median 6e-3 and ν by 2e-2: not adopted.
+
+**The closed form (derived).** The smile is `σ̂(k) = k / I(k)`, `I(k) = ∫_0^k dz / g(z)`, `g(z) = √(σ² + 2ρνσz + ν²z²)`. Its derivative vanishes where `I(k) = k / g(k)`. With `u = (ν/σ)k` and `c = √(1 − ρ²)` this is the positive root of
+
+`φ(u) = asinh((ρ + u)/c) − asinh(ρ/c) − u / √(1 + 2ρu + u²)`,
+
+which depends on ρ alone: `x_Tu = u*(ρ) · σ/ν`. `φ(0) = 0` and `φ′(u) = u(ρ + u) / (1 + 2ρu + u²)^{3/2}`, so there is no positive root for ρ ≥ 0 (the smile rises from the money) and exactly one, beyond −ρ, for ρ < 0. `smile_minimum_root` evaluates the two `asinh` in the stable difference form `asinh(((ρ + u) − ρ√q)/c²)`, brackets from −ρ, solves by Brent and polishes by two Newton steps; `sabr_smile_minimum` keeps the search interval `[0.01√T, 3√T]` and the flags of the minimiser it replaces.
+
+**Against the minimiser** (`test_exact_zone_edge_matches_the_minimiser`; 2,520 grid points over σ ∈ {0.01 … 3}, ρ ∈ {−0.999 … 0.999}, ν ∈ {1e-3 … 20}, T ∈ {0.02 … 3}: 802 interior minima, 779 without a minimum (ρ ≥ 0), 460 below the floor, 418 beyond the search cap). Same flag on 2,459 points; where both are interior the edges agree to 2.2e-7 relative for ρ ≤ −0.1 and to 1.7e-4 at worst (at ρ = −1e-4, where the smile is flat to 1e-15 around its minimum; the smile at the closed form is never higher). **The 61 other points are one artefact of the minimiser, asserted in the test, not hidden:** all have ρ ≥ 0, so the smile has no minimum; the minimiser stops just above the floor (1e-6 to 5e-3 relative), past its own 1e-6 test, and reports an interior minimum where the closed form reports none. The edge differs by that same amount there; the flag differs.
+
+**The noise experiment on all 127 dates** (4,711 expiry fits, 1e-15 relative noise on the vols; the fitter on `main` against this one; 72 s):
+
+| change under the noise | fitter on `main`: median / p99 / max | exact edge: median / p99 / max |
+|---|---|---|
+| ρ | 6e-6 / 3.0e-3 / 1.2e-2 | 1e-8 / 9e-5 / 2.3e-3 |
+| ν | 1e-5 / 5.1e-3 / 3.0e-2 | 2e-8 / 1.1e-4 / 2.6e-3 |
+| smile at the quotes, vp | 1.1e-3 / 0.45 / 3.5 | 6e-7 / 6e-3 / 0.22 |
+| smile inside \|k\| ≤ 0.2, vp | 9e-5 / 0.058 / 0.73 | 1e-7 / 5e-4 / 0.009 |
+| weighted RMS | 3e-7 / 0.014 / 1.2 | 4e-13 / 2e-4 / 0.027 |
+
+Fits moving by more than 0.01 vp at the quotes: 1,519 → 32; by more than 0.1 vp: 308 → 4; by more than 1 vp: 9 → 0. Inside |k| ≤ 0.2 none moves by more than 0.01 vp (282 before). *Fit quality:* the weighted RMS is lower on 1,886 fits and higher on 102 (largest increase 0.081, largest decrease 0.146; median 1.811 for both); the plain RMS rises by more than 0.01 vp on 89 fits and by more than 0.1 vp on one (0.184), and falls by more than 0.01 vp on 42. *Against the old fits:* ρ moves by a median 3e-6 (max 1.2e-2), ν by 5e-6 (max 2.0e-2), the smile at the quotes by a median 4e-4 vp, 0.41 at the 99th percentile and 3.8 at most — the size of the old fitter's own noise; the held-slope and at-bound sets are equal on 4,361 fits. 0.016 s per fit at the median (0.025 before).
+
+**Tags and guards.** `sabrw.py` joins `IMPORTER_GUARDED_MODULES` (it writes the `sabrw` section of every snapshot; a change of the fitter passed the importer guard silently before). `IMPORTER_TAG` is bumped to **2026-10-04**: the change moves snapshots. `FIT_CODE_TAG` is *not* bumped and `fit_guard.json` is re-recorded: the desk marking fit on five snapshots with their stored sections unchanged is bit-identical before and after the code change (the marking reads the stored fits' parameters, not the zone edge); the fit records' keys move anyway, because the stored fits they read do.
+
+**Regenerated.** The `sabrw` section of all 256 tracked snapshots (`scripts/add_sabrw_sections.py --replace`, 481 s): every byte before the section is identical in all 256, the section and its tag are new in all 256. **The market, surface and provenance sections were deliberately left as they are** — a full re-import on this machine would also move every fitted (ρ, η, γ) in its last digits (§13.3: up to 1e-7), and with them the leverage key of every spec built on a tracked snapshot, SABRW or not. The golden backtest store is regenerated from a toy build under the new tag (21 files, 129 kB). *For the owner's review:* say if a full re-import of the tracked snapshots is wanted instead.
+
+**Not started (owner's instruction): the rebuild.** What the new tag and the new fits invalidate, and the estimated cost, is in the PR; nothing under `cache/` or `outputs/` was touched.
+
 ---
 
 ## 14. (superseded — the delta regimes are now §7.2)
@@ -1965,6 +1995,7 @@ Built inline (the phase-1 agent workflow failed on the account's spend limit; it
 ---
 
 ## 17. Change log v1.1 → v2.0
+- 2026-10-04 SABRW exact zone edge: §13.5 (new) — the mechanism, the closed form, the grid test against the minimiser, the 127-date noise experiment, the tags, what was regenerated.
 - 2026-10-04 M11 Part 5 (own branch): §18.9 the vendor source — the invariant, `volsto/market/vendor.py`, the sites moved, the walking and contract tests, the same-machine proof.
 - 2026-10-04 M11 Part 4: §18.6 the canonical chain and the ORATS importer for SPX with the 2024-01-03 measurements and the same-machine proof that no HDN snapshot moved; §18.7 the vendor-source plan; §18.8 the single-stock report; §13 wording.
 - 2026-10-04 stored fit records: §13.4 (new) — the fit key, the record store beside the leverage cache, the backtest reading records, the migration, the sites not wired.

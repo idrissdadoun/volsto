@@ -29,7 +29,8 @@ In the central zone the smile is plain SABR, so the ATM level, skew and curvatur
 **Zones** (:func:`zones`): ``x_Td = N⁻¹(−Δ_put) σ_ref √T`` with ``Δ_put = −15 %`` and ``σ_ref =
 30 %`` (the documents' "≈": the ``½σ²T`` term of the put delta is left out — volsto's reading),
 ``x_Tu`` the plain SABR smile's minimum on ``k > 0`` (:func:`sabr_smile_minimum`; volsto's
-reading of the documents' ``arginf σ̂^SABR``), ``x_EXd = 4 x_Td`` and ``x_EXu = 2 x_Tu``.
+reading of the documents' ``arginf σ̂^SABR``; in closed form ``u*(ρ) σ/ν``,
+:func:`smile_minimum_root`), ``x_EXd = 4 x_Td`` and ``x_EXu = 2 x_Tu``.
 
 **Fit** (:func:`fit_sabrw`): weighted non-linear least squares on one expiry's quotes,
 ``Σ_i ((σ̂(k_i) − σ̂_mid,i) / ε_i)²``, under bounds (:data:`BOUNDS`).  The documents' solver is
@@ -44,13 +45,14 @@ pricing surface: its place is the step-0 input of the marking calibration.  Chec
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Final
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
-from scipy.optimize import least_squares, minimize_scalar
+from scipy.optimize import brentq, least_squares
 from scipy.stats import norm
 
 FloatArray = NDArray[np.float64]
@@ -154,24 +156,76 @@ def sabr_bbf_vol(k: ArrayLike, sigma: float, rho: float, nu: float) -> FloatArra
     return np.asarray(out, dtype=np.float64)
 
 
+def smile_minimum_root(rho: float) -> float | None:
+    """``u*(ρ)``: the position of the plain SABR smile's minimum on ``k > 0`` in units of
+    ``σ/ν`` (``x = u* σ/ν``), ``None`` when the smile has none (``ρ ≥ 0``).  **Derived.**
+
+    The smile is ``σ̂(k) = k / I(k)`` with ``I(k) = ∫_0^k dz / g(z)`` and
+    ``g(z) = sqrt(σ² + 2ρνσ z + ν² z²)``.  Its derivative vanishes where ``I(k) = k I′(k)``,
+    i.e. ``I(k) = k / g(k)``.  With ``u = (ν/σ) k`` and ``c = sqrt(1 − ρ²)``,
+
+        ν I(k) = asinh((ρ + u)/c) − asinh(ρ/c),      ν k / g(k) = u / sqrt(1 + 2ρu + u²),
+
+    so the minimum is the positive root of
+
+        φ(u) = asinh((ρ + u)/c) − asinh(ρ/c) − u / sqrt(q(u)),      q(u) = 1 + 2ρu + u²,
+
+    which depends on ``ρ`` alone: ``σ`` and ``ν`` only scale it.  ``φ(0) = 0`` and
+    ``φ′(u) = u (ρ + u) / q(u)^{3/2}``: for ``ρ ≥ 0`` ``φ`` increases from 0 and has no positive
+    root (the smile rises from the money); for ``ρ < 0`` it decreases on ``(0, −ρ)``, increases
+    beyond and grows like ``ln u``, so it has exactly one positive root, beyond ``−ρ``.  The two
+    ``asinh`` are subtracted in the stable form ``asinh(a) − asinh(b) = asinh(a sqrt(1 + b²) −
+    b sqrt(1 + a²))``, here ``asinh(((ρ + u) − ρ sqrt(q)) / c²)``.  The root is bracketed from
+    ``−ρ``, found by Brent's method and polished by two Newton steps (machine precision; the
+    bounded scalar minimiser this replaces was accurate to about 1e-8 relative, which made the
+    zone edge — and through it the fit's finite-difference Jacobian — noisy: SPEC §13.5).
+    Checked by ``tests/test_sabrw.py::test_exact_zone_edge_matches_the_minimiser``."""
+    if not rho < 0.0:
+        return None
+    c2 = 1.0 - rho * rho
+
+    def phi(u: float) -> float:
+        q = 1.0 + 2.0 * rho * u + u * u
+        root_q = math.sqrt(q)
+        return math.asinh(((rho + u) - rho * root_q) / c2) - u / root_q
+
+    lo = -rho
+    if not phi(lo) < 0.0:  # |ρ| so small that φ is lost in rounding: no usable minimum
+        return None
+    hi = max(4.0, -8.0 * rho)
+    while phi(hi) <= 0.0:
+        hi *= 4.0
+        if hi > 1e12:
+            return None
+    u = float(brentq(phi, lo, hi, xtol=1e-15, rtol=8.9e-16, maxiter=200))
+    for _ in range(2):
+        q = 1.0 + 2.0 * rho * u + u * u
+        slope = u * (rho + u) / q**1.5
+        if slope > 0.0:
+            u -= phi(u) / slope
+    return u
+
+
 def sabr_smile_minimum(sigma: float, rho: float, nu: float, T: float) -> tuple[float, bool]:
     """``(x, interior)``: the minimum of the plain SABR smile on ``0 < k ≤ SMILE_MIN_SEARCH √T``,
     and whether it is an interior minimum.  Without one (``ρ ≥ 0``: the smile rises from the
-    money) ``x`` is ``SMILE_MIN_FLOOR √T``."""
+    money; or the minimum falls below ``SMILE_MIN_FLOOR √T`` or beyond ``SMILE_MIN_SEARCH √T``)
+    ``x`` is ``SMILE_MIN_FLOOR √T``.
+
+    The minimum is ``x = u*(ρ) σ/ν`` with ``u*`` the root of :func:`smile_minimum_root` — the
+    closed form (since 2026-10-04; until then a bounded scalar minimiser of the smile, of which
+    this keeps the search interval and the flags)."""
     if not T > 0.0:
         raise ValueError("T must be positive")
     lo, hi = SMILE_MIN_FLOOR * np.sqrt(T), SMILE_MIN_SEARCH * np.sqrt(T)
-    res = minimize_scalar(
-        lambda x: float(sabr_bbf_vol(np.array([x]), sigma, rho, nu)[0]),
-        bounds=(lo, hi),
-        method="bounded",
-        options={"xatol": 1e-9 * max(1.0, hi)},
-    )
-    x = float(res.x)
+    u = smile_minimum_root(rho)
+    if u is None:
+        return float(lo), False
+    x = u * sigma / nu
     interior = lo * (1.0 + 1e-6) < x < hi * (1.0 - 1e-6)
     if not interior:
         return float(lo), False
-    return x, True
+    return float(x), True
 
 
 def zones(params: SabrwParams, T: float) -> tuple[SabrwZones, bool]:
