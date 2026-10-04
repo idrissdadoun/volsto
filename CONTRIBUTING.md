@@ -74,10 +74,17 @@ whose Accelerate gives other last bits — SPEC §13.3.)
   1e-3 for a flagged one (`tests/helpers.py`, with the measured maxima beside the constants).
 - **A golden store carries the bytes its records name** (`tests/golden/`), so a record is
   verified against stored bytes.
-- **Known gap** (planned, SPEC §13.3): the leverage cache key hashes fitted parameters, which
-  another machine reproduces to 1e-8 only. Until fitted parameters are stored records keyed by
-  their inputs, a leverage calibrated on one machine is a cache miss after a refit on another,
-  and the golden backtest store must be regenerated on the machine that runs its tests.
+- **Fitted parameters are stored records** (SPEC §13.4, `volsto/calibration/fit_records.py`):
+  a marking fit is a record keyed by its inputs (the snapshot's market, surface and SABRW fits,
+  the fit config, the SSR target, `FIT_CODE_TAG`), kept beside the leverage cache
+  (`<cache>/fits`). A pipeline reads the record when it exists and fits only when it does not,
+  so the leverage key is the same on every machine that holds the record; there is no rounding
+  inside keys. Bump `FIT_CODE_TAG` when a change moves any marking fit (guarded by
+  `fit_guard.json`).
+- **Known gap**: the backtest reads the records; the precompute's marking points, the hedger's
+  recalibration rule and the rotation states still fit in place (declared in
+  `tests/test_fit_records.py::NOT_YET_RECORDED`), and the golden backtest store is regenerated
+  on the machine that runs its tests.
 
 ## Code
 
