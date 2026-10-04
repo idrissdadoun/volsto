@@ -53,6 +53,7 @@ from volsto.calibration.history import hdn_available_dates
 from volsto.market import import_hdn as ih
 from volsto.market.loaders import load_ssvi_surface
 from volsto.market.surface import CALENDAR_GRID_N_T, ESSVISurface, SSVISurface
+from volsto.market.vendor import HdnSource
 
 ROOT = Path(__file__).resolve().parents[1]
 ANCHOR = "2022-12-30"
@@ -200,8 +201,7 @@ def committed_snapshots() -> dict[str, Any]:
 
 def run_day(root: Path, date: str, *, with_ssvi: bool) -> dict[str, Any]:
     f = ih.HdnFilters()
-    manifest = ih.load_manifest(root)
-    chain = ih.load_day(root / "day_by_date" / f"{date}_options.csv", "SPX", manifest=manifest)
+    chain = HdnSource(root).load_chain(date, "SPX")
     fwds = ih.implied_forwards(chain, max_years=f.max_years, band=f.near_atm_band)
     grid, pts = ih.to_grid_surface(chain, fwds, f)
     row: dict[str, Any] = {"date": date}

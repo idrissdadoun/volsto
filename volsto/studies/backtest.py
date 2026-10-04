@@ -373,7 +373,6 @@ from volsto.calibration.history import (
     MIN_INCREMENTS,
     SurfaceHistory,
     SurfacePillarSource,
-    hdn_available_dates,
 )
 from volsto.calibration.particle import CALIBRATION_CODE_TAG
 from volsto.calibration.stability import PARAM_COLUMNS, flag_unidentified, rolling_fit
@@ -392,12 +391,13 @@ from volsto.market.curves import DiscountCurve, ForwardCurve
 from volsto.market.import_hdn import (
     DEFAULT_CALENDAR_REPAIR,
     IMPORTER_TAG,
-    import_day,
     write_snapshot,
 )
 from volsto.market.loaders import sabrw_fits_from_config, snapshot_spec, step0_source
 from volsto.market.surface import ArbitrageError, ImpliedSurface, surface_from_config
 from volsto.market.varswap import varswap_strike
+from volsto.market.vendor import ABSENT as VENDOR_ABSENT
+from volsto.market.vendor import SOURCES, VendorError, VendorSource, vendor_source
 from volsto.models.leverage import LeverageFunction
 from volsto.models.lsv import LSV
 from volsto.products.autocall import Autocall, Phoenix
@@ -479,7 +479,7 @@ PROBE_ATTEMPTS: Final[int] = 6
 #: timing exists: measured 2026-09-16 on 2022-07-27 (1.11 s, repair on, single process).
 IMPORT_S_FALLBACK: Final[float] = 1.1
 #: Vendors with an importer.
-VENDORS: tuple[str, ...] = ("hdn",)
+VENDORS: tuple[str, ...] = tuple(SOURCES)
 #: Rolling-book schedules and marking policies.
 ROLLING_EVERY: tuple[str, ...] = ("month", "none")
 ROLLING_MARK: tuple[str, ...] = ("daily", "inception")
@@ -1216,6 +1216,13 @@ class BacktestConfig:
     def data_root(self) -> Path:
         return _resolve(self.section("data")["root"])
 
+    def data_source(self) -> VendorSource:
+        """A fresh vendor source of ``data.vendor`` at ``data.root`` — the one object that knows
+        the vendor's files (:mod:`volsto.market.vendor`, SPEC §18.9): its calendar, day loading,
+        checksums and rate curve.  Fresh on every call, so it reads the vendor's manifest as it
+        is now; :class:`InputIndex` keeps one for its lifetime."""
+        return vendor_source(str(self.section("data")["vendor"]), self.data_root)
+
     @property
     def underlying(self) -> str:
         return str(self.section("data")["underlying"])
@@ -1371,19 +1378,15 @@ def calendar(cfg: BacktestConfig) -> list[str]:
     not silently shift the fixing grid: ``data.missing_close`` decides what it does).  A day
     that is neither present nor listed is invisible — the manifest is the only exchange
     calendar the importer has."""
-    dates = set(hdn_available_dates(cfg.data_root))
-    try:
-        listed = json.loads(manifest_file(cfg).read_text(encoding="utf-8")).get(
-            "trading_days_missing", []
-        )
-    except (DateFailure, OSError, ValueError, AttributeError):
-        listed = []
-    dates.update(str(d) for d in listed if isinstance(d, str))
+    source = cfg.data_source()
+    dates = set(source.available_dates())
+    dates.update(source.missing_dates())
     return sorted(d for d in dates if cfg.start <= d <= cfg.end)
 
 
 def source_file(cfg: BacktestConfig, date: str) -> Path:
-    return cfg.data_root / "day_by_date" / f"{date}_options.csv"
+    """The vendor file the chain of ``date`` is read from (the source's, for messages)."""
+    return cfg.data_source().day_file(date)
 
 
 def shard_block(dates: Sequence[str], index: int, count: int) -> list[str]:
@@ -2179,21 +2182,9 @@ class RefusedError(RuntimeError):
     leverage under ``--no-calibrate``."""
 
 
-def manifest_file(cfg: BacktestConfig) -> Path:
-    """The vendor manifest the importer reads (its Treasury curve gives every date's rates):
-    ``day_by_date/manifest.json``, else ``manifest.json`` at the data root (the importer's
-    search order)."""
-    for cand in (
-        cfg.data_root / "day_by_date" / "manifest.json",
-        cfg.data_root / "manifest.json",
-    ):
-        if cand.is_file():
-            return cand
-    raise DateFailure(f"no manifest.json under {cfg.data_root}")
-
-
-#: The checksum of a calendar date whose day file does not exist.
-ABSENT = "absent"
+#: The checksum of a calendar date whose day file does not exist
+#: (:data:`volsto.market.vendor.ABSENT`).
+ABSENT = VENDOR_ABSENT
 
 
 class InputIndex:
@@ -2209,34 +2200,25 @@ class InputIndex:
     def __init__(self, cfg: BacktestConfig, vendor_dates: Sequence[str]) -> None:
         self.cfg = cfg
         self.dates = list(vendor_dates)
+        #: the vendor source, kept for the index's lifetime (it reads its manifest once)
+        self.source = cfg.data_source()
         self._sha: dict[str, str] = {}
-        self._manifest: dict[str, Any] | None = None
         self._entries: dict[str, str] = {}
         self._digests: dict[str, str] = {}
 
     def file_sha(self, date: str) -> str:
         """The day file's SHA-256, or ``"absent"`` for a calendar date without a file."""
         if date not in self._sha:
-            src = source_file(self.cfg, date)
-            self._sha[date] = _file_sha256(src) if src.is_file() else ABSENT
+            self._sha[date] = self.source.day_digest(date)
         return self._sha[date]
 
     def manifest_sha(self, date: str) -> str:
         """The SHA-256 of the manifest entry the import of ``date`` reads."""
         if date not in self._entries:
-            if self._manifest is None:
-                try:
-                    data = json.loads(manifest_file(self.cfg).read_text(encoding="utf-8"))
-                except (OSError, ValueError) as exc:
-                    raise DateFailure(f"unreadable vendor manifest: {exc}") from exc
-                self._manifest = dict(data) if isinstance(data, dict) else {}
-            m = self._manifest
-            name = source_file(self.cfg, date).name
-            entry = {
-                "product": m.get("product"),
-                "rates": (m.get("rates") or {}).get(date),
-                "file": next((f for f in m.get("files", []) if f.get("name") == name), None),
-            }
+            try:
+                entry = self.source.import_entry(date)
+            except VendorError as exc:
+                raise DateFailure(str(exc)) from exc
             self._entries[date] = hashlib.sha256(_canonical(_jsonable(entry)).encode()).hexdigest()
         return self._entries[date]
 
@@ -3586,8 +3568,7 @@ def import_snapshot(
     returns the snapshot digest of the bytes written."""
     surf = cfg.section("surface")
     try:
-        cfg_map, _, _, _ = import_day(
-            cfg.data_root,
+        cfg_map, _, _, _ = cfg.data_source().import_day(
             date,
             cfg.underlying,
             essvi=bool(surf["essvi"]),

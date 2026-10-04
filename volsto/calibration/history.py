@@ -59,6 +59,7 @@ from volsto.market.curves import ForwardCurve
 from volsto.market.import_hdn import DEFAULT_CALENDAR_REPAIR, CalendarRepairConfig
 from volsto.market.surface import ImpliedSurface, atm_skew_numeric
 from volsto.market.varswap import ForwardVarianceCurve, varswap_strike
+from volsto.market.vendor import HdnSource, VendorSource
 from volsto.models.bergomi import BergomiSV, factor_step_covariance, sqrt_covariance
 
 FloatArray = NDArray[np.float64]
@@ -1663,9 +1664,49 @@ def synthetic_2f_history(
 
 
 def hdn_available_dates(root: str | Path) -> list[str]:
-    """Trading dates (``YYYY-MM-DD``) with a ``day_by_date/<date>_options.csv`` file."""
-    files = sorted(Path(root).joinpath("day_by_date").glob("*_options.csv"))
-    return [f.name[:10] for f in files]
+    """Trading dates (``YYYY-MM-DD``) the HistoricalData.net source at ``root`` holds
+    (:meth:`volsto.market.vendor.HdnSource.available_dates`: the source owns the layout)."""
+    return HdnSource(root).available_dates()
+
+
+def build_history(
+    source: VendorSource,
+    dates: Sequence[str],
+    out_dir: str | Path,
+    *,
+    underlying: str = "SPX",
+    pillars: Sequence[float] = DEFAULT_PILLARS,
+    essvi: bool = True,
+    skip_failures: bool = True,
+    calendar_repair: CalendarRepairConfig | None = DEFAULT_CALENDAR_REPAIR,
+) -> tuple[SurfaceHistory, dict[str, str]]:
+    """Import each date through a vendor source (:meth:`volsto.market.vendor.VendorSource.
+    import_day`), write the snapshot YAML into ``out_dir`` and build the history from the
+    snapshots.  Returns the history and the failures ``{date: error}``; with
+    ``skip_failures=False`` the first importer error propagates.  About 1 s per day plus 0.1 s
+    per day for the pillar strip (measured on the 2022 H2 sample) — a test should run a handful
+    of days only.  ``calendar_repair`` is passed to the importer (eSSVI calendar repair, M10
+    Part 0; ``None`` = pre-M10 behaviour)."""
+    from volsto.market.import_hdn import write_snapshot
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    written: list[Path] = []
+    failures: dict[str, str] = {}
+    for date in dates:
+        try:
+            cfg, _, _, _ = source.import_day(
+                date, underlying, essvi=essvi, calendar_repair=calendar_repair
+            )
+            written.append(write_snapshot(cfg, out / f"{underlying.lower()}_{date}.yaml"))
+        except Exception as exc:
+            if not skip_failures:
+                raise
+            failures[date] = f"{type(exc).__name__}: {exc}"
+            log.warning("import of %s failed: %s", date, exc)
+    if not written:
+        raise ValueError(f"no day could be imported: {failures}")
+    return SurfaceHistory.from_snapshots(written, pillars), failures
 
 
 def build_hdn_history(
@@ -1679,32 +1720,17 @@ def build_hdn_history(
     skip_failures: bool = True,
     calendar_repair: CalendarRepairConfig | None = DEFAULT_CALENDAR_REPAIR,
 ) -> tuple[SurfaceHistory, dict[str, str]]:
-    """Run the importer (:func:`volsto.market.import_hdn.import_day`) for each date, write the
-    snapshot YAML into ``out_dir`` and build the history from the snapshots.  Returns the
-    history and the failures ``{date: error}``; with ``skip_failures=False`` the first importer
-    error propagates.  About 1 s per day plus 0.1 s per day for the pillar strip (measured on
-    the 2022 H2 sample) — a test should run a handful of days only.  ``calendar_repair`` is
-    passed to the importer (eSSVI calendar repair, M10 Part 0; ``None`` = pre-M10 behaviour)."""
-    from volsto.market.import_hdn import import_day, write_snapshot
-
-    out = Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    written: list[Path] = []
-    failures: dict[str, str] = {}
-    for date in dates:
-        try:
-            cfg, _, _, _ = import_day(
-                root, date, underlying, essvi=essvi, calendar_repair=calendar_repair
-            )
-            written.append(write_snapshot(cfg, out / f"{underlying.lower()}_{date}.yaml"))
-        except Exception as exc:
-            if not skip_failures:
-                raise
-            failures[date] = f"{type(exc).__name__}: {exc}"
-            log.warning("import of %s failed: %s", date, exc)
-    if not written:
-        raise ValueError(f"no day could be imported: {failures}")
-    return SurfaceHistory.from_snapshots(written, pillars), failures
+    """:func:`build_history` on the HistoricalData.net source at ``root``."""
+    return build_history(
+        HdnSource(root),
+        dates,
+        out_dir,
+        underlying=underlying,
+        pillars=pillars,
+        essvi=essvi,
+        skip_failures=skip_failures,
+        calendar_repair=calendar_repair,
+    )
 
 
 __all__ = [
@@ -1726,6 +1752,7 @@ __all__ = [
     "SyntheticHistory",
     "VolVolEstimate",
     "build_hdn_history",
+    "build_history",
     "correlation_with_se",
     "day_forward_variance_curve",
     "estimate_history",
