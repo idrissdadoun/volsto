@@ -11,17 +11,22 @@ needs nothing.
 from __future__ import annotations
 
 import ast
+import datetime as dt
 import hashlib
 import json
 import shutil
 from pathlib import Path
 
+import _orats_fixture as fx
 import numpy as np
 import pytest
+import yaml
 
 from volsto.calibration import history, raw_history
+from volsto.data import raw, roots, store
 from volsto.market import import_hdn as ih
-from volsto.market import vendor
+from volsto.market import import_orats, vendor
+from volsto.market.chain import validate_chain
 from volsto.studies import backtest as bt
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,7 +34,11 @@ HDN_SAMPLE = ROOT / "data" / "hdn_sample" / "options_sample_2022H2"
 TOY_CONFIG = ROOT / "configs" / "backtest" / "hdn_2022h2_toy.yaml"
 
 #: The modules that may know a vendor's layout and call its loaders.
-VENDOR_MODULES = ("volsto/market/import_hdn.py", "volsto/market/vendor.py")
+VENDOR_MODULES = (
+    "volsto/market/import_hdn.py",
+    "volsto/market/import_orats.py",
+    "volsto/market/vendor.py",
+)
 #: Declared exceptions, each with its reason.
 DECLARED = {
     "scripts/capture_yfinance.py": "writes today's chain IN the HDN layout: a producer of the "
@@ -100,7 +109,8 @@ def test_no_site_outside_the_vendor_modules_knows_a_vendor_layout() -> None:
 
 
 def test_registry_and_the_backtest_choice() -> None:
-    assert set(vendor.SOURCES) == {"hdn"} and tuple(vendor.SOURCES) == bt.VENDORS
+    assert set(vendor.SOURCES) == {"hdn", "orats"} and tuple(vendor.SOURCES) == bt.VENDORS
+    assert isinstance(vendor.vendor_source("orats", "/nowhere"), vendor.OratsSource)
     assert isinstance(vendor.vendor_source("hdn", "/nowhere"), vendor.HdnSource)
     with pytest.raises(vendor.VendorError, match="unknown vendor 'nope'"):
         vendor.vendor_source("nope", "/nowhere")
@@ -123,11 +133,15 @@ def source_copy(tmp_path: Path) -> vendor.HdnSource:
     return vendor.HdnSource(tmp_path / "hdn")
 
 
-@pytest.mark.parametrize("name", sorted(vendor.SOURCES))
-def test_source_contract(name: str, source_copy: vendor.HdnSource, tmp_path: Path) -> None:
-    """Every registered source: the calendar, the chain, the digests, the rate curve and the
-    import agree with each other."""
-    assert name == "hdn"  # the fixture of the one registered source; a new source adds its own
+def test_every_registered_source_has_a_contract_test() -> None:
+    """A new source must add its own contract test below (they need a vendor-specific fixture)."""
+    assert sorted(vendor.SOURCES) == ["hdn", "orats"]
+
+
+def test_hdn_source_contract(source_copy: vendor.HdnSource, tmp_path: Path) -> None:
+    """The HDN source: the calendar, the chain, the digests, the rate curve and the import
+    agree with each other."""
+    name = "hdn"
     src = vendor.vendor_source(name, source_copy.location)
     dates = src.available_dates()
     assert dates == sorted(set(dates)) and len(dates) == 3 and all(len(d) == 10 for d in dates)
@@ -138,6 +152,7 @@ def test_source_contract(name: str, source_copy: vendor.HdnSource, tmp_path: Pat
     assert src.day_digest("1999-01-04") == vendor.ABSENT
     # the chain is what the importer's steps read
     chain = src.load_chain(d, "SPX")
+    assert validate_chain(chain) is chain
     assert set(CHAIN_COLUMNS) <= set(chain.columns) and set(CHAIN_ATTRS) <= set(chain.attrs)
     assert chain.attrs["quote_date"] == d and chain.attrs["file"] == src.day_file(d).name
     assert ((chain["bid"] > 0) & (chain["ask"] > 0) & (chain["T"] > 0)).all()
@@ -211,3 +226,108 @@ def test_consumers_read_through_the_source(source_copy: vendor.HdnSource, tmp_pa
     path.unlink()
     with pytest.raises(bt.DateFailure, match=r"no manifest\.json under"):
         bt.InputIndex(cfg, dates).manifest_sha(dates[0])
+
+
+# --------------------------------------------------------------------------------------------
+# the ORATS source (on the synthetic fixture's store; no vendor data needed)
+# --------------------------------------------------------------------------------------------
+
+ORATS_DAYS = [dt.date(2024, 1, 2), dt.date(2024, 1, 3), dt.date(2024, 1, 4)]
+
+
+def build_orats(root: Path, days: list[dt.date], calendar: list[dt.date]) -> None:
+    raw_dir = root / "raw" / "orats"
+    for day in days:
+        fx.write_day(raw_dir, day)
+    fx.write_calendar(root / "history" / "SPX.csv", calendar)
+    rep = raw.verify_raw(raw_dir, calendar=root / "history" / "SPX.csv", workers=1)
+    raw.write_manifest(raw_dir, rep.manifest())
+    assert store.convert(raw_dir, root / "store" / "orats", workers=1).clean
+
+
+@pytest.fixture()
+def orats_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Two of three calendar days converted (the middle one never delivered), the roots and
+    the close history pointed at the temporary directory."""
+    (tmp_path / "history").mkdir()
+    build_orats(tmp_path, [ORATS_DAYS[0], ORATS_DAYS[2]], ORATS_DAYS)
+    monkeypatch.setenv(roots.ENV_RAW, str(tmp_path / "raw"))
+    monkeypatch.setenv(roots.ENV_STORE, str(tmp_path / "store"))
+    monkeypatch.setattr(import_orats, "HISTORY_DIR", tmp_path / "history")
+    return tmp_path
+
+
+def test_orats_source_contract(orats_root: Path) -> None:
+    src = vendor.vendor_source("orats", orats_root / "store")
+    dates = src.available_dates()
+    assert dates == ["2024-01-02", "2024-01-04"]
+    # the day verify-raw found missing against the trading calendar is the vendor's missing day
+    assert src.missing_dates() == ["2024-01-03"]
+    d = dates[0]
+    man = store.read_manifest(orats_root / "store" / "orats")["files"]
+    # the day digest is the raw zip's sha256 (what the importer records as file_sha256)
+    assert src.day_file(d) == store.day_path(orats_root / "store" / "orats", d)
+    assert src.day_digest(d) == man[d]["raw_sha256"]
+    assert src.day_digest("2024-01-03") == vendor.ABSENT
+    chain = src.load_chain(d, "SPX")
+    assert validate_chain(chain) is chain and chain.attrs["vendor"] == "orats"
+    assert set(CHAIN_COLUMNS) <= set(chain.columns) and set(CHAIN_ATTRS) <= set(chain.attrs)
+    tenors, zeros = src.prior_rate_curve(d)
+    assert np.array_equal(tenors, chain.attrs["rate_tenors"])
+    assert np.array_equal(zeros, chain.attrs["rate_zeros"])
+    cfg, _fit, points, _chain = src.import_day(d, "SPX")
+    assert cfg["provenance"]["file_sha256"] == src.day_digest(d)
+    assert cfg["provenance"]["vendor"] == "orats" and len(points.table) > 0
+    # the entry: the store's binding of the day and the close the import reads
+    entry = src.import_entry(d)
+    assert entry["store"]["raw_sha256"] == man[d]["raw_sha256"]
+    assert entry["closes"] == {"SPX": 4700.0}
+    before = {x: json.dumps(src.import_entry(x), sort_keys=True) for x in dates}
+    # a corrected close of one date changes that date's entry and no other
+    closes = orats_root / "history" / "SPX.csv"
+    closes.write_text(closes.read_text().replace("2024-01-04,4700.0", "2024-01-04,4712.5"))
+    fresh = vendor.vendor_source("orats", orats_root / "store")
+    assert json.dumps(fresh.import_entry(dates[0]), sort_keys=True) == before[dates[0]]
+    assert json.dumps(fresh.import_entry(dates[1]), sort_keys=True) != before[dates[1]]
+    # a re-converted day (another raw file) changes its digest and its entry
+    fx.write_day(orats_root / "raw" / "orats", ORATS_DAYS[0], mutate=lambda f: f.iloc[:-4])
+    rep = raw.verify_raw(orats_root / "raw" / "orats", calendar=closes, workers=1)
+    raw.write_manifest(orats_root / "raw" / "orats", rep.manifest())
+    store.convert(orats_root / "raw" / "orats", orats_root / "store" / "orats", workers=1)
+    again = vendor.vendor_source("orats", orats_root / "store")
+    assert again.day_digest(dates[0]) != src.day_digest(dates[0])
+    assert json.dumps(again.import_entry(dates[0]), sort_keys=True) != before[dates[0]]
+    assert src.day_digest(dates[0]) == man[d]["raw_sha256"]  # a source reads its manifest once
+    # no store, no raw manifest: an empty calendar, never an exception
+    empty = vendor.OratsSource(orats_root / "nowhere")
+    assert empty.available_dates() == [] and empty.day_digest(d) == vendor.ABSENT
+
+
+def test_backtest_inputs_through_the_orats_source(orats_root: Path, tmp_path: Path) -> None:
+    """``data.vendor: orats`` with ``data.root`` the store root: the backtest's calendar, input
+    index, snapshot import and snapshot binding go through the source (nothing is calibrated,
+    nothing is priced)."""
+    raw_cfg = bt.load_backtest_config(TOY_CONFIG).to_mapping()
+    raw_cfg["data"].update(vendor="orats", root=str(orats_root / "store"))
+    raw_cfg["dates"] = {"start": "2024-01-01", "end": "2024-01-05"}
+    cfg = bt.BacktestConfig.from_mapping(raw_cfg, source=str(TOY_CONFIG))
+    assert isinstance(cfg.data_source(), vendor.OratsSource)
+    # the missing trading day is in the calendar (it must not silently shift the fixing grid)
+    assert bt.calendar(cfg) == ["2024-01-02", "2024-01-03", "2024-01-04"]
+    index = bt.InputIndex(cfg, bt.calendar(cfg))
+    src = cfg.data_source()
+    assert index.file_sha("2024-01-02") == src.day_digest("2024-01-02")
+    assert index.file_sha("2024-01-03") == bt.ABSENT
+    assert len({index.digest(d) for d in bt.calendar(cfg)}) == 3
+    # the import writes a snapshot the binding accepts, and an edited one is refused
+    snap = tmp_path / "snapshots" / "spx_2024-01-02.yaml"
+    sha, entry = index.file_sha("2024-01-02"), index.manifest_sha("2024-01-02")
+    digest = bt.import_snapshot(cfg, "2024-01-02", sha, entry, snap)
+    doc = yaml.safe_load(snap.read_text())
+    assert doc["provenance"]["vendor"] == "orats" and doc["provenance"]["file_sha256"] == sha
+    assert digest == bt.snapshot_digest(snap)
+    bt.bind_snapshot(cfg, snap, sha, entry, "import", digest)
+    assert bt.snapshot_bound(cfg, snap, sha, entry)
+    assert not bt.snapshot_bound(cfg, snap, "0" * 64, entry)
+    snap.write_text(snap.read_text().replace("vendor: orats", "vendor: other"))
+    assert not bt.snapshot_bound(cfg, snap, sha, entry)

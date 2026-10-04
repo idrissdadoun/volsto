@@ -21,7 +21,9 @@ third occurrence — and now read through a :class:`VendorSource`:
 :class:`HdnSource` is HistoricalData.net (a directory with ``day_by_date/<date>_options.csv``
 and a ``manifest.json``); it wraps :mod:`volsto.market.import_hdn` unchanged, so every digest,
 chain and snapshot is what the hard-coded sites produced (proven on the same machine, SPEC
-§18.7).  :data:`SOURCES` is the registry the backtest's ``data.vendor`` chooses from;
+§18.9).  :class:`OratsSource` is ORATS, read from the Parquet store through
+:mod:`volsto.market.import_orats`.  :data:`SOURCES` is the registry the backtest's
+``data.vendor`` chooses from;
 :func:`vendor_source` builds one.  A source is cheap and reads lazily; it caches the vendor's
 manifest for its own lifetime, so a caller that must see a changed manifest builds a new one.
 
@@ -38,10 +40,15 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, ClassVar, Final
 
+import numpy as np
 import pandas as pd
 from numpy.typing import NDArray
 
+from volsto.data import raw as raw_layer
+from volsto.data import store as store_layer
+from volsto.data.roots import DataError, DataRoots
 from volsto.market import import_hdn as ih
+from volsto.market import import_orats
 
 ABSENT: Final = "absent"
 """The digest of a calendar date whose day file does not exist."""
@@ -201,7 +208,124 @@ class HdnSource(VendorSource):
         )
 
 
-SOURCES: Final[dict[str, Callable[[Path], VendorSource]]] = {HdnSource.name: HdnSource}
+class OratsSource(VendorSource):
+    """ORATS, read from the Parquet store (:mod:`volsto.data.store`) through the importer of
+    :mod:`volsto.market.import_orats`.  ``location`` is the store *root* (what
+    ``VOLSTO_DATA_STORE`` names); the vendor's files are under ``<root>/orats``.
+
+    * calendar — the store manifest's dates; the missing days are those ``volsto-data
+      verify-raw`` found against the trading calendar (the raw manifest's ``findings.missing``),
+      none when there is no raw manifest;
+    * day file — the store's Parquet file of the date; the **day digest is the raw zip's
+      sha256** the store manifest binds the file to (what the importer writes as
+      ``file_sha256``), :data:`ABSENT` when the Parquet file is not on disk;
+    * import entry — the store manifest's entry of the date (raw file, raw sha256, schema
+      version, rows, Parquet sha256, layout version) and the official close the import reads
+      for each index underlying (:data:`volsto.market.import_hdn.INDEX_ROOTS`): a re-converted
+      day, another schema version or a corrected close makes the date stale;
+    * rate curve — the file's ``iRate`` at the slices of the index chain (a prior: SPEC §18.6).
+    """
+
+    name: ClassVar[str] = "orats"
+
+    def __init__(self, root: str | Path, *, history_dir: str | Path | None = None) -> None:
+        self.root = Path(root)
+        self.history_dir = None if history_dir is None else Path(history_dir)
+        self._manifest: dict[str, Any] | None = None
+
+    @property
+    def location(self) -> Path:
+        return self.root
+
+    @property
+    def store_dir(self) -> Path:
+        return self.root / self.name
+
+    def _closes(self, underlying: str) -> Path | None:
+        if self.history_dir is None:
+            return None  # the importer's default: data/history/<underlying>.csv
+        return self.history_dir / f"{underlying.upper()}.csv"
+
+    def manifest(self) -> dict[str, Any]:
+        """The store manifest's ``files``, read once per source."""
+        if self._manifest is None:
+            try:
+                self._manifest = dict(store_layer.read_manifest(self.store_dir)["files"])
+            except (OSError, ValueError, KeyError, DataError) as exc:
+                raise VendorError(f"unreadable store manifest: {exc}") from exc
+        return self._manifest
+
+    def available_dates(self) -> list[str]:
+        try:
+            return sorted(self.manifest())
+        except VendorError:
+            return []
+
+    def missing_dates(self) -> list[str]:
+        try:
+            raw_dir = DataRoots.resolve().raw_dir(self.name)
+            man = raw_layer.read_manifest(raw_dir) if raw_dir.is_dir() else None
+            listed = [] if man is None else man["findings"].get("missing", [])
+        except (OSError, ValueError, KeyError, DataError):
+            return []
+        return [str(d) for d in listed if isinstance(d, str)]
+
+    def day_file(self, date: str) -> Path:
+        return store_layer.day_path(self.store_dir, date)
+
+    def day_digest(self, date: str) -> str:
+        entry = self.manifest().get(date) if self.day_file(date).is_file() else None
+        return ABSENT if entry is None else str(entry["raw_sha256"])
+
+    def import_entry(self, date: str) -> Any:
+        entry = self.manifest().get(date)
+        closes: dict[str, float | None] = {}
+        for underlying in ih.INDEX_ROOTS:
+            try:
+                closes[underlying] = import_orats.official_close(
+                    underlying, date, self._closes(underlying)
+                )
+            except DataError:
+                closes[underlying] = None
+        keys = ("raw_file", "raw_sha256", "schema_version", "rows", "sha256", "layout_version")
+        return {
+            "store": None if entry is None else {k: entry.get(k) for k in keys},
+            "closes": closes,
+        }
+
+    def load_chain(self, date: str, underlying: str = "SPX") -> pd.DataFrame:
+        return import_orats.load_day(
+            date, underlying, store=self.root, closes=self._closes(underlying)
+        )
+
+    def prior_rate_curve(self, date: str) -> tuple[NDArray[Any], NDArray[Any]]:
+        chain = self.load_chain(date, next(iter(ih.INDEX_ROOTS)))
+        return np.asarray(chain.attrs["rate_tenors"]), np.asarray(chain.attrs["rate_zeros"])
+
+    def import_day(
+        self,
+        date: str,
+        underlying: str = "SPX",
+        *,
+        filters: ih.HdnFilters | None = None,
+        essvi: bool = True,
+        calendar_repair: ih.CalendarRepairConfig | None = ih.DEFAULT_CALENDAR_REPAIR,
+    ) -> tuple[dict[str, Any], ih.SSVIFit, ih.SurfacePoints, pd.DataFrame]:
+        return import_orats.import_day(
+            date,
+            underlying,
+            filters=filters,
+            essvi=essvi,
+            calendar_repair=calendar_repair,
+            store=self.root,
+            closes=self._closes(underlying),
+        )
+
+
+SOURCES: Final[dict[str, Callable[[Path], VendorSource]]] = {
+    HdnSource.name: HdnSource,
+    OratsSource.name: OratsSource,
+}
 """Registered vendor sources by name (the backtest's ``data.vendor``)."""
 
 
