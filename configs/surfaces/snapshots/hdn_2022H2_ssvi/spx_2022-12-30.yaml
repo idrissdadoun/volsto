@@ -1443,15 +1443,15 @@ sabrw:
   - T: 1.9726027397260273
     n: 41
     params:
-      sigma: 0.22032291041054564
-      rho: -0.7104073656427021
-      nu: 0.5198283076831558
+      sigma: 0.22032413724405914
+      rho: -0.7104844270137853
+      nu: 0.5197695532979117
       t_d: 1.0
-      t_u: 3.495057097193293
+      t_u: 3.551560506685002
       ex_d: 1.0
       ex_u: 0.8738899351171421
-    rms_vp: 0.3342056463531017
-    weighted_rms: 3.4922695407758084
+    rms_vp: 0.33406029028646694
+    weighted_rms: 3.4904561308329614
     held:
     - t_d
     - ex_d
@@ -1462,7 +1462,6 @@ sabrw:
     - 'zone coverage changed during the fit for [''ex_u'']: {''ex_d'': 0, ''t_d'':
       2, ''t_u'': 11, ''ex_u'': 5} -> {''ex_d'': 0, ''t_d'': 2, ''t_u'': 6, ''ex_u'':
       0}'
-    - 'solver: The maximum number of function evaluations is exceeded.'
   - T: 2.96986301369863
     n: 39
     params:

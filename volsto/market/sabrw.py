@@ -87,6 +87,12 @@ MIN_ZONE_QUOTES: Final[int] = 3
 initial value (1: plain SABR extrapolation) and flagged — the documents' "wide open
 configuration" otherwise leaves it to the solver's noise."""
 PARAM_NAMES: Final[tuple[str, ...]] = ("sigma", "rho", "nu", "t_d", "t_u", "ex_d", "ex_u")
+MAX_NFEV: Final[int] = 20_000
+"""Function evaluations the fit may use.  2,000 until 2026-10-04: with the exact zone edge
+three of the 4,711 fits of the 2022 H2 sample (long expiries whose upside slope ``T_u`` rests
+on 3 to 6 quotes, along a narrow curved valley) were still descending at 2,000 and were stored
+unconverged, flagged; they converge within 5,000 to 20,000 evaluations (3 to 14 s), and the other
+4,708 fits are bit-identical at either limit (SPEC §13.5)."""
 STEP0_MIN_QUOTES: Final[int] = 20
 """Fewest quotes an expiry's fit needs to enter step 0 (:class:`SabrwTermStructure`).  Measured
 over the 2022 H2 SPX sample (4 711 fits, 2026-09-27): the median expiry holds 118 quotes, 1 % hold
@@ -176,9 +182,13 @@ def smile_minimum_root(rho: float) -> float | None:
     beyond and grows like ``ln u``, so it has exactly one positive root, beyond ``−ρ``.  The two
     ``asinh`` are subtracted in the stable form ``asinh(a) − asinh(b) = asinh(a sqrt(1 + b²) −
     b sqrt(1 + a²))``, here ``asinh(((ρ + u) − ρ sqrt(q)) / c²)``.  The root is bracketed from
-    ``−ρ``, found by Brent's method and polished by two Newton steps (machine precision; the
-    bounded scalar minimiser this replaces was accurate to about 1e-8 relative, which made the
-    zone edge — and through it the fit's finite-difference Jacobian — noisy: SPEC §13.5).
+    ``−ρ``, found by Brent's method and polished by two Newton steps.  **Accuracy**: ``φ`` is a
+    difference of terms of order ``|ρ|`` that cancels to order ``|ρ|³`` near the root, so the
+    relative error of ``u*`` grows like ``1e-16 / ρ²`` — a few ulps for ``|ρ| ≳ 0.4``, about
+    2e-14 at ``ρ = −0.1``, 5e-11 at ``−1e-3``, 5e-9 at ``−1e-4`` (measured) — which is harmless
+    for the fits (the smile is flat to rounding around its minimum there) and far below the
+    bounded scalar minimiser this replaces (about 1e-8 relative everywhere, which made the zone
+    edge — and through it the fit's finite-difference Jacobian — noisy: SPEC §13.5).
     Checked by ``tests/test_sabrw.py::test_exact_zone_edge_matches_the_minimiser``."""
     if not rho < 0.0:
         return None
@@ -365,7 +375,7 @@ def fit_sabrw(
     T: float,
     *,
     init: SabrwParams | None = None,
-    max_nfev: int = 2000,
+    max_nfev: int = MAX_NFEV,
 ) -> SabrwFit:
     """Fit one expiry's quotes (log-moneyness ``k``, mid implied vols ``iv``) by weighted least
     squares ``Σ ((σ̂(k_i) − iv_i) / ε_i)²`` with ``ε = weights`` (module docstring), inside

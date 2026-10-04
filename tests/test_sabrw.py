@@ -295,10 +295,11 @@ def test_exact_zone_edge_matches_the_minimiser() -> None:
     (no minimum), minima below the floor and minima beyond the search cap.
 
     Same edge and same flag everywhere, except one artefact of the minimiser, counted and
-    asserted, not hidden: on 61 of the 2,520 grid points — all with ρ ≥ 0, where the smile has
-    no minimum — the minimiser stops just above the floor (1e-6 to 5e-3 relative), past its own
-    1e-6 test, and reports an interior minimum; the closed form reports none.  The edge itself
-    differs by that same 5e-3 at most there."""
+    asserted point by point, not hidden: on a few dozen of the 2,520 grid points (61 on macOS,
+    58 on Linux: the count is the minimiser's on that machine) — all with ρ ≥ 0, where the
+    smile has no minimum — the minimiser stops just above the floor (1e-6 to 5e-3 relative),
+    past its own 1e-6 test, and reports an interior minimum; the closed form reports none.  The
+    edge itself differs by that same 5e-3 at most there."""
     import itertools
 
     sig = (0.01, 0.05, 0.15, 0.4, 1.0, 3.0)
@@ -354,9 +355,33 @@ def test_exact_zone_edge_matches_the_minimiser() -> None:
           f"{worst_any:.2e} (rho <= -0.1: {worst_identified:.2e})")  # fmt: skip
     assert min(kinds.values()) > 100, kinds  # every regime is on the grid
     assert worst_any <= EDGE_RTOL_ANY and worst_identified <= EDGE_RTOL_IDENTIFIED
-    assert artefacts == 61, artefacts  # of 2,520 grid points, all with rho >= 0
+    # How many points show the artefact belongs to scipy's bounded minimiser on one machine,
+    # not to our code (measured: 61 on macOS arm64, 58 on Linux x86-64, numpy 2.5.3 and scipy
+    # 1.18.1 on both), so the count is bounded, not pinned (SPEC §13.3); every point is checked
+    # above.
+    assert 0 < artefacts <= 100, artefacts
     # the root depends on rho alone, and the edge scales with sigma / nu
     assert sabrw.smile_minimum_root(-0.7) == pytest.approx(1.0226444902407816, rel=1e-14)
     a, _ = sabrw.sabr_smile_minimum(0.2, -0.7, 1.0, 1.0)
     b, _ = sabrw.sabr_smile_minimum(0.4, -0.7, 2.0, 1.0)
     assert a == pytest.approx(b, rel=1e-15)
+
+
+def test_no_stored_fit_stopped_at_the_evaluation_limit() -> None:
+    """No fit stored in a tracked snapshot ended on the solver's evaluation limit (three did at
+    ``max_nfev`` = 2,000 with the exact zone edge; SPEC §13.5), and the limit is the named
+    constant."""
+    import yaml
+
+    assert sabrw.MAX_NFEV == 20_000
+    snaps = Path(__file__).resolve().parents[1] / "configs" / "surfaces" / "snapshots"
+    files = sorted(snaps.rglob("spx_*.yaml"))
+    assert len(files) == 256
+    n = 0
+    stopped = []
+    for path in files:
+        for fit in yaml.safe_load(path.read_text())["sabrw"]["fits"]:
+            n += 1
+            if any("maximum number of function evaluations" in flag for flag in fit["flags"]):
+                stopped.append((path.name, fit["T"]))
+    assert n > 9000 and stopped == [], stopped
