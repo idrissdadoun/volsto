@@ -86,6 +86,30 @@ class DataRoots:
         return self.store / vendor
 
 
+#: Where macOS mounts external volumes.  A path below it whose volume directory is absent is an
+#: unmounted disk: creating it would silently write to the internal disk instead.
+VOLUMES_DIR = Path("/Volumes")
+
+
+def ensure_dir(path: Path, *, volumes_dir: Path = VOLUMES_DIR) -> Path:
+    """Create ``path`` (and parents) and return it — refusing when it lies on a volume that is
+    not mounted (``/Volumes/<name>`` absent).  Raw and store may both sit on external volumes
+    (owner's decision 2026-10-03): nothing assumes the internal disk, and nothing may fall back
+    to it silently."""
+    p = Path(os.path.abspath(path))
+    try:
+        rel = p.relative_to(volumes_dir)
+    except ValueError:
+        rel = None
+    if rel is not None and rel.parts and not (volumes_dir / rel.parts[0]).is_dir():
+        raise DataError(
+            f"{path}: the volume {volumes_dir / rel.parts[0]} is not mounted (refusing to "
+            "create the directory on the internal disk)"
+        )
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
 def existing_ancestor(path: Path) -> Path:
     """``path`` or its nearest existing ancestor (the volume a write to ``path`` lands on)."""
     p = path.resolve()

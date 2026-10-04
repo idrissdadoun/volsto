@@ -17,6 +17,7 @@ click==8.5.0
 contourpy==1.4.0
 curl-cffi==0.16.3
 cycler==0.12.1
+duckdb==1.5.6
 et-xmlfile==2.0.0
 execnet==2.1.2
 fonttools==4.65.0

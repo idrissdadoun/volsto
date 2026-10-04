@@ -30,7 +30,7 @@ volsto-data = "volsto.data.cli:main"
 
 [project.optional-dependencies]
 viewers = ["plotly>=5.18", "streamlit>=1.30", "openpyxl>=3.1", "kaleido"]
-data = ["yfinance>=0.2", "requests>=2.31"]
+data = ["yfinance>=0.2", "requests>=2.31", "duckdb>=1.0"]
 studies = ["matplotlib>=3.8", "cycler>=0.12"]
 dev = [
     "pytest>=7.4",

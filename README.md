@@ -348,10 +348,15 @@ volsto-data status                                   # roots, free space, raw fi
 volsto-data fetch --vendor orats --profile <aws profile> --bucket <bucket> --prefix <prefix> --dry-run
 volsto-data fetch --vendor orats --profile <aws profile> --bucket <bucket> --prefix <prefix>
 volsto-data verify-raw --vendor orats                # raw manifest, trading-calendar and OPRA checks
+volsto-data convert --vendor orats                   # one typed Parquet file per trading day
+volsto-data verify --vendor orats                    # every Parquet file against its raw file
+volsto-data extract --tickers SPX                    # one Parquet file per ticker, all dates
+volsto-data sql "select count(*) from strikes"       # optional, DuckDB (pip install -e ".[data]")
 ```
 
 `fetch` wraps `aws s3 sync` and takes the *name* of an AWS profile you configured; the code
-never sees a credential. `docs/data_runbook.md` is the download-day procedure; SPEC §18 has the
+never sees a credential. The store is a faithful typed copy (every vendor column, float64,
+zstd 9), rebuildable from raw; both roots may sit on external volumes. `docs/data_runbook.md` is the download-day procedure; SPEC §18 has the
 design and the measurements. Tests that need the ORATS one-day sample skip when
 `data/orats_sample/` is absent.
 

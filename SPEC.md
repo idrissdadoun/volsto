@@ -102,6 +102,9 @@ volsto/
       orats.py           # ORATS strikes file: naming, declared schema versions
       raw.py             # verify-raw: raw manifest, trading-calendar and OPRA checks
       fetch.py           # aws s3 sync wrapper (profile name only; no credentials)
+      store.py           # convert (raw zip -> typed Parquet per day), verify, store manifest
+      extract.py         # one Parquet per ticker across all dates
+      sql.py             # optional DuckDB view over the store (data extra)
       cli.py             # volsto-data entry point
     studies/
       m4.py              # headline study runner behind the M4/M4b tables (implemented)
@@ -1438,7 +1441,7 @@ M8. Hedging framework; port the cliquet and FVA hedging studies as regression te
 M9. Precompute CLI + Streamlit viewers + Excel export. **Done and accepted 2026-09-16** (§9.2; grid on the light tier with the 3-bucket forward-variance ladder; the full default grid runs on an owner-provisioned VM, `docs/vm_grid_run.md`).
 M10. Study runner with LaTeX output; regenerate the original paper's tables; backtest study on the market history (§15 Part 4). **Built and committed 2026-09-16/17 (0aa8dcb and its 2026-09-17 follow-up; pending owner review; open items in §10.3):** Part 0 eSSVI calendar repair (§13.1–13.2), the study runner (§10.1), the catalogue S1–S7 (§10.2), the rolling backtest with seasoning and sticky-leverage attribution (§10.3, §6.10, §7.12.1), `docs/methodology.md`, `docs/studies.md`.
 
-M11. Vendor data store and ORATS importer (§18). **In progress (2026-10-03):** Part 0 (the one-day sample inspected, `docs/m11_part0.md`) and Part 1 (data roots, raw manifest and calendar check, `fetch`, the `volsto-data` CLI, `docs/data_runbook.md`) built; Parts 2a–5 follow, one PR per part.
+M11. Vendor data store and ORATS importer (§18). **In progress (2026-10-03):** Part 0 (the one-day sample inspected, `docs/m11_part0.md`) and Part 1 (data roots, raw manifest and calendar check, `fetch`, the `volsto-data` CLI, `docs/data_runbook.md`) built; Part 2a (the layout measured) and Part 2b (`convert`, `verify`, `extract`, `sql`; §18.3–18.4) built; Parts 3–5 follow, one PR per part, with the stored fit records (§13.3) before Part 4.
 
 Open items for the owner: the original study archive (SSVI parameters, seeds, tables) — the M4 cliquet baseline is ≈ 10–16% above the study at every ω with ratios across ω agreeing to 1%, consistent with a surface difference; the paid EOD archive for a multi-year backtest.
 
@@ -1898,6 +1901,7 @@ Built inline (the phase-1 agent workflow failed on the account's spend limit; it
 ---
 
 ## 17. Change log v1.1 → v2.0
+- 2026-10-03 M11 Parts 2a–2b: §18.3 (the layout table, the owner's choice, scaled integers as a later option), §18.4 (the store: convert, verify, extract, sql, measured throughput).
 - 2026-10-03 M11 Parts 0–1: §18 (new) — the ORATS one-day sample as measured, the owner's decisions, the data roots, `volsto-data status / fetch / verify-raw`, the raw manifest; §1 layout (`volsto/data/`); §12 M11.
 - 2026-09-16/17 M10: §13.1 certified eSSVI calendar repair (Part 0) and §13.2 the eSSVI surface in the calibration spec; §10.1 the study runner (`volsto-study`, results with enforced stderrs, LaTeX/figures, manifest, rerun/render, the calibration guard at `calibrate_leverage`'s entry); §10.2 the study catalogue S1–S7 (paired errors, S1 regenerating the M4 baseline exactly); §10.3 the rolling backtest (`volsto-backtest`, immutable attempts with one pointer and one verdict, the 25-date proof of concept); §6.10 seasoned trades; §7.12.1 sticky-leverage attribution with the curve-move rates step and paired standard errors; §8.2 study C re-run under the rebuilt rule and study B's Phoenix rows corrected; §4.3 the code-tag hash re-recorded without a bump; §9.2 the VM runbook and measured-cost report; `docs/methodology.md`, `docs/studies.md`.
 - 2026-09-17 M10 follow-up: §10.3 storage round 5 (all refusals before any write, one `computed_under_another_config` judgement, a journalled migration under a store-root flock, unsettled verdicts, foreign pointer versions refused, date locks as a flock on the date directory with `dir_fd` operations, record version 2 with the leverage content digest, `VOLSTO_BACKTEST_REQUIRE_PATHS`); §7.12.1 / §10.3 `cum_pnl_stderr` and paired group errors with the `aggregate()` helper, per-unit books and per-trade units; §10.2 `EXACT_KINDS` declarations with walker enforcement, z-scores with stderr 1, delta-method error stderrs, S1's per-window put-wing verdicts, S5's `marking_fit` helper, S6's `ratio_stderr_bound`, S7's repaired-history gate and rank decided flags; §8.2 the world-(ii) gate on the repaired discriminator run with the pre-repair run as fallback; §13.1 the second-pass comparison stored and cited; the slow Part 0 gate test; docs and CONTRIBUTING updated; round 6: blank path overrides refused, version-1 records done with `legacy_unverified` (status, study.md, manifest) and never re-adopted over a version-2 attempt, `DateLock.still_at`, migration refusals up front (headerless foreign stores, interrupted migrations of another config, unreadable journals kept), `gc` on read-only stores, one printed-command builder with a walking test, paired theta carry and roll-down (volsto/risk/greeks.py), the shared test build lock (`tests/_locks.py`), an environment-isolation fixture, S5's window-keyed spot skew and S7's whole-set headline flag.
@@ -1954,7 +1958,7 @@ Built inline (the phase-1 agent workflow failed on the account's spend limit; it
 
 ## 18. Vendor data store and ORATS import (M11)
 
-As built, part by part (one PR per part; Parts 2a–5 are added here as they land). Code: `volsto/data/` (`roots.py`, `orats.py`, `raw.py`, `fetch.py`, `cli.py`), console script `volsto-data`, `tests/test_data_layer.py`, `tests/_orats_fixture.py`; the download-day commands are `docs/data_runbook.md`; the sample inspection in full is `docs/m11_part0.md`.
+As built, part by part (one PR per part; Parts 2a–5 are added here as they land). Code: `volsto/data/` (`roots.py`, `orats.py`, `raw.py`, `fetch.py`, `store.py`, `extract.py`, `sql.py`, `cli.py`), console script `volsto-data`, `tests/test_data_layer.py`, `tests/test_data_store.py`, `tests/_orats_fixture.py`; the download-day commands are `docs/data_runbook.md`; the sample inspection in full is `docs/m11_part0.md`.
 
 **Purpose.** The ORATS "Near End-of-Day" historical archive (US listed options, 2007 to today, one zipped CSV per trading day, 5,000+ tickers, delivered through AWS S3 with credentials that expire 14 days after purchase) becomes the second vendor beside HistoricalData.net (§13). Everything is built and measured on ORATS's free one-day sample before the purchase, so the download window is spent downloading and verifying.
 
@@ -2028,5 +2032,78 @@ The sample scanned by `verify-raw`: 66,808,802 bytes, sha256 as above, 716,822 r
 
 **Tests** (`tests/test_data_layer.py`, 16, ≈ 4 s; the sample test skips when `data/orats_sample/` is absent). The synthetic fixture `tests/_orats_fixture.py` writes 39-column ORATS-format zips into a temporary directory: SPX with the `SPXW` root on every expiry and the `SPX` root (priced one day shorter) on the third Fridays 2024-01-19 and 2024-02-16 — so both roots share (ticker, expirDate, strike) there — plus XSP and AAPL, Black-76 prices on a skewed smile with a bid/ask. Covered: root precedence and blank refusals; no tracked file under the data roots; the free-space refusal; the declared schema, drift descriptions, date and name parsing, the OPRA root; the fixture's third-Friday structure; a clean `verify-raw` and its manifest, reuse and `--rehash`, serial against parallel; a second copy checked against a manifest (a flipped byte with size and mtime kept, a missing file); every calendar finding (missing, beyond the calendar, unexpected, duplicated, unmatched name); every content finding (OPRA columns absent, SPX symbols blank, `trade_date` mismatch, renamed and added columns, a corrupt zip); the real sample's Part 0 numbers; `fetch` dry run then sync against the stand-in `aws` (the listing precedes the sync, the argv, no `--delete`, a planted secret in the environment never printed), its refusals (space, a failed listing, forbidden extras, no AWS CLI, a bucket with a path, a blank profile, an untrusted listing) and the resume hint; the CLI's exit codes 0 / 1 / 2.
 
-**Not built yet.** `convert`, `verify`, `extract`, `sql` (Part 2b, after the owner chooses the layout from Part 2a's table), the read API (Part 3), the importer (Part 4), the second-vendor plan (Part 5).
+### 18.3 Part 2a — the store layout, measured (2026-10-03)
+
+Measure only, on the sample day (716,822 rows, 39 columns, zip 66.8 MB), typed from the declared schema and sorted by (ticker, expirDate, strike, cOpra); every layout round-trips exactly (`Table.equals`). Reading the CSV from the zip with the dates parsed takes 0.31 s, sorting 0.06 s. Read times are the best of three with a warm page cache and pyarrow's default threading; cold reads were not measured.
+
+**Where the bytes are.** Part 0's guess (the OPRA strings) was wrong: of 94.9 MB at zstd 3 with dictionaries, the three string columns cost 3.4 MB and the 30 float columns 89.8 MB. The Greeks and IVs are 6–8 decimal digits, which compress better as text than as doubles.
+
+| layout (row groups of 131,072) | zstd 3 | zstd 9 | zstd 15 |
+|---|---|---|---|
+| dictionary on all columns | 94.9 MB (1.42 × zip) | 84.1 (1.26) | 83.7 (1.25) |
+| dictionary off | 81.3 (1.22) | **76.4 (1.14)** | 75.1 (1.12) |
+| dictionary on strings only | 82.3 (1.23) | 77.5 (1.16) | 76.2 (1.14) |
+| BYTE_STREAM_SPLIT on floats, dictionary on strings | 95.6 (1.43) | 93.8 (1.40) | 91.8 (1.37) |
+| BYTE_STREAM_SPLIT on floats, dictionary off | 94.6 (1.42) | 92.7 (1.39) | 90.7 (1.36) |
+| write time, dictionary off | 0.45 s | 1.7 s | 7.8 s |
+
+zstd 19, dictionary off: 74.1 MB (1.11), 24 s. Snappy with dictionaries: 115.7 MB (1.73). Front-coding the OPRA symbols (DELTA_BYTE_ARRAY) saves about 2 MB. BYTE_STREAM_SPLIT is worse at every level.
+
+| rows per group (zstd 9) | groups | dictionary on | dictionary off | read SPX | read AAPL |
+|---|---|---|---|---|---|
+| 16,384 | 44 | 97.6 MB | — | 2.1 ms | 1.8 ms |
+| 65,536 | 11 | 88.5 | — | 3.1 | 2.9 |
+| 131,072 | 6 | 84.1 | 76.4 | 4.6 | 4.5 |
+| 262,144 | 3 | 78.8 | 76.2 | 6.3 | 7.6 |
+| 1,048,576 | 1 | 74.6 | 76.1 | 15.3 | 15.1 |
+
+Reading all tickers takes 0.013–0.022 s in every layout; unsorted by ticker the SPX read is 15.5 ms instead of 5.6 ms.
+
+| universe | tickers | rows (share of the day) | zstd 3, dictionary on | zstd 9, OPRA front-coded |
+|---|---|---|---|---|
+| indices (SPX, XSP, NDX, RUT, VIX, DJX, OEX, XEO) | 8 | 34,481 (4.8 %) | 4.7 MB | 4.3 MB |
+| + 30 ETFs | 38 | 69,209 (9.7 %) | 9.4 | 8.3 |
+| + the ten names of `data/history` | 48 | 78,836 (11.0 %) | 10.6 | 9.4 |
+| + the top 100 tickers by rows | 114 | 147,379 (20.6 %) | 20.0 | 17.4 |
+| + the top 500 | 501 | 322,099 (44.9 %) | 43.5 | 37.8 |
+| + the top 1,500 | 1,500 | 492,786 (68.7 %) | 66.1 | 57.1 |
+| full universe | 5,787 | 716,822 | 94.9 | 82.2 |
+
+Extrapolated to the archive (each ratio applied to the 200–350 GB zipped estimate, itself ±40 %): zstd 3 with dictionaries 284–497 GB; zstd 3 dictionary off 243–426 GB; **zstd 9 dictionary off 229–400 GB**; zstd 15 dictionary off 225–393 GB; the 48-ticker subset 28–49 GB.
+
+**Owner's choice (2026-10-03): zstd 9, dictionary off, row groups of 131,072, float64, the full universe.** Raw and store may both sit on external volumes; nothing may assume the internal disk.
+
+**A later option, recorded, not taken: scaled integers.** 28 of the 30 float columns are exact multiples of 1e-8 on the sample (all but `extCTheo` and `extPTheo`); stored as int64 × 1e8 with DELTA_BINARY_PACKED they give 57.9 MB at zstd 3 and 55.4 MB at zstd 9 (0.83 × the zip, against 1.14). Every value is kept exactly but the stored type is no longer float64, so it was measured and set aside; the store is rebuildable from raw, so the layout can change later without a new download.
+
+### 18.4 Part 2b — the store (as built, 2026-10-03)
+
+Code: `volsto/data/store.py` (convert, verify, the store manifest), `volsto/data/extract.py`, `volsto/data/sql.py`, the `convert` / `verify` / `extract` / `sql` commands of `volsto-data`; `tests/test_data_store.py`.
+
+**`volsto-data convert --vendor orats [--workers N] [--force]`.** Each raw zip's CSV is read straight from the zip and written as `<store>/orats/strikes/year=YYYY/YYYY-MM-DD.parquet`: every vendor column under its original name, typed from the declared schema (`arrow_schema`; dates parsed with `%m/%d/%Y`), no derived number, rows sorted by (ticker, expirDate, strike, cOpra), in the chosen layout (`LAYOUT`). Each file carries its provenance in its Parquet metadata (`volsto.vendor`, `trade_date`, `raw_file`, `raw_sha256`, `schema_version`, `layout_version`).
+- *Inputs.* The raw manifest of `verify-raw` is required and must still describe the directory (a file added, removed or changed in size or mtime is a refusal naming `verify-raw`); each zip is hashed again as it is read and must equal the manifest's sha256. A date with more than one raw file, an unmatched name and an unreadable zip are listed as failures.
+- *Loud failures* (the file is not converted, its reason is printed, exit 1, the other files go on): schema drift, named column by column; a date or number that does not parse; a `trade_date` column that disagrees with the file name; an SPX row with an empty `cOpra` or `pOpra` (decision 8); a changed raw file. `cOpra` uniqueness is checked in every file and violations are reported (count and examples) on this and every later run; the file is still converted.
+- *Idempotent, atomic.* The store manifest `<store>/orats/store_manifest.json` binds each date to its raw file and raw sha256, row count, schema version, layout version, Parquet bytes and sha256. A date whose entry names the current raw sha256 and layout and whose file is on disk with the recorded size is skipped. Each Parquet file is written to a temporary name in its own directory, synced and renamed; the manifest is replaced atomically every 25 files and at the end; a failed file's entry is removed. `store_digest` (a SHA-256 over every date's raw sha256, rows, schema version and Parquet sha256) is what derived data is bound to.
+- *Space and volumes.* Refused before any write when the store volume is short of 1.14 × the zips to convert plus the 10 GiB margin. A root below `/Volumes/<name>` whose volume is not mounted is refused (`ensure_dir`), never created on the internal disk; temporary files share their destination's directory, so nothing assumes which disk holds which root.
+
+**`volsto-data verify --vendor orats [--workers N]`.** For every store date: the raw sha256 and the Parquet sha256 against the manifest; then the raw CSV re-read, typed and sorted, against the Parquet file — the schema, the row count, per column the null count and the sum (floats summed over identically ordered rows in one chunk, so equal bit for bit; dates as day numbers; strings as UTF-8 lengths), then the whole tables for equality. Raw dates not converted, store dates without a raw file and Parquet files without a manifest entry are listed. Exit 1 on any finding.
+
+**`volsto-data extract --tickers SPX,…`.** `<store>/orats/by_ticker/<TICKER>.parquet`: every store row of the ticker, columns unchanged, in (trade_date, expirDate, strike, cOpra) order, one row group per trade date, the store's compression; `by_ticker/manifest.json` records rows, dates, sha256 and the `store_digest` it was built from, so an extract built from another state of the store reads `stale` (`extract_state`, shown by `status`) and the same command rebuilds it. A ticker on no date fails loudly and writes no file; a store holding more than one schema version is refused until a rule for the differing columns is decided.
+
+**`volsto-data sql "<query>"`.** Optional: DuckDB (the `data` extra only; imported inside the command, and a test checks that neither the library nor the other commands import it) over one view, `strikes` — every day file plus `year`. In-memory and read-only.
+
+**Measured (2026-10-03; internal SSD).** The sample day: 716,822 rows, 66.8 MB of zip → 76.4 MB of Parquet (1.14 ×), 2.6 s in one process, peak memory 724 MiB; `verify` 0.9 s, 1.18 GiB; no `cOpra` duplicate; the SPX rows (10,519) read back with the 1,590 third-Friday duplicate keys. Throughput on 16 sample-sized days (the sample's CSV with the trade date rewritten; scratch files, deleted):
+
+| step | workers | wall clock | per worker | extrapolated to ≈ 4,970 days |
+|---|---|---|---|---|
+| convert | 4 | 10.7 s | 1.1 GiB peak | 55 min |
+| convert | 8 (default) | 7.0 s (2.3 days/s) | 0.92 GiB | 36 min, 7–9 GiB in total |
+| convert | 16 | 5.5 s | 0.76 GiB | 29 min |
+| verify | 8 | 3.0 s (5.3 days/s) | 1.2 GiB | 16 min |
+| extract SPX, SPY, AAPL | 1 | 1.3 s (0.08 s per day) | — | 7 min |
+
+SPX extract: 1.09 MiB per day at the sample's size (about 5 GB for the archive). Older years are smaller, so the times are upper estimates; a spinning raw disk bounds the conversion by its read rate.
+
+**Tests** (`tests/test_data_store.py`, 13, ≈ 5 s; the sample test skips when the sample is absent, the DuckDB test when DuckDB is not installed; sizes and times are printed, never asserted). On the synthetic fixture: a faithful, typed, sorted copy equal value for value to the CSV text, with the third Friday's two roots, the layout and the provenance metadata; row groups prune on the ticker; idempotence, the stale-raw refusal, a removed file, `--force`, a layout change; atomicity (a death between the write and the rename leaves no file and no temporary, and the run resumes); every loud failure (drift, blank SPX symbols, an ISO date, a `trade_date` mismatch, a non-numeric count, a raw file edited with size and mtime kept); `cOpra` violations and two files for one date; the free-space and unmounted-volume refusals; `verify` catching a changed value, a null, a dropped row, an orphan, an unconverted date and two swapped rows; the extract's content, row groups, binding and staleness; the DuckDB view; the CLI's exit codes.
+
+**Not built yet.** The read API (Part 3), the importer (Part 4), the second-vendor plan (Part 5).
 
