@@ -7,8 +7,10 @@
 
 with every vendor column under its original name, typed from the schema declared in
 :mod:`volsto.data.orats` (nothing is inferred from a file; dates are parsed with the explicit
-format and fail loudly).  Rows are sorted by :data:`SORT_KEY` — (ticker, expirDate, strike,
-cOpra) — so a ticker filter prunes row groups on their statistics.
+format and fail loudly).  Every file has the store's one schema
+(:data:`volsto.data.orats.STORE_SCHEMA`): a column an older layout does not have (the OPRA
+symbols before 2021) is null.  Rows are sorted by :data:`SORT_KEY` — (ticker, expirDate,
+strike, cOpra) — so a ticker filter prunes row groups on their statistics.
 
 **Layout** (owner's choice from the Part 2a table, 2026-10-03; :data:`LAYOUT`): zstd level 9,
 dictionary encoding off, row groups of 131,072 rows, float64 kept exactly, the full universe.
@@ -17,11 +19,11 @@ Measured on the sample day: 76.4 MB, 1.14 × the zip.
 **Loud failures** — a file is not converted, its reason is listed and the command exits 1 —
 on: schema drift (the header is not a known schema version; the difference is named, and a
 version is added only after the owner confirms); a date or number that does not parse; a
-``trade_date`` column that disagrees with the file name; ``cOpra`` or ``pOpra`` empty on an
-``SPX`` row (owner's decision 8: the OPRA root is the only AM/PM marker); a raw file whose
-sha256 is not the raw manifest's (run ``verify-raw`` again).  ``cOpra`` is checked for
-uniqueness within each file and violations are reported (the file is still converted: the
-store is a copy).
+``trade_date`` column that disagrees with the file name; a raw file whose sha256 is not the
+raw manifest's (run ``verify-raw`` again).  A day without OPRA symbols is converted (owner's
+instruction, 2026-10-04).  **Uniqueness** is checked within each file and violations are
+reported (the file is still converted: the store is a copy): the key of a row is its ``cOpra``
+when it has one, otherwise (ticker, expirDate, strike).
 
 **Idempotent and atomic.**  The store manifest ``<store>/<vendor>/store_manifest.json`` binds
 each Parquet file to its raw file's sha256, its row count, its schema version and its own
@@ -98,9 +100,10 @@ class ConvertError(DataError):
     """One raw file that cannot be converted; the message names the reason."""
 
 
-def arrow_schema(version: int) -> pa.Schema:
-    """The store schema of an ORATS schema version: the declared columns, in file order."""
-    return pa.schema([(name, ARROW_TYPES[kind]) for name, kind in orats.SCHEMA_VERSIONS[version]])
+def arrow_schema(version: int | None = None) -> pa.Schema:
+    """The store schema: :data:`volsto.data.orats.STORE_SCHEMA`, whatever the layout of the
+    raw file (``version`` is accepted for the callers that name one and changes nothing)."""
+    return pa.schema([(name, ARROW_TYPES[kind]) for name, kind in orats.STORE_SCHEMA])
 
 
 def day_path(store_dir: Path, date: str) -> Path:
@@ -109,12 +112,13 @@ def day_path(store_dir: Path, date: str) -> Path:
 
 
 def read_raw_table(zip_path: Path) -> tuple[pa.Table, int]:
-    """The CSV of a raw zip as a typed table in file order, and its schema version.  Raises
-    :class:`ConvertError` on schema drift, on a zip without exactly one member and on any value
-    that does not parse under the declared types."""
+    """The CSV of a raw zip as a typed table in file order with the store's schema (a column
+    the file's layout lacks is null), and its schema version.  Raises :class:`ConvertError` on
+    schema drift, on a zip without exactly one data member and on any value that does not
+    parse under the declared types."""
     try:
         with zipfile.ZipFile(zip_path) as zf:
-            infos = [i for i in zf.infolist() if not i.is_dir()]
+            infos, _ = rawmod.data_members(zf)
             if len(infos) != 1:
                 raise ConvertError(f"expected one member, found {len(infos)}")
             member = infos[0].filename
@@ -140,7 +144,11 @@ def read_raw_table(zip_path: Path) -> tuple[pa.Table, int]:
                 parsed = pc.strptime(tbl[name], format=orats.DATE_FORMAT, unit="s")
                 i = tbl.column_names.index(name)
                 tbl = tbl.set_column(i, name, pc.cast(parsed, pa.date32()))
-        return tbl.cast(arrow_schema(version)), version
+        schema = arrow_schema()
+        for i, f in enumerate(schema):
+            if f.name not in tbl.column_names:
+                tbl = tbl.add_column(i, f, pa.nulls(tbl.num_rows, f.type))
+        return tbl.cast(schema), version
     except (zipfile.BadZipFile, pa.ArrowException, OSError, UnicodeDecodeError) as exc:
         raise ConvertError(f"{type(exc).__name__}: {exc}") from exc
 
@@ -152,20 +160,14 @@ def sort_table(tbl: pa.Table) -> pa.Table:
 
 def check_table(tbl: pa.Table, date: str) -> dict[str, Any]:
     """The per-file checks of the module docstring on a raw table; raises :class:`ConvertError`
-    on a ``trade_date`` or OPRA failure and returns the ``cOpra`` uniqueness counts."""
+    on a ``trade_date`` failure and returns the uniqueness counts: ``copra_empty`` (rows
+    without a ``cOpra``), ``copra_duplicates`` (rows repeating a symbol) and
+    ``key_duplicates`` (rows without a symbol repeating a (ticker, expirDate, strike))."""
     days = pc.unique(tbl["trade_date"]).to_pylist()
     if [d.isoformat() for d in days] != [date]:
         got = sorted(d.isoformat() for d in days)[:5]
         raise ConvertError(f"the file name says {date}, the trade_date column {got}")
-    c_empty = pc.equal(pc.utf8_trim_whitespace(tbl["cOpra"]), "")
-    p_empty = pc.equal(pc.utf8_trim_whitespace(tbl["pOpra"]), "")
-    spx = pc.equal(tbl["ticker"], orats.OPRA_REQUIRED_TICKER)
-    spx_empty = int(pc.sum(pc.and_(spx, pc.or_(c_empty, p_empty))).as_py() or 0)
-    if spx_empty:
-        raise ConvertError(
-            f"{spx_empty} of {int(pc.sum(spx).as_py() or 0)} SPX rows without an OPRA symbol "
-            "(the OPRA root is the only AM/PM marker; no fallback is implemented)"
-        )
+    c_empty = pc.fill_null(pc.equal(pc.utf8_trim_whitespace(tbl["cOpra"]), ""), True)
     n_empty = int(pc.sum(c_empty).as_py() or 0)
     symbols = tbl["cOpra"].filter(pc.invert(c_empty))
     duplicates = len(symbols) - int(pc.count_distinct(symbols).as_py())
@@ -174,7 +176,27 @@ def check_table(tbl: pa.Table, date: str) -> dict[str, Any]:
         counts = pc.value_counts(symbols)
         many = counts.filter(pc.greater(counts.field("counts"), 1))
         examples = many.field("values").to_pylist()[:5]
-    return {"copra_empty": n_empty, "copra_duplicates": duplicates, "copra_examples": examples}
+    key_duplicates = 0
+    if n_empty:
+        bare = tbl.select(["ticker", "expirDate", "strike"]).filter(c_empty)
+        groups = bare.group_by(["ticker", "expirDate", "strike"]).aggregate([([], "count_all")])
+        key_duplicates = bare.num_rows - groups.num_rows
+        if key_duplicates:
+            many = groups.filter(pc.greater(groups["count_all"], 1)).slice(0, 5)
+            examples += [
+                f"{t} {e.isoformat()} {k:g}"
+                for t, e, k in zip(
+                    many["ticker"].to_pylist(),
+                    many["expirDate"].to_pylist(),
+                    many["strike"].to_pylist(),
+                )
+            ]
+    return {
+        "copra_empty": n_empty,
+        "copra_duplicates": duplicates,
+        "key_duplicates": key_duplicates,
+        "copra_examples": examples,
+    }
 
 
 def write_parquet(tbl: pa.Table, dest: Path, metadata: dict[str, Any]) -> None:
@@ -307,7 +329,7 @@ class ConvertReport:
     converted: list[str] = field(default_factory=list)
     skipped: int = 0
     failed: dict[str, str] = field(default_factory=dict)  # raw file → reason
-    violations: dict[str, str] = field(default_factory=dict)  # date → cOpra uniqueness
+    violations: dict[str, str] = field(default_factory=dict)  # date → uniqueness
     rows: int = 0
     bytes_written: int = 0
     raw_bytes: int = 0
@@ -422,11 +444,8 @@ def convert(
         rep.converted.append(date)
         rep.rows += result["rows"]
         rep.bytes_written += result["bytes"]
-        if result["copra_duplicates"]:
-            rep.violations[date] = (
-                f"{result['copra_duplicates']} duplicate cOpra symbols, e.g. "
-                f"{result['copra_examples']}"
-            )
+        if result["copra_duplicates"] or result["key_duplicates"]:
+            rep.violations[date] = _violation(result) + f", e.g. {result['copra_examples']}"
 
     done = 0
     if workers == 1 or len(jobs) <= 1:
@@ -446,11 +465,25 @@ def convert(
                         )
     # violations of files converted earlier stay visible
     for date, entry in files.items():
-        if entry.get("copra_duplicates") and date not in rep.violations:
-            rep.violations[date] = f"{entry['copra_duplicates']} duplicate cOpra symbols"
+        if date not in rep.violations and (
+            entry.get("copra_duplicates") or entry.get("key_duplicates")
+        ):
+            rep.violations[date] = _violation(entry)
     write_manifest(store_dir, manifest)
     rep.wall_s = time.perf_counter() - t0
     return rep
+
+
+def _violation(entry: dict[str, Any]) -> str:
+    parts = []
+    if entry.get("copra_duplicates"):
+        parts.append(f"{entry['copra_duplicates']} duplicate cOpra symbols")
+    if entry.get("key_duplicates"):
+        parts.append(
+            f"{entry['key_duplicates']} rows without a symbol repeating a "
+            "(ticker, expirDate, strike)"
+        )
+    return "; ".join(parts)
 
 
 def format_convert(rep: ConvertReport) -> str:
@@ -510,7 +543,7 @@ def verify_one(job: tuple[str, str, str, dict[str, Any]]) -> list[str]:
         got = pq.read_table(parquet_path).combine_chunks()
         if version != entry["schema_version"]:
             problems.append(f"schema version {entry['schema_version']} stored, {version} raw")
-        if got.schema.remove_metadata() != arrow_schema(version):
+        if got.schema.remove_metadata() != arrow_schema():
             problems.append("the Parquet schema is not the declared schema")
             return problems
         if got.num_rows != raw.num_rows or got.num_rows != entry["rows"]:

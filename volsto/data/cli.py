@@ -3,9 +3,9 @@
 ``status``      the two roots, where each came from, free space, raw files and manifest.
 ``fetch``       ``aws s3 sync`` of a vendor archive into ``<raw>/<vendor>/``
                 (:mod:`volsto.data.fetch`; ``--dry-run`` lists first; no credentials here).
-``verify-raw``  hash and scan every raw zip, write the raw manifest, check the trading
-                calendar, schema and OPRA columns (:mod:`volsto.data.raw`); exit 1 on any
-                finding.
+``verify-raw``  hash and scan every raw zip (year folders included; other files ignored),
+                write the raw manifest, check the trading calendar and the schema, report
+                the OPRA columns (:mod:`volsto.data.raw`); exit 1 on any finding.
 ``convert``     raw zips → one typed Parquet file per trading day (:mod:`volsto.data.store`).
 ``verify``      every Parquet file against its raw file: rows, null counts, sums, equality.
 ``extract``     one Parquet file per ticker across all dates (:mod:`volsto.data.extract`).

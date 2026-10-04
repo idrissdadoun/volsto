@@ -110,13 +110,13 @@ def test_loader_fails_loudly(root: Path) -> None:
         io.load_day(ISO, "SPX", store=root / "store", closes=root / "other.csv")
     with pytest.raises(DataError, match="no close history"):
         io.load_day(ISO, "SPX", store=root / "store", closes=root / "absent.csv")
-    # decision 8: a ticker row without its OPRA symbol (the converter refuses SPX; XSP shows
-    # the loader's own check) and a root outside the known ones
+    # a row without any OPRA symbol on an underlying that has no settlement rule (only SPX
+    # has one, owner's instruction 2026-10-04) and a root outside the known ones
     raw_dir = root / "raw" / "orats"
 
     def edit(df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
-        df.loc[df.index[df["ticker"] == "XSP"][0], "pOpra"] = ""
+        df.loc[df.index[df["ticker"] == "XSP"][0], ["cOpra", "pOpra"]] = ""
         aapl = df["ticker"] == "AAPL"
         df.loc[aapl, "cOpra"] = df.loc[aapl, "cOpra"].str.replace("AAPL", "AAPL1", n=1)
         return df
@@ -127,12 +127,109 @@ def test_loader_fails_loudly(root: Path) -> None:
     )
     assert store.convert(raw_dir, root / "store" / "orats", workers=1).converted == [ISO]
     fx.write_calendar(root / "XSP.csv", [DAY])
-    with pytest.raises(DataError, match=r"1 of .* XSP rows without an OPRA symbol"):
+    with pytest.raises(DataError, match=r"1 of .* XSP rows without an OPRA symbol, and no"):
         io.load_day(ISO, "XSP", store=root / "store", closes=root / "XSP.csv")
     with pytest.raises(DataError, match=r"OPRA roots \['AAPL1'\], outside the known \['AAPL'\]"):
         io.load_day(ISO, "AAPL", store=root / "store", closes=root / "XSP.csv")
     with pytest.raises(ValueError, match="columns missing"):
         chainmod.validate_chain(pd.DataFrame({"contract": ["x"]}))
+
+
+def _store_of(tmp: Path, mutate: object) -> Path:
+    """A store holding the fixture day edited by ``mutate`` (an older layout)."""
+    raw_dir = tmp / "raw" / "orats"
+    fx.write_day(raw_dir / "2024", DAY, mutate=mutate)  # type: ignore[arg-type]
+    fx.write_calendar(tmp / "SPX.csv", [DAY])
+    raw.write_manifest(
+        raw_dir, raw.verify_raw(raw_dir, calendar=tmp / "SPX.csv", workers=1).manifest()
+    )
+    assert not store.convert(raw_dir, tmp / "store" / "orats", workers=1).failed
+    return tmp
+
+
+def _saturday(df: pd.DataFrame, rows: pd.Series) -> pd.Series:
+    """``expirDate`` with the standard expiries of ``rows`` dated on the Saturday, as the
+    files before 2015 date them."""
+    third = {fx.us_date(d): fx.us_date(d + dt.timedelta(days=1)) for d in fx.THIRD_FRIDAYS}
+    return df["expirDate"].where(~rows, df["expirDate"].map(lambda x: third.get(x, x)))
+
+
+def test_settlement_by_period_reproduces_the_opra_chain(root: Path, tmp_path: Path) -> None:
+    """Owner's instruction 2026-10-04.  The same day told three ways gives the same chain
+    (contracts, roots, maturities, quotes): with OPRA symbols (2021-05-28 on), and without
+    them with the PM third-Friday series under ticker SPXPM and the standard expiries dated
+    on the Saturday (2011-10-04 to 2017).  With only the PM series under ticker SPX and no
+    SPXPM (about 2018 to 2021-05-27) the chain is the PM part.  A day on which nothing tells
+    the two series apart is excluded: :class:`AmbiguousSettlement`."""
+    want = load(root)
+    cols = [c for c in want.columns if c not in ("yte",)]
+
+    def spxpm_period(df: pd.DataFrame) -> pd.DataFrame:
+        spx = df["ticker"] == "SPX"
+        pm = df["cOpra"].map(orats.opra_root) == "SPXW"
+        third = df["expirDate"].isin([fx.us_date(d) for d in fx.THIRD_FRIDAYS])
+        df = df.assign(
+            ticker=df["ticker"].where(~(spx & pm & third), orats.SPX_PM_TICKER),
+            expirDate=_saturday(df, spx),
+        )
+        return df.drop(columns=["cOpra", "pOpra"])
+
+    got = io.load_day(
+        ISO, "SPX", store=_store_of(tmp_path / "a", spxpm_period) / "store", closes=root / "SPX.csv"
+    )
+    pd.testing.assert_frame_equal(got[cols], want[cols])
+    assert got.attrs["schema_version"] == 2 and set(got.attrs["settled_by"]) == {
+        "ticker",
+        "calendar",
+    }
+    assert want.attrs["settled_by"] == {"opra": int((fx.day_frame(DAY)["ticker"] == "SPX").sum())}
+    assert "settlement" not in io.source_provenance(want)
+    assert (
+        io.source_provenance(got)["settlement"]["vendor_rows_by_source"] == got.attrs["settled_by"]
+    )
+
+    def pm_only(df: pd.DataFrame) -> pd.DataFrame:
+        am = (df["ticker"] == "SPX") & (df["cOpra"].map(orats.opra_root) == "SPX")
+        return df[~am].drop(columns=["cOpra", "pOpra"])
+
+    got = io.load_day(
+        ISO, "SPX", store=_store_of(tmp_path / "b", pm_only) / "store", closes=root / "SPX.csv"
+    )
+    pm_part = want[want["root"] == "SPXW"].reset_index(drop=True)
+    pd.testing.assert_frame_equal(got[cols], pm_part[cols])
+    assert set(got["root"]) == {"SPXW"} and set(got.attrs["settled_by"]) == {"calendar"}
+
+    def no_marker(df: pd.DataFrame) -> pd.DataFrame:
+        return df.drop(columns=["cOpra", "pOpra"])  # both series under SPX, no symbol
+
+    where = _store_of(tmp_path / "c", no_marker)
+    with pytest.raises(io.AmbiguousSettlement, match=r"repeat a \(root, expiry, strike\)"):
+        io.load_day(ISO, "SPX", store=where / "store", closes=root / "SPX.csv")
+
+
+def test_settlement_rule_and_canonical_expiry() -> None:
+    d = dt.date
+    # the Saturday of an old standard expiry is its Friday; a Good Friday its Thursday
+    assert orats.canonical_expiry(d(2012, 3, 17)) == (d(2012, 3, 16), True)
+    assert orats.canonical_expiry(d(2016, 6, 17)) == (d(2016, 6, 17), True)
+    assert orats.good_friday(2014) == d(2014, 4, 18) and orats.good_friday(2019) == d(2019, 4, 19)
+    assert orats.canonical_expiry(d(2014, 4, 19)) == (d(2014, 4, 17), True)  # Saturday dated
+    assert orats.canonical_expiry(d(2019, 4, 18)) == (d(2019, 4, 18), True)  # Thursday dated
+    assert orats.canonical_expiry(d(2019, 4, 19)) == (d(2019, 4, 18), True)  # Friday dated
+    assert orats.canonical_expiry(d(2012, 12, 31)) == (d(2012, 12, 31), False)  # a quarterly
+    assert orats.canonical_expiry(d(2012, 3, 23)) == (d(2012, 3, 23), False)  # a weekly
+    rule = orats.settlement_without_opra
+    monthly, weekly = d(2012, 4, 21), d(2012, 3, 23)
+    assert rule("SPXPM", monthly, d(2012, 3, 16), spxpm_listed=True) == "PM"
+    assert rule("SPX", monthly, d(2012, 3, 16), spxpm_listed=True) == "AM"
+    assert rule("SPX", weekly, d(2012, 3, 16), spxpm_listed=True) == "PM"
+    assert rule("SPX", d(2007, 3, 17), d(2007, 1, 3), spxpm_listed=False) == "AM"  # before SPXPM
+    assert rule("SPX", d(2011, 12, 17), d(2011, 10, 3), spxpm_listed=False) == "AM"
+    assert rule("SPX", d(2019, 3, 15), d(2019, 1, 3), spxpm_listed=False) == "PM"  # AM absent
+    with pytest.raises(ValueError, match="not an SPX-family ticker"):
+        rule("XSP", monthly, d(2012, 3, 16), spxpm_listed=False)
+    assert orats.osi_symbol("SPXW", d(2012, 3, 16), -1, 1402.5) == "SPXW120316P01402500"
+    assert orats.opra_root(orats.osi_symbol("SPX", d(2012, 4, 20), 1, 1400.0)) == "SPX"
 
 
 def test_parity_recovers_the_fixture_market(root: Path) -> None:

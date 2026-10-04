@@ -9,16 +9,25 @@ decision 3, 2026-10-03).  :data:`SCHEMA_VERSIONS` maps a schema version to its o
 column by column (:func:`describe_drift`), and a new version is added only after the owner
 confirms it.  Version 1 is the 39-column layout of the free sample (trade date 2024-01-03): the
 36 columns ORATS publishes, in their published order, plus ``cOpra``, ``pOpra`` (OPRA symbols)
-and ``cMidIv``.
+and ``cMidIv``.  Version 2 is the older 37-column layout of the archive (from 2007): version 1
+without the two OPRA columns, the others in the same order (owner's instruction, 2026-10-04:
+the older layouts are accepted).  **The store has one schema**, :data:`STORE_SCHEMA` (version
+1's columns): a column a file's layout does not have is null in the store.
 
 Types: ``string``, ``int64``, ``float64`` and ``date`` (``M/D/YYYY`` without zero padding,
 parsed with the explicit format :data:`DATE_FORMAT`; anything else fails loudly).  ``divRate``
 is ``float64`` although the sample only holds zeros.
 
-The OPRA root (:func:`opra_root`) is the only AM/PM marker in the file: ticker ``SPX`` merges
-the roots ``SPX`` (AM-settled) and ``SPXW`` (PM-settled), which share the third-Friday expiry
-dates.  A file whose ``cOpra`` or ``pOpra`` is missing or empty on an ``SPX`` row is unusable
-for the index importer and is reported loudly (owner's decision 8).
+**AM or PM settlement of SPX** changes with the period (the vendor's statement, checked on
+the data by ``scripts/orats_census.py``; SPEC §18.10).  Where the OPRA symbols exist, ticker
+``SPX`` merges the roots ``SPX`` (AM-settled) and ``SPXW`` (PM-settled), which share the
+third-Friday expiry dates, and the root (:func:`opra_root`) tells them apart.  Before that the
+PM third-Friday series is the ticker ``SPXPM`` (:data:`SPX_PM_TICKER`) and ticker ``SPX`` is AM
+on the monthly expiry dates and PM on the others; later the AM monthly is absent and ticker
+``SPX`` is PM throughout.  :func:`settlement_without_opra` is that rule for a row without a
+symbol; :func:`canonical_expiry` maps the Saturday dates of the old standard expiries to the
+last trading day and says whether a date is a monthly expiry.  A day without OPRA symbols is
+no longer a failure (owner's instruction, 2026-10-04; it was under decision 8).
 """
 
 from __future__ import annotations
@@ -35,8 +44,14 @@ DEFAULT_FILE_PATTERN = r"ORATS_SMV_Strikes_(\d{8})\.zip"
 #: accepts both).
 DATE_FORMAT = "%m/%d/%Y"
 OPRA_COLUMNS: tuple[str, str] = ("cOpra", "pOpra")
-#: The ticker whose OPRA symbols must be populated (decision 8).
+#: The ticker whose OPRA-symbol population the raw manifest counts.
 OPRA_REQUIRED_TICKER = "SPX"
+#: The ticker of the PM-settled third-Friday SPX series where the file has no OPRA symbols.
+SPX_PM_TICKER = "SPXPM"
+#: First trade date of the ``SPXPM`` ticker in the archive (the vendor's statement; the census
+#: of ``scripts/orats_census.py`` reports the date the data shows).  Before it ticker ``SPX``
+#: holds only the AM monthly series.
+SPXPM_FIRST_DATE = _dt.date(2011, 10, 4)
 #: An OSI symbol is the root followed by ``YYMMDD``, ``C``/``P`` and eight strike digits.
 OSI_TAIL = 15
 
@@ -81,8 +96,15 @@ SCHEMA_V1: tuple[tuple[str, str], ...] = (
     ("spot_px", "float64"),
     ("trade_date", "date"),
 )
+#: The older layout: version 1 without the OPRA columns.
+SCHEMA_V2: tuple[tuple[str, str], ...] = tuple(
+    (name, kind) for name, kind in SCHEMA_V1 if name not in OPRA_COLUMNS
+)
 #: Known schema versions.  Add one only after the owner confirms the drift it answers.
-SCHEMA_VERSIONS: dict[int, tuple[tuple[str, str], ...]] = {1: SCHEMA_V1}
+SCHEMA_VERSIONS: dict[int, tuple[tuple[str, str], ...]] = {1: SCHEMA_V1, 2: SCHEMA_V2}
+#: The store's one schema: every known layout is a subset of it, in its order.
+STORE_SCHEMA: tuple[tuple[str, str], ...] = SCHEMA_V1
+STORE_COLUMNS: tuple[str, ...] = tuple(name for name, _ in STORE_SCHEMA)
 
 
 def schema_columns(version: int) -> tuple[str, ...]:
@@ -98,7 +120,7 @@ def schema_version_of(columns: Sequence[str]) -> int | None:
     return None
 
 
-def describe_drift(columns: Sequence[str], version: int = max(SCHEMA_VERSIONS)) -> str:
+def describe_drift(columns: Sequence[str], version: int = 1) -> str:
     """How ``columns`` differ from schema ``version``: missing, unexpected, reordered."""
     want = schema_columns(version)
     missing = [c for c in want if c not in columns]
@@ -134,3 +156,64 @@ def opra_root(symbol: str) -> str:
     """OSI root of an OPRA symbol: the symbol without its trailing 15 characters, stripped
     (the sample's symbols are unpadded, 16–20 characters)."""
     return symbol[:-OSI_TAIL].strip()
+
+
+def good_friday(year: int) -> _dt.date:
+    """Good Friday of ``year`` (Gregorian Easter, the anonymous algorithm, minus two days):
+    the only exchange holiday that fell on a third Friday before 2026."""
+    a, b, c = year % 19, year // 100, year % 100
+    d, e = b // 4, b % 4
+    g = (8 * b + 13) // 25
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = c // 4, c % 4
+    m = (32 + 2 * e + 2 * i - h - k) % 7
+    n = (a + 11 * h + 19 * m) // 433
+    month = (h + m - 7 * n + 90) // 25
+    day = (h + m - 7 * n + 33 * month + 19) % 32
+    return _dt.date(year, month, day) - _dt.timedelta(days=2)
+
+
+def third_friday(year: int, month: int) -> _dt.date:
+    first = _dt.date(year, month, 1)
+    return first + _dt.timedelta(days=(4 - first.weekday()) % 7 + 14)
+
+
+def canonical_expiry(expiry: _dt.date) -> tuple[_dt.date, bool]:
+    """``(last trading day, is a monthly expiry)`` of a file's ``expirDate``.
+
+    The standard (third-Friday) expiries are dated on the Saturday after the third Friday in
+    the older files and on the Friday itself later; a Saturday date is moved to the Friday,
+    and a Friday that is Good Friday to the Thursday before it.  The date is a monthly expiry
+    when it is the third Friday of its month, the Saturday after it, or the Thursday before a
+    third Friday that is Good Friday.  Any other date is returned unchanged."""
+    day = expiry - _dt.timedelta(days=1) if expiry.weekday() == 5 else expiry
+    friday = third_friday(day.year, day.month)
+    holiday = good_friday(day.year)
+    if day == friday:
+        return (day - _dt.timedelta(days=1) if day == holiday else day), True
+    if friday == holiday and expiry == friday - _dt.timedelta(days=1):
+        return expiry, True
+    return day, False
+
+
+def settlement_without_opra(
+    ticker: str, expiry: _dt.date, trade_date: _dt.date, *, spxpm_listed: bool
+) -> str:
+    """``"AM"`` or ``"PM"`` of an SPX-family row that has no OPRA symbol (owner's rule,
+    2026-10-04): ticker ``SPXPM`` is PM; ticker ``SPX`` on a monthly expiry
+    (:func:`canonical_expiry`) is AM while ``SPXPM`` rows exist that day
+    (``spxpm_listed``) or before :data:`SPXPM_FIRST_DATE`, PM otherwise."""
+    if ticker == SPX_PM_TICKER:
+        return "PM"
+    if ticker != OPRA_REQUIRED_TICKER:
+        raise ValueError(f"{ticker!r} is not an SPX-family ticker")
+    _, monthly = canonical_expiry(expiry)
+    if monthly and (spxpm_listed or trade_date < SPXPM_FIRST_DATE):
+        return "AM"
+    return "PM"
+
+
+def osi_symbol(root: str, expiry: _dt.date, cp: int, strike: float) -> str:
+    """The OSI symbol of a contract (root, ``YYMMDD``, ``C``/``P``, the strike in thousandths
+    on eight digits), unpadded like the vendor's: what a row without symbols is named by."""
+    return f"{root}{expiry:%y%m%d}{'C' if cp == 1 else 'P'}{round(strike * 1000):08d}"
