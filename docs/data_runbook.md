@@ -122,22 +122,16 @@ version or the AM/PM fallback is agreed. If the calendar file ends before the la
 caffeinate -i rsync -a --progress "$VOLSTO_DATA_RAW/orats/" /Volumes/<other>/volsto-raw/orats/
 ```
 
-Then verify the copy by content, not by size:
+Then verify the copy by content, not by size or date — every file is hashed again and compared
+by name and sha256 with the manifest of step 4:
 
 ```bash
-caffeinate -i .venv/bin/volsto-data --raw /Volumes/<other>/volsto-raw verify-raw --vendor orats --rehash
+caffeinate -i .venv/bin/volsto-data --raw /Volumes/<other>/volsto-raw verify-raw --vendor orats --against "$VOLSTO_DATA_RAW/orats/raw_manifest.json"
 ```
 
-```bash
-.venv/bin/python -c "
-import json, os, sys
-a, b = (json.load(open(os.path.join(r, 'orats', 'raw_manifest.json')))['files'] for r in sys.argv[1:3])
-ha, hb = ({f['file']: f['sha256'] for f in m} for m in (a, b))
-bad = sorted(k for k in ha.keys() | hb.keys() if ha.get(k) != hb.get(k))
-print('copies identical:', len(ha), 'files' if not bad else '', 'DIFFERENT: ' + ', '.join(bad[:20]) if bad else '')
-sys.exit(1 if bad else 0)
-" "$VOLSTO_DATA_RAW" /Volumes/<other>/volsto-raw
-```
+Exit 0 and "identical to the reference manifest" means the copy is good. A missing, extra or
+different file is listed as a `FINDING`. (The manifest travels with the files: `rsync` copied
+it too, and the scan reads `*.zip` only, so it is never taken for a raw file.)
 
 - Time: the copy is bounded by the slower disk (300 GB at 150 MB/s ≈ 35 min; at 500 MB/s ≈
   10 min); the verification as step 4.

@@ -28,6 +28,13 @@ when any is present):
 
 An entry whose size and modification time are unchanged is reused from the existing manifest
 (``reused``); ``rehash=True`` reads every file again.  The manifest is replaced atomically.
+The manifest lives inside the raw directory so that it travels with the files; the scan and
+the calendar check read ``*.zip`` only, so it is never mistaken for a raw file.
+
+**A second copy** is checked with ``against=<a manifest>`` (``--against``): every file is
+hashed again (a copy keeps size and modification time, so nothing is reused) and compared by
+name and sha256 with that manifest — a file missing on either side or a different hash is a
+finding.  ``against`` may be the manifest that came with the copy itself.
 """
 
 from __future__ import annotations
@@ -223,6 +230,8 @@ class RawReport:
     date_mismatch: dict[str, str] = field(default_factory=dict)
     drift: dict[str, str] = field(default_factory=dict)
     opra_missing: dict[str, str] = field(default_factory=dict)
+    reference: Path | None = None  # the manifest ``--against`` compared with
+    reference_diff: dict[str, str] = field(default_factory=dict)
 
     @property
     def first(self) -> str | None:
@@ -247,6 +256,7 @@ class RawReport:
             "trade_date mismatches": len(self.date_mismatch),
             "schema drift": len(self.drift),
             "files without OPRA symbols on SPX": len(self.opra_missing),
+            "files differing from the reference manifest": len(self.reference_diff),
         }
         return {k: v for k, v in kinds.items() if v}
 
@@ -302,6 +312,7 @@ class RawReport:
                 "date_mismatch": self.date_mismatch,
                 "drift": self.drift,
                 "opra_missing": self.opra_missing,
+                "reference_diff": self.reference_diff,
             },
             "opra_coverage_by_year": self.opra_coverage_by_year(),
             "files": [asdict(f) for f in self.files],
@@ -310,7 +321,11 @@ class RawReport:
 
 def read_manifest(raw_dir: Path) -> dict[str, Any] | None:
     """The stored raw manifest of a vendor's raw directory, ``None`` when there is none."""
-    p = raw_dir / MANIFEST_NAME
+    return read_manifest_file(raw_dir / MANIFEST_NAME)
+
+
+def read_manifest_file(p: Path) -> dict[str, Any] | None:
+    """A raw manifest by path, ``None`` when the file does not exist."""
     if not p.exists():
         return None
     data: dict[str, Any] = json.loads(p.read_text())
@@ -347,6 +362,7 @@ def verify_raw(
     calendar: Path = DEFAULT_CALENDAR,
     workers: int = DEFAULT_WORKERS,
     rehash: bool = False,
+    against: Path | None = None,
 ) -> RawReport:
     """Scan every ``*.zip`` below ``raw_dir`` (recursively: a sync keeps the vendor's prefix
     layout) and run the checks of the module docstring.  Does not write: the caller stores
@@ -360,6 +376,14 @@ def verify_raw(
     if workers < 1:
         raise DataError("workers must be at least 1")
     cal = load_calendar(calendar)
+    reference: dict[str, Any] | None = None
+    if against is not None:
+        # read before anything else: ``against`` may be this directory's own manifest (a
+        # copy made with the manifest inside), which the caller replaces afterwards
+        reference = read_manifest_file(against)
+        if reference is None:
+            raise DataError(f"--against {against}: no such manifest")
+        rehash = True  # a copy keeps size and mtime: only the bytes can vouch for it
     paths = sorted(p for p in raw_dir.rglob("*.zip") if not p.name.startswith("."))
     previous: dict[str, RawFile] = {}
     if not rehash:
@@ -385,6 +409,9 @@ def verify_raw(
     files.sort(key=lambda f: f.file)
     rep = RawReport(vendor, raw_dir, pattern, calendar, cal[-1].isoformat(), files, reused)
     _check(rep, cal)
+    if reference is not None:
+        rep.reference = against
+        rep.reference_diff = _reference_diff(files, reference)
     return rep
 
 
@@ -426,6 +453,21 @@ def _check(rep: RawReport, cal: Sequence[_dt.date]) -> None:
             rep.beyond_calendar.append(d)
         elif day not in cal_set:
             rep.unexpected.append(d)
+
+
+def _reference_diff(files: Sequence[RawFile], reference: dict[str, Any]) -> dict[str, str]:
+    """Files whose sha256 differs from the reference manifest's, or present on one side only."""
+    ref = {e["file"]: e["sha256"] for e in reference["files"]}
+    here = {f.file: f.sha256 for f in files}
+    diff: dict[str, str] = {}
+    for name in sorted(ref.keys() | here.keys()):
+        if name not in here:
+            diff[name] = "in the reference manifest, absent here"
+        elif name not in ref:
+            diff[name] = "present here, not in the reference manifest"
+        elif ref[name] != here[name]:
+            diff[name] = f"sha256 {here[name][:12]}… here, {ref[name][:12]}… in the reference"
+    return diff
 
 
 def _date_problem(f: RawFile) -> str | None:
@@ -481,6 +523,7 @@ def format_report(rep: RawReport) -> str:
         ("trade_date mismatches", rep.date_mismatch),
         ("schema drift", rep.drift),
         ("files without OPRA symbols on SPX", rep.opra_missing),
+        ("files differing from the reference manifest", rep.reference_diff),
     ]
     for title, items_d in mapped:
         if items_d:
@@ -496,6 +539,11 @@ def format_report(rep: RawReport) -> str:
             f"    {y['year']}: {y['files']} | {y['opra_columns']} | {y['opra_ok_spx']} | "
             f"{y['rows']:,} | {y['c_empty']:,} | {y['p_empty']:,} | {y['spx_rows']:,} | "
             f"{y['spx_opra_empty']:,}"
+        )
+    if rep.reference is not None and not rep.reference_diff:
+        out.append(
+            f"  identical to the reference manifest {rep.reference}: {len(rep.files)} files, "
+            "same names and sha256"
         )
     found = rep.findings()
     if found:

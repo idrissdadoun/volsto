@@ -78,6 +78,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="read every file again (default: reuse manifest entries of unchanged size and mtime)",
     )
+    vp.add_argument(
+        "--against",
+        default=None,
+        help="a raw manifest to compare with by name and sha256 (checks a second copy; "
+        "implies --rehash)",
+    )
     return ap
 
 
@@ -119,6 +125,7 @@ def cmd_verify_raw(roots: DataRoots, args: argparse.Namespace) -> int:
         calendar=Path(args.calendar),
         workers=args.workers,
         rehash=args.rehash,
+        against=Path(args.against) if args.against else None,
     )
     path = rawmod.write_manifest(raw_dir, rep.manifest())
     print(rawmod.format_report(rep))

@@ -213,6 +213,41 @@ def test_verify_raw_manifest_and_reuse(raw_dir: Path) -> None:
     )
 
 
+def test_verify_raw_checks_a_second_copy(
+    raw_dir: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The manifest travels inside the raw directory, is never read as a raw file, and a copy
+    is checked against it by content (size and mtime preserved, so nothing may be reused)."""
+    cal = tmp_path / "calendar.csv"
+    raw.write_manifest(raw_dir, verify(raw_dir).manifest())
+    assert verify(raw_dir).findings() == {}, "the manifest in the directory is not a finding"
+    copy = tmp_path / "copy" / "orats"
+    shutil.copytree(raw_dir, copy, copy_function=shutil.copy2)
+    own = copy / raw.MANIFEST_NAME
+    rep = raw.verify_raw(copy, calendar=cal, workers=1, against=own)
+    assert rep.findings() == {} and rep.reused == 0 and rep.reference == own
+    assert "identical to the reference manifest" in raw.format_report(rep)
+    # one flipped byte with size and mtime kept, one file missing, one extra
+    victim = copy / fx.FILE_NAME.format(DAYS[1])
+    st = victim.stat()
+    data = bytearray(victim.read_bytes())
+    data[-1] ^= 0xFF  # the zip's trailing comment-length byte: size unchanged
+    victim.write_bytes(bytes(data))
+    os.utime(victim, ns=(st.st_atime_ns, st.st_mtime_ns))
+    (copy / fx.FILE_NAME.format(DAYS[3])).unlink()
+    rep = raw.verify_raw(copy, calendar=cal, workers=1, against=raw_dir / raw.MANIFEST_NAME)
+    assert set(rep.reference_diff) == {fx.FILE_NAME.format(DAYS[1]), fx.FILE_NAME.format(DAYS[3])}
+    assert "sha256" in rep.reference_diff[fx.FILE_NAME.format(DAYS[1])]
+    assert "absent here" in rep.reference_diff[fx.FILE_NAME.format(DAYS[3])]
+    assert rep.findings()["files differing from the reference manifest"] == 2
+    with pytest.raises(DataError, match="no such manifest"):
+        raw.verify_raw(copy, calendar=cal, against=tmp_path / "none.json")
+    argv = ["--raw", str(copy.parent), "verify-raw", "--vendor", "orats", "--workers", "1"]
+    argv += ["--calendar", str(cal), "--against", str(raw_dir / raw.MANIFEST_NAME)]
+    assert cli.main(argv) == 1
+    assert "FINDING files differing from the reference manifest (2)" in capsys.readouterr().out
+
+
 def test_verify_raw_parallel_matches_serial(raw_dir: Path) -> None:
     assert verify(raw_dir, workers=3).files == verify(raw_dir, workers=1).files
 
