@@ -2150,8 +2150,10 @@ GOLDEN_R2 = ROOT / "tests" / "golden" / "backtest_store_r2.tar.gz"
 
 def flat_store(build: BacktestBuild) -> dict[str, bytes]:
     """Replace the build's store by the round-2 golden (the flat layout written by the
-    volsto-backtest of 2026-09-16 on the same 5 toy dates) and unbind the snapshots; returns the
-    golden's files."""
+    volsto-backtest of 2026-09-16 on the same 5 toy dates) with the snapshots its records name
+    (``snapshots/spx_<date>.yaml`` in the archive: stored bytes, not this machine's import —
+    ``tests/test_snapshot_portability.py`` checks the two against each other) and unbind them;
+    returns the golden's files."""
     import tarfile
 
     shutil.rmtree(build.store_root / "dates")

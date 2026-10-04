@@ -39,6 +39,32 @@ work is done. Every rule here was set by the owner and each has a reason recorde
   the viewers layer that calibrates, and it says so in its log and manifest.
 - **Production particle count is 8·10⁵** (SPEC §11).
 
+## Machine-dependent arithmetic
+
+**Nothing may depend on the bit pattern of a number that came out of LAPACK or an iterative
+solver. Identities (digests, cache keys, bindings) are computed from inputs and from stored
+bytes, never from a recomputation on the current machine. Comparisons of fitted numbers use
+one tolerance, in vol points.** (Owner's rule, 2026-10-03; the third occurrence, after the fit
+tolerance and the cache-absent skips of `fix/test-portability`: 11 tests failed on a new Mac
+whose Accelerate gives other last bits — SPEC §13.3.)
+
+- **One comparator**: `volsto/market/compare.py` — "the same surface within `SURFACE_TOL_VP`
+  = 1e-4 vol points" on a fixed (maturity, log-moneyness) grid. Every test that compares a
+  committed snapshot with a fresh import uses it, and so does the backtest migration's binding
+  rule. `tests/test_snapshot_portability.py` walks every tracked snapshot against it.
+- **Stored fits are data.** The SABRW fits in a snapshot are read back, never fitted a second
+  time and compared (the fit moves by up to 3.7 vol points under a few ulps of input noise); the
+  same test walks `volsto/` and `scripts/` for a second caller of the fitter.
+- **A fit is compared on what it is judged on** (break-evens, skew, SSR), and on its parameters
+  only where it is interior: a fit with ν at its cap or a correlation within 1e-3 of ±1 is
+  flagged and its parameters are not compared (`tests/helpers.py`).
+- **A golden store carries the bytes its records name** (`tests/golden/`), so a record is
+  verified against stored bytes.
+- **Known gap** (planned, SPEC §13.3): the leverage cache key hashes fitted parameters, which
+  another machine reproduces to 1e-8 only. Until fitted parameters are stored records keyed by
+  their inputs, a leverage calibrated on one machine is a cache miss after a refit on another,
+  and the golden backtest store must be regenerated on the machine that runs its tests.
+
 ## Code
 
 - `black` (line length 100), `ruff`, `mypy --strict` clean on every file touched.

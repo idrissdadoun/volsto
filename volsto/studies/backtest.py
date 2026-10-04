@@ -381,6 +381,7 @@ from volsto.config import (
 )
 from volsto.engine.grid import TimeGrid
 from volsto.engine.mc import MonteCarlo
+from volsto.market.compare import snapshot_difference
 from volsto.market.curves import DiscountCurve, ForwardCurve
 from volsto.market.import_hdn import (
     DEFAULT_CALENDAR_REPAIR,
@@ -3853,8 +3854,9 @@ def migrate_store(store: BacktestStore, ledger: Ledger) -> dict[str, dict[str, A
     that ranks below a published one never becomes current); only then are the flat files
     removed — those no attempt holds are moved to ``quarantine/``; leftovers are renamed
     ``*.imported`` before their removal.  The snapshots of the migrated dates whose results
-    verify are then bound only if a fresh import of the day file reproduces their content
-    digest; otherwise they stay unbound (the date is recomputed) and the mismatch is recorded."""
+    verify are then bound only if a fresh import of the day file reproduces them (the same
+    import within the surface tolerance, :func:`_bind_migrated_snapshots`); otherwise they stay
+    unbound (the date is recomputed) and the mismatch is recorded."""
     why = migration_refusal(store, ledger)
     if why:
         raise RefusedError(why)
@@ -3976,8 +3978,11 @@ def _bind_migrated_snapshots(
     ledger: Ledger, dates: Sequence[str]
 ) -> tuple[list[str], dict[str, str]]:
     """Bind the snapshot of each migrated date whose results verify, when a fresh import of its
-    day file reproduces the snapshot's content digest (about 1 s per date; dates already bound
-    are skipped, so an interrupted binding resumes)."""
+    day file reproduces the snapshot — equal in everything but floats and the same surface
+    within :data:`volsto.market.compare.SURFACE_TOL_VP` vol points
+    (:func:`~volsto.market.compare.snapshot_difference`; until 2026-10-03 the content digests
+    had to be equal, which only the machine that wrote the store could meet) — about 1 s per
+    date; dates already bound are skipped, so an interrupted binding resumes."""
     bound: list[str] = []
     unbound: dict[str, str] = {}
     for d in dates:
@@ -4008,12 +4013,15 @@ def _bind_migrated_snapshots(
             continue
         with tempfile.TemporaryDirectory(prefix="volsto-bind-") as tmp:
             try:
-                fresh = import_snapshot(ledger.cfg, d, source, manifest, Path(tmp) / snap.name)
+                import_snapshot(ledger.cfg, d, source, manifest, Path(tmp) / snap.name)
             except DateFailure as exc:
                 unbound[d] = str(exc)
                 continue
-        if fresh != digest:
-            unbound[d] = "a fresh import of its day file gives another snapshot"
+            # not by digest: a fresh import on another machine differs in the last bits of
+            # every fitted number (CONTRIBUTING.md, "Machine-dependent arithmetic")
+            why = snapshot_difference(snap, Path(tmp) / snap.name)
+        if why is not None:
+            unbound[d] = f"a fresh import of its day file gives another snapshot ({why})"
             continue
         bind_snapshot(
             ledger.cfg, snap, source, manifest, "migration (fresh import reproduced)", digest
