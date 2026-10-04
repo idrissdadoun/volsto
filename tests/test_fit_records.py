@@ -351,3 +351,57 @@ def test_key_ignores_the_bytes_and_sees_every_ulp(tmp_path: Path) -> None:
     rhos = (float(np.nextafter(spec.surface.rhos[0], 0.0)), *spec.surface.rhos[1:])
     up = dataclasses.replace(spec, surface=dataclasses.replace(spec.surface, rhos=rhos))
     assert fr.fit_key(fr.fit_inputs(up, cfg, 1.0, fits)) != key
+
+
+def test_key_is_made_of_what_the_snapshot_stores_not_of_the_zones() -> None:
+    """A loaded SABRW fit carries zone edges recomputed at load time (a root solver, norm.ppf):
+    they differ in the last bits between machines for one snapshot file.  The key is made of the
+    stored fields only, so it does not move when the zones do — and it equals the key computed
+    from the file's own ``sabrw.fits`` entries."""
+    import numpy as np
+    import yaml
+
+    from volsto.config import CalibrationSpec, load_yaml
+    from volsto.market.loaders import snapshot_spec
+    from volsto.market.sabrw import SabrwZones
+
+    base = load_yaml(ROOT / "configs" / "studies" / "lsv_reference_2f.yaml", CalibrationSpec)
+    cfg = fit_preset("desk", skew_eps=0.10)
+    spec = snapshot_spec(base, SNAPSHOT)
+    fits = load_sabrw_fits(SNAPSHOT)
+    assert fits is not None
+    inputs = fr.fit_inputs(spec, cfg, 1.0, fits)
+    key = fr.fit_key(inputs)
+    # the inputs' sabrw part is the file's own list, field for field
+    stored = yaml.safe_load(SNAPSHOT.read_text())["sabrw"]["fits"]
+    assert inputs["sabrw"] == stored
+    assert all("zones" not in entry for entry in inputs["sabrw"])
+    # zones moved by one ulp (each edge, up and down) and by ten: the same key
+    for ulps in (1, -1, 10):
+
+        def nudge(x: float, ulps: int = ulps) -> float:
+            for _ in range(abs(ulps)):
+                x = float(np.nextafter(x, np.inf if ulps > 0 else -np.inf))
+            return x
+
+        moved = tuple(
+            dataclasses.replace(
+                f,
+                zones=SabrwZones(
+                    nudge(f.zones.x_exd),
+                    nudge(f.zones.x_td),
+                    nudge(f.zones.x_tu),
+                    nudge(f.zones.x_exu),
+                ),
+            )
+            for f in fits
+        )
+        assert moved != fits
+        assert fr.fit_key(fr.fit_inputs(spec, cfg, 1.0, moved)) == key
+    # ... while a stored field moved by one ulp is another key
+    f0 = fits[0]
+    params = dataclasses.replace(f0.params, nu=float(np.nextafter(f0.params.nu, np.inf)))
+    changed = (dataclasses.replace(f0, params=params), *fits[1:])
+    assert fr.fit_key(fr.fit_inputs(spec, cfg, 1.0, changed)) != key
+    changed = (dataclasses.replace(f0, n=f0.n + 1), *fits[1:])
+    assert fr.fit_key(fr.fit_inputs(spec, cfg, 1.0, changed)) != key

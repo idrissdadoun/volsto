@@ -10,7 +10,9 @@ again, so the leverage key is the same everywhere.
 
 **Key** (:func:`fit_key`): the SHA-256 of what the fit reads and nothing else — the market and
 surface configuration (an eSSVI's pillar ``rhos`` included), the perturbation layer, the
-snapshot's stored SABRW fits when step 0 reads them, the resolved fit configuration, the SSR
+snapshot's stored SABRW fits when step 0 reads them (:func:`stored_sabrw_fit`: the fields the
+snapshot holds, **not** the zone edges a loaded fit recomputes — those are machine-dependent in
+their last bits and the marking fit never reads them), the resolved fit configuration, the SSR
 target — and the fit code tag :data:`FIT_CODE_TAG`.  It is the content of the snapshot the fit
 depends on (not the digest of its bytes: provenance text does not move a fit), so the backtest
 and any other pipeline fitting the same surface share one record.
@@ -75,6 +77,7 @@ import volsto
 from volsto.calibration.fit_2f import BreakEvenFitConfig, FitResult, load_fit_spec
 from volsto.calibration.stability import PARAM_COLUMNS
 from volsto.config import BergomiParams, CalibrationSpec, to_mapping
+from volsto.market.sabrw import PARAM_NAMES
 
 log = logging.getLogger(__name__)
 
@@ -109,6 +112,26 @@ def canonical(payload: Any) -> str:
 _canonical = canonical
 
 
+def stored_sabrw_fit(fit: Any) -> dict[str, Any]:
+    """One SABRW fit as the snapshot stores it (:func:`volsto.market.import_hdn.sabrw_section`):
+    ``T``, ``n``, the seven parameters, the two fit errors, the held and at-bound slopes and the
+    flags — and nothing else.  **Not the zones**: a loaded :class:`~volsto.market.sabrw.SabrwFit`
+    carries zone edges recomputed at load time (``x_Tu`` by a root solver, ``x_Td`` through
+    ``norm.ppf``), which differ in their last bits between machines for one snapshot file
+    (measured on Linux: up to 10 ulp on 352 of 458 stored fits), and which the marking fit
+    never reads.  The key is made of what the file holds."""
+    return {
+        "T": float(fit.T),
+        "n": int(fit.n),
+        "params": {k: float(v) for k, v in zip(PARAM_NAMES, fit.params.as_array(), strict=True)},
+        "rms_vp": float(fit.rms_vp),
+        "weighted_rms": float(fit.weighted_rms),
+        "held": list(fit.held),
+        "at_bound": list(fit.at_bound),
+        "flags": list(fit.flags),
+    }
+
+
 def fit_inputs(
     spec: CalibrationSpec,
     cfg: BreakEvenFitConfig,
@@ -118,7 +141,8 @@ def fit_inputs(
     """What a marking fit reads, as a JSON-able mapping: the market and surface of ``spec`` with
     its perturbation layer (the model, particle and scheme settings play no part), the resolved
     fit configuration, the SSR target and — when the configuration's step 0 reads them — the
-    snapshot's stored SABRW fits (``None`` otherwise, whatever the snapshot holds)."""
+    snapshot's stored SABRW fits (:func:`stored_sabrw_fit`: what the file holds, never the zones
+    recomputed at load time; ``None`` otherwise, whatever the snapshot holds)."""
     reads_fits = cfg.step0 is not None
     if reads_fits and sabrw_fits is None:
         raise ValueError("the fit's step 0 reads the snapshot's SABRW fits: none given")
@@ -128,7 +152,7 @@ def fit_inputs(
         "perturbation": None if spec.perturbation is None else to_mapping(spec.perturbation),
         "fit": to_mapping(cfg),
         "ssr_target": float(ssr_target),
-        "sabrw": [to_mapping(f) for f in sabrw_fits or ()] if reads_fits else None,
+        "sabrw": [stored_sabrw_fit(f) for f in sabrw_fits or ()] if reads_fits else None,
     }
 
 
