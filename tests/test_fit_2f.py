@@ -49,7 +49,13 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import pytest
-from helpers import assert_params_close
+from helpers import (
+    FIT_JUDGED_RTOL_BOUNDARY,
+    FIT_JUDGED_RTOL_INTERIOR,
+    assert_fit_judged_close,
+    assert_params_close,
+    fit_at_boundary,
+)
 from scipy.optimize import LinearConstraint, minimize
 
 from volsto.analytics.bergomi import atmf_skew_order1
@@ -682,7 +688,11 @@ def test_tables_yaml_and_fit_spec(spx_fits, tmp_path) -> None:  # type: ignore[n
 def test_realised_lsv_ssr_reported_for_study_fits(fast_sim) -> None:  # type: ignore[no-untyped-def]
     """The cached study fits of ``scripts/m7_p1_marking.py`` (``configs/studies/m7_p1_marking``;
     skipped when absent): the recorded fit is reproduced by the fitter with the entry's config and
-    step-0 source (same parameters, the cache key), the cached leverage is read (never calibrated), stage 3 reports the calibrated LSV's
+    step-0 source — its break-evens, skew and SSR on every spec (within ``FIT_JUDGED_RTOL_INTERIOR`` = 1e-6,
+    or ``FIT_JUDGED_RTOL_BOUNDARY`` = 1e-3 for a fit flagged at the boundary), its
+    parameters within ``FIT_RTOL`` where the fit is interior (a fit with ``ν`` at its cap or a
+    correlation within 1e-3 of ±1 is flagged and its parameters are not compared: they are not
+    identified to the last digits there) — the cached leverage is read (never calibrated), stage 3 reports the calibrated LSV's
     numerical SSR at 3M and 1Y with standard errors, the mean ``|L − 1|`` and the stage-3 assertion
     verdict at 3M — reported, not asserted equal to the SSR target / pass (the owner: the realised
     SSR is a diagnostic, about 1.4–2.0 at ``ssr_target = 1``)."""
@@ -698,7 +708,16 @@ def test_realised_lsv_ssr_reported_for_study_fits(fast_sim) -> None:  # type: ig
         r = fit_2f_marking(
             surface, fs.config, ssr_target=fs.ssr_target, step0=fs.step0_source(surface)
         )
-        assert_params_close(r.params, fs.spec.model, (path.name, r.params, fs.spec.model))
+        # what the fit is judged on is reproduced on every machine; its parameters only where
+        # the fit is interior (owner's decision 2026-10-03, SPEC §13.3)
+        boundary = fit_at_boundary(fs.spec.model, fs.config.nu_cap)
+        assert fit_at_boundary(r.params, fs.config.nu_cap) == boundary, path.name
+        rel = FIT_JUDGED_RTOL_BOUNDARY if boundary else FIT_JUDGED_RTOL_INTERIOR
+        assert_fit_judged_close(r.params, fs.spec.model, r.xi0, r.table["T"], path.name, rel=rel)
+        if boundary:
+            print(f"{path.name}: at the boundary ({boundary}) — parameters not compared")
+        else:
+            assert_params_close(r.params, fs.spec.model, (path.name, r.params, fs.spec.model))
         assert r.status == fs.fit["status"]
         lsv = _cached(fs.spec)
         rep = stage3_validation(
@@ -1198,20 +1217,13 @@ def test_step0_from_sabrw_fits(spx) -> None:  # type: ignore[no-untyped-def]
 
     with pytest.raises(ValueError, match="radicand_floor"):
         sabr_reduce_triplet(ts, 1.0, radicand_floor=1.0)
-    if not HDN_SAMPLE.exists():
-        pytest.skip("HDN sample not present: the real-quote half is skipped")
-    from volsto.market import import_hdn as ih
+    # the real-quote half: the SABRW fits stored in the 2022-12-30 snapshot (data: read back,
+    # never fitted a second time)
+    from volsto.market.loaders import load_sabrw_fits
 
-    f = ih.HdnFilters()
-    ch = ih.load_day(
-        HDN_SAMPLE / "day_by_date" / "2022-12-30_options.csv",
-        "SPX",
-        manifest=ih.load_manifest(HDN_SAMPLE),
-    )
-    _, pts = ih.to_grid_surface(
-        ch, ih.implied_forwards(ch, max_years=f.max_years, band=f.near_atm_band), f
-    )
-    real = SabrwTermStructure.from_fits(ih.sabrw_fits(pts, t_min=0.05, t_max=3.1), atm)
+    stored = load_sabrw_fits(SPX)
+    assert stored is not None
+    real = SabrwTermStructure.from_fits(stored, atm)
     r = fit_2f_marking(spx, cfg, ssr_target=1.0, step0=real)
     c = np.asarray(r.targets.correl_target)
     print(

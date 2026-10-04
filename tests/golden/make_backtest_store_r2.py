@@ -3,9 +3,15 @@ layout** of the round-2 ``volsto-backtest`` (2026-09-16; ``dates/<d>/{rows.parqu
 done.json}`` and ``backtest.json``, version-1 dependency records) — the legacy store the
 migration tests read (``tests/test_backtest.py::flat_store``).
 
-The golden must be computed by the current importer and calibration code: its records name the
-snapshot digests and leverage keys the tests' live toy build produces, so it is regenerated
-whenever those change (first: the fit's θ fix of 2026-09-17, SPEC §13.1).  Source: an
+The golden must be computed by the current importer and calibration code, so it is regenerated
+whenever those change (first: the fit's θ fix of 2026-09-17, SPEC §13.1).  Since 2026-10-03 it
+carries the snapshots its records name (``snapshots/spx_<date>.yaml``, the store's own
+location for them), so the snapshot binding is verified against stored bytes on any machine.
+**Its leverage keys are still those of the machine that built it** (a key hashes the fitted
+parameters, which another machine reproduces to 1e-8 only, and a toy leverage is 8.6 MB — too
+large to ship): on another machine the migration tests fail on the leverage until fitted
+parameters are stored records (CONTRIBUTING.md, "Machine-dependent arithmetic"); regenerate the
+golden there.  Last regenerated on the owner's Mac (M5 Pro, macOS 26.5.1), 2026-10-03.  Source: an
 attempts-layout toy build written by the sanctioned fixture (``tests/_backtest_build.py``, e.g.
 the last pytest run's ``<tmp>/pytest-<n>/toy_backtest/A/outputs/backtest/hdn_2022h2_toy``).
 Nothing is calibrated here.
@@ -38,9 +44,10 @@ from typing import Any
 
 import pandas as pd
 
-from volsto.studies.backtest import state_link, state_params
+from volsto.studies.backtest import snapshot_bytes_digest, state_link, state_params
 
 GOLDEN = Path(__file__).resolve().parent / "backtest_store_r2.tar.gz"
+SNAPSHOTS = "snapshots/"
 DROPPED_TOP_LEVEL = ("previous_cache_key", "previous_date", "volsto_version")
 
 
@@ -125,7 +132,16 @@ def main(argv: list[str]) -> int:
         assert sorted(rec) == sorted(old_doc["record"]), d
         assert sorted(rec["leverage"]) == sorted(old_doc["record"]["leverage"]), d
         new[f"dates/{d}/done.json"] = (json.dumps(flat, indent=2, sort_keys=True) + "\n").encode()
-    assert sorted(new) == sorted(old), sorted(set(new) ^ set(old))
+    assert sorted(new) == sorted(n for n in old if not n.startswith(SNAPSHOTS)), sorted(
+        set(new) ^ set(old)
+    )
+    # the snapshots the records name, byte for byte (2026-10-03): the migration tests verify the
+    # stored records against these stored bytes, never against an import on the current machine
+    for d in dates:
+        snap = store / "snapshots" / f"spx_{d}.yaml"
+        data = snap.read_bytes()
+        assert snapshot_bytes_digest(data) == docs[d]["record"]["snapshot"], d
+        new[f"{SNAPSHOTS}spx_{d}.yaml"] = data
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz", compresslevel=9) as tar:
         for name in sorted(new):
