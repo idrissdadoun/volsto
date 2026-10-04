@@ -617,9 +617,7 @@ def preset_cliquet(
     cl = (
         product
         if isinstance(product, AdditiveCliquet)
-        else product._inner()
-        if isinstance(product, ReverseCliquet)
-        else None
+        else product._inner() if isinstance(product, ReverseCliquet) else None
     )
     T = float(product.maturity)
     inst: list[HedgeInstrument] = [ctx.spot_instrument()]

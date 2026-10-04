@@ -17,6 +17,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import pytest
+import yaml
 
 from volsto.calibration.cache import spec_key
 from volsto.config import (
@@ -692,19 +693,23 @@ def test_snapshot_provenance_names_the_importer_tag(pipeline: Pipeline) -> None:
 
 
 def test_snapshot_stores_the_sabrw_fits(pipeline: Pipeline, tmp_path: Path) -> None:
-    """The snapshot stores the day's SABRW fits (its ``sabrw`` section, SPEC §15 Part 3): the
-    loader reads back exactly :func:`~volsto.market.import_hdn.sabrw_fits` of the day's retained
-    quotes — every expiry from ``SABRW_T_MIN`` to the last with at least seven quotes, parameters,
-    zones, errors, counts, held slopes, bounds and flags bit for bit — under the importer's tag;
-    the committed SPX anchor carries the same section as a fresh import of its day."""
+    """The snapshot stores the day's SABRW fits (its ``sabrw`` section, SPEC §15 Part 3) and the
+    stored section is read back unchanged — every expiry from ``SABRW_T_MIN`` to the last with at
+    least seven quotes, parameters, errors, counts, held slopes, bounds and flags bit for bit,
+    under the importer's tag — for a fresh import and for the committed SPX anchor.  The stored
+    fits are data: nothing here fits a second time and compares (the fit moves by up to 3.7 vol
+    points under a few ulps of input noise, SPEC §13.3; owner's decision 2026-10-03)."""
     from volsto.market.loaders import load_sabrw_fits
 
     cfg, _fit, points, _chain = pipeline
     assert cfg["sabrw"]["importer_tag"] == import_hdn.IMPORTER_TAG
     path = import_hdn.write_snapshot(cfg, tmp_path / "snap.yaml")
-    want = import_hdn.sabrw_fits(
-        points, t_min=import_hdn.SABRW_T_MIN, t_max=float(points.table["T"].max())
-    )
-    assert len(want) >= 30 and load_sabrw_fits(path) == want
+    fits = load_sabrw_fits(path)
+    assert fits is not None and len(fits) >= 30
+    assert import_hdn.sabrw_section(fits) == cfg["sabrw"]  # read back unchanged
+    t_last = float(points.table["T"].max())
+    assert all(import_hdn.SABRW_T_MIN <= f.T <= t_last and f.n >= 7 for f in fits)
     committed = ROOT / "configs" / "surfaces" / "snapshots" / "hdn_2022H2" / f"spx_{DAY}.yaml"
-    assert load_sabrw_fits(committed) == want
+    stored = load_sabrw_fits(committed)
+    assert stored is not None and [f.T for f in stored] == [f.T for f in fits]
+    assert import_hdn.sabrw_section(stored) == yaml.safe_load(committed.read_text())["sabrw"]

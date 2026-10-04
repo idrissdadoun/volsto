@@ -42,6 +42,7 @@ import pandas as pd
 from volsto.calibration.fit_2f import BreakEvenFitConfig, fit_2f_marking, fit_preset
 from volsto.calibration.targets import DEFAULT_ATF_REF
 from volsto.market import import_hdn as ih
+from volsto.market.loaders import sabrw_fits_from_config
 from volsto.market.sabrw import SabrwTermStructure
 
 K2_BOUNDS = (0.05, 5.0)
@@ -85,9 +86,10 @@ def run_date(
     sab: list[dict] = []
     t0 = time.time()
     try:
-        _cfg, fit, points, _chain = ih.import_day(root, date)
+        cfg, fit, _points, _chain = ih.import_day(root, date)
         surface = fit.surface
-        fits = ih.sabrw_fits(points, t_min=t_min, t_max=t_max)
+        # the fits the import itself stored (data: read back, never fitted a second time)
+        fits = tuple(f for f in sabrw_fits_from_config(cfg) or () if t_min <= f.T <= t_max)
         ts = SabrwTermStructure.from_fits(fits, lambda T: float(surface.atm_vol(T)))
     except Exception as exc:  # the date is recorded as failed for every variant
         traceback.print_exc()
