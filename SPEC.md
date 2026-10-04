@@ -97,6 +97,12 @@ volsto/
       mixing.py          # mixing solution for pure-SV vanilla smiles (ch. 8 App. A)
     pde/
       lsv1f.py           # 2D finite-difference pricer for the 1F degenerate case (validation only)
+    data/                # vendor data layer (§18): roots, raw manifest, fetch, volsto-data CLI
+      roots.py           # VOLSTO_DATA_RAW / VOLSTO_DATA_STORE, free-space check
+      orats.py           # ORATS strikes file: naming, declared schema versions
+      raw.py             # verify-raw: raw manifest, trading-calendar and OPRA checks
+      fetch.py           # aws s3 sync wrapper (profile name only; no credentials)
+      cli.py             # volsto-data entry point
     studies/
       m4.py              # headline study runner behind the M4/M4b tables (implemented)
       runner.py          # run a study from YAML, write parquet + LaTeX tables + figures
@@ -1432,6 +1438,8 @@ M8. Hedging framework; port the cliquet and FVA hedging studies as regression te
 M9. Precompute CLI + Streamlit viewers + Excel export. **Done and accepted 2026-09-16** (§9.2; grid on the light tier with the 3-bucket forward-variance ladder; the full default grid runs on an owner-provisioned VM, `docs/vm_grid_run.md`).
 M10. Study runner with LaTeX output; regenerate the original paper's tables; backtest study on the market history (§15 Part 4). **Built and committed 2026-09-16/17 (0aa8dcb and its 2026-09-17 follow-up; pending owner review; open items in §10.3):** Part 0 eSSVI calendar repair (§13.1–13.2), the study runner (§10.1), the catalogue S1–S7 (§10.2), the rolling backtest with seasoning and sticky-leverage attribution (§10.3, §6.10, §7.12.1), `docs/methodology.md`, `docs/studies.md`.
 
+M11. Vendor data store and ORATS importer (§18). **In progress (2026-10-03):** Part 0 (the one-day sample inspected, `docs/m11_part0.md`) and Part 1 (data roots, raw manifest and calendar check, `fetch`, the `volsto-data` CLI, `docs/data_runbook.md`) built; Parts 2a–5 follow, one PR per part.
+
 Open items for the owner: the original study archive (SSVI parameters, seeds, tables) — the M4 cliquet baseline is ≈ 10–16% above the study at every ω with ratios across ω agreeing to 1%, consistent with a surface difference; the paid EOD archive for a multi-year backtest.
 
 ---
@@ -1930,6 +1938,7 @@ Built inline (the phase-1 agent workflow failed on the account's spend limit; it
 ---
 
 ## 17. Change log v1.1 → v2.0
+- 2026-10-03 M11 Parts 0–1: §18 (new) — the ORATS one-day sample as measured, the owner's decisions, the data roots, `volsto-data status / fetch / verify-raw`, the raw manifest; §1 layout (`volsto/data/`); §12 M11.
 - 2026-10-03 machine portability (stage A): §13.3 (new) — the cross-machine measurements, the invariant, the one surface comparator, stored SABRW fits as data, the golden store with its snapshots, the migration's binding rule, the fit test on judged quantities, the planned fit records; §10.3 binding wording.
 - 2026-09-16/17 M10: §13.1 certified eSSVI calendar repair (Part 0) and §13.2 the eSSVI surface in the calibration spec; §10.1 the study runner (`volsto-study`, results with enforced stderrs, LaTeX/figures, manifest, rerun/render, the calibration guard at `calibrate_leverage`'s entry); §10.2 the study catalogue S1–S7 (paired errors, S1 regenerating the M4 baseline exactly); §10.3 the rolling backtest (`volsto-backtest`, immutable attempts with one pointer and one verdict, the 25-date proof of concept); §6.10 seasoned trades; §7.12.1 sticky-leverage attribution with the curve-move rates step and paired standard errors; §8.2 study C re-run under the rebuilt rule and study B's Phoenix rows corrected; §4.3 the code-tag hash re-recorded without a bump; §9.2 the VM runbook and measured-cost report; `docs/methodology.md`, `docs/studies.md`.
 - 2026-09-17 M10 follow-up: §10.3 storage round 5 (all refusals before any write, one `computed_under_another_config` judgement, a journalled migration under a store-root flock, unsettled verdicts, foreign pointer versions refused, date locks as a flock on the date directory with `dir_fd` operations, record version 2 with the leverage content digest, `VOLSTO_BACKTEST_REQUIRE_PATHS`); §7.12.1 / §10.3 `cum_pnl_stderr` and paired group errors with the `aggregate()` helper, per-unit books and per-trade units; §10.2 `EXACT_KINDS` declarations with walker enforcement, z-scores with stderr 1, delta-method error stderrs, S1's per-window put-wing verdicts, S5's `marking_fit` helper, S6's `ratio_stderr_bound`, S7's repaired-history gate and rank decided flags; §8.2 the world-(ii) gate on the repaired discriminator run with the pre-repair run as fallback; §13.1 the second-pass comparison stored and cited; the slow Part 0 gate test; docs and CONTRIBUTING updated; round 6: blank path overrides refused, version-1 records done with `legacy_unverified` (status, study.md, manifest) and never re-adopted over a version-2 attempt, `DateLock.still_at`, migration refusals up front (headerless foreign stores, interrupted migrations of another config, unreadable journals kept), `gc` on read-only stores, one printed-command builder with a walking test, paired theta carry and roll-down (volsto/risk/greeks.py), the shared test build lock (`tests/_locks.py`), an environment-isolation fixture, S5's window-keyed spot skew and S7's whole-set headline flag.
@@ -1981,3 +1990,84 @@ Built inline (the phase-1 agent workflow failed on the account's spend limit; it
 - 2026-09-13 M6: §6.5–6.8 (barrier machinery, autocall / Phoenix, digital-structure risk, headline rows, conventions approved at the review), §9.1 PDE cross-check with the ±6 sd width, §4.2 M6 Part 0 notes (pricing-noise finding, the second-order step's compensator fix, gate met on six pricing seeds, far-wing bias recorded), §7.13 measured budget, §12 M6 status; M7 started per §15.
 - 2026-09-13 M5: §7.15 implementation notes (fwd-var sizing on the log-contract strip, saturating skew/curvature profile, one-sided boundary bumps, cliquet Bachelier deviation measured, fixing/barrier/realised-variance definitions, LR aggregation, cubic conditional basis, attribution conventions, budget); §12 M5 status.
 - 2026-09-13 merge (this file): the implementer's measured tables and notes re-applied over v2.0 — §2.4 replication bounds, §3.1 scheme switches and M4b status, §3.3 second-order step, §4.1 M3 notes and production particle count, §4.2 acceptance table, pre-M4 findings and M4b notes, §5 grid rule, §6.3 M4/M4b tables, §10 M4b baseline, §11 particle-count convention, §12 M4b status, §13 M3b notes.
+
+---
+
+## 18. Vendor data store and ORATS import (M11)
+
+As built, part by part (one PR per part; Parts 2a–5 are added here as they land). Code: `volsto/data/` (`roots.py`, `orats.py`, `raw.py`, `fetch.py`, `cli.py`), console script `volsto-data`, `tests/test_data_layer.py`, `tests/_orats_fixture.py`; the download-day commands are `docs/data_runbook.md`; the sample inspection in full is `docs/m11_part0.md`.
+
+**Purpose.** The ORATS "Near End-of-Day" historical archive (US listed options, 2007 to today, one zipped CSV per trading day, 5,000+ tickers, delivered through AWS S3 with credentials that expire 14 days after purchase) becomes the second vendor beside HistoricalData.net (§13). Everything is built and measured on ORATS's free one-day sample before the purchase, so the download window is spent downloading and verifying.
+
+**Standing rules of the milestone (owner, 2026-10-03).** Vendor data never enters git — raw files, Parquet, or anything that reproduces vendor quotes in bulk (`data/` and `*.parquet` are ignored; `test_no_tracked_file_under_the_data_roots` fails on a tracked file under `data/` or either resolved root). The code never handles credentials: `fetch` takes the name of an AWS profile the owner configured. Nothing is bought or downloaded but the free sample. The HDN path does not move: every HDN snapshot is byte-identical after each change, proven on all sample dates before `importer_guard.json` is re-recorded. No tolerance enters a test before the measured number is reported and the owner agrees the constant. Tests that need the ORATS sample skip with the reason when it is absent; the plumbing tests run on a synthetic ORATS-format fixture built in a temporary directory.
+
+### 18.1 Part 0 — the one-day sample as measured (trade date 2024-01-03)
+
+Sample: `https://s3.amazonaws.com/assets.orats.com/ORATS_SMV_Strikes_20240103.zip` → `data/orats_sample/` (git-ignored), sha256 `e04a37310b0f453fedc03a000c55adfc517a119279150173916ebdc5fb514570`. Measured in a cloud session on 2026-10-03 (`docs/m11_part0.md`) and re-measured on the owner's Mac the same day before Part 1 (download 3.05 s; the checks 1.4 s; no Monte Carlo, no calibration): every figure below reproduced, with one correction — the OPRA symbols are unpadded, 16–20 characters (root + 15), not 21 as the Part 0 note says.
+
+- **File.** 66,808,802 bytes zipped, one member of 222,935,113 bytes (CSV), 716,822 rows, 5,787 tickers, 80 expiry dates. Comma-delimited, LF, no quoting, header row, dates as `M/D/YYYY` without zero padding. Name `ORATS_SMV_Strikes_YYYYMMDD.zip`.
+- **Columns.** 39, not the 36 ORATS publishes: `cOpra`, `pOpra` (OPRA symbols) and `cMidIv` are extra; the published 36 are present in their published order. Nulls only in `spot_px`.
+- **S&P 500.** Tickers `SPX` (10,519 rows) and `XSP` (5,393). Ticker `SPX` merges two OPRA roots: `SPX` (AM-settled, 3,278 rows) and `SPXW` (PM-settled, 7,241). 1,590 duplicate (ticker, expirDate, strike) keys (3,180 rows), all SPX, on the five third Fridays where both roots list (2024-01-19, 02-16, 03-15, 04-19, 05-17); zero duplicates on (root, expirDate, strike); `cOpra` and `pOpra` are each unique in the file. AM/PM is recoverable from the OPRA root and from nothing else.
+- **`yte`** is calendar days to the expiry date / 365 rounded to five decimals (largest difference 4.8e-6), one value per (ticker, expiry) and the same for both roots, zero on same-day expiries (1,334 rows). No time of day, no AM adjustment.
+- **`stkPx`** is not an implied futures price. For SPX it equals our parity forward discounted at `iRate` within 3 bp through one year (`docs/m11_part0.md` §4).
+- **`spot_px`** is unusable: null on 94.7 % of rows (678,951; present on 47 index tickers, on no single stock), and where present it matches neither the close nor the snapshot level (SPX 4674.89 against the official close 4704.81 in `data/history/SPX.csv`).
+- **Rates.** `divRate` is zero on every row. `iRate` takes eight values (3.93–5.55 %), a step function of the day's Treasury constant-maturity yields. `residualRateData` on SPX: median −1.08 % a year (quartiles −1.38 % / −0.85 %); its definition is unknown.
+- **No timestamp column**: the snapshot time ("14 minutes before the close") cannot be verified from the file.
+- **Quotes.** Either bid is zero on 46.8 % of rows.
+- **Size.** Typed Parquet of this day at zstd-3 is 99 MB, 1.5 times the zip. Extrapolated archive (≈ 4,970 trading days): 200–350 GB zipped, 0.65–1.2 TB unzipped, uncertain by ±40 %.
+
+**Decisions taken on Part 0 (owner, 2026-10-03).**
+1. *Time to expiry*: from (trade date, expiry date, OPRA root) with the HDN rule — calendar days / 365, one day less for the AM root; `yte` is a cross-check only.
+2. *Spread filter*: bid and ask prices are inverted with our implied forward and discount factor; vendor IVs are cross-checks, never inputs. The HDN path keeps its current filter (which prefers the vendor's `iv_bid` / `iv_ask` where present); the difference between the two vendors' filters is recorded with Part 4.
+3. *Schema*: declared in code, column by column; nothing is inferred from a file; `divRate` is float64; dates are parsed with an explicit format and fail loudly.
+4. *Spot*: never `spot_px`. Spot is the option-implied spot the importer computes; the official close in `data/history/SPX.csv` is the fixing reference only. The 10 bp / 3 se asynchrony warning was written for HDN; for ORATS implied spot minus close is a measurement, not a data problem.
+5. *`stkPx`*: cross-check only — our parity forward against `stkPx·exp(iRate·T)`, in bp.
+6. *Prior rate curve*: the file's `iRate` step function, documented as such; the importer's implied funding curve supersedes it as for HDN.
+7. *Raw stays zipped*: nothing ever unzips the archive to disk in bulk.
+8. *OPRA dependency*: a file where `cOpra` or `pOpra` is missing or empty for SPX fails loudly; the fallback (AM/PM from the expiry calendar) is a plan only.
+9. XSP and single stocks are out of scope for the importer in this milestone.
+
+**Open questions for ORATS** (the sample cannot answer; `docs/m11_part0.md` §6): the column history since 2007 and when the OPRA columns appear; the roots of pre-2010 weeklies and of the 2011–2015 `SPXPM` series; the S3 layout and naming; delisted tickers; the snapshot time; the definitions of `residualRateData`, `spot_px` and the `ext*` columns. `verify-raw` (below) answers the first, third and part of the second on download day.
+
+### 18.2 Part 1 — data roots, raw layer, download runbook (as built, 2026-10-03)
+
+**Roots** (`volsto/data/roots.py`). Two roots in the viewers' `VOLSTO_*` pattern, later sources winning — default, environment, CLI flag — and `volsto-data status` prints which one applied:
+
+| root | environment | flag | default | holds |
+|---|---|---|---|---|
+| raw | `VOLSTO_DATA_RAW` | `--raw` | `data/raw` | vendor zips exactly as delivered, never modified, never unzipped to disk; may sit on an external volume |
+| store | `VOLSTO_DATA_STORE` | `--store` | `data/store` | the typed Parquet store (Part 2b), rebuildable from raw |
+
+Each vendor owns one sub-directory (`<raw>/orats/`, `<store>/orats/`). A blank value is refused. Every bulk write first calls `require_free_space` (needed bytes plus the named margin `FREE_SPACE_MARGIN_BYTES` = 10 GiB on the target volume) and refuses when short.
+
+**Schema** (`volsto/data/orats.py`). `SCHEMA_VERSIONS` declares each known layout as ordered `(column, type)` pairs with the types `string`, `int64`, `float64`, `date`; version 1 is the sample's 39 columns (`ticker`, `cOpra`, `pOpra` strings; `expirDate`, `trade_date` dates in `%m/%d/%Y`; `cVolu`, `cOi`, `pVolu`, `pOi` int64; everything else float64, `divRate` included). A header that is not exactly a known version is drift, described column by column (`describe_drift`: missing, unexpected, reordered); a version is added only after the owner confirms. The raw file name is the regular expression `ORATS_SMV_Strikes_(\d{8})\.zip` by default and a parameter everywhere (`--pattern`).
+
+**`volsto-data fetch --vendor orats --profile <aws profile> --bucket … --prefix … [--include GLOB]… [--dry-run] [-- <aws args>]`** (`fetch.py`) wraps the AWS CLI. It first lists the source (`aws s3 ls --recursive --summarize`: object count and total bytes, first and last keys). `--dry-run` then runs the sync with `--dryrun`, counts what would be downloaded, warns if the sync would be refused for space, and writes nothing. Without it, the sync is refused when the raw volume is short of the bytes still to download plus the margin, and otherwise runs `aws s3 sync s3://<bucket>/<prefix>/ <raw>/orats/ --profile <name> --no-progress`. Resumable: the same command again skips completed objects. `--delete`, `--profile` and `--dryrun` are refused as extra arguments (the raw layer is never modified). Only the profile's name reaches the command line; the environment is never printed; nothing reads `~/.aws`. A missing AWS CLI is a refusal with the install hint (it is not installed on the owner's Mac as of 2026-10-03). Tested against a stand-in `aws` executable; never run against a real bucket.
+
+**`volsto-data verify-raw --vendor orats [--pattern RE] [--calendar CSV] [--workers N] [--rehash] [--against MANIFEST]`** (`raw.py`) reads every `*.zip` below `<raw>/orats/` (recursively: a sync keeps the vendor's prefix layout), hashes it, streams its single CSV member from inside the zip (four columns as strings, 16 MiB blocks) and writes the raw manifest `<raw>/orats/raw_manifest.json` atomically. Per file: relative path, bytes, mtime, **sha256 of the zip**, trade date (from the name), member name and CSV bytes, the column list, the schema version (`null` on drift), the row count, the distinct `trade_date` texts, whether both OPRA columns exist, the rows with an empty `cOpra` / `pOpra`, the SPX rows and the SPX rows without a symbol. An entry whose size and mtime are unchanged is reused (the report says how many); `--rehash` reads everything. The manifest stays inside the raw directory so that it travels with the files (owner's decision, 2026-10-03); the scan and the calendar check read `*.zip` only. `--against <manifest>` checks a second copy: every file is hashed again (a copy keeps size and mtime) and compared by name and sha256 with that manifest, a file missing on either side or a different hash being a finding. The checks — each listed in the report and in the manifest, exit 1 when any is present, never silent:
+
+- *calendar*: every trading day from the first file to the last has exactly one file, the calendar being the dates of `data/history/SPX.csv` (`DEFAULT_CALENDAR`). Missing days, unexpected dates (not in the calendar), dates with more than one file, and files dated beyond the calendar's last date (refresh the calendar) are listed;
+- *names and content*: a zip the pattern does not match; an unreadable zip or one without exactly one member; a `trade_date` column that is absent, holds several values, is not `%m/%d/%Y`, or disagrees with the file name;
+- *schema drift*: named against the latest version;
+- *OPRA dependency* (decision 8): every file whose `cOpra` / `pOpra` is absent or empty on an SPX row, and the coverage per year (files, files with the columns, files usable for SPX, rows, empty symbols, SPX rows, SPX rows without a symbol).
+
+**`volsto-data status`**: the roots and their sources, free space, the raw zip count and bytes per vendor, the manifest's date range and findings, and whether it is stale against the directory.
+
+**Measured (2026-10-03, owner's Mac: 18 cores, 48 GB, internal SSD, 784 GiB free).**
+
+| step | measured | extrapolation to ≈ 4,970 files |
+|---|---|---|
+| sample download, public HTTPS, one stream | 66.8 MB in 3.05 s (21.9 MB/s) | 2.5–4.4 h for 200–350 GB at that rate; `aws s3 sync` runs 10 parallel requests, the real bucket is unmeasured |
+| sha256 of the zip | 0.02 s | — |
+| inflate the 223 MB CSV from the zip | 0.26 s | — |
+| `verify-raw`, 1 worker | 14.3 s for 32 sample-sized files (0.45 s per file) | 37 min |
+| `verify-raw`, 8 workers (default) | 3.1 s for 32 files (10 files/s) | ≈ 8 min if the disk keeps up (an external disk at 150 MB/s reads 300 GB in ≈ 35 min) |
+| `verify-raw`, 16 workers | 2.7 s for 32 files | no gain worth the default |
+| peak memory, all processes | 0.41–0.53 GB | the same |
+
+The sample scanned by `verify-raw`: 66,808,802 bytes, sha256 as above, 716,822 rows, schema v1, one `trade_date` value equal to the name's, 10,519 SPX rows, no empty OPRA symbol — clean.
+
+**Tests** (`tests/test_data_layer.py`, 16, ≈ 4 s; the sample test skips when `data/orats_sample/` is absent). The synthetic fixture `tests/_orats_fixture.py` writes 39-column ORATS-format zips into a temporary directory: SPX with the `SPXW` root on every expiry and the `SPX` root (priced one day shorter) on the third Fridays 2024-01-19 and 2024-02-16 — so both roots share (ticker, expirDate, strike) there — plus XSP and AAPL, Black-76 prices on a skewed smile with a bid/ask. Covered: root precedence and blank refusals; no tracked file under the data roots; the free-space refusal; the declared schema, drift descriptions, date and name parsing, the OPRA root; the fixture's third-Friday structure; a clean `verify-raw` and its manifest, reuse and `--rehash`, serial against parallel; a second copy checked against a manifest (a flipped byte with size and mtime kept, a missing file); every calendar finding (missing, beyond the calendar, unexpected, duplicated, unmatched name); every content finding (OPRA columns absent, SPX symbols blank, `trade_date` mismatch, renamed and added columns, a corrupt zip); the real sample's Part 0 numbers; `fetch` dry run then sync against the stand-in `aws` (the listing precedes the sync, the argv, no `--delete`, a planted secret in the environment never printed), its refusals (space, a failed listing, forbidden extras, no AWS CLI, a bucket with a path, a blank profile, an untrusted listing) and the resume hint; the CLI's exit codes 0 / 1 / 2.
+
+**Not built yet.** `convert`, `verify`, `extract`, `sql` (Part 2b, after the owner chooses the layout from Part 2a's table), the read API (Part 3), the importer (Part 4), the second-vendor plan (Part 5).
+

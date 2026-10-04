@@ -59,6 +59,8 @@ uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python -e ".[de
    | Path | Contents |
    |---|---|
    | `data/hdn_sample/` | the HistoricalData.net option-chain sample 2022 H2 (licensed, local only) |
+   | `data/orats_sample/` | the ORATS free one-day sample (`ORATS_SMV_Strikes_20240103.zip`; re-download: `docs/m11_part0.md`) |
+   | `data/raw/`, `data/store/` | vendor archives as delivered and the Parquet store built from them (`VOLSTO_DATA_RAW`, `VOLSTO_DATA_STORE`; see "Vendor data") |
    | `data/history/` | yfinance and Cboe daily closes (`scripts/fetch_history.py` re-downloads them) |
    | `cache/` | the content-addressed leverage cache (hours to days of calibration) |
    | `outputs/` | the results store, study outputs and reports |
@@ -330,6 +332,28 @@ log-contract strip; skew / curvature bumps use a saturating profile; the cliquet
 cross-check is an approximation even under Black–Scholes — the exact independent-legs reference
 is `bs_cliquet_value_mc`).  `scripts/m5_budget.py` runs the full report under the reference LSV
 and prints the recalibration count and wall clock (the viewer precompute budget).
+
+## Vendor data (M11)
+
+Vendor archives never enter git. Two roots, each overridable by an environment variable or a
+flag of `volsto-data`:
+
+| Root | Variable | Default | Contents |
+|---|---|---|---|
+| raw | `VOLSTO_DATA_RAW` (`--raw`) | `data/raw` | vendor zips exactly as delivered (may be an external volume) |
+| store | `VOLSTO_DATA_STORE` (`--store`) | `data/store` | the typed Parquet store derived from raw |
+
+```bash
+volsto-data status                                   # roots, free space, raw files, manifest
+volsto-data fetch --vendor orats --profile <aws profile> --bucket <bucket> --prefix <prefix> --dry-run
+volsto-data fetch --vendor orats --profile <aws profile> --bucket <bucket> --prefix <prefix>
+volsto-data verify-raw --vendor orats                # raw manifest, trading-calendar and OPRA checks
+```
+
+`fetch` wraps `aws s3 sync` and takes the *name* of an AWS profile you configured; the code
+never sees a credential. `docs/data_runbook.md` is the download-day procedure; SPEC §18 has the
+design and the measurements. Tests that need the ORATS one-day sample skip when
+`data/orats_sample/` is absent.
 
 ## Development
 
