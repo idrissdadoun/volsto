@@ -114,7 +114,7 @@ HDN_COLUMNS: tuple[str, ...] = (
     "vega",
     "rho",
 )
-IMPORTER_TAG: str = "2026-09-27"
+IMPORTER_TAG: str = "2026-10-04"
 """The importer's numerics tag, written into every snapshot's ``provenance.importer_tag`` and
 checked by the backtest store (a stored snapshot imported under another tag is stale and is
 re-imported).  Bump it whenever a change moves any snapshot an import produces; the source of
@@ -125,6 +125,7 @@ IMPORTER_GUARDED_MODULES: tuple[str, ...] = (
     "volsto/market/import_hdn.py",
     "volsto/market/surface.py",
     "volsto/market/curves.py",
+    "volsto/market/sabrw.py",  # it writes the sabrw section of every snapshot (2026-10-04)
 )
 IMPORTER_GUARD_FILE = Path(__file__).resolve().parent / "importer_guard.json"
 FUNDING_KNOTS: tuple[float, ...] = (1.0 / 12.0, 0.25, 0.5, 1.0, 2.0, 3.0)

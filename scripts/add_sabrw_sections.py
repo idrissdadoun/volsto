@@ -26,17 +26,32 @@ from volsto.market.vendor import HdnSource
 
 ROOT = Path(__file__).resolve().parents[1]
 DIRS = (
+    ROOT / "configs" / "surfaces" / "snapshots",
     ROOT / "configs" / "surfaces" / "snapshots" / "hdn_2022H2",
     ROOT / "configs" / "surfaces" / "snapshots" / "hdn_2022H2_ssvi",
 )
 
 
-def add_section(path: Path, source: HdnSource) -> int | None:
-    """Append the section to ``path``; the number of fits, ``None`` when it already has one."""
+SECTION_START = "\nsabrw:\n"
+
+
+def add_section(path: Path, source: HdnSource, *, replace: bool = False) -> int | None:
+    """Append the section to ``path``; the number of fits, ``None`` when it already has one.
+    With ``replace`` an existing section — which must be the file's last one — is fitted again
+    and rewritten, every byte before it left as it is (after a change of the fitter:
+    ``IMPORTER_TAG`` is bumped and the stored fits are regenerated, the market and surface
+    sections are not)."""
     text = path.read_text(encoding="utf-8")
     raw = yaml.safe_load(text)
     if "sabrw" in raw:
-        return None
+        if not replace:
+            return None
+        cut = text.rindex(SECTION_START) + 1
+        head = yaml.safe_load(text[:cut])
+        if "sabrw" in head or head != {k: v for k, v in raw.items() if k != "sabrw"}:
+            raise SystemExit(f"{path}: the sabrw section is not the last one: not rewritten")
+        text = text[:cut]
+        raw = head
     prov = raw["provenance"]
     f = ih.HdnFilters()
     if to_mapping(asdict(f)) != prov["filters"]:
@@ -61,6 +76,11 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dirs", nargs="*", default=[str(d) for d in DIRS])
     ap.add_argument("--root", default=str(ROOT / "data/hdn_sample/options_sample_2022H2"))
+    ap.add_argument(
+        "--replace",
+        action="store_true",
+        help="fit again and rewrite the sections that exist (after a change of the fitter)",
+    )
     a = ap.parse_args()
     root = Path(a.root)
     source = HdnSource(root)
@@ -68,7 +88,7 @@ def main() -> None:
     done = skipped = 0
     for d in a.dirs:
         for path in sorted(Path(d).glob("spx_*.yaml")):
-            n = add_section(path, source)
+            n = add_section(path, source, replace=a.replace)
             if n is None:
                 skipped += 1
                 continue

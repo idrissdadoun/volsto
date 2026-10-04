@@ -129,7 +129,7 @@ Applied since (M10, 2026-09-16/17):
   snapshot binding (2026-09-22: 25 proof-of-concept dates read `done` under a changed importer)
   were three occurrences. One place: `IMPORTER_TAG` in `volsto/market/import_hdn.py`, written into
   every snapshot's provenance, checked by the store's verdict and by `snapshot_bound`, and hashed
-  against the importer, surface and curve sources (`importer_guard.json`,
+  against the importer, surface, curve and (since 2026-10-04) SABRW sources (`importer_guard.json`,
   `test_importer_tag_guard`). Bump it when a change moves any snapshot; re-record the hash without
   a bump only for a change proven not to, and say so in the commit.
 - **Vendor source (2026-10-04):** nothing outside a vendor source knows where a vendor's days

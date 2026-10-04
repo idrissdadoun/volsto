@@ -13,6 +13,7 @@ import pytest
 from scipy.integrate import quad
 from scipy.stats import norm
 
+from volsto.market import sabrw
 from volsto.market.sabrw import (
     MIN_ZONE_QUOTES,
     STEP0_MIN_QUOTES,
@@ -251,3 +252,136 @@ def test_term_structure_excludes_thin_and_railed_fits() -> None:
         SabrwTermStructure.from_fits([good[0], thin], lambda T: 0.2)
     with pytest.raises(ValueError, match="min_quotes"):
         SabrwTermStructure.from_fits(good, lambda T: 0.2, min_quotes=0)
+
+
+# --------------------------------------------------------------------------------------------
+# the exact zone edge (2026-10-04): the closed form against the bounded minimiser it replaces
+# --------------------------------------------------------------------------------------------
+
+
+def _minimiser_edge(sigma: float, rho: float, nu: float, T: float) -> tuple[float, bool, float]:
+    """The implementation ``sabr_smile_minimum`` had until 2026-10-04, verbatim (a bounded
+    scalar minimiser of the plain SABR smile), plus the raw point the minimiser returned."""
+    from scipy.optimize import minimize_scalar
+
+    lo, hi = sabrw.SMILE_MIN_FLOOR * np.sqrt(T), sabrw.SMILE_MIN_SEARCH * np.sqrt(T)
+    res = minimize_scalar(
+        lambda x: float(sabrw.sabr_bbf_vol(np.array([x]), sigma, rho, nu)[0]),
+        bounds=(lo, hi),
+        method="bounded",
+        options={"xatol": 1e-9 * max(1.0, hi)},
+    )
+    x = float(res.x)
+    interior = lo * (1.0 + 1e-6) < x < hi * (1.0 - 1e-6)
+    if not interior:
+        return float(lo), False, x
+    return x, True, x
+
+
+#: Largest relative distance between the minimiser's edge and the closed form where both are
+#: interior — measured 2026-10-04 on the grid below: 1.7e-4 at most (at ρ = −1e-4, where the
+#: smile is flat to 1e-15 around its minimum), median 1e-8, 2.2e-7 at the 90th percentile.
+EDGE_RTOL_ANY = 1e-3
+#: ... and on the well-identified part of the grid (ρ ≤ −0.1): measured 2.2e-7 at most.
+EDGE_RTOL_IDENTIFIED = 5e-6
+#: How far above the floor (relative) the minimiser stops when there is no minimum and it
+#: wrongly reports one — measured: 1.03e-6 to 5.05e-3.
+FLOOR_ARTEFACT_RTOL = 1e-2
+
+
+def test_exact_zone_edge_matches_the_minimiser() -> None:
+    """``sabr_smile_minimum`` in closed form (``x = u*(ρ) σ/ν``, :func:`smile_minimum_root`)
+    against the bounded minimiser it replaces, on a grid of σ, ρ, ν and T that includes ρ ≥ 0
+    (no minimum), minima below the floor and minima beyond the search cap.
+
+    Same edge and same flag everywhere, except one artefact of the minimiser, counted and
+    asserted point by point, not hidden: on a few dozen of the 2,520 grid points (61 on macOS,
+    58 on Linux: the count is the minimiser's on that machine) — all with ρ ≥ 0, where the
+    smile has no minimum — the minimiser stops just above the floor (1e-6 to 5e-3 relative),
+    past its own 1e-6 test, and reports an interior minimum; the closed form reports none.  The
+    edge itself differs by that same 5e-3 at most there."""
+    import itertools
+
+    sig = (0.01, 0.05, 0.15, 0.4, 1.0, 3.0)
+    rhos = (-0.999, -0.99, -0.9, -0.7, -0.4, -0.1, -0.01, -1e-4, 0.0, 0.3, 0.9, 0.999)
+    nus = (1e-3, 0.05, 0.3, 1.0, 3.0, 10.0, 20.0)
+    Ts = (0.02, 0.05, 0.25, 1.0, 3.0)
+    kinds = {"interior": 0, "no minimum (rho >= 0)": 0, "below the floor": 0, "beyond the cap": 0}
+    artefacts = 0
+    worst_any = worst_identified = 0.0
+    for s, r, v, T in itertools.product(sig, rhos, nus, Ts):
+        lo, hi = sabrw.SMILE_MIN_FLOOR * np.sqrt(T), sabrw.SMILE_MIN_SEARCH * np.sqrt(T)
+        x_old, in_old, raw = _minimiser_edge(s, r, v, T)
+        x_new, in_new = sabrw.sabr_smile_minimum(s, r, v, T)
+        u = sabrw.smile_minimum_root(r)
+        assert (u is None) == (r >= 0.0)
+        if in_new:
+            # the closed form is a minimum: the first-order condition, and no lower neighbour
+            assert u is not None and x_new == pytest.approx(u * s / v, rel=1e-15)
+            f = [
+                float(sabrw.sabr_bbf_vol(np.array([x_new * m]), s, r, v)[0])
+                for m in (0.999, 1.0, 1.001)
+            ]
+            assert f[1] <= f[0] and f[1] <= f[2], (s, r, v, T)
+        if in_old != in_new:
+            # the one artefact: no minimum exists (rho >= 0), the minimiser stops just above the
+            # floor — past its own 1e-6 test — and calls it interior
+            assert in_old and not in_new and x_new == lo and r >= 0.0, (s, r, v, T)
+            assert lo * (1.0 + 1e-6) < raw < lo * (1.0 + FLOOR_ARTEFACT_RTOL), (
+                s,
+                r,
+                v,
+                T,
+                raw / lo,
+            )
+            artefacts += 1
+            continue
+        if in_new:
+            kinds["interior"] += 1
+            rel = abs(x_old - x_new) / x_new
+            worst_any = max(worst_any, rel)
+            if r <= -0.1:
+                worst_identified = max(worst_identified, rel)
+        else:
+            assert x_old == x_new == lo
+            if u is None:
+                kinds["no minimum (rho >= 0)"] += 1
+            elif u * s / v <= lo * (1.0 + 1e-6):
+                kinds["below the floor"] += 1
+            else:
+                assert u * s / v >= hi * (1.0 - 1e-6)
+                kinds["beyond the cap"] += 1
+    print(f"\nzone edge: {kinds}; minimiser artefacts {artefacts}; largest relative difference "
+          f"{worst_any:.2e} (rho <= -0.1: {worst_identified:.2e})")  # fmt: skip
+    assert min(kinds.values()) > 100, kinds  # every regime is on the grid
+    assert worst_any <= EDGE_RTOL_ANY and worst_identified <= EDGE_RTOL_IDENTIFIED
+    # How many points show the artefact belongs to scipy's bounded minimiser on one machine,
+    # not to our code (measured: 61 on macOS arm64, 58 on Linux x86-64, numpy 2.5.3 and scipy
+    # 1.18.1 on both), so the count is bounded, not pinned (SPEC §13.3); every point is checked
+    # above.
+    assert 0 < artefacts <= 100, artefacts
+    # the root depends on rho alone, and the edge scales with sigma / nu
+    assert sabrw.smile_minimum_root(-0.7) == pytest.approx(1.0226444902407816, rel=1e-14)
+    a, _ = sabrw.sabr_smile_minimum(0.2, -0.7, 1.0, 1.0)
+    b, _ = sabrw.sabr_smile_minimum(0.4, -0.7, 2.0, 1.0)
+    assert a == pytest.approx(b, rel=1e-15)
+
+
+def test_no_stored_fit_stopped_at_the_evaluation_limit() -> None:
+    """No fit stored in a tracked snapshot ended on the solver's evaluation limit (three did at
+    ``max_nfev`` = 2,000 with the exact zone edge; SPEC §13.5), and the limit is the named
+    constant."""
+    import yaml
+
+    assert sabrw.MAX_NFEV == 20_000
+    snaps = Path(__file__).resolve().parents[1] / "configs" / "surfaces" / "snapshots"
+    files = sorted(snaps.rglob("spx_*.yaml"))
+    assert len(files) == 256
+    n = 0
+    stopped = []
+    for path in files:
+        for fit in yaml.safe_load(path.read_text())["sabrw"]["fits"]:
+            n += 1
+            if any("maximum number of function evaluations" in flag for flag in fit["flags"]):
+                stopped.append((path.name, fit["T"]))
+    assert n > 9000 and stopped == [], stopped
