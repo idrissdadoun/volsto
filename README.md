@@ -354,6 +354,17 @@ volsto-data extract --tickers SPX                    # one Parquet file per tick
 volsto-data sql "select count(*) from strikes"       # optional, DuckDB (pip install -e ".[data]")
 ```
 
+Reading the store from Python (vendor-native columns; a missing date or ticker raises with the
+exact `volsto-data` command that produces it; nothing is downloaded, converted or fitted):
+
+```python
+from volsto.market.store import available_dates, load_chain, load_range
+
+available_dates("orats")                                   # ['2024-01-03', ...]
+spx = load_chain("orats", "2024-01-03", "SPX")             # one day, one ticker
+hist = load_range("orats", "SPX", "2024-01-01", "2024-12-31", columns=["trade_date", "strike", "cBidPx"])
+```
+
 `fetch` wraps `aws s3 sync` and takes the *name* of an AWS profile you configured; the code
 never sees a credential. The store is a faithful typed copy (every vendor column, float64,
 zstd 9), rebuildable from raw; both roots may sit on external volumes. `docs/data_runbook.md` is the download-day procedure; SPEC §18 has the
