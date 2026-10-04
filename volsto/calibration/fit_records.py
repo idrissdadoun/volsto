@@ -15,6 +15,18 @@ target — and the fit code tag :data:`FIT_CODE_TAG`.  It is the content of the 
 depends on (not the digest of its bytes: provenance text does not move a fit), so the backtest
 and any other pipeline fitting the same surface share one record.
 
+**Canonical encoding** (what is hashed; :func:`canonical`).  The inputs are first brought to
+plain values by :func:`volsto.config.to_mapping` — a dataclass becomes a mapping of its fields,
+a tuple or an array a list, a numpy scalar a Python number — from the *loaded* objects, so a
+snapshot's bytes never reach the key: its key order, comments, number formatting (``0.1`` or
+``1.0e-1``; ``3`` where the field is a float) and provenance play no part.  The mapping
+``{"fit_code_tag": tag, "inputs": inputs}`` is then written as JSON with the keys sorted, the
+separators ``,`` and ``:`` and no other whitespace, every float as Python's shortest
+round-trip ``repr`` of its IEEE-754 double (two floats have the same text if and only if they
+are the same double, so a one-ulp change of any number the fit reads is another key), integers
+as integers, ``None`` as ``null``, and the SHA-256 is taken of its UTF-8 bytes.  Checked by
+``tests/test_fit_records.py::test_key_ignores_the_bytes_and_sees_every_ulp``.
+
 **Store** (:class:`FitRecords`): ``<root>/<key[:2]>/<key>.json`` — by convention
 ``<leverage cache>/fits``, so the records travel with the leverages they key.  A record holds the
 key, its inputs' digests, the fit code tag, where and when it was written, and the fit's summary
@@ -89,8 +101,12 @@ MODEL_FIELDS: Final[tuple[str, ...]] = tuple(f.name for f in dataclasses.fields(
 # --------------------------------------------------------------------------------------------
 
 
-def _canonical(payload: Any) -> str:
+def canonical(payload: Any) -> str:
+    """The canonical JSON text of ``payload`` (module docstring, *Canonical encoding*)."""
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+
+
+_canonical = canonical
 
 
 def fit_inputs(
@@ -484,6 +500,13 @@ def migrate_backtest_store(
             fits = sabrw_fits_from_config(raw) if fit_cfg.step0 is not None else None
             if "params" not in summary or "status" not in summary:
                 raise ValueError("fit.json holds no fitted parameters (a skipped or failed date)")
+            if fit_cfg.step0 is not None and fits is None:
+                raise ValueError(
+                    "its snapshot has no sabrw section (imported before the importer stored "
+                    "the fits): the fit's inputs cannot be re-derived; re-import and recompute "
+                    "the date"
+                )
+            fit_inputs(spec, fit_cfg, ssr, fits)
         except Exception as exc:
             rep.skipped[date] = f"{type(exc).__name__}: {exc}"
             continue

@@ -4093,3 +4093,17 @@ def test_fit_records_migrate_from_a_backtest_store(
     assert fr.main(argv) == 0
     assert f"records written 0, already present {len(b.dates)}" in capsys.readouterr().out
     assert {v.status for v in bt.Ledger.of(cfg_at(b)).verdicts().values()} == {"done"}
+    # a date whose fit inputs cannot be re-derived is skipped with the reason, never a crash:
+    # under a fit that reads the snapshot's SABRW fits, a snapshot without the section
+    desk = raw_config()
+    desk["marking"]["fit"] = "desk"
+    desk_path = write_config(b.base, desk, "desk.yaml")
+    snap = b.snapshots_root / f"spx_{b.dates[0]}.yaml"
+    doc = yaml.safe_load(snap.read_text())
+    doc.pop("sabrw")
+    snap.write_text(yaml.safe_dump(doc, sort_keys=False))
+    rep = fr.migrate_backtest_store(
+        desk_path, b.store_root, b.snapshots_root, b.cache_root, dry_run=True
+    )
+    assert list(rep.skipped) == [b.dates[0]] and "no sabrw section" in rep.skipped[b.dates[0]]
+    assert len(rep.written) == len(b.dates) - 1
