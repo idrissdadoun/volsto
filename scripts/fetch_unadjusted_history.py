@@ -27,9 +27,10 @@ import datetime as dt
 import hashlib
 import json
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
-import yfinance as yf
+import yfinance as yf  # type: ignore[import-untyped]
 
 OUT = Path("data/history_unadjusted")
 NAMES = ["AAPL", "AMZN", "HD", "JNJ", "JPM", "MSFT", "NVDA", "PG", "UNH", "XOM"]
@@ -37,10 +38,11 @@ NAMES = ["AAPL", "AMZN", "HD", "JNJ", "JPM", "MSFT", "NVDA", "PG", "UNH", "XOM"]
 
 def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
+    series: dict[str, dict[str, Any]] = {}
     man = {
         "fetched": dt.datetime.now(dt.UTC).isoformat(timespec="seconds"),
         "source": "yfinance Ticker.history(auto_adjust=False, actions=True)",
-        "series": {},
+        "series": series,
     }
     for t in NAMES:
         h = yf.Ticker(t).history(start="1990-01-01", auto_adjust=False, actions=True)
@@ -62,7 +64,7 @@ def main() -> None:
         )
         p = OUT / f"{t}.csv"
         out.to_csv(p, index=False)
-        man["series"][t] = {
+        series[t] = {
             "rows": len(out),
             "first": out.date.iloc[0],
             "last": out.date.iloc[-1],
@@ -80,9 +82,9 @@ def main() -> None:
             "..",
             out.date.iloc[-1],
             "dividends",
-            man["series"][t]["n_dividends"],
+            series[t]["n_dividends"],
             "splits",
-            man["series"][t]["splits"],
+            series[t]["splits"],
         )
     (OUT / "manifest.json").write_text(json.dumps(man, indent=1) + "\n")
 
