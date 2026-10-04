@@ -23,10 +23,11 @@ the data by ``scripts/orats_census.py``; SPEC §18.10).  Where the OPRA symbols 
 ``SPX`` merges the roots ``SPX`` (AM-settled) and ``SPXW`` (PM-settled), which share the
 third-Friday expiry dates, and the root (:func:`opra_root`) tells them apart.  Before that the
 PM third-Friday series is the ticker ``SPXPM`` (:data:`SPX_PM_TICKER`) and ticker ``SPX`` is AM
-on the monthly expiry dates and PM on the others; later the AM monthly is absent and ticker
-``SPX`` is PM throughout.  :func:`settlement_without_opra` is that rule for a row without a
-symbol; :func:`canonical_expiry` maps the Saturday dates of the old standard expiries to the
-last trading day and says whether a date is a monthly expiry.  A day without OPRA symbols is
+on the monthly expiry dates and PM on the others; from 2017-05-10 to 2021-05-27 ticker ``SPX``
+holds one unmarked monthly series, AM or PM per (trade date, expiry) as the open interest shows
+(:mod:`volsto.data.spx_settlement`).  :func:`settlement_without_opra` is that rule for a row
+without a symbol; :func:`canonical_expiry` maps the Saturday dates of the old standard expiries
+to the last trading day and says whether a date is a monthly expiry.  A day without OPRA symbols is
 no longer a failure (owner's instruction, 2026-10-04; it was under decision 8).
 """
 
@@ -34,7 +35,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 VENDOR = "orats"
 #: Default raw file name; group 1 is the trade date ``YYYYMMDD``.  A parameter of ``fetch``
@@ -196,19 +197,68 @@ def canonical_expiry(expiry: _dt.date) -> tuple[_dt.date, bool]:
     return day, False
 
 
+#: From this trade date a non-monthly Friday expiry under ticker ``SPX`` is PM-settled.  Before
+#: it the end-of-week expirations were AM-settled: P.M.-settled end-of-week expirations were
+#: approved on 2010-09-14 (SEC release 34-62911) and until then only the quarterly series were
+#: P.M.-settled.  December 2010 is the changeover and is flagged uncertain
+#: (:func:`settlement_uncertain`).
+WEEKLY_PM_FROM = _dt.date(2010, 12, 1)
+
+
+def is_quarter_end(day: _dt.date) -> bool:
+    """Whether ``day`` is the last weekday of March, June, September or December (the
+    quarterly expiry)."""
+    if day.month not in (3, 6, 9, 12) or day.weekday() > 4:
+        return False
+    nxt = day + _dt.timedelta(days=1)
+    while nxt.weekday() > 4:
+        nxt += _dt.timedelta(days=1)
+    return nxt.month != day.month
+
+
+def settlement_uncertain(trade_date: _dt.date) -> bool:
+    """The changeover month of the end-of-week expirations (December 2010)."""
+    return (trade_date.year, trade_date.month) == (2010, 12)
+
+
 def settlement_without_opra(
-    ticker: str, expiry: _dt.date, trade_date: _dt.date, *, spxpm_listed: bool
+    ticker: str,
+    expiry: _dt.date,
+    trade_date: _dt.date,
+    *,
+    spxpm_listed: bool,
+    table: Mapping[tuple[str, str], str] | None = None,
 ) -> str:
-    """``"AM"`` or ``"PM"`` of an SPX-family row that has no OPRA symbol (owner's rule,
-    2026-10-04): ticker ``SPXPM`` is PM; ticker ``SPX`` on a monthly expiry
-    (:func:`canonical_expiry`) is AM while ``SPXPM`` rows exist that day
-    (``spxpm_listed``) or before :data:`SPXPM_FIRST_DATE`, PM otherwise."""
+    """``"AM"``, ``"PM"`` or ``"DROP"`` of an SPX-family row that has no OPRA symbol (owner's
+    rule of 2026-10-04, BARRIER_STUDY_SPEC §2.2; SPEC §18.10):
+
+    * ticker ``SPXPM`` is PM;
+    * ticker ``SPX`` on a monthly expiry (:func:`canonical_expiry`) is AM while ``SPXPM`` rows
+      exist that day (``spxpm_listed``) or before :data:`SPXPM_FIRST_DATE`; afterwards it is
+      what ``table`` says for (trade date, canonical expiry) — the table built from the open
+      interest (:mod:`volsto.data.spx_settlement`), ``DROP`` where it cannot tell;
+    * ticker ``SPX`` on another expiry is PM, except before :data:`WEEKLY_PM_FROM`, when a
+      Friday that is not a quarter end is AM (the end-of-week expirations of that time).
+
+    A monthly row that needs the table and is not in it raises ``KeyError`` (``ValueError``
+    when no table is given)."""
     if ticker == SPX_PM_TICKER:
         return "PM"
     if ticker != OPRA_REQUIRED_TICKER:
         raise ValueError(f"{ticker!r} is not an SPX-family ticker")
-    _, monthly = canonical_expiry(expiry)
-    if monthly and (spxpm_listed or trade_date < SPXPM_FIRST_DATE):
+    canon, monthly = canonical_expiry(expiry)
+    if monthly:
+        if spxpm_listed or trade_date < SPXPM_FIRST_DATE:
+            return "AM"
+        if canon <= trade_date:
+            return "DROP"  # the expiring series on its own date: stale, never used
+        if table is None:
+            raise ValueError(
+                f"the settlement of the {canon} monthly on {trade_date} needs the open-interest "
+                "table (volsto.data.spx_settlement)"
+            )
+        return table[(trade_date.isoformat(), canon.isoformat())]
+    if trade_date < WEEKLY_PM_FROM and canon.weekday() == 4 and not is_quarter_end(canon):
         return "AM"
     return "PM"
 

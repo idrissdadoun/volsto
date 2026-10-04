@@ -70,7 +70,7 @@ from typing import Any, Final
 import numpy as np
 import pandas as pd
 
-from volsto.data import orats
+from volsto.data import orats, spx_settlement
 from volsto.data.roots import REPO_ROOT, DataError, DataRoots
 from volsto.market import import_hdn as ih
 from volsto.market import store as vendor_store
@@ -150,12 +150,15 @@ def family_rows(
     return out
 
 
-def settle(frame: pd.DataFrame, name: str) -> pd.DataFrame:
+def settle(frame: pd.DataFrame, name: str, *, store: str | Path | None = None) -> pd.DataFrame:
     """``frame`` (vendor rows of ``name``'s tickers on one day) with ``root``, ``settlement``
     (``AM``/``PM``), ``settled_by`` (``opra``, ``ticker`` or ``calendar``), ``expiration``
     (ISO, the last trading day) and the two contract names ``c_contract`` / ``p_contract``
-    (module docstring).  Raises :class:`DataError` on an unknown root or on symbols of two
-    roots in one row, :class:`AmbiguousSettlement` on a repeated (root, expiry, strike)."""
+    (module docstring).  Rows the settlement table cannot tell (``DROP``) are left out and
+    listed in ``attrs["dropped_expiries"]``; ``attrs["settlement_uncertain"]`` flags December
+    2010.  Raises :class:`DataError` on an unknown root, on symbols of two roots in one row or
+    on a missing settlement table, :class:`AmbiguousSettlement` on a repeated (root, expiry,
+    strike)."""
     iso = str(frame.attrs["trade_date"])
     trade = _dt.date.fromisoformat(iso)
     out = frame.copy()
@@ -187,15 +190,44 @@ def settle(frame: pd.DataFrame, name: str) -> pd.DataFrame:
                 f"orats {iso}: {int(bare_mask.sum())} of {len(out)} {name} rows without an "
                 "OPRA symbol, and no settlement rule for this underlying"
             )
+        twice = (
+            out[bare]
+            .assign(_canon=canon[bare])
+            .duplicated(["ticker", "_canon", "strike"], keep=False)
+        )
+        if twice.any():
+            ex = out[bare].loc[twice, ["ticker", "expirDate", "strike"]].head(3).to_dict("records")
+            raise AmbiguousSettlement(
+                f"orats {iso}: {int(twice.sum())} {name} rows without a symbol repeat a "
+                f"(root, expiry, strike) and nothing tells them apart, e.g. {ex}"
+            )
         tickers = out["ticker"].to_numpy()
         listed = bool((tickers == orats.SPX_PM_TICKER).any())
-        settlement[bare_mask] = [
-            orats.settlement_without_opra(t, e, trade, spxpm_listed=listed)
-            for t, e in zip(tickers[bare_mask], out["expirDate"].to_numpy()[bare_mask])
-        ]
+        table = None
+        if not listed and trade >= orats.SPXPM_FIRST_DATE:
+            table = spx_settlement.load_table(DataRoots.resolve(store=store).store_dir(VENDOR))
+        try:
+            settlement[bare_mask] = [
+                orats.settlement_without_opra(t, e, trade, spxpm_listed=listed, table=table)
+                for t, e in zip(tickers[bare_mask], out["expirDate"].to_numpy()[bare_mask])
+            ]
+        except KeyError as exc:
+            raise DataError(
+                f"orats {iso}: the SPX settlement table has no entry for {exc.args[0]}: "
+                "python scripts/orats_spx_settlement.py"
+            ) from exc
         settled_by[bare_mask] = np.where(
             tickers[bare_mask] == orats.SPX_PM_TICKER, "ticker", "calendar"
         )
+    keep = settlement != spx_settlement.DROP
+    dropped = sorted({d.isoformat() for d in canon[~keep]})
+    if not keep.all():
+        out, canon, sym_root = out[keep], canon[keep], sym_root[keep]
+        c_sym, p_sym, bare = c_sym[keep], p_sym[keep], bare[keep]
+        settlement, settled_by = settlement[keep], settled_by[keep]
+    out.attrs.update(frame.attrs)
+    out.attrs["dropped_expiries"] = dropped
+    out.attrs["settlement_uncertain"] = orats.settlement_uncertain(trade)
     by_rule = pd.Series(settlement, index=out.index).map(ROOT_OF_SETTLEMENT)
     out["root"] = sym_root.where(~bare, by_rule)
     out["settlement"] = settlement
@@ -253,7 +285,7 @@ def load_day(
     command) when the store does not hold the day, :class:`AmbiguousSettlement` on a day that
     cannot be settled, and :class:`DataError` on an unknown root or a missing close."""
     name = underlying.upper()
-    frame = settle(family_rows(date, name, store=store), name)
+    frame = settle(family_rows(date, name, store=store), name, store=store)
     iso = str(frame.attrs["trade_date"])
     settled_by = {str(k): int(v) for k, v in frame["settled_by"].value_counts().items()}
     chain = pd.concat([_side(frame, 1), _side(frame, -1)], ignore_index=True)
@@ -287,6 +319,8 @@ def load_day(
             "raw_sha256": frame.attrs["raw_sha256"],
             "schema_version": int(frame.attrs["schema_version"]),
             "settled_by": settled_by,
+            "dropped_expiries": list(frame.attrs.get("dropped_expiries", [])),
+            "settlement_uncertain": bool(frame.attrs.get("settlement_uncertain", False)),
             "closes": str(Path(closes) if closes is not None else HISTORY_DIR / f"{name}.csv"),
         }
     )
@@ -310,8 +344,11 @@ def source_provenance(chain: pd.DataFrame) -> dict[str, Any]:
         out["settlement"] = {
             "rule": "OPRA root where present; ticker SPXPM is PM; ticker SPX on a monthly "
             "expiry is AM while SPXPM is listed that day or before "
-            f"{orats.SPXPM_FIRST_DATE.isoformat()}, PM otherwise",
+            f"{orats.SPXPM_FIRST_DATE.isoformat()}, then as the open-interest table says; "
+            f"non-monthly Fridays before {orats.WEEKLY_PM_FROM.isoformat()} are AM",
             "vendor_rows_by_source": settled_by,
+            "dropped_expiries": list(chain.attrs.get("dropped_expiries", [])),
+            "uncertain": bool(chain.attrs.get("settlement_uncertain", False)),
         }
     return out
 
