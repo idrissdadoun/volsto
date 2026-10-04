@@ -47,7 +47,8 @@ def one(job: tuple[str, str]) -> pd.DataFrame:
         .reset_index()
     )
     out.insert(0, "date", date)
-    return out[out["expiry"] > date]
+    later: pd.DataFrame = out[out["expiry"] > date]
+    return later
 
 
 def main() -> None:
