@@ -1,5 +1,10 @@
 """HistoricalData.net end-of-day option-chain importer (SPEC §13, milestone M3b).
 
+Only step 1 (:func:`load_day`) and the vendor entries of the snapshot's provenance
+(:func:`snapshot_config`) are specific to HistoricalData.net.  Steps 2–5 read the canonical
+chain of :mod:`volsto.market.chain` and nothing else, and serve every vendor
+(:mod:`volsto.market.import_orats` is the second, M11 Part 4).
+
 Pipeline, one function per step (each testable):
 
 1. :func:`load_day` — read one daily 34-column CSV, keep the SPX/SPXW roots (or another
@@ -481,6 +486,7 @@ def implied_spot(
     *,
     window_days: int = SPOT_WINDOW_DAYS,
     min_expiries: int = SPOT_MIN_EXPIRIES,
+    async_check: bool = True,
 ) -> SpotEstimate:
     """The index level the option quotes imply (owner's decision 2026-09-22, SPEC §13.1): the
     intercept of ``ln F_i − r_i T_i = ln S − q T_i`` over the expiries within ``window_days``
@@ -490,7 +496,9 @@ def implied_spot(
     moves the two differ by tens of basis points; the snapshot's ``spot`` is this level and
     ``close`` keeps the official print for fixings.  The standard error is the regression's,
     inflated by ``max(1, χ²/dof)``; a difference beyond :data:`SPOT_ASYNC_BP` and
-    :data:`SPOT_ASYNC_SE` is logged."""
+    :data:`SPOT_ASYNC_SE` is logged.  ``async_check=False`` (a chain whose snapshot is known to
+    precede the close: its ``spot_async_check`` attr, :mod:`volsto.market.chain`) reports the
+    offset as a measurement: nothing is logged and ``asynchronous`` stays false."""
     if close <= 0:
         raise ValueError("close must be positive")
     fes = sorted(
@@ -521,7 +529,7 @@ def implied_spot(
     spot = float(np.exp(ln_s))
     offset_bp = 1e4 * (spot / close - 1.0)
     z = offset_bp / se_bp if se_bp > 0 else float("inf")
-    asynchronous = abs(offset_bp) > SPOT_ASYNC_BP and abs(z) > SPOT_ASYNC_SE
+    asynchronous = async_check and abs(offset_bp) > SPOT_ASYNC_BP and abs(z) > SPOT_ASYNC_SE
     if asynchronous:
         log.warning(
             "spot asynchrony: the options imply %.2f against the close %.2f (%+.1f bp, %.1f se, "
@@ -705,7 +713,9 @@ def to_grid_surface(
         np.asarray(chain.attrs["rate_zeros"], float),
     )
     funding, funding_fit = implied_funding_curve(forwards, treasury)
-    spot_est = implied_spot(forwards, funding, spot)
+    spot_est = implied_spot(
+        forwards, funding, spot, async_check=bool(chain.attrs.get("spot_async_check", True))
+    )
     fc = forward_curve_from_forwards(
         spot_est.spot,
         funding,
@@ -1448,14 +1458,37 @@ def snapshot_config(
     manifest: dict[str, Any],
     sabrw: Sequence[SabrwFit] | None = None,
 ) -> dict[str, Any]:
-    """Dated market config: ``market`` + ``ssvi`` sections (loadable by ``load_ssvi_surface``)
-    plus ``provenance``, and the ``sabrw`` section when ``sabrw`` fits are given
-    (:func:`sabrw_section`; outside the surface config, so no calibration key moves)."""
-    fc = fit.surface.forward_curve
+    """Dated market config of an HDN day: :func:`snapshot_document` with the vendor's
+    provenance (vendor, product, day file and its SHA-256, the manifest's SHA-256 of it)."""
     sha = hashlib.sha256(Path(source_file).read_bytes()).hexdigest()
     listed: dict[str, Any] = next(
         (f for f in manifest.get("files", []) if f.get("name") == Path(source_file).name), {}
     )
+    source = {
+        "vendor": "historicaldata.net",
+        "product": manifest.get("product"),
+        "file": Path(source_file).name,
+        "file_sha256": sha,
+        "manifest_sha256": listed.get("sha256"),
+    }
+    return snapshot_document(chain, fit, points, filters, source=source, sabrw=sabrw)
+
+
+def snapshot_document(
+    chain: pd.DataFrame,
+    fit: SSVIFit,
+    points: SurfacePoints,
+    filters: HdnFilters,
+    *,
+    source: Mapping[str, Any],
+    sabrw: Sequence[SabrwFit] | None = None,
+) -> dict[str, Any]:
+    """Dated market config from a canonical chain (:mod:`volsto.market.chain`), whatever the
+    vendor: ``market`` + ``ssvi`` sections (loadable by ``load_ssvi_surface``) plus
+    ``provenance`` — ``source`` (the vendor's own entries: who, which file, its checksums)
+    first, then what the importer did — and the ``sabrw`` section when ``sabrw`` fits are given
+    (:func:`sabrw_section`; outside the surface config, so no calibration key moves)."""
+    fc = fit.surface.forward_curve
     rho_param = fit.params["rho"]
     essvi = isinstance(rho_param, list)
     ssvi = {
@@ -1483,11 +1516,7 @@ def snapshot_config(
         },
         "ssvi": ssvi,
         "provenance": {
-            "vendor": "historicaldata.net",
-            "product": manifest.get("product"),
-            "file": Path(source_file).name,
-            "file_sha256": sha,
-            "manifest_sha256": listed.get("sha256"),
+            **dict(source),
             "quote_date": chain.attrs["quote_date"],
             "underlying": chain.attrs["underlying"],
             "roots": list(INDEX_ROOTS.get(chain.attrs["underlying"], (chain.attrs["underlying"],))),
@@ -1621,15 +1650,21 @@ def main(argv: list[str] | None = None) -> int:
         prog="volsto-import",
         description="Import a vendor option chain into a dated volsto market config",
     )
-    ap.add_argument("--vendor", default="hdn", choices=["hdn"])
+    ap.add_argument("--vendor", default="hdn", choices=["hdn", "orats"])
     ap.add_argument("--date", required=True, help="trading date YYYY-MM-DD")
     ap.add_argument("--underlying", default="SPX")
     ap.add_argument(
         "--root",
         default="data/hdn_sample/options_sample_2022H2",
-        help="sample / archive directory (contains day_by_date/)",
+        help="hdn: sample / archive directory (contains day_by_date/)",
     )
-    ap.add_argument("--out", default="configs/surfaces/snapshots", help="output directory")
+    ap.add_argument(
+        "--out",
+        default=None,
+        help="output directory (default: configs/surfaces/snapshots for hdn; for orats the "
+        "store, <VOLSTO_DATA_STORE>/orats/snapshots — vendor-derived, never the repository)",
+    )
+    ap.add_argument("--store", default=None, help="orats: the store root (env VOLSTO_DATA_STORE)")
     ap.add_argument(
         "--ssvi",
         action="store_true",
@@ -1648,16 +1683,31 @@ def main(argv: list[str] | None = None) -> int:
     filters = HdnFilters(
         min_bid=args.min_bid, max_rel_spread_vol=args.max_rel_spread, max_years=args.max_years
     )
-    cfg, fit, points, _ = import_day(
-        args.root,
-        args.date,
-        args.underlying,
-        filters=filters,
-        essvi=not args.ssvi,
-        calendar_repair=None if args.no_calendar_repair else DEFAULT_CALENDAR_REPAIR,
-    )
+    repair = None if args.no_calendar_repair else DEFAULT_CALENDAR_REPAIR
+    if args.vendor == "orats":
+        from volsto.market import import_orats
+
+        cfg, fit, points, _ = import_orats.import_day(
+            args.date,
+            args.underlying,
+            filters=filters,
+            essvi=not args.ssvi,
+            calendar_repair=repair,
+            store=args.store,
+        )
+        out_dir = Path(args.out) if args.out else import_orats.snapshots_dir(args.store)
+    else:
+        cfg, fit, points, _ = import_day(
+            args.root,
+            args.date,
+            args.underlying,
+            filters=filters,
+            essvi=not args.ssvi,
+            calendar_repair=repair,
+        )
+        out_dir = Path(args.out or "configs/surfaces/snapshots")
     suffix = "_ssvi" if args.ssvi else ""
-    out = Path(args.out) / f"{args.underlying.lower()}_{args.date}{suffix}.yaml"
+    out = out_dir / f"{args.underlying.lower()}_{args.date}{suffix}.yaml"
     write_snapshot(cfg, out)
     log.info(
         "wrote %s (%d points, %d expiries)",
