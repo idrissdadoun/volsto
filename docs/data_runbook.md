@@ -101,8 +101,11 @@ caffeinate -i .venv/bin/volsto-data verify-raw --vendor orats
 Hashes every zip, streams every CSV from inside its zip (nothing is unzipped to disk), writes
 `$VOLSTO_DATA_RAW/orats/raw_manifest.json` and prints: files, bytes, rows, the schema versions
 seen, every missing / unexpected / duplicated trading day against `data/history/SPX.csv`, every
-`trade_date` mismatch, every schema drift with the columns named, every file without OPRA
-symbols on SPX, and the OPRA coverage per year. Exit 0 only when all of it is clean.
+`trade_date` mismatch, every schema drift with the columns named, and — as notes, not findings —
+the files without OPRA symbols on SPX, the files carrying a `__MACOSX` member (ignored) and the
+OPRA coverage per year. Exit 0 only when the findings are clean. The archive's year folders are
+read; anything that is not a final `*.zip` (the `.docx` of column definitions, an unfinished
+`.zip.<suffix>` download) is ignored.
 
 - Time: measured 0.45 s per sample-sized file on one core, 3.1 s for 32 files on 8 workers
   (10 files/s; internal SSD) → about 8 min for 4,970 files if the disk keeps up; an external
@@ -112,9 +115,10 @@ symbols on SPX, and the OPRA coverage per year. Exit 0 only when all of it is cl
   everything again.
 
 Expect findings on the real archive (this is the step that answers the open questions of
-SPEC §18): send me the output. In particular **schema drift** (older years with fewer columns)
-and **files without OPRA symbols on SPX** stop the importer for those dates until a schema
-version or the AM/PM fallback is agreed. If the calendar file ends before the last file
+SPEC §18): send me the output. **Schema drift** (a layout that is neither the 39-column one nor
+the older 37-column one without the OPRA symbols) stops the conversion of those files until a
+schema version is agreed. A file without OPRA symbols is converted, and the SPX importer settles
+it by the period's rule (SPEC §18.10). If the calendar file ends before the last file
 ("files dated beyond the calendar"), refresh `data/history/SPX.csv` and re-run.
 
 ## 5. Second copy of raw on another disk
@@ -160,8 +164,8 @@ plus 10 GiB. Interrupted: run it again, finished days are skipped.
 - Disk: 1.14 × the zips: 229–400 GB for the 200–350 GB estimate. If raw and store share one
   disk, they need 430–750 GB together.
 - Exit 1 lists every file that failed (`FAILED <file>: <reason>`) — schema drift, a value that
-  does not parse, a `trade_date` mismatch, an SPX row without an OPRA symbol — and every day
-  whose `cOpra` is not unique. A failed day is not in the store; send me the list.
+  does not parse, a `trade_date` mismatch — and every day whose key is not unique (`cOpra` when
+  present, otherwise ticker, expiry, strike). A failed day is not in the store; send me the list.
 
 ## 7. Verify the store
 
