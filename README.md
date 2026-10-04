@@ -64,6 +64,7 @@ uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python -e ".[de
    | `data/hdn_sample/` | the HistoricalData.net option-chain sample 2022 H2 (licensed, local only) |
    | `data/orats_sample/` | the ORATS free one-day sample (`ORATS_SMV_Strikes_20240103.zip`; re-download: `docs/m11_part0.md`) |
    | `data/raw/`, `data/store/` | vendor archives as delivered and the Parquet store built from them (`VOLSTO_DATA_RAW`, `VOLSTO_DATA_STORE`; see "Vendor data") |
+   | `data/history_unadjusted/` | as-traded closes, dividends and splits of the single names (`scripts/fetch_unadjusted_history.py`) |
    | `data/history/` | yfinance and Cboe daily closes (`scripts/fetch_history.py` re-downloads them) |
    | `cache/` | the content-addressed leverage cache (hours to days of calibration) |
    | `outputs/` | the results store, study outputs and reports |
