@@ -4,8 +4,14 @@ kernel; calibration and pricing share the kernel step for step; variance swaps i
 
 from __future__ import annotations
 
+import dataclasses
+import hashlib
+import platform
+import sys
 from pathlib import Path
 
+import _k5_reference
+import _particle_reference_m6
 import numpy as np
 import pytest
 
@@ -178,6 +184,233 @@ def test_conditional_variance_estimate_recovers_smooth_curve() -> None:
         cfg=ParticleConfig(n_particles=n, horizon=1.0, tail_extrapolation="flat"),
     )
     assert flat[0] == flat[1] and flat[-1] == flat[-2]
+
+
+# ---------------------------------------------------------------------------------------------
+# the regression estimators: the default path is the m6 estimator, the binned one is K.5's
+# ---------------------------------------------------------------------------------------------
+
+
+def _same_calibration(a, b) -> None:
+    """Bit-for-bit: every leverage row, the bandwidths and the final particle cloud."""
+    assert a.leverage.values.dtype == b.leverage.values.dtype == np.float64
+    np.testing.assert_array_equal(a.leverage.values, b.leverage.values)
+    np.testing.assert_array_equal(a.bandwidths, b.bandwidths)
+    np.testing.assert_array_equal(a.final_log_spot, b.final_log_spot)
+    np.testing.assert_array_equal(a.final_factors, b.final_factors)
+
+
+def _synthetic_cloud(n: int = 60_000, seed: int = 5):
+    rng = np.random.default_rng(seed)
+    k = 0.2 * rng.standard_t(6, n) - 0.03 * rng.exponential(1.0, n)  # skewed, fat put tail
+    v = 0.04 * np.exp(-1.5 * k) * np.exp(rng.normal(-0.245, 0.7, n))
+    return k, v, np.linspace(-2.5, 2.5, 2001)
+
+
+def test_default_estimator_is_the_m6_sorted_path(market, fast_calibration, monkeypatch) -> None:
+    """The split of ``conditional_variance_estimate`` into a regression stage and
+    ``_finish_estimate`` moved code and changed no number: against the frozen copy of the m6
+    function (``tests/_particle_reference_m6.py``), every option of the post-processing on a
+    synthetic cloud, then a whole calibration at the fast settings (50k particles, 1y)."""
+    import volsto.calibration.particle as particle
+
+    assert ParticleConfig().estimator is None
+    assert "estimator" not in fast_calibration.leverage.metadata
+    k, v, grid = _synthetic_cloud()
+    slope = float(np.polyfit(k, np.log(v), 1)[0])
+    cases: list[tuple[dict, float | None]] = [({}, None)]
+    cases += [({"tail_extrapolation": t}, None) for t in ("flat", "log_linear", "adaptive")]
+    cases += [({"tail_extrapolation": t}, slope) for t in ("sv_slope", "cloud_slope")]
+    cases += [
+        ({"bias_correction": False}, None),
+        ({"kernel": "quartic"}, None),
+        ({"regression": "nadaraya_watson", "tail_extrapolation": "flat"}, None),
+        ({"min_window": 500, "min_window_fraction": 0.002}, None),
+        ({"quantile_clip": 0.02, "n_regression_points": 51}, None),
+        ({"estimator": "sorted"}, None),
+    ]
+    for changes, tail_slope in cases:
+        cfg = ParticleConfig(n_particles=k.size, horizon=1.0, **changes)
+        for h in (0.004, 0.03):
+            got = conditional_variance_estimate(k, v, grid, h, cfg, tail_slope)
+            ref = _particle_reference_m6.conditional_variance_estimate(
+                k, v, grid, h, cfg, tail_slope
+            )
+            np.testing.assert_array_equal(got, ref, err_msg=f"{changes} h={h}")
+    # degenerate clouds: one point, and no positive estimate
+    one = np.full(4000, 0.1)
+    for vv in (np.full(4000, 0.04), np.zeros(4000)):
+        cfg = ParticleConfig(n_particles=4000)
+        np.testing.assert_array_equal(
+            conditional_variance_estimate(one, vv, grid, 0.01, cfg),
+            _particle_reference_m6.conditional_variance_estimate(one, vv, grid, 0.01, cfg),
+        )
+    # a whole calibration with the frozen estimator in place of the library's
+    _, surface, kernel = market
+    monkeypatch.setattr(
+        particle,
+        "conditional_variance_estimate",
+        _particle_reference_m6.conditional_variance_estimate,
+    )
+    frozen = calibrate_leverage(surface, kernel, FAST_PARTICLE, FAST_SIM)
+    _same_calibration(fast_calibration, frozen)
+
+
+def test_binned_estimator_equals_the_k5_reference(market, monkeypatch) -> None:
+    """Fast variant of the K.5 equality (the 8·10⁵ one is
+    ``test_binned_estimator_equals_the_k5_run``): the library's binned estimator against the K.5
+    scratch estimator (``tests/_k5_reference.py``, another route to the same numbers) — node
+    for node on a synthetic cloud, then a whole calibration at the fast settings on the 1F
+    reference spec.  At 50k particles the floor (2000 particles, 4% of the cloud) is active on
+    most nodes, so the exact tail sums carry the comparison; the 8·10⁵ test carries the bins."""
+    import volsto.calibration.binned as binned
+    import volsto.calibration.particle as particle
+
+    k, v, grid = _synthetic_cloud()
+    for changes in ({}, {"min_window": 300, "min_window_fraction": 0.005}, {"min_window": 1}):
+        cfg = ParticleConfig(n_particles=k.size, horizon=1.0, estimator="binned", **changes)
+        for h in (0.004, 0.03):
+            for deflate in (False, True):
+                got = binned.binned_regression(k, v, h, cfg, deflate=deflate)
+                ref = _k5_reference.regression(k, v, h, cfg, deflate)
+                assert got is not None and ref is not None
+                for a, b in zip(got, ref[:5]):
+                    np.testing.assert_array_equal(a, b, err_msg=f"{changes} h={h} {deflate}")
+            np.testing.assert_array_equal(
+                conditional_variance_estimate(k, v, grid, h, cfg),
+                _k5_reference.conditional_variance_estimate(k, v, grid, h, cfg),
+            )
+    # the binned estimate is the sorted one up to the binning error (floored nodes: rounding)
+    cfg = ParticleConfig(n_particles=k.size, horizon=1.0, estimator="binned")
+    sorted_est = conditional_variance_estimate(
+        k, v, grid, 0.03, dataclasses.replace(cfg, estimator=None)
+    )
+    assert not np.array_equal(conditional_variance_estimate(k, v, grid, 0.03, cfg), sorted_est)
+    # degenerate cloud: the plain mean, as the sorted path
+    one = np.full(4000, 0.1)
+    flat = conditional_variance_estimate(
+        one, np.full(4000, 0.04), grid, 0.01, ParticleConfig(n_particles=4000, estimator="binned")
+    )
+    np.testing.assert_array_equal(flat, np.full(grid.shape, 0.04))
+    # a whole calibration
+    _, surface, kernel = market
+    cfg = dataclasses.replace(FAST_PARTICLE, estimator="binned")
+    lib = calibrate_leverage(surface, kernel, cfg, FAST_SIM)
+    assert lib.leverage.metadata["estimator"] == "binned"
+    monkeypatch.setattr(
+        particle, "conditional_variance_estimate", _k5_reference.conditional_variance_estimate
+    )
+    ref_run = calibrate_leverage(surface, kernel, cfg, FAST_SIM)
+    _same_calibration(lib, ref_run)
+
+
+# -- the same two statements at the cache settings (8·10⁵ particles, 3y), slow ----------------
+
+#: 2022-07-01 desk marking fit (fit_preset("desk", skew_eps=0.10), ssr_target=1.0), the
+#: parameters of the J.4 / K.2 / K.5 runs of the calibration-speed study, as literals: a test
+#: does not refit (CONTRIBUTING, machine-dependent arithmetic).
+K_STUDY_SNAPSHOT = "configs/surfaces/snapshots/hdn_2022H2/spx_2022-07-01.yaml"
+K_STUDY_PARAMS = {
+    "nu": 2.991888248939484,
+    "theta": 0.2039339463581286,
+    "k1": 15.740028921421281,
+    "k2": 1.0573587761444543,
+    "rho12": 0.7155136238037159,
+    "rho_SX1": -0.99,
+    "rho_SX2": -0.726374380798787,
+}
+K_STUDY_SEED = 12345
+K_STUDY_PARTICLES = 800_000
+#: SHA-256 of the float64 leverage values (1255 x 2001, C order) and of the 1254 bandwidths of
+#: the library's default path on that date and seed: the K.2 rerun baseline (recorded from the
+#: K.3(0) control run of 2026-10-04, commit 9a99aaf, which K.3(0) showed equal to the K.2 rerun).
+K2_BASELINE_LEVERAGE_SHA256 = "95a379d6f47f6c5e92d1b698c39dc500d80032768046a4ee05707642b9bffda8"
+K2_BASELINE_BANDWIDTHS_SHA256 = "5d19730b673dd791a42774b2c1276f5db4509a16a7f5c46fd996552fe03b35b3"
+#: SHA-256 of the float64 leverage values of the K.5(2) run (variant C, no deflation) on that
+#: date and seed.  K.5(2) stored its leverages in float32, so the digest was recorded on
+#: 2026-10-04 from a float64 rerun of the study's ORIGINAL scratch estimator (its k5_hybrid.py
+#: and k5_lean.py, not tests/_k5_reference.py) on the m6 library (commit 9a99aaf); the rerun's
+#: float32 image equals the float32 leverage K.5(2) stored, and its bandwidths are the baseline's.
+K5_RUN_LEVERAGE_SHA256 = "a1f66eef66f9bd94bbf02f4e6eca82d0ab0f20253965ff62f5d781df43cc9399"
+#: The digests are bit patterns of numbers computed with this platform's libm and numpy
+#: partition: they are asserted where they were recorded and nowhere else.
+DIGEST_PLATFORM = ("darwin", "arm64")
+
+
+def _on_digest_platform() -> bool:
+    return (sys.platform, platform.machine()) == DIGEST_PLATFORM
+
+
+def _sha256(a: np.ndarray) -> str:
+    return hashlib.sha256(np.ascontiguousarray(a, dtype=np.float64).tobytes()).hexdigest()
+
+
+def _k_study_market(estimator: str | None):
+    from volsto.market.loaders import snapshot_spec
+
+    root = Path(__file__).resolve().parents[1]
+    base = load_yaml(root / "configs" / "studies" / "lsv_reference_2f.yaml", CalibrationSpec)
+    spec = snapshot_spec(base, root / K_STUDY_SNAPSHOT)
+    spec = dataclasses.replace(
+        spec,
+        model=BergomiParams(**K_STUDY_PARAMS),
+        particle=dataclasses.replace(
+            spec.particle, n_particles=K_STUDY_PARTICLES, seed=K_STUDY_SEED, estimator=estimator
+        ),
+    )
+    _, surface, kernel = build_market(spec)
+    return spec, surface, kernel
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(
+    not _on_digest_platform(),
+    reason=f"the K.2 baseline digest was recorded on {DIGEST_PLATFORM}; bit patterns are "
+    "asserted only there",
+)
+def test_default_path_matches_the_k2_baseline_digest() -> None:
+    """The library's default path at the cache settings (8·10⁵ particles, 3y, 2022-07-01, seed
+    12345) gives the leverage the m6 code gave before the estimator was split and the draws
+    were made lean: the digest of the K.2 rerun baseline."""
+    spec, surface, kernel = _k_study_market(None)
+    res = calibrate_leverage(surface, kernel, spec.particle, spec.sim, local_vol_cfg=spec.local_vol)
+    assert res.leverage.values.shape == (1255, 2001)
+    assert _sha256(res.bandwidths) == K2_BASELINE_BANDWIDTHS_SHA256
+    assert _sha256(res.leverage.values) == K2_BASELINE_LEVERAGE_SHA256
+
+
+@pytest.mark.slow
+def test_binned_estimator_equals_the_k5_run(monkeypatch) -> None:
+    """The library's binned estimator at the cache settings equals the K.5 scratch estimator
+    bit for bit — all 1255 leverage rows and the bandwidths, in float64 — and, where it was
+    recorded, the digest of the K.5(2) run itself."""
+    import volsto.calibration.particle as particle
+
+    spec, surface, kernel = _k_study_market("binned")
+    lib = calibrate_leverage(surface, kernel, spec.particle, spec.sim, local_vol_cfg=spec.local_vol)
+    monkeypatch.setattr(
+        particle, "conditional_variance_estimate", _k5_reference.conditional_variance_estimate
+    )
+    ref_run = calibrate_leverage(
+        surface, kernel, spec.particle, spec.sim, local_vol_cfg=spec.local_vol
+    )
+    assert lib.leverage.values.shape == (1255, 2001)
+    _same_calibration(lib, ref_run)
+    if _on_digest_platform():
+        assert _sha256(lib.leverage.values) == K5_RUN_LEVERAGE_SHA256
+
+
+def test_particle_estimator_switch_validation() -> None:
+    with pytest.raises(ValueError, match="estimator"):
+        ParticleConfig(estimator="histogram")
+    for bad in ({"kernel": "quartic"}, {"regression": "nadaraya_watson"}):
+        with pytest.raises(ValueError, match="binned"):
+            ParticleConfig(estimator="binned", **bad)
+    from volsto.config import to_mapping
+
+    assert "estimator" not in to_mapping(ParticleConfig())
+    assert to_mapping(ParticleConfig(estimator="binned"))["estimator"] == "binned"
+    assert to_mapping(ParticleConfig(estimator="sorted"))["estimator"] == "sorted"
 
 
 def test_leverage_function_interpolation_and_io(market, tmp_path: Path) -> None:

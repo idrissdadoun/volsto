@@ -30,11 +30,13 @@ import logging
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
 
 from volsto._numba import njit, prange
+from volsto.calibration.binned import binned_regression
 from volsto.calibration.guard import check_calibration_allowed
 from volsto.config import LocalVolConfig, ParticleConfig, SimConfig
 from volsto.engine.grid import TimeGrid
@@ -119,25 +121,12 @@ def kernel_regression(
     return out, slope, cnt
 
 
-def conditional_variance_estimate(
-    k: FloatArray,
-    v: FloatArray,
-    grid: FloatArray,
-    h: float,
-    cfg: ParticleConfig,
-    tail_slope: float | None = None,
-) -> FloatArray:
-    """``E[v | k]`` on the output ``grid`` (the leverage ``k`` grid).
-
-    The regression itself runs on a dense grid of ``cfg.n_regression_points`` spanning the
-    cloud's trusted ``[q, 1−q]`` quantile range (M4b: a fixed grid over the whole leverage range
-    put 0.025 between regression points while the cloud at the first slices is 0.006 wide and
-    ``E[ξ|k]`` varies like ``exp(ω ρ k / (σ√t))``; linear interpolation of that exponential between
-    far-apart nodes biased the short-end leverage low by ~1% in variance at ω = 3 — 0.09 vol
-    points on the 1m ATM vol — independently of the step size); values inside the range are
-    interpolated onto ``grid``, the tails are extended flat or log-linearly / log-quadratically
-    (SPEC §4.1 and :class:`~volsto.config.ParticleConfig`).
-    """
+def _sorted_regression(
+    k: FloatArray, v: FloatArray, h: float, cfg: ParticleConfig
+) -> tuple[FloatArray, float, float, FloatArray, FloatArray] | None:
+    """The regression stage on the sorted particles: ``(kreg, q_lo, q_hi, m, slope)`` — the
+    nodes spanning the trusted quantile range, ``E[v | k]`` there and its slope — or ``None`` for
+    a degenerate cloud."""
     order = np.argsort(k, kind="stable")
     ks = np.ascontiguousarray(k[order])
     vs = np.ascontiguousarray(v[order])
@@ -145,13 +134,29 @@ def conditional_variance_estimate(
     q_lo = float(ks[min(int(cfg.quantile_clip * n), n - 1)])
     q_hi = float(ks[max(int((1.0 - cfg.quantile_clip) * n) - 1, 0)])
     if not q_hi > q_lo:
-        # degenerate cloud (e.g. all particles at one point): use the plain mean everywhere
-        return np.full(grid.shape, float(v.mean()))
+        return None
     kreg = np.linspace(q_lo, q_hi, cfg.n_regression_points)
     window = max(cfg.min_window, int(cfg.min_window_fraction * n))
     m, slope, _ = kernel_regression(
         ks, vs, kreg, h, cfg.kernel == "gaussian", cfg.regression == "local_linear", window
     )
+    return kreg, q_lo, q_hi, m, slope
+
+
+def _finish_estimate(
+    m: FloatArray,
+    slope: FloatArray,
+    kreg: FloatArray,
+    q_lo: float,
+    q_hi: float,
+    grid: FloatArray,
+    h: float,
+    cfg: ParticleConfig,
+    v: FloatArray,
+    tail_slope: float | None,
+) -> FloatArray:
+    """From the node estimates to ``E[v | k]`` on the output ``grid``: bad nodes interpolated,
+    the plug-in curvature correction, the interpolation onto ``grid`` and the tails."""
     good = np.isfinite(m) & (m > 0)
     if not np.any(good):
         return np.full(grid.shape, float(v.mean()))
@@ -220,6 +225,40 @@ def conditional_variance_estimate(
         out[lo] = m[0]
         out[hi] = m[-1]
     return np.asarray(out, dtype=np.float64)
+
+
+def conditional_variance_estimate(
+    k: FloatArray,
+    v: FloatArray,
+    grid: FloatArray,
+    h: float,
+    cfg: ParticleConfig,
+    tail_slope: float | None = None,
+) -> FloatArray:
+    """``E[v | k]`` on the output ``grid`` (the leverage ``k`` grid).
+
+    The regression itself runs on a dense grid of ``cfg.n_regression_points`` spanning the
+    cloud's trusted ``[q, 1−q]`` quantile range (M4b: a fixed grid over the whole leverage range
+    put 0.025 between regression points while the cloud at the first slices is 0.006 wide and
+    ``E[ξ|k]`` varies like ``exp(ω ρ k / (σ√t))``; linear interpolation of that exponential between
+    far-apart nodes biased the short-end leverage low by ~1% in variance at ω = 3 — 0.09 vol
+    points on the 1m ATM vol — independently of the step size); values inside the range are
+    interpolated onto ``grid``, the tails are extended flat or log-linearly / log-quadratically
+    (SPEC §4.1 and :class:`~volsto.config.ParticleConfig`).
+
+    Two stages: the regression at the nodes — on the sorted particles
+    (:func:`_sorted_regression`, the default) or without a sort (``cfg.estimator == "binned"``,
+    :func:`volsto.calibration.binned.binned_regression`) — and :func:`_finish_estimate`, shared.
+    """
+    if cfg.estimator == "binned":
+        reg = binned_regression(k, v, h, cfg)
+    else:
+        reg = _sorted_regression(k, v, h, cfg)
+    if reg is None:
+        # degenerate cloud (e.g. all particles at one point): use the plain mean everywhere
+        return np.full(grid.shape, float(v.mean()))
+    kreg, q_lo, q_hi, m, slope = reg
+    return _finish_estimate(m, slope, kreg, q_lo, q_hi, grid, h, cfg, v, tail_slope)
 
 
 @dataclass
@@ -388,25 +427,21 @@ def calibrate_leverage(
             if j + 1 in snap_idx:
                 snapshots[snap_idx[j + 1]] = (ls.copy(), fac.copy())
         final_ls, final_fac = ls, fac
-        results.append(
-            LeverageFunction(
-                times,
-                k_grid,
-                L,
-                fc,
-                {
-                    "seed": seed,
-                    "n_particles": N,
-                    "horizon": T,
-                    "kernel": cfg.kernel,
-                    "bandwidth_factor": cfg.bandwidth_factor,
-                    "tail_extrapolation": cfg.tail_extrapolation,
-                    "code_tag": CALIBRATION_CODE_TAG,
-                    "scheme": scheme.__dict__.copy(),
-                    "schedule": repr(sim.step_schedule),
-                },
-            )
-        )
+        metadata: dict[str, Any] = {
+            "seed": seed,
+            "n_particles": N,
+            "horizon": T,
+            "kernel": cfg.kernel,
+            "bandwidth_factor": cfg.bandwidth_factor,
+            "tail_extrapolation": cfg.tail_extrapolation,
+            "code_tag": CALIBRATION_CODE_TAG,
+            "scheme": scheme.__dict__.copy(),
+            "schedule": repr(sim.step_schedule),
+        }
+        if cfg.estimator is not None:
+            # written only when the switch is set: a default calibration's file is unchanged
+            metadata["estimator"] = cfg.estimator
+        results.append(LeverageFunction(times, k_grid, L, fc, metadata))
         log.info("particle pass %d/%d done (%d steps, N=%d)", p + 1, n_pass, n_steps, N)
     lev = results[0] if n_pass == 1 else LeverageFunction.average(results[0], results[1])
     assert final_ls is not None and final_fac is not None
