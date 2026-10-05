@@ -1,11 +1,13 @@
 """The estimator gate of the barrier study (BARRIER_STUDY_ADDENDUM §2).
 
 Merges ``feature/binned-estimator``, checks that no test newly fails, runs the machinery of
-pilot check 9 with the estimator unset and ``"binned"`` (3 dates × 4 seeds, mark ``ssr12``,
-100,000 particles, ``min_window=0``, every pilot cell), and writes its decision to
+pilot check 9 with the estimator unset and ``"binned"`` (the 3 check-9 dates and 3 stressed
+ones — 2008-10-06, 2018-02-05, 2020-03-02 — × 4 seeds, mark ``ssr12``, 100,000 particles,
+``min_window=0``, every cell of the date's entry; addendum 1b), and writes its decision to
 ``outputs/interview/gate.json``: ``{"estimator": "binned", …}`` when (a), (b) and (c) all pass,
 ``{"estimator": null, "reason": …}`` otherwise — also when the merge conflicts in code, a test
-newly fails (the merge is then reverted), the gate errors, or it runs past 45 minutes.
+newly fails (the merge is then reverted), the gate errors, or it runs past 60 minutes.  Binned
+is selected only if (a), (b) and (c) pass on all six dates.
 
     python scripts/barrier_gate.py [--workers 12]
 
@@ -33,7 +35,9 @@ ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "outputs" / "interview"
 GATE = OUT / "gate.json"
 BRANCH = "feature/binned-estimator"
-DATES = ("2024-01-02", "2024-02-12", "2024-03-25")
+#: The three calm check-9 dates and three stressed ones (addendum 1b: the binned-minus-sorted
+#: scatter grows as the particle count falls, and the pilot dates are all calm).
+DATES = ("2024-01-02", "2024-02-12", "2024-03-25", "2008-10-06", "2018-02-05", "2020-03-02")
 SEEDS = (0, 1, 2, 3)
 ESTIMATORS: tuple[str | None, ...] = (None, "binned")
 TESTS = (
@@ -43,7 +47,9 @@ TESTS = (
     "tests/test_barrier_theory.py",
     "tests/test_import_orats.py",
 )
-DEADLINE_S = 45 * 60.0
+DEADLINE_S = 60 * 60.0  # addendum 1b
+#: Limits of (b) are multiplied, cell by cell, by max(1, at-the-money vol at entry / 15 %).
+VOL_REFERENCE = 0.15
 MAX_PRICE_BP = 0.6
 MAX_DELTA = 0.003
 MAX_TIME_RATIO = 0.8
@@ -119,7 +125,7 @@ def gate_job(job: tuple[str, int, str | None]) -> Any:
         seed=bh.seed_of(date) + 1000 * seed,
         estimator=estimator,
     )
-    out = ent[["entry", "months", "side", "barrier", "K", "F0", "DF0"]].copy()
+    out = ent[["entry", "months", "side", "barrier", "K", "F0", "DF0", "atm"]].copy()
     for c in marks.columns:
         out[c] = marks[c].to_numpy()
     out["seed"] = seed
@@ -153,6 +159,11 @@ def timing() -> dict[str, float]:
 
 
 def evaluate(frame: Any) -> dict[str, Any]:
+    """Criteria (a) and (b) per date and quantity.  (a): every cell, |binned − sorted| of the
+    seed means within 2 standard errors or 1 % (check 9's criterion).  (b): every same-seed
+    paired difference at most 0.6 bp of spot (prices) or 0.003 (deltas), times
+    ``max(1, atm / 15 %)`` of the cell.  Also the mean signed paired difference and its
+    standard error."""
     import numpy as np
 
     x = frame.copy()
@@ -163,37 +174,54 @@ def evaluate(frame: Any) -> dict[str, Any]:
     key = ["entry", "months", "side", "barrier"]
     table = []
     ok_a = ok_b = True
-    for q in ("a1", "a2", "a1_delta", "a2_delta"):
-        g = x.groupby([*key, "estimator"])[q].agg(["mean", "std", "count"]).unstack("estimator")
-        a, b = g["mean"]["binned"], g["mean"]["sorted"]
-        se = np.sqrt(
-            g["std"]["binned"] ** 2 / g["count"]["binned"]
-            + g["std"]["sorted"] ** 2 / g["count"]["sorted"]
-        )
-        d = a - b
-        z = (d / se.where(se > 0)).abs()
-        rel = d.abs() / b.abs().where(b.abs() > 0)
-        passed = (z <= 2) | (rel <= 0.01) | (d == 0)
-        paired = x.pivot_table(index=[*key, "seed"], columns="estimator", values=q)
-        pd_ = (paired["binned"] - paired["sorted"]).abs()
-        is_price = not q.endswith("delta")
-        scale = 1e4 if is_price else 1.0
-        limit = MAX_PRICE_BP if is_price else MAX_DELTA
-        b_ok = bool(scale * pd_.max() <= limit)
-        ok_a &= bool(passed.all())
-        ok_b &= b_ok
-        table.append(
-            {
-                "quantity": q,
-                "cells": len(d),
-                "(a) outside 2 se or 1 %": int((~passed).sum()),
-                "paired |diff| median": float(scale * pd_.median()),
-                "paired |diff| max": float(scale * pd_.max()),
-                "unit": "bp of spot" if is_price else "delta",
-                "(b) limit": limit,
-                "(b) pass": b_ok,
-            }
-        )
+    for date, xd in x.groupby("entry"):
+        for q in ("a1", "a2", "a1_delta", "a2_delta"):
+            g = (
+                xd.groupby([*key, "estimator"])[q]
+                .agg(["mean", "std", "count"])
+                .unstack("estimator")
+            )
+            a, b = g["mean"]["binned"], g["mean"]["sorted"]
+            se = np.sqrt(
+                g["std"]["binned"] ** 2 / g["count"]["binned"]
+                + g["std"]["sorted"] ** 2 / g["count"]["sorted"]
+            )
+            d = a - b
+            z = (d / se.where(se > 0)).abs()
+            rel = d.abs() / b.abs().where(b.abs() > 0)
+            passed = (z <= 2) | (rel <= 0.01) | (d == 0)
+            paired = xd.pivot_table(index=[*key, "seed"], columns="estimator", values=q)
+            diff = paired["binned"] - paired["sorted"]
+            atm = xd.groupby([*key, "seed"])["atm"].first().reindex(diff.index)
+            factor = np.maximum(1.0, atm / VOL_REFERENCE)
+            is_price = not q.endswith("delta")
+            scale = 1e4 if is_price else 1.0
+            limit = MAX_PRICE_BP if is_price else MAX_DELTA
+            over = scale * diff.abs() > limit * factor
+            a_ok, b_ok = bool(passed.all()), bool(not over.any())
+            ok_a &= a_ok
+            ok_b &= b_ok
+            table.append(
+                {
+                    "date": str(date),
+                    "quantity": q,
+                    "cells": len(d),
+                    "(a) outside 2 se or 1 %": int((~passed).sum()),
+                    "(a) pass": a_ok,
+                    "paired |diff| median": float(scale * diff.abs().median()),
+                    "paired |diff| max": float(scale * diff.abs().max()),
+                    "max |diff| / scaled limit": float(
+                        (scale * diff.abs() / (limit * factor)).max()
+                    ),
+                    "mean signed paired diff": float(scale * diff.mean()),
+                    "its standard error": float(scale * diff.std(ddof=1) / np.sqrt(len(diff))),
+                    "unit": "bp of spot" if is_price else "delta",
+                    "(b) limit before scaling": limit,
+                    "atm scaling max": float(factor.max()),
+                    "(b) over the limit": int(over.sum()),
+                    "(b) pass": b_ok,
+                }
+            )
     return {"table": table, "a": ok_a, "b": ok_b}
 
 
@@ -245,7 +273,7 @@ def main() -> None:
             for _ in jobs:
                 left = DEADLINE_S - (time.perf_counter() - t0)
                 if left <= 0:
-                    raise TimeoutError("gate run beyond 45 minutes")
+                    raise TimeoutError("gate run beyond 60 minutes")
                 parts.append(it.next(timeout=left))
         frame = pd.concat(parts, ignore_index=True)
         frame.to_parquet(OUT / "gate_runs.parquet", index=False)
