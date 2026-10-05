@@ -287,6 +287,57 @@ def main() -> None:
             f"than 1 % of the price at {n_bad}; largest {100 * worst:.2f} % → {'PASS' if n_bad == 0 else 'FAIL'}"
         )
     (bh.OUT / "checks2.md").write_text("\n".join(lines) + "\n")
+    write_summary()
+
+
+def write_summary() -> None:
+    """Addendum §12: at the end of phase F, a short summary at the top of PROGRESS — which
+    estimator, what ran, what did not, the verdict table (written by the chain when the
+    session is not there to write it)."""
+    import json
+    import time
+
+    progress = bh.OUT / "PROGRESS.md"
+    gate = json.loads((bh.OUT / "gate.json").read_text()) if (bh.OUT / "gate.json").exists() else {}
+    res = bh.RESULTS
+    counts = {
+        "LSV entry files (lsv2)": len(list((res / "lsv2").glob("*.parquet"))),
+        "LSV daily files (lsv2_daily)": len(list((res / "lsv2_daily").glob("*.parquet"))),
+        "features2": len(list((res / "features2").glob("*.parquet"))),
+        "local-vol buckets": len(list((res / "buckets_lv").glob("*.parquet"))),
+        "touch files": len(list((res / "touches").glob("*.parquet"))),
+        "quote files": len(list((res / "quotes").glob("*.parquet"))),
+    }
+    out = [
+        f"# Summary at the end of phase F — {time.strftime('%Y-%m-%d %H:%M')} (written by the chain)",
+        "",
+        f"- Estimator: **{gate.get('estimator') or 'sorted (default path)'}**"
+        + (f" — {gate.get('reason')}" if gate.get("reason") else ""),
+        "- Ran: " + "; ".join(f"{k} {v}" for k, v in counts.items()),
+        "- Reports: `report/report.pdf` (strict sample), `report_built/report.pdf` (all built entries)",
+        "- Not run: check 11.5 (restarts at the bucket mid-dates); the LSV daily study is phase G/H",
+        "- Checks of §11: see `checks2.md`: "
+        + "; ".join(
+            ln.split("**")[1] + (" PASS" if "PASS" in ln and "FAIL" not in ln else " FAIL")
+            for ln in lines
+            if ln.startswith("- **") and ("PASS" in ln or "FAIL" in ln)
+        ),
+        "",
+    ]
+    verdict = bh.OUT / "report" / "tables" / "verdict.csv"
+    if verdict.exists():
+        v = pd.read_csv(verdict)
+        out += ["| prediction | statistic | estimate | verdict |", "|---|---|---|---|"]
+        out += [
+            f"| {r.prediction} | {r.statistic} | {r.estimate} | {r.verdict} |"
+            for r in v.itertuples()
+        ]
+        out.append("")
+    marker = "# Summary at the end of phase F"
+    text = progress.read_text()
+    if text.startswith(marker):  # replace an earlier summary
+        text = text[text.index("\n---\n", 1) + 5 :] if "\n---\n" in text else text
+    progress.write_text("\n".join(out) + "\n---\n\n" + text)
 
 
 if __name__ == "__main__":
