@@ -1516,6 +1516,17 @@ def build(version: int, tenor: str, pdf: bool) -> None:
                     "pass": "PASS" if j.get("pass") else "FAIL",
                 }
             )
+    p8 = dd.OUT / "c8.csv"
+    if p8.exists() and version >= 3:
+        x8 = pd.read_csv(p8)
+        crow.append(
+            {
+                "check": "C8",
+                "result": f"{len(x8)} dates, copula against `volsto.multi` local vol at the same correlation: forward LV / copula {x8['P_D_lv_over_copula'].min():.3f} to {x8['P_D_lv_over_copula'].max():.3f}, "
+                f"call at the forward's price {x8['C1_lv_over_copula'].min():.2f} to {x8['C1_lv_over_copula'].max():.2f}, single-name strip LV / smile {x8['SS_lv_over_smile'].min():.3f} to {x8['SS_lv_over_smile'].max():.3f} (table C8)",
+                "pass": "reported",
+            }
+        )
     CK = pd.DataFrame(crow)
     rep.table(
         "checks",
