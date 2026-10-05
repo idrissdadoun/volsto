@@ -119,7 +119,9 @@ def load() -> tuple[pd.DataFrame, pd.DataFrame]:
         hi = np.searchsorted(meetings, cells["expiry"].to_numpy(str), side="right")
         cells["fomc_in_life"] = (hi - lo).astype(float)
         cells["knock_on_fomc"] = cells["tau1"].isin(set(meetings)) if "tau1" in cells else False
-    lsv_files = sorted((bh.RESULTS / "lsv_entries").glob("*.parquet"))
+    lsv_files = sorted((bh.RESULTS / "lsv2").glob("*.parquet")) or sorted(
+        (bh.RESULTS / "lsv_entries").glob("*.parquet")
+    )  # the addendum's store when it exists
     if lsv_files:
         lsv = pd.concat([pd.read_parquet(p) for p in lsv_files], ignore_index=True)
         lsv = lsv[[c for c in lsv.columns if "_van_" not in c]]

@@ -70,7 +70,9 @@ def assemble_entry(entry: str) -> dict[str, Any]:
         # the LSV daily series (step 6), where it exists
         lparts = []
         for d in dates:
-            p = run.LSV_DAILY / f"{d}.parquet"
+            p = bh.RESULTS / "lsv2_daily" / f"{d}.parquet"  # the addendum's store first
+            if not p.exists():
+                p = run.LSV_DAILY / f"{d}.parquet"
             if p.exists():
                 day = pd.read_parquet(p)
                 lparts.append(day[day["cell"].str.startswith(entry + "|")])
