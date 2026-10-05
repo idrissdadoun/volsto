@@ -243,8 +243,9 @@ mark (SSR 1.2), all of them marked and delta-hedged every day to expiry. The spe
 `scripts/barrier_*.py`; the report is `outputs/interview/report/report.pdf` (strict sample:
 the 744 entries whose surface meets the eSSVI tolerances) and `report_built/` (all 1,028 built
 entries). The numbers below are from the strict sample, in % of the entry spot, with block
-standard errors over entry dates; they are the render of 2026-10-05 02:25, before the LSV daily
-series.
+standard errors over entry dates. The LSV daily series (every knock-out re-marked and hedged
+each day under the LSV, leverage recalibrated daily) covers the entries from 2021-06-01 so far:
+221 entry dates, 7,380 trades; the render is that of 2026-10-05 05:03.
 
 **What it confirms.**
 
@@ -262,6 +263,14 @@ series.
   touches is 0.8–1.2 vol points above local vol's and 1.7 below at down touches. Getting out of
   the static hedge C8 at an up touch costs the holder of the knock-out 0.12 (1m) and 0.28 (3m)
   per knocked trade because of the smile, close to 0.8·w·κ·n.
+
+- *The model moves the premium, not the hedge.* On the 221 entries from 2021-06 marked and
+  hedged every day under both models (daily knock-outs, standard-deviation barriers), the
+  dispersion of the hedged P&L is the same under the LSV and under local vol (0.53 against 0.53
+  at 1m, 0.70 against 0.72 at 3m, 0.94 against 0.97 at 6m on the call side; within 0.02 on the
+  put side), and the mean hedged P&L of the buyer differs by about the difference of the two
+  premiums: −0.02, −0.09, −0.19 on calls and +0.01, +0.05, +0.09 on puts at 1, 3 and 6 months,
+  for premium differences of +0.02, +0.08, +0.15 and −0.01, −0.05, −0.10.
 
 **What it contradicts or qualifies.**
 

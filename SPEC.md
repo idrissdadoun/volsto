@@ -1233,7 +1233,7 @@ The study of §8.4 on every weekly entry of the ORATS history (§18.10). Specifi
 
 **Estimator.** `feature/binned-estimator` was merged after a gate (`scripts/barrier_gate.py`): six dates (three calm, 2008-10-06, 2018-02-05, 2020-03-02) × 4 seeds at the study's settings (100,000 particles, 1 % regression floor); knock-out prices and sticky-strike deltas agree with the sorted estimator within 0.17 bp of spot and 0.0016 on every cell, a calibration takes 0.46 of the time. Every LSV calibration of the study passes `estimator="binned"`.
 
-**Runs** (2026-10-04 / 05, one machine, 14 processes): day import 4,969 days (4,965 built); local-vol entries 1,031; local-vol daily marks and bumped marks 4,969 days (5 h 51 min); LSV entry marks 1,028 entries (71 min, binned); the LSV daily series by blocks from 2021-06. Results under `outputs/interview/barrier_results/` (git-ignored; backed up outside the repository).
+**Runs** (2026-10-04 / 05, one machine, 14 processes): day import 4,969 days (4,965 built); local-vol entries 1,031; local-vol daily marks and bumped marks 4,969 days (5 h 51 min); LSV entry marks 1,028 entries (71 min, binned); the LSV daily series by blocks: 2021-06-01 to 2026-10-02 done (1,342 days, 2 h 57 min, 10 processes, binned, no fallback), earlier blocks after it. Results under `outputs/interview/barrier_results/` (git-ignored; backed up outside the repository).
 
 ## 9. Viewers
 
