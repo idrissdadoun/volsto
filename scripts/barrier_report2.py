@@ -878,18 +878,16 @@ class Report2(base.Report):
             for name in ("B3", "B4", "B5_2"):
                 d = (g[f"Pq_{name}"] - g[f"P_{name}"]).abs()
                 rel = d / g[f"P_{name}"].abs().where(g[f"P_{name}"].abs() > 2e-5)
-                row[f"{NAMES[name]} |diff| bp mean / p90"] = (
-                    f"{1e4 * d.mean():.2f} / {1e4 * d.quantile(0.9):.2f}"
-                )
-                row[f"{NAMES[name]} % of price"] = f"{100 * rel.median():.1f}"
-            row["strikes beyond the listed range"] = int(g["Pq_B5_2"].isna().sum())
+                row[f"{NAMES[name]} Δ bp"] = f"{1e4 * d.mean():.2f} / {1e4 * d.quantile(0.9):.2f}"
+                row[f"{NAMES[name]} Δ %"] = f"{100 * rel.median():.1f}"
+            row["out of range"] = int(g["Pq_B5_2"].isna().sum())
             for piece, (lo_, hi_) in (("UP", ("B3", "B5_2")), ("W", ("B5_2", "B4"))):
                 paid = (self.terminal[lo_] - self.terminal[hi_]).reindex(g["cell"]).to_numpy() * g[
                     "DF0"
                 ].to_numpy()
                 for tag, pre in (("surface", "P_"), ("quotes", "Pq_")):
                     e = (g[f"{pre}{lo_}"] - g[f"{pre}{hi_}"]).to_numpy() - paid
-                    row[f"{piece} priced−realised ({tag})"] = f"{100 * np.nanmean(e):.3f}"
+                    row[f"{piece} p−r ({tag})"] = f"{100 * np.nanmean(e):.3f}"
             rows.append(row)
         self.table(
             "quotes",
@@ -897,8 +895,9 @@ class Report2(base.Report):
             "Vanilla structures repriced from the quotes (implied vol interpolated between the two "
             "neighbouring listed strikes and, in total variance at fixed log-moneyness, between the "
             "two expiries around the trade's): absolute difference with the surface price in bp of "
-            "spot (mean and 90th percentile) and in % of the price (median); and the ladder pieces "
-            "UP and W, priced minus realised, with surface and with quote-based premiums.",
+            "spot (Δ bp: mean / 90th percentile) and in % of the price (Δ %: median); the cells with "
+            "a strike beyond the listed range (NaN, counted); and the ladder pieces UP and W, priced "
+            "minus realised (p−r), with surface and with quote-based premiums.",
             index=False,
         )
 
