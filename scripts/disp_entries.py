@@ -104,6 +104,30 @@ def put_at(m: ds.Marginal, strike: float) -> float:
     return float(np.interp(strike, m.strike, m.call) - (m.f - strike))
 
 
+def marginals_for(
+    date: str, names: list[str], T: float, vendor: bool = False
+) -> dict[str, Any] | None:
+    """The marginals of ``names`` at maturity ``T`` on ``date``, built exactly as in
+    :func:`entry_job` (forward rule, hygiene filters, vendor fallback): ``{ticker: (marginal,
+    tenor smile, expiry smiles)}``, or ``None`` when a name has no usable smile within five
+    days."""
+    chains = dd.read_chains(date, names)
+    panel = dd.prices().ffill()
+    out: dict[str, Any] = {}
+    for t in names:
+        sm, _, _ = smiles_of(t, date, chains.get(t))
+        if not sm or t not in panel.columns or not np.isfinite(panel.at[date, t]):
+            return None
+        spot = float(panel.at[date, t])
+        ts = ds.smile_at(sm, spot, T, vendor)
+        m = ds.build_marginal(ts)
+        if abs(table_straddle(m) / m.straddle - 1.0) > 0.01 and not vendor:
+            ts = ds.smile_at(sm, spot, T, True)
+            m = ds.build_marginal(ts)
+        out[t] = (m, ts, sm)
+    return out
+
+
 def entry_job(args: tuple[str, str, int, bool, str, bool, str]) -> dict[str, Any]:
     global RULE
     date, label, n_days, vendor, out_dir, monthly, RULE = args

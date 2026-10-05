@@ -1222,8 +1222,8 @@ the call's strike 80% of the forward dispersion.
   straddle package 32 (the zero-premium package and the variance dispersion are not ranked).
 * History 2006–2026 (3m windows): COR3M averaged 41% against a realised 29% (high-VIX tercile
   54% vs 33%); realised dispersion 0.104 against a straddle-package payoff 0.041; the
-  palladium-to-package ratio is largest when the basket is flat (−3..3%: 0.092 vs 0.078) and
-  smallest in large moves (> 10%: 0.129 vs 0.017; < −10%: 0.136 vs 0.029).
+  palladium-to-package ratio is smallest when the basket is flat (−3..3%: 0.092 vs 0.078) and
+  largest in large moves (> 10%: 0.129 vs 0.017; < −10%: 0.136 vs 0.029).
 
 ### 8.6 The barrier study on 2007–2026 (owner's specification of 2026-10-04 and its addendum; branch `barrier-vanilla-dispersion`)
 

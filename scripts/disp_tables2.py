@@ -251,7 +251,7 @@ def rule_r2(d: pd.DataFrame) -> pd.Series:
     if "fsr_PF" not in d:
         return out
     sr = pd.DataFrame({col: d[f"fsr_{k}"] for k, col in R2_CANDIDATES.items()})
-    best = sr.idxmax(axis=1, skipna=True)
+    best = sr.fillna(-np.inf).idxmax(axis=1)
     top = sr.max(axis=1, skipna=True)
     for i in d.index:
         if not np.isfinite(top[i]):
@@ -561,4 +561,118 @@ def break_even(d: pd.DataFrame, tenor: str, r1: pd.Series, r2: pd.Series) -> pd.
                     sens[m],
                     prem[m],
                 )
+    return pd.DataFrame(rows)
+
+
+def model_s_tables(d: pd.DataFrame, tenor: str) -> dict[str, pd.DataFrame]:
+    """Phase 4 (spec §3.7): the skew-consistent copula against the base one on the monthly
+    subset — prices, the richness split, the calls and the conditional profile."""
+    path = dd.OUT / f"model_s_{tenor}.parquet"
+    if not path.exists():
+        return {}
+    ms = pd.read_parquet(path)
+    x = d.merge(ms, on="date", how="inner")
+    x = x[x["converged"].astype(bool)]
+    o = x[x["has_outcome"]]
+    out: dict[str, pd.DataFrame] = {}
+    rows = []
+    groups = [("all", ms), ("IS", ms[ms["date"] <= dd.IS_END]), ("OOS", ms[ms["date"] > dd.IS_END])]
+    for label, g in groups:
+        gx = x[x["date"].isin(g["date"])]
+        row: dict[str, Any] = {
+            "sample": label, "monthly dates": len(g), "converged": int(g["converged"].sum()), "slope at a bound": int((g["slope_flag"] != "").sum()),
+            "median c": tb.num(g["c"].median()), "median s": tb.num(g["s"].median()),
+            "90 % put: market / Gaussian copula": tb.num((g["put90_mkt"] / g["put90_gaussian"]).median(), 2),
+            "P_D^S / P_D": tb.num(gx["P_D_S"].sum() / gx["P_D"].sum()), "median of the ratio": tb.num((gx["P_D_S"] / gx["P_D"]).median()),
+        }  # fmt: skip
+        for m in ("075", "100", "125", "150"):
+            row[f"C^S / C at {int(m) / 100:g}"] = tb.num(
+                gx[f"C_S_{m}"].sum() / gx[f"C_{m}"].sum(), 2
+            )
+        row["√(E^S[V] / E^Q[V])"] = tb.num(float(np.sqrt(gx["EV_S"].sum() / gx["EQV"].sum())))
+        row["C3 under S, max"] = f"{g['c3_S'].max():.4f}"
+        rows.append(row)
+    out["model_S"] = pd.DataFrame(rows)
+    rows = []
+    for label, g in (("all", o), ("IS", o[o["IS"]]), ("OOS", o[~o["IS"]])):
+        g = g[g["EQV"].gt(0)]
+        if len(g) < 12:
+            continue
+        r0 = tb.richness(g)
+        g2 = g.assign(P_D=g["P_D_S"], EV=g["EV_S"])
+        r1 = tb.richness(g2)
+        rows.append({"sample": label, "windows (monthly)": len(g), "base: P_D / D": tb.num(r0["richness"]), "base: convexity κ_Q/κ_P": tb.num(r0["convexity factor"]),
+                     "model S: P_D / D": tb.num(r1["richness"]), "model S: convexity κ_Q/κ_P": tb.num(r1["convexity factor"]), "variance factor (same)": tb.num(r0["variance factor"]),
+                     "κ_Q base / S": f"{r0['kappa_Q']:.3f} / {r1['kappa_Q']:.3f}", "κ_P": tb.num(r0["kappa_P"])})  # fmt: skip
+    out["T4_model_S"] = pd.DataFrame(rows)
+    rows = []
+    blk = max(1, tb.STEP[tenor] // 4)  # monthly entries: about three months of windows per block
+    for m in tb.MULT[:5]:
+        row = {"strike": f"{int(m) / 100:g} × forward price"}
+        for label, g in (("IS", o[o["IS"]]), ("OOS", o[~o["IS"]]), ("all", o)):
+            a, lo, hi = st.bootstrap_ratio(g[f"PC_pay_{m}"], g[f"C_{m}"], blk)
+            b, lo2, hi2 = st.bootstrap_ratio(g[f"PC_pay_{m}"], g[f"C_S_{m}"], blk)
+            row[f"base, {label}"] = (
+                f"{a:.2f} [{lo:.2f}, {hi:.2f}]" if label == "all" else tb.num(a, 2)
+            )
+            row[f"model S, {label}"] = (
+                f"{b:.2f} [{lo2:.2f}, {hi2:.2f}]" if label == "all" else tb.num(b, 2)
+            )
+        rows.append(row)
+    row = {"strike": "forward (K = 0)"}
+    for label, g in (("IS", o[o["IS"]]), ("OOS", o[~o["IS"]]), ("all", o)):
+        row[f"base, {label}"] = tb.num(g["D"].sum() / g["P_D"].sum(), 2)
+        row[f"model S, {label}"] = tb.num(g["D"].sum() / g["P_D_S"].sum(), 2)
+    out["T5_model_S"] = pd.DataFrame([row, *rows])
+    rows = []
+    labels = ["below −10 %", "−10 to −3 %", "±3 %", "3 to 10 %", "above 10 %"]
+    edges = [-np.inf, -0.10, -0.03, 0.03, 0.10, np.inf]
+    oo = o.assign(
+        bucket=pd.cut(o["Rb"], edges, labels=labels),
+        rel=o["D_rel"] / o["E_DB"],
+        rel_s=o["D_rel"] / o["E_DB_S"],
+    )
+    for j, k in enumerate(labels):
+        g = oo[oo["bucket"] == k]
+        rows.append({"basket performance": k, "windows (monthly)": len(g), "realised D/B over the base forward": tb.num(g["rel"].mean()),
+                     "over model S's forward": tb.num(g["rel_s"].mean()), "base copula profile": tb.num(x[f"profile_{j}"].mean(), 2),
+                     "model S profile": tb.num(x[f"profile_S_{j}"].mean(), 2), "probability, base / S": f"{x[f'profile_share_{j}'].mean():.3f} / {x[f'profile_share_S_{j}'].mean():.3f}",
+                     "realised frequency": tb.num(len(g) / max(len(oo), 1), 3)})  # fmt: skip
+    out["T11_model_S"] = pd.DataFrame(rows)
+    return out
+
+
+def marks_table(d: pd.DataFrame, tenor: str) -> pd.DataFrame:
+    """Phase 4 (spec §5.5): the unwind P&L at one third and two thirds of the life against the
+    P&L at expiry, monthly subset."""
+    path = dd.OUT / f"marks_{tenor}.parquet"
+    if not path.exists():
+        return pd.DataFrame()
+    mk = pd.read_parquet(path)
+    if "error" in mk:
+        mk = mk[mk["error"].isna()]
+    o = d[d["has_outcome"]].set_index("date")
+    rows = []
+    for label, col in (("PF U", "PF_U"), ("PF H", "PF_H"), ("PC(1) U", "PC_100_U"), ("SS U", "SS_U"), ("BS U", "BS_U"), ("PKG_v U", "PKG_v_U"),
+                       ("PKG_v H", "PKG_v_H"), ("PKG_theta U", "PKG_theta_U"), ("PKG_theta H", "PKG_theta_H"), ("GAP U", "GAP_U"), ("PF_v U", "PF_v_U")):  # fmt: skip
+        row: dict[str, Any] = {"structure": label}
+        dates = sorted(set(mk["date"]) & set(o.index))
+        final = o.loc[dates, col]
+        for stage in ("1/3", "2/3"):
+            g = (
+                mk[(mk["stage"] == stage) & mk["date"].isin(dates)]
+                .set_index("date")[col]
+                .reindex(dates)
+            )
+            row[f"mean at {stage}"] = tb.pct(g.mean(), 2)
+            row[f"sd at {stage}"] = tb.pct(g.std(), 2)
+            row[f"5 % at {stage}"] = tb.pct(g.quantile(0.05), 2)
+            row[f"corr. with expiry, {stage}"] = tb.num(
+                float(np.corrcoef(g.fillna(g.mean()), final)[0, 1]), 2
+            )
+        row["mean at expiry"] = tb.pct(final.mean(), 2)
+        row["sd at expiry"] = tb.pct(final.std(), 2)
+        row["5 % at expiry"] = tb.pct(final.quantile(0.05), 2)
+        row["entries"] = len(dates)
+        rows.append(row)
     return pd.DataFrame(rows)

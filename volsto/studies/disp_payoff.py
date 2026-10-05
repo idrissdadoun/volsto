@@ -103,17 +103,21 @@ def hedge_legs(
     vol_names: FloatArray,
     vol_basket: float,
     sig_rel: FloatArray,
+    n_total: int | None = None,
 ) -> dict[str, float]:
     """Daily delta hedges over one window.  ``path`` is ``(N + 1) × n``, the value of each
     frozen holding per unit of its entry price (row 0 is ones).  Hedges are rebalanced at each
-    of the first ``N`` closes and held to the next; price changes only (no carry).
+    of the first ``N`` closes and held to the next; price changes only (no carry).  With
+    ``n_total`` the path is the first ``N`` days of a window of ``n_total`` days of maturity
+    ``T`` (the hedges accrued when the position is unwound before expiry).
 
     Returns the hedge P&L of the single-name strip (``Σ w_i`` of each straddle's hedge), of the
     basket straddle (hedged with the frozen basket) and of the Palladium forward, and the
     notional traded by each (``Σ_t |Δδ_t|`` with the entry and exit trades)."""
     path = np.asarray(path, dtype=np.float64)
     n_steps = path.shape[0] - 1
-    tau = T * (n_steps - np.arange(n_steps)) / n_steps
+    life = n_steps if n_total is None else int(n_total)
+    tau = T * (life - np.arange(n_steps)) / life
     x = path[:-1]
     dx = np.diff(path, axis=0)
     basket = path @ w

@@ -35,15 +35,17 @@ Path by path, the triangle inequality gives
 The straddle dispersion trade is the *lower bound* of the palladium's payoff. The gap between
 the two is
 
-    D − (Σ w_i |r_i| − |r_B|) = 2 Σ_{i : sign(r_i) ≠ sign(r_B)} w_i · min(|r_i|, |r_B|)
-                                (plus the names that moved with the basket but less than it),
+    D − (Σ w_i |r_i| − |r_B|) = 2 Σ_i w_i · ( |r_B| − (ε r_i)⁺ )⁺,      ε = sign(r_B),
 
-non-zero only on the names that moved *against* the basket (or less than it in the same
-direction): the palladium pays for every name's deviation from the basket, the straddle trade
-only for the excess of the names' moves over the basket's. When every name moves with the
-basket and more than it (a crash where everything falls but by different amounts), the two
-coincide; when names move in opposite directions (sector rotation, idiosyncratic events, a
-flat basket with busy components), the palladium pays and the straddle trade pays little.
+twice the weighted shortfall of every name that lags the basket in the direction of the
+basket's move, each capped at the basket's move (a name that moved against the basket counts
+for the whole of it). The gap is zero when the basket ends where it started and grows with
+the size of the basket's move: the palladium pays for every name's deviation from the basket,
+the straddle trade for the names' average distance from zero minus the basket's. When the
+basket ends flat (sector rotation, idiosyncratic events, a flat basket with busy components),
+the two coincide. When everything moves the same way by different amounts (a crash where
+everything falls, a rally where everything rises), every name finishes on the same side of its
+strike: the straddle package pays nothing and the gap is the whole palladium.
 
 That is the whole intuition: **the palladium is a call on *relative* moves; the straddle
 package is a call on *excess absolute* moves.** The palladium forward is worth much more than
@@ -132,9 +134,10 @@ The patterns that matter for the framework:
 
 * the **correlation risk premium**: COR3M sits above the realised 3m correlation on average
   (the gap is the straddle trade's carry) and widens in high-VIX regimes;
-* the **palladium / straddle-trade payoff ratio** by regime: it is largest when the basket is
-  flat (the `−3..3%` bucket: the names move, the basket does not) and smallest in large
-  basket moves of either sign — the triangle gap closes when everything moves together;
+* the **palladium / straddle-trade payoff ratio** by regime: it is smallest when the basket is
+  flat (the `−3..3%` bucket: the names move, the basket does not, and the two payoffs nearly
+  coincide) and largest in large basket moves of either sign — the straddle package stops
+  paying when everything finishes on the same side, and the gap opens;
 * realised dispersion rises with the VIX tercile *less* than the basket's absolute move does:
   high-vol regimes are high-correlation regimes.
 

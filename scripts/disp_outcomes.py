@@ -176,14 +176,15 @@ def main() -> None:
     for p in files:
         with p.open("rb") as fh:
             r = pickle.load(fh)
-        for tag in ("B1", "B2"):
+        tags = [t for t in ("B1", "B2", "B3") if t in r]
+        for tag in tags:
             e_rows.append(entry_row(r, tag))
         for j, t in enumerate(r["names"]):
             legs.append(
                 {
                     "date": r["date"], "ticker": t, "w_B1": r["w_B1"][j], "spot": r["spots"][j],
                     **{k: float(r["legs"][k][j]) for k in ("f", "atm_vol", "straddle", "vega", "M", "var_vs", "vol_90", "vol_110", "skew", "half_spread")},
-                    "sig_rel_B1": float(r["B1"]["sig_rel"][j]), "sig_rel_B2": float(r["B2"]["sig_rel"][j]),
+                    **{f"sig_rel_{tag}": float(r[tag]["sig_rel"][j]) for tag in tags},
                     "rule": r["rules"][j], "bracket_lo": r["legs"]["bracket_lo"][j], "bracket_hi": r["legs"]["bracket_hi"][j],
                 }
             )  # fmt: skip
@@ -192,12 +193,12 @@ def main() -> None:
             continue  # no outcome yet (the last day of the store)
         days = days_all[i0 : i0 + n_days + 1]
         path, event, carried = window_path(panel, filled, r["names"], days)
-        changed = any(days[0] < c <= days[-1] for c in change_days)
+        changed = "B1" in tags and any(days[0] < c <= days[-1] for c in change_days)
         track = {}
         for b in ("DJX", "DIA"):
             a, z = filled.at[days[0], b], filled.at[days[-1], b]
             track[f"ret_{b}"] = float(z / a - 1.0)
-        for tag in ("B1", "B2"):
+        for tag in tags:
             o_rows.append(outcome_row(r, tag, path, event, carried, track, changed))
     entries = pd.DataFrame(e_rows)
     outcomes = pd.DataFrame(o_rows)
@@ -206,7 +207,7 @@ def main() -> None:
     entries.to_parquet(dd.OUT / f"entries_{args.tenor}{args.suffix}.parquet", index=False)
     outcomes.to_parquet(dd.OUT / f"outcomes_{args.tenor}{args.suffix}.parquet", index=False)
     pd.DataFrame(legs).to_parquet(dd.OUT / f"legs_{args.tenor}{args.suffix}.parquet", index=False)
-    b1 = outcomes[outcomes["basket"] == "B1"]
+    b1 = outcomes[outcomes["basket"] == outcomes["basket"].iloc[0]]
     print(f"{args.tenor}{args.suffix}: {len(entries) // 2} entry dates, {len(b1)} windows with an outcome; "
           f"basket events {int(b1['basket_event'].sum())}; max sandwich violation {b1['sandwich_violation'].max():.1e}; "
           f"max gap-formula error {b1['gap_formula_error'].max():.1e}; max C11 error {b1['c11_error'].max():.1e}")  # fmt: skip

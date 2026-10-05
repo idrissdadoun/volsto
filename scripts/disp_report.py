@@ -551,6 +551,88 @@ def mean_diff(o: pd.DataFrame, a: str, b: str, lag: int) -> str:
     return f"{tb.pct(x['mean'], 2)} % in sample (t {x['t']:.1f}), {tb.pct(y['mean'], 2)} % out of sample (t {y['t']:.1f})"
 
 
+def third_phase(rep: Report, d: pd.DataFrame, tenor: str) -> None:
+    """Phase 4: model S, the marks during the life, basket B3 (what exists)."""
+    import disp_tables2 as t2
+
+    ms = t2.model_s_tables(d, tenor)
+    if ms:
+        rep.add("## Model S: a copula that reprices the basket's skew\n")
+        rep.add(
+            "Same single-name smiles; the correlation of a scenario is `c − s × M` (clipped to [0.02, 0.98]) with `M` the common factor, so it rises in sell-offs for `s > 0`; "
+            "`(c, s)` reprice the DJX at-the-money straddle and its 90 % put on each date (first entry of each month). The question: do the forward's richness and the calls' cheapness "
+            "survive a model that reprices the basket's skew while keeping the single-name smiles? Dates on which the two targets are not both met are left out of the comparisons (counted).\n"
+        )
+        rep.table(
+            "model_S",
+            ms["model_S"],
+            "Model S on the monthly subset: calibration, and its prices over the base copula's (ratios of sums over dates; the cash strikes are the base run's).",
+        )
+        rep.table(
+            "T4_model_S",
+            ms["T4_model_S"],
+            "The richness split (T4) with model S prices, on the monthly windows where it converged, beside the base copula on the same windows.",
+        )
+        rep.table(
+            "T5_model_S",
+            ms["T5_model_S"],
+            "Calls (T5): Σ payoff / Σ price under each model, same windows and strikes (block-bootstrap 95 % interval on the pooled column).",
+        )
+        rep.table(
+            "T11_model_S",
+            ms["T11_model_S"],
+            "Relative dispersion by basket performance (T11) with model S's forward and its conditional profile.",
+        )
+    mk = t2.marks_table(d, tenor)
+    if len(mk):
+        rep.add("## Marks during the life\n")
+        rep.table(
+            "marks",
+            mk,
+            "Monthly subset: the P&L of unwinding at one third and two thirds of the life (every leg re-priced with that day's smiles; the Palladium conditional on the performances to date, at the correlation that reprices that day's DJX straddle of the remaining maturity on the frozen basket; hedged versions add the hedges accrued), against the P&L at expiry; % of notional.",
+        )
+    if (dd.OUT / f"outcomes_{tenor}_B3.parquet").exists():
+        x = tb.load(tenor, "B3", "_B3")
+        o = x[x["has_outcome"]]
+        lag = tb.LAG[tenor]
+        rows = []
+        for label in (
+            "PF U",
+            "PF H",
+            "PC(1) static hedge",
+            "SS U",
+            "SS H",
+            "BS U",
+            "PKG_v U",
+            "PKG_v H",
+            "PKG_theta H",
+            "GAP U",
+            "GAP_rho U",
+            "PF_v U",
+        ):
+            col = tb.STRUCTS[label]
+            row = {"structure": label}
+            for sample, g in (("all", o), ("IS", o[o["IS"]]), ("OOS", o[~o["IS"]])):
+                s_ = st.describe(g[col], lag)
+                row[f"{sample} mean"], row[f"{sample} t"] = tb.pct(s_["mean"]), tb.num(s_["t"], 2)
+            row["sd"] = tb.pct(o[col].std())
+            rows.append(row)
+        rep.add("## Basket B3: ten large caps at equal weights\n")
+        rep.add(
+            "AAPL, MSFT, AMZN, NVDA, JPM, XOM, JNJ, PG, HD, UNH. **Survivorship: the list was chosen in 2026**; past winners are over-represented, which inflates persistent relative trends and realised dispersion. The basket straddle is the copula's at the Dow's ρ_cop of the same date (no listed option): the comparison of the Palladium with its package is model against model.\n"
+        )
+        rep.table(
+            "T13_B3",
+            pd.DataFrame(rows),
+            "B3 (survivorship-biased list of 2026), 3m: mean P&L in % of notional with the Hansen–Hodrick t.",
+        )
+        rep.table(
+            "T2_B3",
+            tb.t2(x),
+            "B3 (survivorship-biased list of 2026): the gap by size of the basket's move.",
+        )
+
+
 def second_phase(rep: Report, d0: pd.DataFrame, tenor: str, dec: pd.DataFrame) -> None:
     import disp_tables2 as t2
 
@@ -664,6 +746,153 @@ def second_phase(rep: Report, d0: pd.DataFrame, tenor: str, dec: pd.DataFrame) -
     }  # type: ignore[attr-defined]
 
 
+def second_verdicts(sec: dict[str, Any], tenor: str, v_row: Any) -> None:
+    """D5, D6, D9, D10, D11 and the two rules, by the spec's criteria."""
+    d = sec["d"]
+    o = d[d["has_outcome"]]
+    lag = tb.LAG[tenor]
+    blk = tb.STEP[tenor]
+    # D5: out-of-the-money calls pay more per unit of premium than the forward
+    for m, label in (("100", "the forward's price"), ("125", "1.25 ×")):
+        out = {}
+        for sample, g in (("IS", o[o["IS"]]), ("OOS", o[~o["IS"]])):
+            rc, _, _ = st.bootstrap_ratio(g[f"PC_pay_{m}"], g[f"C_{m}"], blk)
+            rf = g["D"].sum() / g["P_D"].sum()
+            # the difference of the two ratios, bootstrapped jointly
+            a = g[[f"PC_pay_{m}", f"C_{m}", "D", "P_D"]].to_numpy(float)
+            rng = np.random.default_rng(21)
+            n = len(a)
+            starts = rng.integers(0, n, size=(2000, int(np.ceil(n / blk))))
+            idx = ((starts[:, :, None] + np.arange(blk)[None, None, :]) % n).reshape(2000, -1)[
+                :, :n
+            ]
+            sm = a[idx].sum(axis=1)
+            diff = sm[:, 0] / sm[:, 1] - sm[:, 2] / sm[:, 3]
+            out[sample] = (rc - rf, float(np.std(diff)), rc, rf)
+        t = out["IS"][0] / out["IS"][1] if out["IS"][1] > 0 else np.nan
+        v_row("D5", f"calls struck at {label}: Σ payoff / Σ price minus the forward's (bootstrap s.e.)", f"{out['IS'][0]:.3f} ± {out['IS'][1]:.3f} ({out['IS'][2]:.3f} against {out['IS'][3]:.3f})",
+              tb.verdict(1, {"diff": out["IS"][0], "t": t}, {"diff": out["OOS"][0]}), f"{out['OOS'][0]:.3f} ± {out['OOS'][1]:.3f}", f"{2.8 * out['OOS'][1]:.3f}", "ratio of premium")  # fmt: skip
+    a_, b_ = (
+        tb.tercile_contrast(d, "VR_cs", o["PF_U"] - o["PKG_theta_H"], tenor, "IS"),
+        tb.tercile_contrast(d, "VR_cs", o["PF_U"] - o["PKG_theta_H"], tenor, "OOS"),
+    )
+    v_row(
+        "D6",
+        "trailing VR_cs → PF U − PKG_theta H (top − bottom IS tercile), % of notional",
+        f"{tb.pm(a_['diff'], a_['se'])} (t {a_['t']:.2f})",
+        tb.verdict(1, a_, b_),
+        tb.pm(b_["diff"], b_["se"]),
+        tb.pct(2.8 * b_["se"]),
+        "the hedged-Palladium version is primary test Q3",
+    )
+    for s_, sign, note in (
+        ("PF_U", 1, "loads on the vol level"),
+        ("PKG_v_H", 1, "loads on the vol level"),
+        ("PKG_theta_H", 0, "should not load: 'confirmed' = |t| < 2 in sample"),
+    ):
+        fi = st.ols(
+            o.loc[o["IS"], s_],
+            np.column_stack([np.ones(int(o["IS"].sum())), o.loc[o["IS"], "vol_ratio_real"]]),
+            lag,
+        )
+        fo = st.ols(
+            o.loc[~o["IS"], s_],
+            np.column_stack([np.ones(int((~o["IS"]).sum())), o.loc[~o["IS"], "vol_ratio_real"]]),
+            lag,
+        )
+        if sign:
+            ver = tb.verdict(
+                sign, {"diff": fi["coef"][1], "t": fi["t"][1]}, {"diff": fo["coef"][1]}
+            )
+        else:
+            ver = "confirmed" if abs(fi["t"][1]) < 2 and abs(fo["t"][1]) < 2 else "contradicted"
+        v_row(
+            "D9",
+            f"slope of {s_.replace('_', ' ')} on realised over implied single-name vol − 1 ({note})",
+            f"{100 * fi['coef'][1]:.2f} ± {100 * fi['se'][1]:.2f} (t {fi['t'][1]:.1f})",
+            ver,
+            f"{100 * fo['coef'][1]:.2f} ± {100 * fo['se'][1]:.2f} (t {fo['t'][1]:.1f})",
+            f"{280 * fo['se'][1]:.2f}",
+            "% of notional per unit of the ratio",
+        )
+    for icol, label in (
+        ("earnings_share", "calendar earnings share"),
+        ("xs_kurtosis", "trailing cross-sectional kurtosis"),
+    ):
+        a_, b_ = (
+            tb.tercile_contrast(d, icol, o["kappa"], tenor, "IS"),
+            tb.tercile_contrast(d, icol, o["kappa"], tenor, "OOS"),
+        )
+        v_row(
+            "D10",
+            f"realised D/√V, top − bottom IS tercile of the {label}",
+            f"{a_['diff']:.3f} ± {a_['se']:.3f} (t {a_['t']:.2f})",
+            tb.verdict(-1, a_, b_),
+            f"{b_['diff']:.3f} ± {b_['se']:.3f}",
+            f"{2.8 * b_['se']:.3f}",
+        )
+    rel = o["D_rel"] / o["E_DB"]
+    relv = rel / (o["vol_names_real"] / o["sig_bar"])
+    for y, label in ((rel, "raw"), (relv, "divided by realised / implied vol")):
+        out = {}
+        for sample, sel in (("IS", o["IS"]), ("OOS", ~o["IS"])):
+            dn_, up_ = y[sel & (o["Rb"] < -0.03)], y[sel & (o["Rb"] > 0.03)]
+            m1, s1, _ = st.mean_se(dn_, lag)
+            m2, s2, _ = st.mean_se(up_, lag)
+            out[sample] = (m1 - m2, float(np.hypot(s1, s2)))
+        t = out["IS"][0] / out["IS"][1] if out["IS"][1] > 0 else np.nan
+        v_row("D11", f"realised D/B over its forward, sell-offs (R̄ < −3 %) minus rallies (R̄ > 3 %), {label}", f"{out['IS'][0]:.3f} ± {out['IS'][1]:.3f} (t {t:.2f})",
+              tb.verdict(-1, {"diff": out["IS"][0], "t": t}, {"diff": out["OOS"][0]}), f"{out['OOS'][0]:.3f} ± {out['OOS'][1]:.3f}", f"{2.8 * out['OOS'][1]:.3f}",
+              "D11 predicts lower in sell-offs holding vols fixed (the vol-adjusted row); standard errors of the two groups combined as if independent")  # fmt: skip
+    t14 = sec["t14"]
+    g = t14[t14["units"].str.startswith("unit")]
+    for name in ("R1", "R2"):
+        for other in ("PF U", "PKG theta H"):
+            h = g[g["strategy"] == f"{name} minus always {other}"]
+            if h.empty:
+                continue
+            r = {x["sample"]: x for x in h.to_dict("records")}
+            v_row(
+                "headline",
+                f"{name} minus always-{other}, mean P&L at unit notional, % of notional (T14)",
+                f"{r['IS']['mean']} (t {r['IS']['t']})",
+                "",
+                f"{r['OOS']['mean']} (t {r['OOS']['t']})",
+                note="no expected sign",
+            )
+
+
+def first_page_calls(sec: dict[str, Any]) -> str:
+    t5 = sec["t5"].set_index("strike")["Σ payoff / Σ price"]
+    return (
+        f"Calls, Σ payoff / Σ price: {t5.get('0.75 × forward price', '–')} at 0.75, {t5.get('1 × forward price', '–')} at the forward's price, "
+        f"{t5.get('1.25 × forward price', '–')} at 1.25, {t5.get('1.5 × forward price', '–')} at 1.5 (T5; the intervals are wide)."
+    )
+
+
+def first_page_rules(sec: dict[str, Any]) -> str:
+    t14 = sec["t14"]
+    g = t14[t14["units"].str.startswith("unit")]
+
+    def line(name: str) -> str:
+        h = g[g["strategy"] == name]
+        return (
+            "; ".join(f"{r['sample']} {r['mean']} (t {r['t']})" for r in h.to_dict("records"))
+            if len(h)
+            else "not available"
+        )
+
+    return (
+        f"Mean P&L at unit notional, % of notional: R1 {line('R1')}; R2 {line('R2')}; always-PF {line('always PF U')}; always-PKG_θ H {line('always PKG_theta H')}; "
+        f"R1 minus always-PKG_θ H {line('R1 minus always PKG theta H')}; R2 minus always-PKG_θ H {line('R2 minus always PKG theta H')} (T14, with the leaves; net of costs: T14_costs)."
+    )
+
+
+def first_page_today(sec: dict[str, Any]) -> str:
+    p15 = sec["p15"].set_index("quantity")["value"]
+    return f"R1 selects **{p15.get('R1 selects', '–')}**, R2 selects **{p15.get('R2 selects', '–')}** (T15 has every indicator with its percentile and the forecast edges)."
+
+
 def mean_verdict(
     y_is: pd.Series, y_oos: pd.Series, sign: int, lag: int
 ) -> tuple[str, float, float, float, float]:
@@ -718,6 +947,11 @@ def build(version: int, tenor: str, pdf: bool) -> None:
     T19 = tb.t19(d, tenor)
     PT = tb.primary_tests(d, tenor)
     chk = tb.checks(d)
+    rep2 = Report(OUT)
+    if version >= 2:
+        safe(rep2, "second phase", lambda: second_phase(rep2, d, tenor, dec))
+    sec = getattr(rep2, "_second", None)
+    rep._second = sec  # type: ignore[attr-defined]
     c1_path = dd.OUT / "c1.json"
     c1 = json.loads(c1_path.read_text()) if c1_path.exists() else {}
 
@@ -875,7 +1109,20 @@ def build(version: int, tenor: str, pdf: bool) -> None:
         f"{tb.pct(g_oos['mean'])} (t {g_oos['t']:.2f})",
         note="no expected sign: this is the PM's choice in one number",
     )
-    VT = pd.DataFrame(verdicts)
+    if sec is not None:
+        safe(rep, "second-phase verdicts", lambda: second_verdicts(sec, tenor, v_row))
+        verdicts[:] = [
+            v for v in verdicts if not (v["item"] == "D5" and v["verdict"] in ("", "phase 3"))
+        ]
+    VT = pd.DataFrame(verdicts).sort_values(
+        "item",
+        key=lambda c: c.map(
+            lambda x: (
+                (0, int(x[1:])) if x[0] == "D" else ((1, int(x[1:])) if x[0] == "Q" else (2, 0))
+            )
+        ),
+        kind="stable",
+    )
 
     # ---- first page
     full = st.describe(o["GAP_U"], lag)
@@ -906,23 +1153,29 @@ def build(version: int, tenor: str, pdf: bool) -> None:
         f"1. **Richness.** Priced at the correlation that reprices the DJX straddle, the Palladium forward cost {tb.pct(o['P_D'].mean(), 2)} on average and paid {tb.pct(o['D'].mean(), 2)}: "
         f"price over realised {rall['richness']:.3f} = variance factor {rall['variance factor']:.3f} (the vanilla strips' squared dispersion against the realised one) × convexity factor {rall['convexity factor']:.3f} "
         f"(κ_Q {rall['kappa_Q']:.3f} against κ_P {rall['kappa_P']:.3f}). In sample {r_is['richness']:.3f} = {r_is['variance factor']:.3f} × {r_is['convexity factor']:.3f}; out of sample {r_oos['richness']:.3f} = {r_oos['variance factor']:.3f} × {r_oos['convexity factor']:.3f} (T4). "
-        + ("Calls by strike: T5 (version 2)." if version < 2 else ""),
+        + ("Calls by strike: T5 (version 2)." if sec is None else first_page_calls(sec)),
         f"2. **Palladium or package.** The gap (Palladium forward minus the vega-neutral package, which pays exactly G) cost {tb.pct(o['P_G'].mean(), 2)} and paid {tb.pct(o['G'].mean(), 2)}: mean P&L {tb.pct(full['mean'])} (t {full['t']:.2f}, hit rate {full['hit']:.2f}); "
         f"in sample {tb.pct(g_is['mean'])} (t {g_is['t']:.2f}), out of sample {tb.pct(g_oos['mean'])} (t {g_oos['t']:.2f}) (T17). Conditions: T17b; primary test Q2 (GP_G): {q4.loc['Q2', 'verdict'] if 'Q2' in q4.index else 'not testable'}.",
         f"3. **Horizon.** Unhedged minus hedged Palladium forward: {tb.pm(*st.mean_se(o['PF_U'] - o['PF_H'], lag)[:2])}; primary test Q3 (trailing VR_cs): {q4.loc['Q3', 'verdict'] if 'Q3' in q4.index else 'not testable'}. "
         f"Realised variance ratio of the windows: mean {o['vr_window'].mean():.2f} (median {o['vr_window'].median():.2f}). "
-        + ("T6 comes with version 2." if version < 2 else ""),
+        + (
+            "T6 comes with version 2."
+            if sec is None
+            else "Whether the trailing ratio predicts the window's: T6."
+        ),
         f"4. **Risk.** Worst decile of basket returns (mean R̄ {tb.pct(w_['Rb'].mean(), 1)}): hedged Palladium forward {tb.pct(w_['PF_H'].mean(), 2)}, hedged vega-neutral package {tb.pct(w_['PKG_v_H'].mean(), 2)}, "
         f"hedged theta-neutral package {tb.pct(w_['PKG_theta_H'].mean(), 2)}, basket straddle {tb.pct(w_['BS_U'].mean(), 2)} (T8, with the event table).",
         "5. **The rule.** "
         + (
             "R1 and R2 come with version 2 (T14, T18); the five primary tests are in the verdict table below."
-            if version < 2
-            else "See T14 and T18."
+            if sec is None
+            else first_page_rules(sec)
         ),
         f"6. **Today ({today['date']}).** ρ_cop {today['rho_cop']:.3f}, ρ_ATM {today['rho_atm']:.3f}; Palladium forward {tb.pct(today['P_D'], 2)}, package {tb.pct(today['SS_mkt'] - today['Str_B_mkt'], 2)}, gap price {tb.pct(today['P_G'], 2)}; "
         f"λ_ρ {today['lambda_rho']:.2f}, λ_θ {today['lam_theta']:.2f}; implied dispersion {today['ID']:.1f} (ATM) and {today['ID_VS']:.1f} (log contracts) vol points. "
-        + ("The full reading (T15) comes with version 2." if version < 2 else ""),
+        + (
+            "The full reading (T15) comes with version 2." if sec is None else first_page_today(sec)
+        ),
     ]
     rep.add("\n".join(answers) + "\n")
     rep.add(
@@ -1162,9 +1415,12 @@ def build(version: int, tenor: str, pdf: bool) -> None:
         if version < 2:
             rep.missing(name, "phase 3 (report v2)")
     if version >= 2:
-        safe(rep, "second phase", lambda: second_phase(rep, d, tenor, dec))
+        rep.blocks += rep2.blocks
+        rep.sheets.update(rep2.sheets)
     else:
         safe(rep, "figures", lambda: figures(rep, d, tenor, dec))
+    if version >= 2:
+        safe(rep, "phase 4", lambda: third_phase(rep, sec["d"] if sec else d, tenor))
     safe(rep, "sensitivities", lambda: sensitivities(rep, d, tenor))
 
     # ---- limits
@@ -1180,7 +1436,7 @@ def build(version: int, tenor: str, pdf: bool) -> None:
     )
     VT.to_csv(OUT / "tables" / "verdict_q2.csv", index=False)
     if version >= 2:
-        safe(rep, "pm summary", lambda: pm_summary(rep, d, PT, tenor))
+        safe(rep, "pm summary", lambda: pm_summary(rep, sec["d"] if sec else d, PT, tenor))
     res = rep.write("report_q2", pdf)
     print(
         f"report v{version}: {len(rep.blocks)} blocks; {res.get('status')} {res.get('reason', '')[:300]}"

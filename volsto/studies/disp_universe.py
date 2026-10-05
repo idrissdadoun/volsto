@@ -78,6 +78,33 @@ def _a(ex: str, parent: str, kind: str, source: str, **becomes: float) -> Action
 #: ORATS prices).  Voluntary exchange offers (PG/Folgers 2008, PFE/Zoetis 2013, GE/Synchrony
 #: 2015, PG/Coty 2016, JNJ/Kenvue 2023) change nothing for a holder who does not tender.
 ACTIONS: Final[tuple[Action, ...]] = (
+    # splits and spin-offs outside a ticker's membership: they enter trailing statistics (a
+    # member's history before it joined), long windows after it left, and basket B3
+    _a("2007-04-03", "NKE", "split", "Nike 2-for-1", NKE=2.0),
+    _a(
+        "2007-09-12",
+        "NVDA",
+        "split",
+        "Nvidia 3-for-2 (no store row of NVDA on 2007-09-11)",
+        NVDA=1.5,
+    ),
+    _a("2012-12-26", "NKE", "split", "Nike 2-for-1", NKE=2.0),
+    _a("2013-04-18", "CRM", "split", "Salesforce 4-for-1", CRM=4.0),
+    _a("2014-06-09", "AAPL", "split", "Apple 7-for-1", AAPL=7.0),
+    _a(
+        "2015-11-02",
+        "HPQ",
+        "spin-off",
+        "Hewlett-Packard: 1 Hewlett Packard Enterprise per share",
+        HPQ=1.0,
+        HPE=1.0,
+    ),
+    _a("2021-04-01", "SHW", "split", "Sherwin-Williams 3-for-1", SHW=3.0),
+    _a("2021-07-20", "NVDA", "split", "Nvidia 4-for-1", NVDA=4.0),
+    _a("2021-08-02", "GE", "reverse split", "GE 1-for-8", GE=0.125),
+    _a("2022-06-06", "AMZN", "split", "Amazon 20-for-1", AMZN=20.0),
+    _a("2022-07-18", "GOOGL", "split", "Alphabet 20-for-1", GOOGL=20.0),
+    _a("2024-06-10", "NVDA", "split", "Nvidia 10-for-1", NVDA=10.0),
     _a(
         "2007-04-03",
         "MO",
