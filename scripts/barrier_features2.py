@@ -116,20 +116,28 @@ def historical(entry: str, cells: pd.DataFrame, vol_of: dict[int, float], tag: s
     closes = run.context()["ohlc"]["close"].loc[:entry].iloc[:-1]
     returns = np.log(closes).diff().dropna()
     names = ("B3", "B4", "B5_2", "B6")
-    out = pd.DataFrame(index=cells.index, columns=[f"{tag}_A1", *[f"{tag}_{n}" for n in names]], dtype=float)
+    out = pd.DataFrame(
+        index=cells.index, columns=[f"{tag}_A1", *[f"{tag}_{n}" for n in names]], dtype=float
+    )
     for months, g in cells.groupby("months"):
         vol = vol_of.get(int(months), float("nan"))
         if not np.isfinite(vol):
             continue
         paths = filtered_historical_paths(
-            returns, HORIZON[int(months)], FHS_PATHS, vol_target=vol, seed=bh.seed_of(entry) + int(months)
+            returns,
+            HORIZON[int(months)],
+            FHS_PATHS,
+            vol_target=vol,
+            seed=bh.seed_of(entry) + int(months),
         )
         hi, lo, last = paths.max(axis=1), paths.min(axis=1), paths[:, -1]
         for r in g.itertuples():
             side, b = int(r.side), float(r.B / r.K)
             knocked = hi > b if side > 0 else lo < b
             legs = bh.structure_legs(side, 1.0, b, 1.0)
-            out.loc[r.Index, f"{tag}_A1"] = np.where(knocked, 0.0, np.maximum(side * (last - 1.0), 0.0)).mean()
+            out.loc[r.Index, f"{tag}_A1"] = np.where(
+                knocked, 0.0, np.maximum(side * (last - 1.0), 0.0)
+            ).mean()
             for n in names:
                 out.loc[r.Index, f"{tag}_{n}"] = bh.legs_payoff(legs[n], side, last).mean()
     return out
@@ -182,9 +190,11 @@ def feature_job(entry: str) -> dict[str, Any]:
                 "roll_value": A * roll,
                 "ko_stat": r.lv_a2 / K + side * A * roll,
                 "n_T": n_T,
-                "upside_skew": float(np.asarray(surf.implied_vol(far, T)).reshape(())) - atm
-                if far > 0
-                else np.nan,
+                "upside_skew": (
+                    float(np.asarray(surf.implied_vol(far, T)).reshape(())) - atm
+                    if far > 0
+                    else np.nan
+                ),
             }
             for j in range(3):
                 rec[f"pi_{j + 1}"] = tw["pi"][j]
@@ -195,7 +205,9 @@ def feature_job(entry: str) -> dict[str, Any]:
             rows.append(rec)
         res = pd.DataFrame(rows)
         for name, theta in TENORS.items():
-            res[f"n_{name}"] = bt.normalised_skew(surf, theta)[0] if theta <= surf.max_maturity else np.nan
+            res[f"n_{name}"] = (
+                bt.normalised_skew(surf, theta)[0] if theta <= surf.max_maturity else np.nan
+            )
         for k, v in feats.items():
             res[k] = v
         atm_of = {int(m): float(g["atm"].iloc[0]) for m, g in ent.groupby("months")}
@@ -208,9 +220,18 @@ def feature_job(entry: str) -> dict[str, Any]:
             for col in frame.columns:
                 res[col] = frame[col].to_numpy()
         # richness of each piece: priced gap over discounted historical gap (local-vol knock-out)
-        prem = {"A1": ent["lv_a1"] / ent["K"], **{n: ent[f"P_{n}"] / ent["K"] for n in ("B3", "B4", "B5_2", "B6")}}
+        prem = {
+            "A1": ent["lv_a1"] / ent["K"],
+            **{n: ent[f"P_{n}"] / ent["K"] for n in ("B3", "B4", "B5_2", "B6")},
+        }
         hist = {
-            "h": {"A1": h1["h_A1"], "B3": h1["h_B3"], "B4": h1["h_B4"], "B5_2": h1["h_B5_2"], "B6": h1["h_B6"]},
+            "h": {
+                "A1": h1["h_A1"],
+                "B3": h1["h_B3"],
+                "B4": h1["h_B4"],
+                "B5_2": h1["h_B5_2"],
+                "B6": h1["h_B6"],
+            },
             "h2": {n: h2[f"h2_{n}"] for n in ("A1", "B3", "B4", "B5_2", "B6")},
         }
         for piece, (long_, short_) in PIECES.items():

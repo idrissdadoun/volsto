@@ -759,7 +759,8 @@ class Report:
                 row[f"hedged {tag.upper()}"] = fmt(mh, sh)
                 row[f"hedged sd {tag.upper()}"] = f"{100 * g[f'pnl_h_{tag}'].std():.3f}"
                 row[f"delta at entry {tag.upper()}"] = f"{g[f'delta0_{tag}'].mean():.3f}"
-            row["LSV re-mark days' P&L"] = f"{100 * g['remark_pnl'].mean():.3f}"
+            rk = "remark_pnl_lsv" if "remark_pnl_lsv" in g else "remark_pnl"
+            row["LSV re-mark days' P&L"] = f"{100 * g[rk].mean():.3f}"
             row["n"] = len(g)
             rows.append(row)
         self.table(
@@ -1150,6 +1151,18 @@ class Report:
                 size = r"\tiny" if n > 12 else (r"\scriptsize" if n > 8 else r"\footnotesize")
                 sep = "2pt" if n > 12 else "3pt"
                 esc = lx.latex_escape
+                # long text columns wrap (a paragraph column), the others stay as they are
+                longest = [
+                    max([len(str(c))] + [len(str(v)) for v in frame[c]]) for c in frame.columns
+                ]
+                spec = "".join(
+                    (
+                        (r">{\raggedright\arraybackslash}p{" + f"{min(0.11 * w_, 7.5):.1f}cm" + "}")
+                        if w_ > 45
+                        else "l"
+                    )
+                    for w_ in longest
+                )
                 head = " & ".join(
                     rf"\shortstack[l]{{{esc(str(c)).replace(' ', r' \\ ', 1) if n > 12 and len(str(c)) > 9 else esc(str(c))}}}"
                     for c in frame.columns
@@ -1160,7 +1173,7 @@ class Report:
                     rf"\setlength\tabcolsep{{{sep}}}",
                     rf"\noindent\textbf{{Table {esc(name)}.}} {lx.inline_to_latex(caption)}",
                     "",
-                    rf"\begin{{longtable}}{{@{{}}{'l' * n}@{{}}}}",
+                    rf"\begin{{longtable}}{{@{{}}{spec}@{{}}}}",
                     r"\toprule",
                     head + r" \\",
                     r"\midrule",
@@ -1170,9 +1183,14 @@ class Report:
                     parts.append(" & ".join(esc(str(v)) for v in row) + r" \\")
                 parts += [r"\bottomrule", r"\end{longtable}", r"\endgroup", ""]
         body = "\n".join(parts)
-        preamble = lx.TEX_PREAMBLE.replace(
-            r"\usepackage[margin=2.5cm]{geometry}", r"\usepackage[landscape,margin=1.3cm]{geometry}"
-        ).replace(r"\documentclass[11pt]{article}", r"\documentclass[10pt]{article}")
+        preamble = (
+            (lx.TEX_PREAMBLE + "\\usepackage{array}\n")
+            .replace(
+                r"\usepackage[margin=2.5cm]{geometry}",
+                r"\usepackage[landscape,margin=1.3cm]{geometry}",
+            )
+            .replace(r"\documentclass[11pt]{article}", r"\documentclass[10pt]{article}")
+        )
         tex = preamble.rstrip("\n") + "\n\\begin{document}\n" + body + "\n\\end{document}\n"
         (self.out / "report.tex").write_text(tex)
         return lx.compile_latex(self.out, "report.tex")

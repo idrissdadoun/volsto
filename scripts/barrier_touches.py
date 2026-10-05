@@ -54,7 +54,11 @@ def knocked_cells(entry: str) -> pd.DataFrame:
         c = pd.read_parquet(
             bh.RESULTS / "cells.parquet", columns=["cell", "entry", "barrier", "tau1", "finished"]
         )
-        c = c[c["finished"].fillna(False).astype(bool) & c["tau1"].notna() & c["barrier"].str.startswith("s")]
+        c = c[
+            c["finished"].fillna(False).astype(bool)
+            & c["tau1"].notna()
+            & c["barrier"].str.startswith("s")
+        ]
         _cells["all"] = c
     c = _cells["all"]
     return c[c["entry"] == entry]
@@ -66,7 +70,9 @@ def vol_at(surface: Any, k: float, theta: float) -> float:
 
 def smile(surface: Any, k0: float, theta: float, h: float) -> tuple[float, float]:
     """``(vol at k0, centred slope over ±h)`` in log-moneyness against the surface's forward."""
-    return vol_at(surface, k0, theta), (vol_at(surface, k0 + h, theta) - vol_at(surface, k0 - h, theta)) / (2 * h)
+    return vol_at(surface, k0, theta), (
+        vol_at(surface, k0 + h, theta) - vol_at(surface, k0 - h, theta)
+    ) / (2 * h)
 
 
 def implied(price: float, F: float, K: float, theta: float, cp: int) -> float:
@@ -74,7 +80,10 @@ def implied(price: float, F: float, K: float, theta: float, cp: int) -> float:
     one = np.asarray(1.0)
 
     def gap(v: float) -> float:
-        return float(bh.black(np.asarray(F), np.asarray(K), np.asarray(theta), np.asarray(v), cp, one)) - price
+        return (
+            float(bh.black(np.asarray(F), np.asarray(K), np.asarray(theta), np.asarray(v), cp, one))
+            - price
+        )
 
     try:
         return float(brentq(gap, 1e-4, 5.0, xtol=1e-10))
@@ -90,7 +99,13 @@ def touch_job(entry: str) -> dict[str, Any]:
         knocked = knocked_cells(entry)
         ent = pd.read_parquet(run.ENTRIES / f"{entry}.parquet")
         ent["cell"] = (
-            ent["entry"] + "|" + ent["months"].astype(str) + "|" + ent["side"].astype(str) + "|" + ent["barrier"]
+            ent["entry"]
+            + "|"
+            + ent["months"].astype(str)
+            + "|"
+            + ent["side"].astype(str)
+            + "|"
+            + ent["barrier"]
         )
         ent = ent.merge(knocked[["cell", "tau1"]], on="cell")
         counts = {"knocked": len(ent), "short": 0, "carried": 0, "no_mark": 0}
@@ -116,7 +131,11 @@ def touch_job(entry: str) -> dict[str, Any]:
             if tau not in markets:
                 markets[tau] = bh.load_day(tau, cal, ohlc)
                 p = run.DAILY / f"{tau}.parquet"
-                dailies[tau] = pd.read_parquet(p, columns=["cell", "DF", *MARKS]) if p.exists() else pd.DataFrame()
+                dailies[tau] = (
+                    pd.read_parquet(p, columns=["cell", "DF", *MARKS])
+                    if p.exists()
+                    else pd.DataFrame()
+                )
             mt = markets[tau]
             if mt.carried:
                 counts["carried"] += 1
@@ -163,7 +182,9 @@ def touch_job(entry: str) -> dict[str, Any]:
                 rec["resid"] = -side * c8_cash
                 rec["resid_pv"] = -side * float(row["C8"].iloc[0]) / dft * float(r.DF0) / K
                 rr, qq = bt.carry_rates(mt.df(theta), f_tau, st, theta)
-                rec["resid_skew"] = rec["resid"] + side * bt.c8_bs(side, st, K, B, theta, sig_real, rr, qq) / K
+                rec["resid_skew"] = (
+                    rec["resid"] + side * bt.c8_bs(side, st, K, B, theta, sig_real, rr, qq) / K
+                )
                 rec["kap_touch"] = float(bt.kap(K, B, sig_real, theta))
             else:
                 counts["no_mark"] += 1
@@ -183,7 +204,11 @@ def touch_job(entry: str) -> dict[str, Any]:
                         cp = 1 if kk >= 0 else -1
                         price = float(np.maximum(cp * (s_T - strike), 0.0).mean())
                         vols.append(implied(price, fwd, strike, theta, cp))
-                    restarts[key] = {"s_T": s_T, "sig": vols[1], "skew": (vols[2] - vols[0]) / (2 * h)}
+                    restarts[key] = {
+                        "s_T": s_T,
+                        "sig": vols[1],
+                        "skew": (vols[2] - vols[0]) / (2 * h),
+                    }
                 except Exception as exc:
                     restarts[key] = {"error": f"{type(exc).__name__}: {exc}"}
             rs = restarts[key]
@@ -192,12 +217,16 @@ def touch_job(entry: str) -> dict[str, Any]:
                 rec["n_lv"] = -rs["skew"] * np.sqrt(theta)
                 legs = bh.legs_from_json(r.legs)
                 for name in MARKS:
-                    rec[f"lv_{name}"] = float(bh.legs_payoff(legs[name], side, rs["s_T"]).mean()) / K
+                    rec[f"lv_{name}"] = (
+                        float(bh.legs_payoff(legs[name], side, rs["s_T"]).mean()) / K
+                    )
             else:
                 rec["restart_error"] = rs["error"]
             move = float(np.log(st / S0))
             rec["ssr_at_touch"] = (
-                (sig_real - sig_stat) / (skew_stat * move) if abs(move) >= 0.01 and skew_stat != 0 else np.nan
+                (sig_real - sig_stat) / (skew_stat * move)
+                if abs(move) >= 0.01 and skew_stat != 0
+                else np.nan
             )
             rec["skew_ratio"] = rec["n_real"] / rec["n_stat"] if rec["n_stat"] != 0 else np.nan
             rows.append(rec)
