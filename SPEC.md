@@ -1225,6 +1225,16 @@ the call's strike 80% of the forward dispersion.
   palladium-to-package ratio is largest when the basket is flat (−3..3%: 0.092 vs 0.078) and
   smallest in large moves (> 10%: 0.129 vs 0.017; < −10%: 0.136 vs 0.029).
 
+### 8.6 The barrier study on 2007–2026 (owner's specification of 2026-10-04 and its addendum; branch `barrier-vanilla-dispersion`)
+
+The study of §8.4 on every weekly entry of the ORATS history (§18.10). Specification: `outputs/interview/BARRIER_STUDY_SPEC.md` and `BARRIER_STUDY_ADDENDUM.md` (kept with the results, outside git); log, assumptions and every check: `outputs/interview/PROGRESS.md`; findings: `docs/barrier_vs_vanilla.md` §6.
+
+**Code.** `volsto/studies/barrier_history.py` — trades (entry dates, expiries, barriers in percent and in standard deviations), structures as legs (option, exact digital, forward), the model-free lower bound, knock rules on closes / highs / lows, the hedge accounting to the trade's own expiry, expanding terciles, the block bootstrap; the day market from the ORATS importer with the bad-day carry (`MovedSurface`); the day engine: one path set per (day, bump) on the future trading days, shared by every live trade, Brownian-bridge extremes sampled with common uniforms, the European knock-out as control variate. `volsto/studies/barrier_theory.py` — the forward-skew premium of the knock-out over its static hedge, the carry control (Reiner–Rubinstein against the Black–Scholes C8), touch weights and annuity, bucket statistics of a path set, the directional skew-stickiness ratio, the frozen forecast of realised vol, the local-vol restart. `scripts/barrier_*.py` — the passes (days, entries, daily, LSV entries and daily with the particle estimator read from the gate, features, buckets, touches, quotes, costs), the assembly, the checks, the report (Markdown → LaTeX → PDF through tectonic). Tests: `tests/test_barrier_history.py` (22), `tests/test_barrier_theory.py` (6).
+
+**Estimator.** `feature/binned-estimator` was merged after a gate (`scripts/barrier_gate.py`): six dates (three calm, 2008-10-06, 2018-02-05, 2020-03-02) × 4 seeds at the study's settings (100,000 particles, 1 % regression floor); knock-out prices and sticky-strike deltas agree with the sorted estimator within 0.17 bp of spot and 0.0016 on every cell, a calibration takes 0.46 of the time. Every LSV calibration of the study passes `estimator="binned"`.
+
+**Runs** (2026-10-04 / 05, one machine, 14 processes): day import 4,969 days (4,965 built); local-vol entries 1,031; local-vol daily marks and bumped marks 4,969 days (5 h 51 min); LSV entry marks 1,028 entries (71 min, binned); the LSV daily series by blocks from 2021-06. Results under `outputs/interview/barrier_results/` (git-ignored; backed up outside the repository).
+
 ## 9. Viewers
 
 `viewers/precompute.py` builds grids into the cache: default grid `ω ∈ {0, 0.5, 1, 1.5, 2, 2.5, 3}`, `ρ1 ∈ {−0.9, −0.7, −0.5, −0.3, 0}`, `k1 ∈ {0.5, 1.5, 4}`, 2F presets (a few `(θ, k1, k2, ρ12)` combinations including the SSR ≈ 1.2 fit), always including the 1F degenerate points so the old studies are recoverable. Precompute is a CLI with resume support. Owner additions (recorded at the M4c review, for M9): the precompute CLI takes an explicit list of grid points and a worker count, so a grid can be sharded across cores or machines and resumed — `volsto-precompute --shard i/n` runs the i-th of n interleaved shards of the point list; the cache is relocatable (relative paths only, manifest-driven), so grids can be computed on a rented multi-core VM and synced to a laptop; production entries use 8·10⁵ particles (§11).
@@ -2158,6 +2168,7 @@ Built inline (the phase-1 agent workflow failed on the account's spend limit; it
 ---
 
 ## 17. Change log v1.1 → v2.0
+- 2026-10-05 the barrier study on 2007–2026: §8.6 (new) — the study's code, the estimator gate (the binned particle estimator merged and selected), the runs; findings in `docs/barrier_vs_vanilla.md` §6.
 - 2026-10-04 the full ORATS archive: §18.10 (new) — older layouts accepted (schema version 2, absent columns null, the key's fallback), SPX settlement by period, the census of 4,970 days, the periods the data shows against the vendor's statement, the anomalous days.
 - 2026-10-04 M11 follow-up: §18.6 tolerances asserted on the sample day, the vendor's vol convention found (an American tree with `residualRateData` as the yield), the VIX-methodology check against Cboe; §18.8 as-traded closes.
 - 2026-10-04 SABRW exact zone edge: §13.5 (new) — the mechanism, the closed form, the grid test against the minimiser, the 127-date noise experiment, the tags, what was regenerated.

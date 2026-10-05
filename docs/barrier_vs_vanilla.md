@@ -229,3 +229,65 @@ implied-minus-realised vol — the two state variables that carry most of the va
 * `volsto/studies/barrier_vs_vanilla.py`: the book, the anchor decomposition, the spot × time
   map, the Greeks, the hedge comparison (including the fly and the ratio as static proxies of
   the knock-out), the 127-day backdated series, the statistical layer, the decision table.
+
+## 6. What 2007–2026 changes
+
+Sections 1 to 5 rest on one date, 127 days of 2022 and the spot history. The same question was
+then put to every weekly entry of the ORATS history: 1,031 entry dates from 2007-01-03 to
+2026-09-28, strike at the snapshot spot, maturities 1 / 3 / 6 / 12 months, barriers at 0.25 to
+2 standard deviations and at fixed percentages, both sides — 74,232 trades, every vanilla
+structure priced off the day's surface, the knock-outs under local vol and under the desk LSV
+mark (SSR 1.2), all of them marked and delta-hedged every day to expiry. The specification is
+`outputs/interview/BARRIER_STUDY_SPEC.md` with its addendum; the code is
+`volsto/studies/barrier_history.py`, `volsto/studies/barrier_theory.py` and
+`scripts/barrier_*.py`; the report is `outputs/interview/report/report.pdf` (strict sample:
+the 744 entries whose surface meets the eSSVI tolerances) and `report_built/` (all 1,028 built
+entries). The numbers below are from the strict sample, in % of the entry spot, with block
+standard errors over entry dates; they are the render of 2026-10-05 02:25, before the LSV daily
+series.
+
+**What it confirms.**
+
+- *Two anchors, not a band.* The three desk marks (SSR 1.0, 1.2, 1.5) price the knock-outs alike;
+  local vol and the LSV are the low and high anchors of the up-and-out call and the reverse for
+  the down-and-out put. The signed gap LSV − local vol grows with maturity: 0.014, 0.063, 0.123,
+  0.209 at 1, 3, 6 and 12 months on the call side, the same on the put side. It is the price of
+  forward skew at the barrier: regressed on the "roll value" (the skew the local-vol price does
+  not charge for, times the annuity of the barrier) the slope is 0.72 ± 0.02 on calls and
+  0.62 ± 0.03 on puts.
+- *The touch test sides with the stationary smile.* On the 8,741 trades knocked on the daily
+  rule, the skew on the knock day is within a few percent of what the entry-day smile predicts
+  by moneyness (ratio 0.94–0.98 on up touches, 1.06–1.25 on down touches) and well away from
+  local vol's prediction, on both sides and at 1 and 3 months. The at-the-money vol at up
+  touches is 0.8–1.2 vol points above local vol's and 1.7 below at down touches. Getting out of
+  the static hedge C8 at an up touch costs the holder of the knock-out 0.12 (1m) and 0.28 (3m)
+  per knocked trade because of the smile, close to 0.8·w·κ·n.
+
+**What it contradicts or qualifies.**
+
+- *Hedged, the knock-out bought at the local-vol price beat the fly.* Section 3.4 expected the
+  fly to win when the vol responds strongly to rallies. Delta-hedged, fly (n = 2) minus knock-out
+  is negative in every tercile of every primary condition on the call side (−0.05 to −0.32), and
+  most negative in the top tercile of the upside skew-stickiness ratio (−0.20 ± 0.03 at 1m against
+  −0.08 ± 0.02 in the bottom tercile). On the put side the difference is small (0 to −0.1).
+- *The justified premium is above both anchors on the call side.* The knock-out premium at which
+  the knock-out would only have matched the fly, hedged, is local vol plus 0.077 at 1m and 0.179
+  at 3m, where the LSV adds 0.014 and 0.063: a share of 5.6 [3.8, 7.3] and 2.8 [1.9, 3.8] of the
+  gap between the anchors. On the put side the share is −0.9 [−1.4, −0.3] at 3m. The touch-day
+  share (what leaving C8 at the knock cost, against what each anchor charges) is between the
+  anchors at 3 months (0.63 on calls, 0.67 on puts) and outside at 1 month.
+- *Rule 4* (knock-out when the skew the dealer charges is below the skew expected at the touch,
+  nothing fitted) beats always-fly by 0.02–0.10 hedged in both halves, and does not beat
+  always-knock-out.
+- *Fly or ratio.* Beyond one standard deviation on the call side the far call W is worth less than
+  0.02 and ratio and fly are the same trade. Near the barrier the ratio earned 0.2–0.35 more than
+  the fly, hedged, at 3 months, for a worst 1 % unhedged outcome of −9 to −16 against −0.4 to −0.6.
+
+**Limits to read these with.** The knock-out has no market price: its premium is a model's. The
+vanilla structures are priced on the fitted surface, which misses the quoted mids by 2–5 bp of
+spot on a spread or a fly at 3 months (quote-based table of the report): of the size of several
+of the differences above. The hedge is a forward to expiry rebalanced once a day at the
+snapshot, without cost. About 236 independent one-month windows and 78 three-month ones carry
+the inference; the six-month and one-year results are indicative. The verdict on the eleven
+pre-registered predictions is the report's table `verdict`.
+
