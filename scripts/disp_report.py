@@ -385,6 +385,15 @@ def sensitivities(rep: Report, d: pd.DataFrame, tenor: str) -> None:
                         d[d["date"].isin(alt["date"])], tenor, "base, on the dates of the run above"
                     )
                 )
+    if {"sig_B_DJX", "sig_B_DIA"} <= set(d.columns):
+        far = (d["sig_B_DJX"] - d["sig_B_DIA"]).abs() > 0.01
+        rows.append(
+            headline(
+                d[~far.fillna(False)],
+                tenor,
+                f"base, without the {int((far & d['has_outcome']).sum())} windows on which the DJX and DIA vols differ by more than 1 vol point",
+            )
+        )
     if len(rows) > 1:
         rep.add("## Sensitivity of the headline to the vol and forward convention\n")
         rep.table(
@@ -1057,7 +1066,8 @@ def first_page_gap_runs(runs: pd.DataFrame | None) -> str:
         return ""
     g = runs[(runs["structure"] == "GAP") & (runs["sample"] == "all")]
     txt = "; ".join(f"{r['run']} {r['mean']} (t {r['t']})" for r in g.to_dict("records"))
-    return f" Other tenors and the equally weighted basket, whole sample: {txt} (T17_other_runs; at 12 and 24 months most windows are priced beyond the last listed expiry of some names, and there are few independent windows)."
+    b12, b24 = beyond_last_expiry("12m"), beyond_last_expiry("24m")
+    return f" Other tenors and the equally weighted basket, whole sample: {txt} (T17_other_runs; a name is priced beyond its last listed expiry on {b12[0]} of {b12[1]} entry dates at 12 months and {b24[0]} of {b24[1]} at 24 months, and there are few independent windows: a sensitivity, not evidence)."
 
 
 def first_page_rules(sec: dict[str, Any]) -> str:
@@ -1338,6 +1348,11 @@ def build(version: int, tenor: str, pdf: bool) -> None:
         f"({len(o)} windows, {int(o['IS'].sum())} in sample to 2016, {int((~o['IS']).sum())} out of sample). Prices at mid, undiscounted; P&L in % of notional; "
         "± is a Hansen–Hodrick standard error (weekly entries of overlapping windows). Theory and notation: `THEORY_NOTES_Q2.pdf`.\n"
     )
+    if version >= 3 and (dd.OUT / "before_guards" / f"outcomes_{tenor}.parquet").exists():
+        rep.add(
+            "**This version supersedes the numbers of v1 and v2.** A check of phase 4 (C8) found vendor expiries that are not smiles (strikes far from the money only, or a vol several times their neighbours'): two guards were added and the entry dates they touch priced again. "
+            'The headline moves little and no conclusion changes except the verdict of primary test Q3 (section "Before and after the expiry guards").\n'
+        )
     rep.add("## The six questions\n")
     q4 = PT.set_index("test")
     answers = [
@@ -1403,18 +1418,25 @@ def build(version: int, tenor: str, pdf: bool) -> None:
     wanted = dd.entry_dates(dd.TENORS[tenor])
     missing = sorted(set(wanted) - set(d["date"]))
     rep.add(
-        f"**Entry dates left out: {len(missing)} of {len(wanted)}** ({', '.join(missing)}): a member has no usable smile within five trading days (GM in December 2008, KFT in December 2010 and RTX in April 2020 have no row in the store), "
+        f"**Entry dates left out: {len(missing)} of {len(wanted)}** ({', '.join(missing)}): a member has no usable smile within five trading days (KFT in December 2010 and RTX in April 2020 have no row in the store; 2008-12-08, left out of v1 and v2 for General Motors, is priced since the expiry guards), "
         f"or has no price move over the whole window ({', '.join(d.attrs.get('stuck_dates', [])) or 'none'}: General Motors on its last day of listing).\n"
     )
     scan = dd.OUT / "smile_scan_removed.csv"
     if scan.exists():
         rm = pd.read_csv(scan)
         one, term = rm[rm["guard"] == "one-sided"], rm[rm["guard"] == "term structure"]
+        ex = dd.OUT / "smile_scan_exact.csv"
+        exact = pd.read_csv(ex) if ex.exists() else None
         rep.add(
             f"**Expiries that are not smiles** (measured on every expiry of every entry date, `scripts/disp_scan_smiles.py`): {len(one)} expiries on {one['date'].nunique()} entry dates have usable strikes on one side of the forward only and are not used when the ticker has a two-sided expiry that day "
             f"(UNH's November 2017 expiry in the summer of 2017: five strikes from 45 to 65 for a share at 195); {len(term)} expiries of five weeks or more on {term['date'].nunique()} dates have an at-the-money vol more than a factor {ds.TERM_BAND:g} from the median of the four nearest expiries and are dropped "
             "(XOM's September 2017 expiry in March 2017: 200 % between two expiries at 16 %). Citigroup and General Motors on five entry dates of February–March 2009 have one-sided expiries only (shares under the lowest listed strike): their smile is the nearest strike's vol, flat. "
-            'Reports v1 and v2 were priced before these two guards; the section "Before and after the expiry guards" gives the difference.\n'
+            + (
+                f"Built as the entry script builds them, a ticker's list of expiries differs with the guards on {exact['date'].nunique()} entry dates ({len(exact)} ticker-dates): these dates are priced again at every tenor. "
+                if exact is not None
+                else ""
+            )
+            + 'Reports v1 and v2 were priced before these two guards; the section "Before and after the expiry guards" gives the difference.\n'
         )
     if c1:
         rows = []

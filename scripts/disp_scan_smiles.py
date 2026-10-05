@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 from multiprocessing import Pool
+from pathlib import Path
 from typing import Any
 
 for _v in ("OMP_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "OPENBLAS_NUM_THREADS"):
@@ -28,6 +30,9 @@ for _v in ("OMP_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "OPENBLAS_NUM_THREADS"):
 
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import disp_entries as de  # noqa: E402
 
 from volsto.studies import disp_data as dd  # noqa: E402
 from volsto.studies import disp_smile as ds  # noqa: E402
@@ -62,6 +67,33 @@ def job(date: str) -> list[dict[str, Any]]:
                     "atm_vol": float(np.interp(0.0, e.k, e.vol)),
                     "vendor_near": float(e.vendor_vol[j]),
                     "k_near": float(e.k[j]),
+                }
+            )
+    return rows
+
+
+def job_exact(date: str) -> list[dict[str, Any]]:
+    """The tickers of ``date`` whose list of expiry smiles differs with and without the guards,
+    built as the entry script builds them (parity forwards, the previous days tried when the
+    day has no usable smile, the forward check in between)."""
+    names = [*du.members_on(date), "DJX", "DIA", *du.B3_NAMES]
+    names = list(dict.fromkeys(names))
+    chains = dd.read_chains(date, names)
+    rows: list[dict[str, Any]] = []
+    for t in names:
+        ds.EXPIRY_GUARDS = False
+        off, day_off, _ = de.smiles_of(t, date, chains.get(t))
+        ds.EXPIRY_GUARDS = True
+        on, day_on, _ = de.smiles_of(t, date, chains.get(t))
+        a = [f"{day_off}:{e.expiry}" for e in off]
+        b = [f"{day_on}:{e.expiry}" for e in on]
+        if a != b:
+            rows.append(
+                {
+                    "date": date,
+                    "ticker": t,
+                    "only without the guards": " ".join(sorted(set(a) - set(b))),
+                    "only with the guards": " ".join(sorted(set(b) - set(a))),
                 }
             )
     return rows
@@ -115,7 +147,24 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=(__doc__ or "").split("\n")[0])
     ap.add_argument("--workers", type=int, default=5)
     ap.add_argument("--summary", action="store_true")
+    ap.add_argument(
+        "--exact",
+        action="store_true",
+        help="compare each ticker's final list of expiries with and without the guards",
+    )
     args = ap.parse_args()
+    if args.exact:
+        dates = sorted({*dd.entry_dates(dd.TENORS["1m"]), dd.LAST_DAY})
+        with Pool(max(1, min(args.workers, dd.cpu_budget()))) as pool:
+            res = pool.map(job_exact, dates, chunksize=4)
+        out = pd.DataFrame([r for rows in res for r in rows])
+        out.to_csv(dd.OUT / "smile_scan_exact.csv", index=False)
+        changed = sorted(out["date"].unique()) if len(out) else []
+        (dd.OUT / "smile_scan_exact_dates.txt").write_text("\n".join(changed) + "\n")
+        print(
+            f"exact scan: {len(dates)} dates; a ticker's expiries differ with the guards on {len(changed)} dates, {len(out)} ticker-dates: {dict(out['ticker'].value_counts().head(15)) if len(out) else {}}"
+        )
+        return
     if not args.summary:
         dates = dd.entry_dates(dd.TENORS["1m"])
         dates = sorted({*dates, dd.LAST_DAY})
