@@ -332,10 +332,13 @@ K_STUDY_PARTICLES = 800_000
 K2_BASELINE_LEVERAGE_SHA256 = "95a379d6f47f6c5e92d1b698c39dc500d80032768046a4ee05707642b9bffda8"
 K2_BASELINE_BANDWIDTHS_SHA256 = "5d19730b673dd791a42774b2c1276f5db4509a16a7f5c46fd996552fe03b35b3"
 #: SHA-256 of the float64 leverage values of the K.5(2) deflation-arm run (variant C with the
-#: deflated bandwidth) on that date and seed.  NOT RECORDED YET: K.5(2) stored its leverages in
-#: float32; the float64 rerun of the scratch reference is pending (it waits for the machine).
-#: The test fails until it is.
-K5_RUN_LEVERAGE_SHA256: str | None = None
+#: deflated bandwidth) on that date and seed.  K.5(2) stored its leverages in float32, so the
+#: digest was recorded on 2026-10-04 from a float64 rerun of the study's ORIGINAL scratch
+#: estimator (its k5_hybrid.py with the deflated bandwidth and k5_lean.py, not
+#: tests/_k5_reference.py) on the m6 library (commit 9a99aaf); the rerun's float32 image equals
+#: the float32 leverage K.5(2) stored for that arm, and its bandwidths are the baseline's.  (The
+#: undeflated run of the first change had a1f66eef…9399.)
+K5_RUN_LEVERAGE_SHA256 = "8fff595fab97e452f82bf88f82b05432266051fdbc937ecd14d0f4d997e97b92"
 #: The digests are bit patterns of numbers computed with this platform's libm and numpy
 #: partition: they are asserted where they were recorded and nowhere else.
 DIGEST_PLATFORM = ("darwin", "arm64")
@@ -399,10 +402,6 @@ def test_binned_estimator_equals_the_k5_run(monkeypatch) -> None:
     assert lib.leverage.values.shape == (1255, 2001)
     _same_calibration(lib, ref_run)
     if _on_digest_platform():
-        assert K5_RUN_LEVERAGE_SHA256 is not None, (
-            "the K.5(2) deflation digest is not recorded: run the float64 rerun of the scratch "
-            "reference and set K5_RUN_LEVERAGE_SHA256"
-        )
         assert _sha256(lib.leverage.values) == K5_RUN_LEVERAGE_SHA256
 
 
