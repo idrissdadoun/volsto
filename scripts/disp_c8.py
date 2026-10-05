@@ -176,15 +176,25 @@ def main() -> None:
     ap.add_argument("--dates", type=int, default=12)
     ap.add_argument("--paths", type=int, default=100_000)
     ap.add_argument("--force", action="store_true")
+    ap.add_argument(
+        "--redo", nargs="*", default=[], help="run these dates again and replace their rows"
+    )
     args = ap.parse_args()
     lock = dd.OUT / "c8.started"
-    if (lock.exists() or (dd.OUT / "c8.json").exists()) and not args.force:
-        print("C8 has run or is running (c8.started / c8.json): nothing to do; --force reruns it")
-        return
-    lock.write_text(time.strftime("%Y-%m-%d %H:%M"))
-    files = sorted(p.stem for p in (dd.OUT / "entries" / "3m").glob("*.pkl"))
-    pick = [files[i] for i in np.linspace(0, len(files) - 2, args.dates).round().astype(int)]
-    rows = []
+    rows: list[dict[str, Any]] = []
+    if args.redo:
+        old = pd.read_csv(dd.OUT / "c8.csv")
+        rows = old[~old["date"].isin(args.redo)].to_dict("records")
+        pick = list(args.redo)
+    else:
+        if (lock.exists() or (dd.OUT / "c8.json").exists()) and not args.force:
+            print(
+                "C8 has run or is running (c8.started / c8.json): nothing to do; --force reruns it"
+            )
+            return
+        lock.write_text(time.strftime("%Y-%m-%d %H:%M"))
+        files = sorted(p.stem for p in (dd.OUT / "entries" / "3m").glob("*.pkl"))
+        pick = [files[i] for i in np.linspace(0, len(files) - 2, args.dates).round().astype(int)]
     for d in pick:
         try:
             rows.append(run_date(d, args.paths))
@@ -196,6 +206,8 @@ def main() -> None:
         except Exception as exc:
             print(f"{d}: failed ({type(exc).__name__}: {exc})", flush=True)
     out = pd.DataFrame(rows)
+    if len(out):
+        out = out.sort_values("date").reset_index(drop=True)
     out.to_csv(dd.OUT / "c8.csv", index=False)
     if len(out):
         summary = {

@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import disp_tables as tb
 
 from volsto.studies import disp_data as dd
+from volsto.studies import disp_smile as ds
 from volsto.studies import disp_stats as st
 from volsto.studies import latex as lx
 
@@ -288,7 +289,7 @@ def coverage(d: pd.DataFrame) -> pd.DataFrame:
 def headline(d: pd.DataFrame, tenor: str, label: str) -> dict[str, Any]:
     """The core headline of one run (spec §1.1 "vendor-vol"): ρ_cop, P_D, the correlation
     premium, the richness split and the gap."""
-    o = d[d["has_outcome"] & d["EQV"].gt(0)]
+    o = d[d["has_outcome"] & d["strip_ok"]]
     lag = tb.LAG[tenor]
     r = tb.richness(o)
     g = st.describe(o["GAP_U"], lag)
@@ -297,6 +298,75 @@ def headline(d: pd.DataFrame, tenor: str, label: str) -> dict[str, Any]:
     return {"run": label, "windows": len(o), "mean ρ_cop": tb.num(o["rho_cop"].mean()), "ρ_cop − ρ_real": f"{a:.3f} ± {sa:.3f}", "mean P_D": tb.pct(o["P_D"].mean()),
             "mean SS": tb.pct(o["SS_mkt"].mean()), "mean Str_B": tb.pct(o["Str_B_mkt"].mean()), "P_D / D": tb.num(r["richness"]), "variance factor": tb.num(r["variance factor"]),
             "convexity factor": tb.num(r["convexity factor"]), "GAP mean": tb.pct(g["mean"]), "GAP t": tb.num(g["t"], 2), "PKG_theta H mean": tb.pct(pk["mean"]), "PKG_theta H t": tb.num(pk["t"], 2)}  # fmt: skip
+
+
+def beyond_last_expiry(tenor: str) -> tuple[int, int, float]:
+    """``(entry dates with at least one name priced beyond its last listed expiry, entry
+    dates, median number of such names on those dates)`` of B1 at ``tenor``."""
+    legs = pd.read_parquet(dd.OUT / f"legs_{tenor}.parquet")
+    e = pd.read_parquet(dd.OUT / f"entries_{tenor}.parquet")
+    e = e[e["basket"] == "B1"].set_index("date")["expiry"]
+    hi = legs["bracket_hi"].astype(str)
+    beyond = hi.isin(["None", "nan", ""]) | (hi < legs["date"].map(e).astype(str))
+    per = beyond.groupby(legs["date"]).sum()
+    return (
+        int((per > 0).sum()),
+        len(per),
+        float(per[per > 0].median()) if (per > 0).any() else 0.0,
+    )
+
+
+def guards_effect(rep: Report, d: pd.DataFrame, tenor: str) -> None:
+    """Before and after the expiry guards of ``disp_smile`` (PROGRESS_Q2, "Expiries that are
+    not smiles"): the run kept in ``before_guards/`` (reports v1 and v2) against the current
+    one, on the same windows."""
+    root = dd.OUT / "before_guards"
+    if not (root / f"outcomes_{tenor}.parquet").exists():
+        return
+    old = tb.load(tenor, "B1", "", root=root)
+    lag = tb.LAG[tenor]
+    both = sorted(set(old.loc[old["has_outcome"], "date"]) & set(d.loc[d["has_outcome"], "date"]))
+    a = old[old["date"].isin(both)].set_index("date")
+    b = d[d["date"].isin(both)].set_index("date")
+    moved = (b["P_D"] - a["P_D"]).abs() > 1e-6
+    rows = []
+
+    def line(label: str, f: Any) -> None:
+        rows.append({"statistic": label, "before the guards (v1, v2)": f(a), "with the guards (v3)": f(b)})  # fmt: skip
+
+    def cell(col: str, mask: Any = None) -> Any:
+        def f(x: pd.DataFrame) -> str:
+            v = x[col] if mask is None else x.loc[mask(x), col]
+            g = st.describe(v, lag) if mask is None else st.describe_subset(x[col], mask(x), lag)
+            return f"{tb.pct(g['mean'])} (t {g['t']:.2f})"
+
+        return f
+
+    line("windows", lambda x: str(len(x)))
+    line("mean ρ_cop", lambda x: tb.num(x["rho_cop"].mean()))
+    line("mean P_D, % of notional", lambda x: tb.pct(x["P_D"].mean()))
+    line("mean single-name strip SS", lambda x: tb.pct(x["SS_mkt"].mean()))
+    line("mean basket straddle", lambda x: tb.pct(x["Str_B_mkt"].mean()))
+    line("price over realised, P_D / D", lambda x: tb.num(tb.richness(x[x["strip_ok"]])["richness"]))  # fmt: skip
+    for col, label in (("GAP_U", "gap"), ("PKG_theta_H", "PKG_θ H"), ("PKG_v_H", "PKG_v H"), ("PF_U", "PF U"), ("PF_H", "PF H")):  # fmt: skip
+        line(f"{label}: mean P&L, all", cell(col))
+        line(f"{label}: in sample", cell(col, lambda x: x["IS"].to_numpy(bool)))
+        line(f"{label}: out of sample", cell(col, lambda x: ~x["IS"].to_numpy(bool)))
+    rep.add("## Before and after the expiry guards\n")
+    dP = (b["P_D"] - a["P_D"])[moved]
+    dS = (b["SS_mkt"] - a["SS_mkt"])[moved]
+    worst = dP.abs().sort_values(ascending=False).head(5)
+    rep.add(
+        f"Reports v1 and v2 were priced before two guards on the vendor's expiries (PROGRESS_Q2, \"Expiries that are not smiles\"): an expiry listed with strikes on one side of the forward only is no longer used when the ticker has a two-sided one that day, and an expiry whose at-the-money vol is more than a factor 2 from its neighbours' is dropped. "
+        f"{int(moved.sum())} of {len(both)} windows change price; on them the Palladium forward moves by {100 * dP.mean():.3f} on average (the strip by {100 * dS.mean():.3f}), at most on "
+        + ", ".join(f"{dt} ({100 * dP[dt]:+.2f})" for dt in worst.index)
+        + " (% of notional).\n"
+    )
+    rep.table(
+        "guards_effect",
+        pd.DataFrame(rows),
+        "The headline of B1 before and after the expiry guards, on the same windows; % of notional, Hansen–Hodrick t.",
+    )
 
 
 def sensitivities(rep: Report, d: pd.DataFrame, tenor: str) -> None:
@@ -348,7 +418,7 @@ def multi(rep: Report, tenor: str) -> None:
                                  "5 %": tb.pct(s["q05"]), "mean P_G": tb.pct(g["P_G"].mean()), "mean G": tb.pct(g["G"].mean()), "n": int(s["n"])})  # fmt: skip
         if basket == "B1":
             for sample, g in (("all", o), ("IS", o[o["IS"]]), ("OOS", o[~o["IS"]])):
-                g = g[g["EQV"].gt(0)]
+                g = g[g["strip_ok"]]
                 r = tb.richness(g)
                 rows_rich.append({"run": tag, "sample": sample, "windows": len(g), "P_D / D": tb.num(r["richness"]), "variance factor": tb.num(r["variance factor"]), "convexity factor": tb.num(r["convexity factor"]),
                                   "κ_Q": tb.num(r["kappa_Q"]), "κ_P": tb.num(r["kappa_P"]), "mean window VR": tb.num(g["vr_window"].mean(), 2), "PF U − PF H": tb.pm(*st.mean_se(g["PF_U"] - g["PF_H"], lag)[:2])})  # fmt: skip
@@ -381,6 +451,7 @@ def multi(rep: Report, tenor: str) -> None:
         rep.add(
             "B2 is the PM's definition (weights 1/30) on the same names; its basket straddle has no listed price and is the copula's at the Dow's ρ_cop (so the copula prices both legs of its package). Standard errors use each tenor's own Hansen–Hodrick lag.\n"
         )
+        rep._gap_runs = pd.DataFrame(rows_gap)  # type: ignore[attr-defined]
         rep.table(
             "T17_other_runs",
             pd.DataFrame(rows_gap),
@@ -390,7 +461,7 @@ def multi(rep: Report, tenor: str) -> None:
             rep.table(
                 "T4_T6_other_tenors",
                 pd.DataFrame(rows_rich),
-                "The richness split (T4), the realised variance ratio of the windows and the unhedged-minus-hedged forward (T6) by tenor, B1.",
+                "The richness split (T4), the realised variance ratio of the windows and the unhedged-minus-hedged forward (T6) by tenor, B1. At 12 and 24 months the pooled split is dominated by the entries of 2008–09, where single-name vols of 150 % and more are extrapolated flat to the tenor: read the out-of-sample row.",
             )
         rep.table(
             "T13_other_runs",
@@ -469,6 +540,22 @@ def costs(
                 s1 = st.describe(t2.stream(dn, pick, False).reindex(o.index)[sel], lag)
                 row[f"{sample} net, margin {m}"] = f"{tb.pct(s1['mean'])} ({s1['t']:.1f})"
         rows.append(row)
+    try:
+        c14 = pd.DataFrame(rows).set_index("strategy")
+        col_is, col_oos = (
+            "IS net, margin 2 correlation points",
+            "OOS net, margin 2 correlation points",
+        )
+        rep._costs = (
+            "; ".join(
+                f"{k} {c14.loc[k, col_is]} in sample, {c14.loc[k, col_oos]} out of sample"
+                for k in c14.index
+                if k in ("R1", "R2", "always PF U", "always PKG_theta H")
+            )
+            + " (mean, % of notional, t in brackets)."
+        )  # type: ignore[attr-defined]
+    except Exception:
+        pass
     rep.table(
         "T14_costs",
         pd.DataFrame(rows),
@@ -537,19 +624,44 @@ def pm_summary(rep: Report, d: pd.DataFrame, PT: pd.DataFrame, tenor: str) -> No
         f"5. **With or without the vol level?** Indicator: single-name vol premium (implied over forecast). Evidence: hedged vega-neutral package {mean('PKG_v_H')}, theta-neutral {mean('PKG_theta_H')}; by the indicator: {evidence('Q5')}. Today: {today('single-name vol premium')}.\n",
         "**The rules against always doing the same thing** (unit notional, % of notional):\n",
     ]
-    for name in ("R1", "R2", "always PF U", "always PKG_theta H", "always PKG_v H"):
-        g = t14[(t14["strategy"] == name) & t14["units"].str.startswith("unit")]
-        if g.empty:
-            continue
-        txt = "; ".join(
-            f"{r_['sample']}: mean {r_['mean']} (t {r_['t']}), s.d. {r_['sd']}, worst {r_['worst']}"
-            for r_ in g.to_dict("records")
+    unit = t14[t14["units"].str.startswith("unit")]
+
+    def rule_text(name: str, full: bool) -> str:
+        g = unit[unit["strategy"] == name]
+        if full:
+            return "; ".join(
+                f"{r_['sample']} mean {r_['mean']} (t {r_['t']}), s.d. {r_['sd']}, worst {r_['worst']}"
+                for r_ in g.to_dict("records")
+            )
+        return ", ".join(
+            f"{r_['sample']} {r_['mean']} (t {r_['t']})" for r_ in g.to_dict("records")
         )
-        lines.append(f"- **{name}**: {txt}.")
+
+    names = {
+        "R1": "R1, the pre-registered leaf list on the indicators",
+        "R2": "R2, the structure with the best forecast Sharpe from the filtered historical simulation",
+    }
+    for name, label in names.items():
+        if (unit["strategy"] == name).any():
+            lines.append(
+                f"- **{label}**: {rule_text(name, True)}; against always the hedged theta-neutral package: {rule_text(f'{name} minus always PKG theta H', False)}."
+            )
+    lines.append(
+        f"- **Always the same structure**: hedged theta-neutral package {rule_text('always PKG_theta H', False)}; hedged vega-neutral package {rule_text('always PKG_v H', False)}; "
+        f"Palladium forward held to expiry {rule_text('always PF U', False)}; hedged {rule_text('always PF H', False)}."
+    )
     p15 = sec["p15"].set_index("quantity")["value"]
     lines.append(
         f"\nToday R1 selects **{p15.get('R1 selects', 'not available')}**, R2 selects **{p15.get('R2 selects', 'not available')}**.\n"
     )
+    cost = getattr(rep, "_costs", None)
+    if cost is not None:
+        lines.append(
+            f"*Net of costs* (half the listed bid-ask on every straddle, 1 bp on hedges, two correlation points of dealer margin on the Palladium): {cost}\n"
+        )
+    ms_path = dd.OUT / f"model_s_{tenor}.parquet"
+    if ms_path.exists():
+        lines.append("*Model.* " + first_page_model_s(sec, tenor).strip() + "\n")
     lines.append(
         "*Limits.* The Palladium has no market price: its price here is a constant-correlation model's at the DJX-implied correlation, before any dealer margin (the report gives the margin at which each conclusion flips). About 40 independent three-month windows in sample and 37 out of sample.\n"
     )
@@ -940,6 +1052,14 @@ def first_page_model_s(sec: dict[str, Any] | None, tenor: str) -> str:
     )
 
 
+def first_page_gap_runs(runs: pd.DataFrame | None) -> str:
+    if runs is None or runs.empty:
+        return ""
+    g = runs[(runs["structure"] == "GAP") & (runs["sample"] == "all")]
+    txt = "; ".join(f"{r['run']} {r['mean']} (t {r['t']})" for r in g.to_dict("records"))
+    return f" Other tenors and the equally weighted basket, whole sample: {txt} (T17_other_runs; at 12 and 24 months most windows are priced beyond the last listed expiry of some names, and there are few independent windows)."
+
+
 def first_page_rules(sec: dict[str, Any]) -> str:
     t14 = sec["t14"]
     g = t14[t14["units"].str.startswith("unit")]
@@ -1022,6 +1142,7 @@ def build(version: int, tenor: str, pdf: bool) -> None:
         safe(rep2, "second phase", lambda: second_phase(rep2, d, tenor, dec))
     sec = getattr(rep2, "_second", None)
     rep._second = sec  # type: ignore[attr-defined]
+    rep._costs = getattr(rep2, "_costs", None)  # type: ignore[attr-defined]
     c1_path = dd.OUT / "c1.json"
     c1 = json.loads(c1_path.read_text()) if c1_path.exists() else {}
 
@@ -1077,8 +1198,8 @@ def build(version: int, tenor: str, pdf: bool) -> None:
             f"skew {o[s].skew():.2f}",
         )
     r_is, r_oos = (
-        tb.richness(o[o["IS"] & o["EQV"].gt(0)]),
-        tb.richness(o[~o["IS"] & o["EQV"].gt(0)]),
+        tb.richness(o[o["IS"] & o["strip_ok"]]),
+        tb.richness(o[~o["IS"] & o["strip_ok"]]),
     )
 
     def kq_ci(g: pd.DataFrame) -> tuple[float, float]:
@@ -1091,8 +1212,8 @@ def build(version: int, tenor: str, pdf: bool) -> None:
         r = (mu[:, 0] / np.sqrt(mu[:, 1])) / (mu[:, 2] / np.sqrt(mu[:, 3]))
         return float(np.percentile(r, 2.5)), float(np.percentile(r, 97.5))
 
-    lo_i, hi_i = kq_ci(o[o["IS"] & o["EQV"].gt(0)])
-    lo_o, hi_o = kq_ci(o[~o["IS"] & o["EQV"].gt(0)])
+    lo_i, hi_i = kq_ci(o[o["IS"] & o["strip_ok"]])
+    lo_o, hi_o = kq_ci(o[~o["IS"] & o["strip_ok"]])
     d4 = (
         "confirmed"
         if (lo_i > 1 and r_oos["convexity factor"] > 1)
@@ -1196,7 +1317,7 @@ def build(version: int, tenor: str, pdf: bool) -> None:
 
     # ---- first page
     full = st.describe(o["GAP_U"], lag)
-    rall = tb.richness(o[o["EQV"].gt(0)])
+    rall = tb.richness(o[o["strip_ok"]])
     stats = {
         k: st.describe(o[c], lag)
         for k, c in (
@@ -1226,7 +1347,8 @@ def build(version: int, tenor: str, pdf: bool) -> None:
         + ("Calls by strike: T5 (version 2)." if sec is None else first_page_calls(sec))
         + first_page_model_s(sec, tenor),
         f"2. **Palladium or package.** The gap (Palladium forward minus the vega-neutral package, which pays exactly G) cost {tb.pct(o['P_G'].mean(), 2)} and paid {tb.pct(o['G'].mean(), 2)}: mean P&L {tb.pct(full['mean'])} (t {full['t']:.2f}, hit rate {full['hit']:.2f}); "
-        f"in sample {tb.pct(g_is['mean'])} (t {g_is['t']:.2f}), out of sample {tb.pct(g_oos['mean'])} (t {g_oos['t']:.2f}) (T17). Conditions: T17b; primary test Q2 (GP_G): {q4.loc['Q2', 'verdict'] if 'Q2' in q4.index else 'not testable'}.",
+        f"in sample {tb.pct(g_is['mean'])} (t {g_is['t']:.2f}), out of sample {tb.pct(g_oos['mean'])} (t {g_oos['t']:.2f}) (T17). Conditions: T17b; primary test Q2 (GP_G): {q4.loc['Q2', 'verdict'] if 'Q2' in q4.index else 'not testable'}."
+        + first_page_gap_runs(getattr(rep2, "_gap_runs", None)),
         f"3. **Horizon.** Unhedged minus hedged Palladium forward: {tb.pm(*st.mean_se(o['PF_U'] - o['PF_H'], lag)[:2])}; primary test Q3 (trailing VR_cs): {q4.loc['Q3', 'verdict'] if 'Q3' in q4.index else 'not testable'}. "
         f"Realised variance ratio of the windows: mean {o['vr_window'].mean():.2f} (median {o['vr_window'].median():.2f}). "
         + (
@@ -1278,6 +1400,22 @@ def build(version: int, tenor: str, pdf: bool) -> None:
         f"{acts[['ex_date', 'parent']].drop_duplicates().shape[0] if len(acts) else 0} corporate actions (`corp_actions.csv`), each checked against the prices around its ex-date: a frozen basket holds what one entry share became, spun-off shares included at their own prices. "
         f"{int(o['basket_event'].sum())} of {len(o)} windows contain a membership change or a corporate action (`basket_event`).\n"
     )
+    wanted = dd.entry_dates(dd.TENORS[tenor])
+    missing = sorted(set(wanted) - set(d["date"]))
+    rep.add(
+        f"**Entry dates left out: {len(missing)} of {len(wanted)}** ({', '.join(missing)}): a member has no usable smile within five trading days (GM in December 2008, KFT in December 2010 and RTX in April 2020 have no row in the store), "
+        f"or has no price move over the whole window ({', '.join(d.attrs.get('stuck_dates', [])) or 'none'}: General Motors on its last day of listing).\n"
+    )
+    scan = dd.OUT / "smile_scan_removed.csv"
+    if scan.exists():
+        rm = pd.read_csv(scan)
+        one, term = rm[rm["guard"] == "one-sided"], rm[rm["guard"] == "term structure"]
+        rep.add(
+            f"**Expiries that are not smiles** (measured on every expiry of every entry date, `scripts/disp_scan_smiles.py`): {len(one)} expiries on {one['date'].nunique()} entry dates have usable strikes on one side of the forward only and are not used when the ticker has a two-sided expiry that day "
+            f"(UNH's November 2017 expiry in the summer of 2017: five strikes from 45 to 65 for a share at 195); {len(term)} expiries of five weeks or more on {term['date'].nunique()} dates have an at-the-money vol more than a factor {ds.TERM_BAND:g} from the median of the four nearest expiries and are dropped "
+            "(XOM's September 2017 expiry in March 2017: 200 % between two expiries at 16 %). Citigroup and General Motors on five entry dates of February–March 2009 have one-sided expiries only (shares under the lowest listed strike): their smile is the nearest strike's vol, flat. "
+            'Reports v1 and v2 were priced before these two guards; the section "Before and after the expiry guards" gives the difference.\n'
+        )
     if c1:
         rows = []
         for cls, r in c1["report"].items():
@@ -1387,7 +1525,8 @@ def build(version: int, tenor: str, pdf: bool) -> None:
     rep.table(
         "T4",
         T4,
-        "D4: the richness split, pooled so that the identity is exact: mean P_D over mean realised D = √(mean E^Q[V] / mean V) × κ_Q/κ_P; and κ_Q/κ_P = (κ_cop/κ_P) × √(E^cop[V]/E^Q[V]), the last factor being how far the copula's own squared dispersion is from the strips'.",
+        "D4: the richness split, pooled so that the identity is exact: mean P_D over mean realised D = √(mean E^Q[V] / mean V) × κ_Q/κ_P; and κ_Q/κ_P = (κ_cop/κ_P) × √(E^cop[V]/E^Q[V]), the last factor being how far the copula's own squared dispersion is from the strips'. "
+        + f"Windows left out because the strips' squared dispersion is not positive or is more than a factor 3 from the copula's: {int((d['has_outcome'] & ~d['strip_ok']).sum())}.",
     )
     rep.table(
         "T7",
@@ -1493,6 +1632,8 @@ def build(version: int, tenor: str, pdf: bool) -> None:
     if version >= 2:
         safe(rep, "phase 4", lambda: third_phase(rep, sec["d"] if sec else d, tenor))
     safe(rep, "sensitivities", lambda: sensitivities(rep, d, tenor))
+    if version >= 3:
+        safe(rep, "guards", lambda: guards_effect(rep, d, tenor))
 
     # ---- limits
     rep.add("## Limits\n")
@@ -1500,11 +1641,20 @@ def build(version: int, tenor: str, pdf: bool) -> None:
         "- **Vendor values and the forward.** Vols are inverted from ORATS's values, not from quotes; the forward of every leg is parity on those values near the money (PROGRESS_Q2 section 2), about 0.2–0.3 % of spot above a dividend-consistent forward for dividend payers at three months. The vendor-vol and rule-(c) sensitivities quantify what the convention moves.\n"
         "- **American exercise.** Single-name and DIA values are American; the out-of-the-money early-exercise premium is ignored.\n"
         "- **The Palladium has no market price.** Its price is the copula's at the correlation that reprices the listed basket straddle; a dealer's quote differs by a margin and by the model (correlation skew, stochastic vol): phase 4 (model S) and the cost section address part of it.\n"
-        "- **Hedges.** Daily at the ORATS snapshot, price changes only: the carry of the hedge and transaction costs are ignored here.\n"
+        "- **Hedges.** Daily at the ORATS snapshot, price changes only: the carry of the hedge is ignored; transaction costs are in the cost section only.\n"
         "- **Overlap and power.** Weekly entries of 13-week windows: about 77 independent windows over the sample (about 40 in sample, 37 out of sample). Standard errors are Hansen–Hodrick; the non-overlapping column is the plain check.\n"
         "- **Frozen basket against the index.** DJX options price the index, whose composition and divisor change; payoffs use the frozen basket (tracking above).\n"
-        "- **Survivorship of B3**, costs, the other tenors and baskets: later versions.\n"
     )
+    if version >= 3:
+        b12, b24 = beyond_last_expiry("12m"), beyond_last_expiry("24m")
+        rep.add(
+            "- **Vendor expiries.** Two guards remove expiries that are not smiles (data section); what the factor 2 does not catch is left as is: DJX long-dated expiries at 1.5–1.8 times their neighbours on four dates of 2023 and at half on two dates of 2007 (they bracket 12 and 24 months only), UTX's July 2019 expiry on 2018-12-03.\n"
+            f"- **Long tenors.** At least one name is priced beyond its last listed expiry on {b12[0]} of {b12[1]} entry dates at 12 months and on {b24[0]} of {b24[1]} at 24 months ({b24[2]:.0f} names of 30 in the median): the 24-month prices are an extrapolation of the 12–18-month smiles, and there are about 19 and 9 independent windows. Read the 12- and 24-month rows as a sensitivity, not as evidence.\n"
+            "- **B3 is survivorship-biased** (the ten names are the large caps of 2026, held back to 2007): the level of its P&L is not evidence; only the comparison between structures on the same windows is read.\n"
+            "- **Model S and C8** run on subsets (the first entry of each month; twelve dates). C8's local vols overstate the single-name strip by about 1 % (SVI fit and time stepping), which the last column of its table removes.\n"
+        )
+    else:
+        rep.add("- **Survivorship of B3**, costs, the other tenors and baskets: later versions.\n")
     VT.to_csv(OUT / "tables" / "verdict_q2.csv", index=False)
     if version >= 2:
         safe(rep, "pm summary", lambda: pm_summary(rep, sec["d"] if sec else d, PT, tenor))

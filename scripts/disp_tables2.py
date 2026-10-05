@@ -595,7 +595,7 @@ def model_s_tables(d: pd.DataFrame, tenor: str) -> dict[str, pd.DataFrame]:
     out["model_S"] = pd.DataFrame(rows)
     rows = []
     for label, g in (("all", o), ("IS", o[o["IS"]]), ("OOS", o[~o["IS"]])):
-        g = g[g["EQV"].gt(0)]
+        g = g[g["strip_ok"]]
         if len(g) < 12:
             continue
         r0 = tb.richness(g)

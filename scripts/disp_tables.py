@@ -9,6 +9,7 @@ DataFrame, P&L in % of notional.  No pricing here.
 # ruff: noqa: E501, RUF001
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -81,15 +82,29 @@ def num(x: float, digits: int = 3) -> str:
     return "–" if not np.isfinite(x) else f"{x:.{digits}f}"
 
 
-def load(tenor: str = "3m", basket: str = "B1", suffix: str = "") -> pd.DataFrame:
-    e = pd.read_parquet(dd.OUT / f"entries_{tenor}{suffix}.parquet")
-    o = pd.read_parquet(dd.OUT / f"outcomes_{tenor}{suffix}.parquet")
+def load(
+    tenor: str = "3m", basket: str = "B1", suffix: str = "", root: Path | None = None
+) -> pd.DataFrame:
+    """One run's entries, outcomes and indicators, one row per entry date of ``basket``
+    (``root``: another folder than the study's output, for the copy kept of an earlier run)."""
+    root = dd.OUT if root is None else root
+    e = pd.read_parquet(root / f"entries_{tenor}{suffix}.parquet")
+    o = pd.read_parquet(root / f"outcomes_{tenor}{suffix}.parquet")
     o = o.rename(columns={"csad_g0": "w_csad_g0", "csad_g1": "w_csad_g1", "csad_g2": "w_csad_g2"})
     d = e.merge(o, on=["date", "basket", "tenor"], how="left")
-    ind_path = dd.OUT / f"indicators_{tenor}{suffix}.parquet"
+    ind_path = root / f"indicators_{tenor}{suffix}.parquet"
     if ind_path.exists():
         d = d.merge(pd.read_parquet(ind_path), on=["date", "basket", "tenor"], how="left")
     d = d[d["basket"] == basket].sort_values("date").reset_index(drop=True)
+    # an entry on which a member has no price move over the whole window (GM on its last day of
+    # listing, 2009-06-01; KFT's month without a row in the store at one month) is not a
+    # tradable basket: left out, like the dates without a usable smile
+    stuck = (
+        d["stuck_names"].fillna(0) > 0 if "stuck_names" in d else pd.Series(False, index=d.index)
+    )
+    dropped = list(d.loc[stuck, "date"])
+    d = d[~stuck].reset_index(drop=True)
+    d.attrs["stuck_dates"] = dropped
     d["year"] = d["date"].str[:4]
     d["IS"] = d["date"] <= dd.IS_END
     d["sample"] = np.where(d["IS"], "IS", "OOS")
@@ -97,6 +112,10 @@ def load(tenor: str = "3m", basket: str = "B1", suffix: str = "") -> pd.DataFram
     for label, lo, hi in PERIODS:
         d.loc[(d["year"] >= lo) & (d["year"] <= hi), "period"] = label
     d["has_outcome"] = d["D"].notna()
+    # the strips' squared dispersion is usable when it is positive and within a factor 3 of the
+    # copula's own (a member on its last day of listing can carry a vol of several hundred
+    # percent, extrapolated flat to the tenor: GM on 2009-06-01 at 6 and 12 months)
+    d["strip_ok"] = d["EQV"].gt(0) & d["EQV"].between(d["EV"] / 3.0, d["EV"] * 3.0)
     # realised counterparts
     d["rho_gap_atm"] = d["rho_atm"] - d["rho_real"]
     d["rho_gap_cop"] = d["rho_cop"] - d["rho_real"]
@@ -281,7 +300,7 @@ def richness(g: pd.DataFrame) -> dict[str, float]:
 
 
 def t4(d: pd.DataFrame) -> pd.DataFrame:
-    o = d[d["has_outcome"] & d["EQV"].gt(0)]
+    o = d[d["has_outcome"] & d["strip_ok"]]
     rows = []
     groups: list[tuple[str, pd.DataFrame]] = [("all", o), ("IS", o[o["IS"]]), ("OOS", o[~o["IS"]])]
     groups += [(label, o[o["period"] == label]) for label, _, _ in PERIODS]

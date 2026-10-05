@@ -36,6 +36,18 @@ MIN_STRIKES: Final = 3
 #: band of the median carry of the ticker's expiries.
 VENDOR_BAND: Final = 2.0
 FORWARD_TOLERANCE: Final = (0.03, 0.05)
+#: Added after report v2 (PROGRESS_Q2, "Expiries that are not smiles"; measured on every
+#: expiry of every entry date by ``scripts/disp_scan_smiles.py``).  (1) When a ticker has, on
+#: the day, expiries with usable strikes on both sides of the forward, the expiries with
+#: strikes on one side only are dropped: their at-the-money vol would be the flat
+#: extrapolation of a wing (UNH's November 2017 expiry on 2017-08-28: five strikes from 45 to
+#: 65 for a share at 195, vols of 160 %).  (2) An expiry of five weeks or more whose
+#: at-the-money vol is more than a factor ``TERM_BAND`` from the median of the four expiries
+#: nearest in order is dropped (XOM's September 2017 expiry in March 2017: 200 % between two
+#: expiries at 16 %).  ``EXPIRY_GUARDS`` is the switch of the scan that measures both.
+TERM_BAND: Final = 2.0
+TERM_MIN_T: Final = 0.1
+EXPIRY_GUARDS: bool = True
 #: Carry rules for the forward of an American name: ``F = S·exp(carry·T)``.
 FORWARD_RULES: Final = ("rate", "rate_plus_residual", "parity")
 #: Latent grid of the quantile tables: ``2^14`` points on ``[−8, 8]``.
@@ -59,6 +71,41 @@ class ExpirySmile:
     def at(self, k: FloatArray, vendor: bool = False) -> FloatArray:
         """Vol at ``k``: linear between strikes, flat outside the listed range."""
         return np.interp(k, self.k, self.vendor_vol if vendor else self.vol)
+
+
+def money_reach(k: FloatArray) -> tuple[float, float]:
+    """Log-moneyness of the nearest strike at or below the forward and at or above it
+    (``-inf`` / ``+inf`` when a side has none)."""
+    below, above = k[k <= 0.0], k[k >= 0.0]
+    return (
+        float(below.max()) if below.size else float("-inf"),
+        float(above.min()) if above.size else float("inf"),
+    )
+
+
+def two_sided(k: FloatArray) -> bool:
+    """Whether the strikes of one expiry stand on both sides of the forward."""
+    below, above = money_reach(k)
+    return bool(np.isfinite(below) and np.isfinite(above))
+
+
+def term_ratio(atm: FloatArray) -> FloatArray:
+    """Each expiry's at-the-money vol over the median of the four expiries nearest in order
+    (two on each side; towards an end, the four nearest); NaN with fewer than three expiries."""
+    v = np.asarray(atm, dtype=np.float64)
+    n = v.size
+    out = np.full(n, np.nan)
+    if n < 3:
+        return out
+    for i in range(n):
+        lo, hi = max(0, i - 2), min(n, i + 3)
+        while hi - lo < 5 and (lo > 0 or hi < n):
+            if lo > 0:
+                lo -= 1
+            if hi - lo < 5 and hi < n:
+                hi += 1
+        out[i] = v[i] / np.median(np.concatenate([v[lo:i], v[i + 1 : hi]]))
+    return out
 
 
 def parity_forward(g: pd.DataFrame, spot: float, df: float, band: float = 0.10) -> float:
@@ -145,7 +192,11 @@ def expiry_smiles(
                 int(K.size - good.sum()),
             )
         )
-    return consistent_forwards(out, spot)
+    if EXPIRY_GUARDS:
+        both = [e for e in out if two_sided(e.k)]
+        out = both or out
+    out = consistent_forwards(out, spot)
+    return consistent_vols(out) if EXPIRY_GUARDS else out
 
 
 def consistent_forwards(smiles: list[ExpirySmile], spot: float) -> list[ExpirySmile]:
@@ -161,6 +212,20 @@ def consistent_forwards(smiles: list[ExpirySmile], spot: float) -> list[ExpirySm
         for e in smiles
         if abs(np.log(e.forward / spot) - m * e.T)
         <= FORWARD_TOLERANCE[0] + FORWARD_TOLERANCE[1] * e.T
+    ]
+
+
+def consistent_vols(smiles: list[ExpirySmile]) -> list[ExpirySmile]:
+    """Drop the expiries of :data:`TERM_MIN_T` or more whose at-the-money vol (linear between
+    strikes) is more than a factor :data:`TERM_BAND` from the median of the four expiries
+    nearest in order (:func:`term_ratio`)."""
+    if len(smiles) < 3:
+        return smiles
+    ratio = term_ratio(np.array([float(np.interp(0.0, e.k, e.vol)) for e in smiles]))
+    return [
+        e
+        for e, x in zip(smiles, ratio, strict=True)
+        if e.T < TERM_MIN_T or not np.isfinite(x) or 1.0 / TERM_BAND <= x <= TERM_BAND
     ]
 
 

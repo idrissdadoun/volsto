@@ -127,6 +127,9 @@ def outcome_row(
         "absR": absR, "absRb": absRb, "D_rel": float(t["D_rel"]), **cs, **st, **hd,
         "basket_event": bool(event or changed), "corporate_action": bool(event), "membership_change": bool(changed),
         "carried_days": carried, **track,
+        # members without a single price move in the window (delisted the next day, or no row
+        # in the store for the whole window): not a tradable basket
+        "stuck_names": int(np.sum(np.all(np.diff(path, axis=0) == 0.0, axis=0))),
         "gap_formula_error": float(abs(dp.gap_formula(path[-1], w) - t["G"])),
         "sandwich_violation": float(max(t["SD"] - t["D"], t["D"] - t["SD"] - 2 * absRb, 0.0)),
     }  # fmt: skip

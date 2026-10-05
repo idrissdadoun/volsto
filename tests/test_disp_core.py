@@ -352,3 +352,66 @@ def test_subset_mean_keeps_the_rows_at_their_place_in_time() -> None:
     assert whole[:2] == pytest.approx(st.mean_se(y, 12)[:2])
     d = st.describe_subset(y, mask, 12)
     assert d["mean"] == pytest.approx(mean) and d["t"] == pytest.approx(mean / se)
+
+
+def test_an_expiry_without_strikes_near_the_money_is_not_a_smile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An expiry listed with strikes far from the money only (the vendor's rows of UNH's
+    November 2017 expiry on 2017-08-28: strikes 45 to 65 for a share at 195, vols of 160 %)
+    must not set the at-the-money vol of the tenor it brackets."""
+    from volsto.market.bs import black_price
+
+    spot = 100.0
+
+    def rows(expiry: str, T: float, strikes: np.ndarray, vol: float) -> pd.DataFrame:
+        call = black_price(spot, strikes, T, vol, 1.0)
+        put = black_price(spot, strikes, T, vol, -1.0)
+        return pd.DataFrame(
+            {
+                "expirDate": expiry, "strike": strikes, "stkPx": spot, "cValue": call,
+                "pValue": put, "smoothSmvVol": vol, "iRate": 0.0, "residualRateData": 0.0,
+            }
+        )  # fmt: skip
+
+    near = rows("2017-10-20", 53 / 365.0, np.arange(80.0, 121.0, 5.0), 0.20)
+    far = rows("2017-11-17", 81 / 365.0, np.arange(25.0, 36.0, 2.5), 1.60)
+    late = rows("2017-12-15", 109 / 365.0, np.arange(80.0, 121.0, 5.0), 0.20)
+    chain = pd.concat([near, far, late], ignore_index=True)
+    smiles = ds.expiry_smiles(chain, "2017-08-28", "parity", spot=spot)
+    assert [e.expiry for e in smiles] == ["2017-10-20", "2017-12-15"]
+    atm = ds.build_marginal(ds.smile_at(smiles, spot, 0.25)).atm_vol
+    assert atm == pytest.approx(0.20, abs=2e-3)
+    # without the guards the far expiry brackets three months and the vol is nowhere near 20 %
+    monkeypatch.setattr(ds, "EXPIRY_GUARDS", False)
+    loose = ds.expiry_smiles(chain, "2017-08-28", "parity", spot=spot)
+    assert len(loose) == 3
+    assert ds.build_marginal(ds.smile_at(loose, spot, 0.25)).atm_vol > 0.5
+    monkeypatch.setattr(ds, "EXPIRY_GUARDS", True)
+    # a ticker with one-sided expiries only keeps them (nothing better that day)
+    alone = ds.expiry_smiles(far, "2017-08-28", "parity", spot=spot)
+    assert [e.expiry for e in alone] == ["2017-11-17"]
+    assert ds.money_reach(np.array([-0.4, -0.1, 0.05, 0.3])) == (-0.1, 0.05)
+    assert ds.two_sided(np.array([-0.1, 0.0, 0.2]))
+    assert not ds.two_sided(np.array([-1.4, -1.2, -1.1]))
+    # an expiry at ten times the vol of its neighbours (XOM, September 2017 expiry in March
+    # 2017) is dropped; a term structure that halves from one end to the other is kept
+    wild = pd.concat(
+        [
+            rows("2017-10-20", 53 / 365.0, np.arange(80.0, 121.0, 5.0), 0.20),
+            rows("2017-11-17", 81 / 365.0, np.arange(80.0, 121.0, 5.0), 1.90),
+            rows("2017-12-15", 109 / 365.0, np.arange(80.0, 121.0, 5.0), 0.21),
+            rows("2018-01-19", 144 / 365.0, np.arange(80.0, 121.0, 5.0), 0.22),
+        ],
+        ignore_index=True,
+    )
+    kept = ds.expiry_smiles(wild, "2017-08-28", "parity", spot=spot)
+    assert [e.expiry for e in kept] == ["2017-10-20", "2017-12-15", "2018-01-19"]
+    assert ds.term_ratio(np.array([0.8, 0.7, 0.6, 0.5, 0.4])) == pytest.approx(
+        [0.8 / 0.55, 0.7 / 0.55, 0.6 / 0.6, 0.5 / 0.65, 0.4 / 0.65]
+    )
+    sloped = [
+        ds.ExpirySmile(str(i), 0.1 * (i + 1), 1.0, 0.0, np.array([-0.1, 0.0, 0.1]), np.full(3, v), np.full(3, v), 0)
+        for i, v in enumerate([0.8, 0.7, 0.6, 0.5, 0.4])
+    ]  # fmt: skip
+    assert len(ds.consistent_vols(sloped)) == 5
