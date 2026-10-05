@@ -245,7 +245,8 @@ the 744 entries whose surface meets the eSSVI tolerances) and `report_built/` (a
 entries). The numbers below are from the strict sample, in % of the entry spot, with block
 standard errors over entry dates. The LSV daily series (every knock-out re-marked and hedged
 each day under the LSV, leverage recalibrated daily) covers the entries from 2021-06-01 so far:
-221 entry dates, 7,380 trades; the render is that of 2026-10-05 05:03.
+452 of 740 entry dates at the render of 2026-10-05 08:16 (2007–2011 and 2021-06 onwards; the
+2012–2021 block was still running and `outputs/interview/after_h.sh` re-renders when it ends).
 
 **What it confirms.**
 
@@ -279,6 +280,26 @@ each day under the LSV, leverage recalibrated daily) covers the entries from 202
   is negative in every tercile of every primary condition on the call side (−0.05 to −0.32), and
   most negative in the top tercile of the upside skew-stickiness ratio (−0.20 ± 0.03 at 1m against
   −0.08 ± 0.02 in the bottom tercile). On the put side the difference is small (0 to −0.1).
+- *What that hedged edge is made of (addendum 2, report v3).* The knock-out at one standard
+  deviation is short vega (−0.12 % of spot per vol point at 3m on the call side) and the fly is
+  not (+0.02); realised vol ran 1.4 ± 0.8 points below the entry implied vol over the lives. Read
+  as entry vega × that premium, the vol carry is +0.155 of the knock-out's +0.421 hedged P&L
+  and −0.215 of the −0.453 by which the fly trailed it; the rest, −0.238 ± 0.094, is not a
+  choice of vega sign. On that rest the justified share of the anchor gap at 3m and 1 sd is
+  1.55 [0.43, 2.81] on calls and 1.44 [0.39, 2.88] on puts (2.96 and 1.20 with the carry in),
+  beside 0.89 [0.04, 1.80] and 1.10 [0.53, 1.71] from the touch days: neither interval is inside
+  [0, 1] (P12 inconclusive), each contains the touch-day share. The carry is first order: per
+  trade, hedged knock-out = a + b·carry + c·touched gives b = 0.48 ± 0.25 with R² 0.07 (0.64 ±
+  0.07 and 0.50 for the spread), so the split is an estimate of means, not a per-trade
+  identity (P13 inconclusive). The same table by barrier, the conditions and the rules ex
+  carry, and the framework read-out are sections A2.11g–A2.12 of the report;
+  `report/pm_framework.md` is the one-page version.
+- *Touch frequencies.* At 3m and 1 sd the up barrier was touched on the daily rule in 19.4 ±
+  3.5 % of trades against a local-vol probability of 19.6 %; the down barrier in 21.7 ± 3.7 %
+  against 30.3 % (P14: confirmed on calls, contradicted on puts).
+- *Hedging costs.* The daily hedge of the 3m 1-sd call knock-out trades 4.7 times the notional
+  per trade against 3.4 for the fly; at 2 bp of the notional traded the fly-minus-knock-out
+  hedged difference moves from −0.453 to −0.428.
 - *The justified premium is above both anchors on the call side.* The knock-out premium at which
   the knock-out would only have matched the fly, hedged, is local vol plus 0.077 at 1m and 0.179
   at 3m, where the LSV adds 0.014 and 0.063: a share of 5.6 [3.8, 7.3] and 2.8 [1.9, 3.8] of the
