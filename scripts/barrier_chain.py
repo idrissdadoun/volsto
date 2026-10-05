@@ -134,6 +134,8 @@ def chain_job(entry: str) -> dict[str, Any]:
                 pieces = bh.expand_legs([(side, {name: legs[name]})])
                 cost = 0.0
                 for x, qty in zip(pieces["x"], pieces["q"], strict=True):
+                    if x <= 0:  # a put struck at or below zero: no value, no cost
+                        continue
                     hs, _ = q(T, float(x))
                     vol = float(np.asarray(surf.implied_vol(float(x), T)).reshape(()))
                     s_ = vol * np.sqrt(T)

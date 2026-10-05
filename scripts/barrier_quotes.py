@@ -128,6 +128,8 @@ def quote_job(entry: str) -> dict[str, Any]:
             for name in STRUCTURES:
                 total = 0.0
                 for leg in legs[name]:
+                    if leg.strike <= 0:  # a put struck at or below zero is worth nothing
+                        continue
                     v = qvol(T, leg.strike)
                     if not np.isfinite(v):
                         total = float("nan")
