@@ -281,7 +281,8 @@ series.
   always-knock-out.
 - *Fly or ratio.* Beyond one standard deviation on the call side the far call W is worth less than
   0.02 and ratio and fly are the same trade. Near the barrier the ratio earned 0.2–0.35 more than
-  the fly, hedged, at 3 months, for a worst 1 % unhedged outcome of −9 to −16 against −0.4 to −0.6.
+  the fly, hedged, at 3 months (barriers at 0.25 and 0.5 standard deviations), for a worst 1 %
+  unhedged outcome of −6 to −16 against −0.4 to −2.3 for the fly.
 
 **Limits to read these with.** The knock-out has no market price: its premium is a model's. The
 vanilla structures are priced on the fitted surface, which misses the quoted mids by 2–5 bp of
