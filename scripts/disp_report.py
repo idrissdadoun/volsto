@@ -108,11 +108,21 @@ class Report:
                 longest = [
                     max([len(str(c))] + [len(str(v)) for v in frame[c]]) for c in frame.columns
                 ]
+                # long text columns wrap; their widths are scaled so that the table fits the page
+                char = 0.105 if n > 11 else (0.125 if n > 7 else 0.15)  # cm per character
+                wide = [w_ > 30 for w_ in longest]
+                fixed = sum(
+                    char * w_ + 0.2 for w_, big in zip(longest, wide, strict=True) if not big
+                )
+                want = [min(char * w_, 7.5) for w_, big in zip(longest, wide, strict=True) if big]
+                room = max(26.0 - fixed, 4.0)
+                scale = min(1.0, room / sum(want)) if want else 1.0
+                widths = iter(want)
                 spec = "".join(
-                    (r">{\raggedright\arraybackslash}p{" + f"{min(0.11 * w_, 7.0):.1f}cm" + "}")
-                    if w_ > 42
+                    (r">{\raggedright\arraybackslash}p{" + f"{scale * next(widths):.1f}cm" + "}")
+                    if big
                     else "l"
-                    for w_ in longest
+                    for big in wide
                 )
                 head = " & ".join(
                     rf"\shortstack[l]{{{esc(str(c)).replace(' ', r' \\ ', 1) if n > 9 and len(str(c)) > 9 else esc(str(c))}}}"
@@ -284,13 +294,14 @@ def sensitivities(rep: Report, d: pd.DataFrame, tenor: str) -> None:
     ):
         if (dd.OUT / f"outcomes_{tenor}{suffix}.parquet").exists():
             alt = tb.load(tenor, "B1", suffix)
-            both = d.merge(alt[["date"]], on="date")
             rows.append(headline(alt, tenor, label))
-            rows.append(
-                headline(d[d["date"].isin(alt["date"])], tenor, "base on the same dates")
-                if len(both) != len(d)
-                else {"run": "(same dates as the base)"}
-            )
+            same = set(alt.loc[alt["has_outcome"], "date"]) == set(d.loc[d["has_outcome"], "date"])
+            if not same:
+                rows.append(
+                    headline(
+                        d[d["date"].isin(alt["date"])], tenor, "base, on the dates of the run above"
+                    )
+                )
     if len(rows) > 1:
         rep.add("## Sensitivity of the headline to the vol and forward convention\n")
         rep.table(
@@ -378,6 +389,166 @@ def multi(rep: Report, tenor: str) -> None:
             pd.concat(rows_t2, ignore_index=True),
             "The gap by size of the basket's move, by tenor and basket.",
         )
+
+
+def costs(
+    rep: Report, d: pd.DataFrame, tenor: str, r1: pd.Series, r2: pd.Series, has_fhs: bool
+) -> None:
+    """Spec §11: the decision table, the rules, the gap and the calibration net of costs, and
+    the break-even dealer margins."""
+    import disp_tables2 as t2
+
+    rep.add("## Costs (sensitivity)\n")
+    rep.add(
+        "Mid prices everywhere above. Here: half the bid-ask of each straddle leg (ORATS quotes at the nearest listed strike and expiry, applied as they are: the listed expiry is not the tenor exactly), "
+        "1 bp of the notional traded by each daily hedge, and a dealer margin on the Palladium of two correlation points (price + 2·|∂P/∂ρ|) or, separately, of 5 % of the premium.\n"
+    )
+    lag = tb.LAG[tenor]
+    nets = {m: t2.net_of_costs(d, m) for m in ("2 correlation points", "5 % of the premium")}
+    o = d[d["has_outcome"]]
+    rows = []
+    for label in (
+        "PF U",
+        "PF H",
+        "PC(1) static hedge",
+        "SS U",
+        "SS H",
+        "BS U",
+        "PKG_v U",
+        "PKG_v H",
+        "PKG_theta U",
+        "PKG_theta H",
+        "GAP U",
+        "GAP_rho U",
+        "PF_v U",
+        "REV H",
+    ):
+        col = tb.STRUCTS[label]
+        row = {"structure": label}
+        for sample, sel in (("IS", o["IS"]), ("OOS", ~o["IS"])):
+            s0 = st.describe(o.loc[sel, col], lag)
+            row[f"{sample} at mid"] = f"{tb.pct(s0['mean'])} ({s0['t']:.1f})"
+            for m, dn in nets.items():
+                s1 = st.describe(dn.loc[o.index][sel][col], lag)
+                row[f"{sample} net, margin {m}"] = f"{tb.pct(s1['mean'])} ({s1['t']:.1f})"
+        rows.append(row)
+    rep.table(
+        "T13_T17_costs",
+        pd.DataFrame(rows),
+        "The decision table and the gap (T13, T17) at mid and net of costs: mean P&L in % of notional with its Hansen–Hodrick t; the two dealer margins change the Palladium structures only.",
+    )
+    rows = []
+    for name, pick in (
+        ("R1", r1),
+        ("R2", r2),
+        ("always PF U", pd.Series("PF_U", index=d.index)),
+        ("always PKG_theta H", pd.Series("PKG_theta_H", index=d.index)),
+        ("always PKG_v H", pd.Series("PKG_v_H", index=d.index)),
+    ):
+        if pick.notna().sum() == 0:
+            continue
+        row = {"strategy": name}
+        for sample, sel in (("IS", o["IS"]), ("OOS", ~o["IS"])):
+            y0 = t2.stream(d, pick, False).reindex(o.index)[sel]
+            s0 = st.describe(y0, lag)
+            row[f"{sample} at mid"] = f"{tb.pct(s0['mean'])} ({s0['t']:.1f})"
+            for m, dn in nets.items():
+                s1 = st.describe(t2.stream(dn, pick, False).reindex(o.index)[sel], lag)
+                row[f"{sample} net, margin {m}"] = f"{tb.pct(s1['mean'])} ({s1['t']:.1f})"
+        rows.append(row)
+    rep.table(
+        "T14_costs",
+        pd.DataFrame(rows),
+        "The rules and three always-strategies (T14) at mid and net of costs, unit notional: mean P&L in % of notional with its t. The picks are those made at mid.",
+    )
+    if has_fhs:
+        dn = nets["2 correlation points"].copy()
+        for s_, col in (
+            ("PF", "PF_U"),
+            ("PKG_v", "PKG_v_U"),
+            ("PKG_theta", "PKG_theta_U"),
+            ("GAP", "GAP_U"),
+        ):
+            dn[f"fedge_{s_}"] = d[f"fedge_{s_}"] - (d[col] - dn[col])
+        c, _ = t2.t18_fhs(dn, tenor)
+        rep.table(
+            "T18_costs",
+            c[c["structure"].isin(["PF", "PKG_v", "PKG_theta", "GAP"])],
+            "Calibration of the FHS edges net of costs (two correlation points on the Palladium): edge and P&L both net; a cost known at entry moves the intercept and the mean, not the ranking.",
+        )
+    rep.table(
+        "break_even_margin",
+        t2.break_even(d, tenor, r1, r2),
+        "Break-even dealer margin: the margin at which the mean P&L at mid (or a rule's advantage over always-PKG_theta H) is zero, in correlation points and in % of the Palladium premium, with block-bootstrap 95 % intervals. A negative number: the structure lost at mid, so any margin makes it worse; the PM knows the quote at which the choice flips.",
+    )
+
+
+def pm_summary(rep: Report, d: pd.DataFrame, PT: pd.DataFrame, tenor: str) -> None:
+    """``pm_summary_q2.md``: one page for the PM's reply."""
+    sec = getattr(rep, "_second", None)
+    if sec is None:
+        return
+    i15 = sec["i15"].set_index("indicator")
+    t14 = sec["t14"]
+    o = d[d["has_outcome"]]
+    lag = tb.LAG[tenor]
+    last = d["date"].iloc[-1]
+
+    def today(label: str) -> str:
+        if label not in i15.index:
+            return "not available"
+        r = i15.loc[label]
+        return f"{r['value']} (percentile {r['percentile (expanding)']}, in-sample tercile: {r['IS tercile']})"
+
+    def evidence(q: str) -> str:
+        r = PT[PT["test"] == q]
+        if r.empty:
+            return "not testable"
+        r = r.iloc[0]
+        unit = "× premium" if q == "Q4" else "% of notional"
+        return f"top minus bottom tercile {r['IS top − bottom']} in sample (t {r['IS t']}), {r['OOS top − bottom']} out of sample ({unit}); verdict: **{r['verdict']}**"
+
+    def mean(col: str) -> str:
+        a, b = st.describe(o.loc[o["IS"], col], lag), st.describe(o.loc[~o["IS"], col], lag)
+        return f"{tb.pct(a['mean'], 2)} % in sample (t {a['t']:.1f}), {tb.pct(b['mean'], 2)} % out of sample (t {b['t']:.1f})"
+
+    lines = [
+        "# Palladium or straddle dispersion: what the backtest says (one page)\n",
+        f"Dow basket (the thirty members at price weights, frozen at entry), {tenor} trades entered every week from {o['date'].min()} to {o['date'].max()}; in sample to 2016, out of sample after. The Palladium is priced with one correlation, the one that reprices the listed DJX straddle. "
+        f"P&L per unit of notional at mid; ± is a standard error for overlapping windows. Today is {last}. Nothing here goes beyond the verdict table of the report.\n",
+        "**The five questions, in order.**\n",
+        f"1. **Long dispersion at all?** Indicator: correlation premium (implied minus forecast correlation). Evidence: implied exceeded realised correlation by {st.mean_se(o['rho_gap_atm'], lag)[0]:.3f} ± {st.mean_se(o['rho_gap_atm'], lag)[1]:.3f} on average; the delta-hedged theta-neutral package earned {mean('PKG_theta_H')}; as a timing signal: {evidence('Q1')}. Today: {today('CRP')}.",
+        f"2. **Fixed or floating strike (Palladium or package)?** Indicator: gap premium (price of the gap over its Gaussian forecast). Evidence: the gap, Palladium forward minus vega-neutral package, earned {mean('GAP_U')}; by the indicator: {evidence('Q2')}. Today: {today('GP_G')}; gap price {tb.pct(d['P_G'].iloc[-1], 2)} % for a package at {tb.pct(d['SS_mkt'].iloc[-1] - d['Str_B_mkt'].iloc[-1], 2)} % and a forward at {tb.pct(d['P_D'].iloc[-1], 2)} %.",
+        f"3. **Terminal or daily (hold or delta-hedge)?** Indicator: trailing variance ratio of relative moves. Evidence: unhedged minus hedged Palladium forward {mean_diff(o, 'PF_U', 'PF_H', lag)}; by the indicator: {evidence('Q3')}. Today: {today('VR_cs')}.",
+        f"4. **Forward or call?** Indicator: variability of dispersion. Evidence: the call struck at the forward's price with a static basket hedge earned {mean('PC_100_S')} against {mean('PF_U')} for the forward; by the indicator: {evidence('Q4')}. Today: {today('variability')}.",
+        f"5. **With or without the vol level?** Indicator: single-name vol premium (implied over forecast). Evidence: hedged vega-neutral package {mean('PKG_v_H')}, theta-neutral {mean('PKG_theta_H')}; by the indicator: {evidence('Q5')}. Today: {today('single-name vol premium')}.\n",
+        "**The rules against always doing the same thing** (unit notional, % of notional):\n",
+    ]
+    for name in ("R1", "R2", "always PF U", "always PKG_theta H", "always PKG_v H"):
+        g = t14[(t14["strategy"] == name) & t14["units"].str.startswith("unit")]
+        if g.empty:
+            continue
+        txt = "; ".join(
+            f"{r_['sample']}: mean {r_['mean']} (t {r_['t']}), s.d. {r_['sd']}, worst {r_['worst']}"
+            for r_ in g.to_dict("records")
+        )
+        lines.append(f"- **{name}**: {txt}.")
+    p15 = sec["p15"].set_index("quantity")["value"]
+    lines.append(
+        f"\nToday R1 selects **{p15.get('R1 selects', 'not available')}**, R2 selects **{p15.get('R2 selects', 'not available')}**.\n"
+    )
+    lines.append(
+        "*Limits.* The Palladium has no market price: its price here is a constant-correlation model's at the DJX-implied correlation, before any dealer margin (the report gives the margin at which each conclusion flips). About 40 independent three-month windows in sample and 37 out of sample.\n"
+    )
+    (rep.out / "pm_summary_q2.md").write_text("\n".join(lines))
+
+
+def mean_diff(o: pd.DataFrame, a: str, b: str, lag: int) -> str:
+    x, y = (
+        st.describe(o.loc[o["IS"], a] - o.loc[o["IS"], b], lag),
+        st.describe(o.loc[~o["IS"], a] - o.loc[~o["IS"], b], lag),
+    )
+    return f"{tb.pct(x['mean'], 2)} % in sample (t {x['t']:.1f}), {tb.pct(y['mean'], 2)} % out of sample (t {y['t']:.1f})"
 
 
 def second_phase(rep: Report, d0: pd.DataFrame, tenor: str, dec: pd.DataFrame) -> None:
@@ -478,9 +649,19 @@ def second_phase(rep: Report, d0: pd.DataFrame, tenor: str, dec: pd.DataFrame) -
         p15,
         "Today: prices, sensitivities, forecast edges, and what the rules select.",
     )
+    safe(rep, "costs", lambda: costs(rep, d, tenor, r1, r2, has_fhs))
     safe(rep, "other runs", lambda: multi(rep, tenor))
     safe(rep, "figures", lambda: figures(rep, d, tenor, dec))
-    rep._second = {"t14": t14, "leaves": leaves, "i15": i15, "p15": p15, "t5": a, "d": d}  # type: ignore[attr-defined]
+    rep._second = {
+        "t14": t14,
+        "leaves": leaves,
+        "i15": i15,
+        "p15": p15,
+        "t5": a,
+        "d": d,
+        "r1": r1,
+        "r2": r2,
+    }  # type: ignore[attr-defined]
 
 
 def mean_verdict(
@@ -998,6 +1179,8 @@ def build(version: int, tenor: str, pdf: bool) -> None:
         "- **Survivorship of B3**, costs, the other tenors and baskets: later versions.\n"
     )
     VT.to_csv(OUT / "tables" / "verdict_q2.csv", index=False)
+    if version >= 2:
+        safe(rep, "pm summary", lambda: pm_summary(rep, d, PT, tenor))
     res = rep.write("report_q2", pdf)
     print(
         f"report v{version}: {len(rep.blocks)} blocks; {res.get('status')} {res.get('reason', '')[:300]}"

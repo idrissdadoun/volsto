@@ -484,3 +484,81 @@ def replica(d: pd.DataFrame, tenor: str) -> tuple[pd.DataFrame, pd.Series]:
                      "R² of the payoff": tb.num(1 - np.var(err) / np.var(g["D"]), 2), "mean replica price": tb.pct(rep_price.reindex(g.index).mean()), "mean P_D": tb.pct(g["P_D"].mean()),
                      "PF − REP: mean P&L": tb.pct(s["mean"]), "t": tb.num(s["t"], 2), "sd": tb.pct(s["sd"]), "n": int(s["n"])})  # fmt: skip
     return pd.DataFrame(rows), pnl
+
+
+def net_of_costs(d: pd.DataFrame, margin: str = "2 correlation points") -> pd.DataFrame:
+    """The frame with every P&L column net of the costs of spec §11: half the bid-ask of each
+    straddle leg (the vendor's quotes at the nearest listed strike and expiry), 1 bp of the
+    notional traded by each daily hedge, and a dealer margin on the Palladium — two correlation
+    points (``2·|∂P/∂ρ|``) or 5 % of the forward's price."""
+    x = d.copy()
+    hs_ss, hs_bs = x["half_spread_SS"].fillna(0.0), x["half_spread_B"].fillna(0.0)
+    if margin == "2 correlation points":
+        m_pf = 2.0 * x["dPD_drho"].abs()
+        m_c = {m: 2.0 * x[f"dC_drho_{m}"].abs() for m in tb.MULT}
+    else:
+        m_pf = 0.05 * x["P_D"]
+        m_c = {m: 0.05 * x[f"C_{m}"] for m in tb.MULT}
+    hedge = {"PF": 1e-4 * x["traded_PF"], "SS": 1e-4 * x["traded_SS"], "BS": 1e-4 * x["traded_BS"]}
+    for tag in ("U", "H"):
+        h = {k: (v if tag == "H" else 0.0) for k, v in hedge.items()}
+        pf, ss, bs = m_pf + h["PF"], hs_ss + h["SS"], hs_bs + h["BS"]
+        x[f"PF_{tag}"] -= pf
+        x[f"SS_{tag}"] -= ss
+        x[f"BS_{tag}"] -= bs
+        x[f"PKG_v_{tag}"] -= ss + bs
+        x[f"PKG_theta_{tag}"] -= ss + x["lam_theta"].abs() * bs
+        x[f"PKG_rho_{tag}"] -= ss + x["lambda_rho"].abs() * bs
+        x[f"GAP_{tag}"] -= pf + ss + bs
+        x[f"GAP_rho_{tag}"] -= pf + ss + x["lambda_rho"].abs() * bs
+        x[f"PF_v_{tag}"] -= pf + x["h_v"].abs() * ss
+        x[f"REV_{tag}"] -= ss + bs
+    for m in tb.MULT:
+        x[f"PC_{m}_U"] -= m_c[m]
+    x["PC_100_S"] -= m_c["100"]
+    return x
+
+
+def break_even(d: pd.DataFrame, tenor: str, r1: pd.Series, r2: pd.Series) -> pd.DataFrame:
+    """The dealer margin at which the mean P&L (or the advantage over always-PKG_theta H) is
+    zero: in correlation points (mean P&L over mean ``|∂P/∂ρ|``) and in % of the premium, with
+    block-bootstrap 95 % intervals.  A negative margin: the structure lost money at mid."""
+    o = d[d["has_outcome"]]
+    blk = tb.STEP[tenor]
+    rows = []
+
+    def row(
+        label: str, pnl: pd.Series, sens: pd.Series, prem: pd.Series, sel: pd.Series | None = None
+    ) -> None:
+        if sel is not None:
+            pnl, sens, prem = pnl[sel], sens[sel], prem[sel]
+        a, lo, hi = st.bootstrap_ratio(pnl, sens.abs(), blk)
+        b, lo2, hi2 = st.bootstrap_ratio(pnl, prem, blk)
+        rows.append({"structure": label, "break-even margin, correlation points": f"{a:.2f} [{lo:.2f}, {hi:.2f}]",
+                     "break-even margin, % of premium": f"{100 * b:.1f} [{100 * lo2:.1f}, {100 * hi2:.1f}]", "n": int(pnl.notna().sum())})  # fmt: skip
+
+    for sample, sel in (("all", o["D"].notna()), ("IS", o["IS"]), ("OOS", ~o["IS"])):
+        row(f"PF U, {sample}", o["PF_U"], o["dPD_drho"], o["P_D"], sel)
+        row(f"PC(1) U, {sample}", o["PC_100_U"], o["dC_drho_100"], o["C_100"], sel)
+        row(f"GAP, {sample}", o["GAP_U"], o["dPD_drho"], o["P_D"], sel)
+    base = o["PKG_theta_H"]
+    for name, pick in (("R1", r1), ("R2", r2)):
+        p = pick.reindex(o.index)
+        if p.notna().sum() == 0:
+            continue
+        y = stream(d, pick, False).reindex(o.index)
+        pall = p.isin(
+            ["PF_U", "PF_H", "PF_v_U", "PF_v_H", "PC_100_S"]
+        )  # the leaves that buy a Palladium
+        sens = o["dPD_drho"].abs().where(pall, 0.0)
+        prem = o["P_D"].where(pall, 0.0)
+        for sample, sel in (("IS", o["IS"]), ("OOS", ~o["IS"])):
+            m = sel & y.notna()
+            if sens[m].sum() > 0:
+                row(
+                    f"{name} minus always PKG_theta H, {sample} (margin on its Palladium leaves)",
+                    (y - base)[m],
+                    sens[m],
+                    prem[m],
+                )
+    return pd.DataFrame(rows)

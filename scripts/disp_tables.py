@@ -717,7 +717,12 @@ def t19(d: pd.DataFrame, tenor: str) -> pd.DataFrame:
                 strict=True,
             )
         ):
-            row[name] = f"{100 * fit['coef'][j + 1]:.2f} ({fit['t'][j + 1]:.1f})"
+            exact = (
+                fit["r2"] > 1.0 - 1e-9
+            )  # the structure is the factor itself (the basket straddle)
+            row[name] = (
+                f"{100 * fit['coef'][j + 1]:.2f} ({'identity' if exact else format(fit['t'][j + 1], '.1f')})"
+            )
             others = [k for k in range(len(factors)) if k != j]
             Xr = np.column_stack([np.ones(len(g)), *[g[factors[k]] for k in others]])
             res = (

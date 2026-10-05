@@ -41,15 +41,16 @@ LAST_DAY: Final = "2026-10-02"
 
 
 def cpu_budget() -> int:
-    """Processes the study may use now (spec §0.3): 6 until the barrier study's last LSV
-    block has ended, then 12."""
+    """Worker processes a pool of the study may use now (spec §0.3: at most 6 processes until
+    the barrier study's last LSV block has ended, then 12)."""
     import re
 
     try:
         done = re.search(r"done +H_lsv_daily_2012-01-03", NIGHT_LOG.read_text()) is not None
     except OSError:
         done = False
-    return 12 if done else 6
+    # one process of the budget is left to the session's foreground work (reports, checks)
+    return 11 if done else 5
 
 
 def day_path(date: str) -> Path:
