@@ -170,3 +170,31 @@ def describe(x: Any, lag: int) -> dict[str, float]:
         "hit": float(np.mean(v > 0)), "q05": float(np.quantile(v, 0.05)),
         "worst": float(v.min()), "n": float(n),
     }  # fmt: skip
+
+
+def subset_mean_se(y: Any, mask: Any, lag: int) -> tuple[float, float, int]:
+    """Mean of ``y`` over the rows of ``mask`` with a Hansen–Hodrick standard error that keeps
+    the rows at their place in time (a regression of ``y`` on the indicator of the subset and
+    of its complement over the whole series): the right error for a tercile or a rule's leaf,
+    whose dates are scattered."""
+    v = np.asarray(y, dtype=np.float64)
+    m = np.asarray(mask, dtype=bool) & np.isfinite(v)
+    n = int(m.sum())
+    if n < 3:
+        return (float(v[m].mean()) if n else float("nan")), float("nan"), n
+    ok = np.isfinite(v)
+    X = np.column_stack([m[ok].astype(float), (~m[ok]).astype(float)])
+    if X[:, 1].sum() == 0:
+        return mean_se(v[ok], lag)
+    fit = ols(v[ok], X, lag)
+    return float(fit["coef"][0]), float(fit["se"][0]), n
+
+
+def describe_subset(y: Any, mask: Any, lag: int) -> dict[str, float]:
+    """:func:`describe` of the rows of ``mask``, the t-statistic from :func:`subset_mean_se`."""
+    v = np.asarray(y, dtype=np.float64)
+    m = np.asarray(mask, dtype=bool)
+    out = describe(v[m], 0)
+    mean, se, _ = subset_mean_se(v, m, lag)
+    out["t"] = mean / se if np.isfinite(se) and se > 0 else float("nan")
+    return out

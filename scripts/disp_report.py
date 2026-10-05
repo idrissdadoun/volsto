@@ -38,6 +38,20 @@ from volsto.studies import latex as lx
 OUT = dd.OUT / "report"
 
 
+def stack(header: str, width: int) -> str:
+    """``header`` cut at spaces into LaTeX lines of at most ``width`` characters."""
+    lines: list[str] = []
+    cur = ""
+    for word in header.split(" "):
+        if cur and len(cur) + 1 + len(word) > width:
+            lines.append(cur)
+            cur = word
+        else:
+            cur = f"{cur} {word}".strip()
+    lines.append(cur)
+    return r" \\ ".join(lx.latex_escape(x) for x in lines)
+
+
 def md_table(frame: pd.DataFrame) -> str:
     head = "| " + " | ".join(str(c) for c in frame.columns) + " |"
     sep = "|" + "|".join("---" for _ in frame.columns) + "|"
@@ -105,9 +119,7 @@ class Report:
                 name, frame, caption = payload
                 n = frame.shape[1]
                 size = r"\tiny" if n > 11 else (r"\scriptsize" if n > 7 else r"\footnotesize")
-                longest = [
-                    max([len(str(c))] + [len(str(v)) for v in frame[c]]) for c in frame.columns
-                ]
+                longest = [max([8] + [len(str(v)) for v in frame[c]]) for c in frame.columns]
                 # long text columns wrap; their widths are scaled so that the table fits the page
                 char = 0.105 if n > 11 else (0.125 if n > 7 else 0.15)  # cm per character
                 wide = [w_ > 30 for w_ in longest]
@@ -115,7 +127,7 @@ class Report:
                     char * w_ + 0.2 for w_, big in zip(longest, wide, strict=True) if not big
                 )
                 want = [min(char * w_, 7.5) for w_, big in zip(longest, wide, strict=True) if big]
-                room = max(26.0 - fixed, 4.0)
+                room = max(25.0 - fixed, 4.0)
                 scale = min(1.0, room / sum(want)) if want else 1.0
                 widths = iter(want)
                 spec = "".join(
@@ -124,9 +136,10 @@ class Report:
                     else "l"
                     for big in wide
                 )
+                # a header is stacked on as many lines as it needs to be no wider than its cells
                 head = " & ".join(
-                    rf"\shortstack[l]{{{esc(str(c)).replace(' ', r' \\ ', 1) if n > 9 and len(str(c)) > 9 else esc(str(c))}}}"
-                    for c in frame.columns
+                    esc(str(c)) if big else rf"\shortstack[l]{{{stack(str(c), w_)}}}"
+                    for c, w_, big in zip(frame.columns, longest, wide, strict=True)
                 )
                 parts += [r"\begingroup", size, r"\setlength\tabcolsep{2.5pt}", rf"\noindent\textbf{{Table {esc(name)}.}} {lx.inline_to_latex(caption)}", "",
                           rf"\begin{{longtable}}{{@{{}}{spec}@{{}}}}", r"\toprule", head + r" \\", r"\midrule", r"\endhead"]  # fmt: skip

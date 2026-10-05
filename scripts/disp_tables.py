@@ -417,7 +417,7 @@ def t13(d: pd.DataFrame, tenor: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.Dat
                 for sample, g in frames:
                     lab = st.tercile(g[icol], cuts)
                     for k in ("low", "mid", "high"):
-                        s2 = st.describe(g.loc[lab == k, col], lag)
+                        s2 = st.describe_subset(g[col], (lab == k).to_numpy(), lag)
                         long.append(
                             {
                                 "structure": label,

@@ -362,7 +362,7 @@ def t14(
                         }
                     )
                     continue
-                s = st.describe(o.loc[m, leaf], tb.LAG[tenor])
+                s = st.describe_subset(o[leaf], m, tb.LAG[tenor])
                 leaves.append(
                     {
                         "rule": name,

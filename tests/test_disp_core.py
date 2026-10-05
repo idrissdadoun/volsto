@@ -337,3 +337,18 @@ def test_statistics_for_overlapping_windows() -> None:
     assert (r, lo, hi) == pytest.approx((0.5, 0.5, 0.5))
     pct = st.expanding_percentile(pd.Series(np.arange(200.0)), min_obs=104)
     assert np.isnan(pct[103]) and pct[150] == 1.0
+
+
+def test_subset_mean_keeps_the_rows_at_their_place_in_time() -> None:
+    rng = np.random.default_rng(6)
+    y = np.convolve(rng.standard_normal(2000), np.ones(13), mode="valid")
+    mask = (np.arange(y.size) // 50) % 3 == 0  # blocks of 50 weeks, one in three
+    mean, se, n = st.subset_mean_se(y, mask, 12)
+    assert mean == pytest.approx(float(y[mask].mean())) and n == int(mask.sum())
+    assert se > float(
+        y[mask].std(ddof=1) / np.sqrt(n)
+    )  # overlapping sums: wider than the naive error
+    whole = st.subset_mean_se(y, np.ones(y.size, dtype=bool), 12)
+    assert whole[:2] == pytest.approx(st.mean_se(y, 12)[:2])
+    d = st.describe_subset(y, mask, 12)
+    assert d["mean"] == pytest.approx(mean) and d["t"] == pytest.approx(mean / se)
