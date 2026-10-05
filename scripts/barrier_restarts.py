@@ -150,7 +150,7 @@ def main() -> None:
         slope, const = np.polyfit(g["n_lv_restart"], g["n_eff_lv"], 1)
         corr = float(np.corrcoef(g["n_lv_restart"], g["n_eff_lv"])[0, 1])
         out.append(
-            f"  {'call' if side > 0 else 'put'} side, {len(g)} cells: n_eff[lv] = {const:.3f} + {slope:.2f} × n_lv(restart), "
+            f"  {'call' if side > 0 else 'put'} side, {len(g)} cells: n_eff[lv] = {const:.3f} + {slope:.2f} x n_lv(restart), "
             f"correlation {corr:.2f}; medians {g['n_eff_lv'].median():.3f} against {g['n_lv_restart'].median():.3f}"
         )
     print("\n".join(out))
