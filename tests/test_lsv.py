@@ -7,6 +7,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import hashlib
+import json
 import platform
 import sys
 from pathlib import Path
@@ -416,9 +417,89 @@ def test_particle_estimator_switch_validation() -> None:
     assert to_mapping(ParticleConfig())["estimator"] == "binned"
     assert to_mapping(ParticleConfig(estimator="sorted"))["estimator"] == "sorted"
     # the default estimator refuses what it does not implement, by name
-    with pytest.raises(ValueError, match="set estimator='sorted'"):
-        ParticleConfig(kernel="quartic")
+    for bad in ({"kernel": "quartic"}, {"regression": "nadaraya_watson"}):
+        with pytest.raises(ValueError, match='set estimator="sorted"'):
+            ParticleConfig(**bad)
     assert ParticleConfig(kernel="quartic", estimator="sorted").kernel == "quartic"
+
+
+def test_stored_spec_of_a_pre_estimator_entry_reads_sorted(
+    spec: CalibrationSpec, market, tmp_path: Path
+) -> None:
+    """An entry written before the estimator was part of every record (code tags m3.2, m4b, m6,
+    no ``estimator`` in its ``spec.json``) reads ``estimator="sorted"`` through
+    ``LeverageCache.load_spec`` — the estimator it was computed with — and not the current
+    default; an entry that names its estimator reads that name; a record under a later tag
+    without the field is refused; nothing on disk is rewritten."""
+    from volsto.calibration.cache import (
+        LEVERAGE_NAME,
+        PRE_ESTIMATOR_CODE_TAGS,
+        SPEC_NAME,
+        read_guard,
+        record_estimator,
+    )
+    from volsto.calibration.particle import CALIBRATION_CODE_TAG
+    from volsto.config import from_mapping, to_mapping
+
+    fc, _, _ = market
+    assert spec.particle.estimator == "binned"  # the current default
+    assert {"m3.2", "m4b", "m6"} == PRE_ESTIMATOR_CODE_TAGS
+    assert set(read_guard()) >= PRE_ESTIMATOR_CODE_TAGS
+    assert CALIBRATION_CODE_TAG not in PRE_ESTIMATOR_CODE_TAGS
+    cache = LeverageCache(tmp_path / "cache")
+    lev = LeverageFunction(
+        np.array([0.0, 0.5, 1.0]), np.linspace(-1.0, 1.0, 5), np.ones((3, 5)), fc
+    )
+    current = to_mapping(spec)
+    old = {
+        **current,
+        "particle": {k: v for k, v in current["particle"].items() if k != "estimator"},
+    }
+    assert "estimator" not in old["particle"]
+
+    def entry(key: str, mapping: dict, code_tag: str | None) -> Path:
+        d = cache.root / key
+        d.mkdir(parents=True)
+        (d / SPEC_NAME).write_text(json.dumps(mapping, indent=1))
+        meta = {"seed": 1, "n_particles": 50_000}
+        if code_tag is not None:
+            meta["code_tag"] = code_tag
+        lev.with_values(lev.values, **meta).save(d / LEVERAGE_NAME)
+        return d
+
+    for tag in sorted(PRE_ESTIMATOR_CODE_TAGS):
+        d = entry(f"old-{tag}", old, tag)
+        before = (d / SPEC_NAME).read_bytes(), (d / LEVERAGE_NAME).read_bytes()
+        rec = cache.load_spec(f"old-{tag}")
+        assert rec.particle.estimator == "sorted", tag
+        # everything else is the stored spec
+        assert to_mapping(rec) == {**old, "particle": {**old["particle"], "estimator": "sorted"}}
+        assert rec == dataclasses.replace(
+            spec, particle=dataclasses.replace(spec.particle, estimator="sorted")
+        )
+        # read as a config, the same mapping takes the default: what the loader exists to prevent
+        assert from_mapping(CalibrationSpec, old).particle.estimator == "binned"
+        assert ((d / SPEC_NAME).read_bytes(), (d / LEVERAGE_NAME).read_bytes()) == before
+    # an m6 entry written with the switch set names its estimator: kept
+    for name in ("binned", "sorted"):
+        named = {**old, "particle": {**old["particle"], "estimator": name}}
+        entry(f"m6-{name}", named, "m6")
+        assert cache.load_spec(f"m6-{name}").particle.estimator == name
+    # an entry of the current code, written by the cache itself, round-trips
+    cache.store(spec, lev, None)
+    assert cache.load_spec(cache.key(spec)) == spec
+    # a record under a tag that knows the field, without it: refused, as is an untagged one
+    for key, tag in (("k5-bare", CALIBRATION_CODE_TAG), ("later-bare", "k9"), ("untagged", None)):
+        entry(key, old, tag)
+        with pytest.raises(ValueError, match="no estimator in the record"):
+            cache.load_spec(key)
+    with pytest.raises(CacheMissError):
+        cache.load_spec("absent")
+    # the rule itself
+    assert record_estimator({}, "m6") == "sorted"
+    assert record_estimator({"estimator": None}, "m4b") == "sorted"
+    assert record_estimator({"estimator": "binned"}, "m6") == "binned"
+    assert record_estimator({"estimator": "sorted"}, CALIBRATION_CODE_TAG) == "sorted"
 
 
 def test_leverage_function_interpolation_and_io(market, tmp_path: Path) -> None:

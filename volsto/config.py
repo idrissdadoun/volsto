@@ -762,8 +762,8 @@ class ParticleConfig:
             self.kernel != "gaussian" or self.regression != "local_linear"
         ):
             raise ValueError(
-                "estimator='binned' (the default) needs kernel='gaussian' and "
-                "regression='local_linear': set estimator='sorted' for another kernel or regression"
+                f"kernel={self.kernel!r} with regression={self.regression!r} is not implemented "
+                'by the binned estimator (the default): set estimator="sorted"'
             )
         if self.antithetic and self.n_particles % 2:
             raise ValueError("n_particles must be even when antithetic")

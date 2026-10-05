@@ -46,7 +46,14 @@ import pandas as pd
 import volsto
 from volsto.calibration.diagnostics import CalibrationReport, reprice_surface
 from volsto.calibration.particle import CALIBRATION_CODE_TAG, calibrate_leverage
-from volsto.config import CalibrationSpec, CurveConfig, MarketConfig, SimConfig, to_mapping
+from volsto.config import (
+    CalibrationSpec,
+    CurveConfig,
+    MarketConfig,
+    SimConfig,
+    from_mapping,
+    to_mapping,
+)
 from volsto.market.curves import ForwardCurve
 from volsto.market.surface import ImpliedSurface, perturbed_surface, surface_from_config
 from volsto.market.varswap import ForwardVarianceCurve, xi0_curve
@@ -147,6 +154,40 @@ def has_complete_leverage(root: str | Path, key: str) -> bool:
         return True
     log.warning("leverage cache entry %s: %s is not a complete archive; a miss", key[:12], path)
     return False
+
+
+#: Code tags whose entries were written before ``ParticleConfig.estimator`` was part of every
+#: record: the field did not exist up to ``m6``, and under ``m6`` it was left out of ``spec.json``
+#: while unset.  An entry under one of these tags that names no estimator was computed by the
+#: sorted estimator, the only one there was (:func:`record_estimator`).
+PRE_ESTIMATOR_CODE_TAGS: frozenset[str] = frozenset({"m3.2", "m4b", "m6"})
+
+
+def record_estimator(particle: Mapping[str, Any], code_tag: str | None, *, where: str = "") -> str:
+    """The regression estimator a stored entry was computed with — the one rule for reading it.
+
+    The stored ``particle`` mapping names it (every entry since code tag ``k5``, and an ``m6``
+    entry written with the switch set): that name.  It names none and the entry's ``code_tag``
+    is in :data:`PRE_ESTIMATOR_CODE_TAGS`: ``"sorted"``.  Anything else is refused — a record
+    under a tag that knows the field must carry it, and the config default (``"binned"``) is what
+    a *new* calibration uses, not what an old one did."""
+    name = particle.get("estimator")
+    if name is not None:
+        return str(name)
+    if code_tag in PRE_ESTIMATOR_CODE_TAGS:
+        return "sorted"
+    raise ValueError(
+        f"{where or 'stored spec'}: no estimator in the record and code tag {code_tag!r} is not "
+        f"one of {sorted(PRE_ESTIMATOR_CODE_TAGS)}, whose entries are the sorted estimator's"
+    )
+
+
+def stored_code_tag(leverage_path: str | Path) -> str | None:
+    """The ``code_tag`` in the metadata of a stored ``leverage.npz`` (``None`` when it has none);
+    only the metadata member of the archive is read."""
+    with np.load(leverage_path, allow_pickle=False) as z:
+        tag = json.loads(str(z["metadata"])).get("code_tag")
+    return None if tag is None else str(tag)
 
 
 class CacheMissError(KeyError):
@@ -413,6 +454,28 @@ class LeverageCache:
         if not p.exists():
             raise CacheMissError(self.key(spec))
         return LeverageFunction.load(p)
+
+    def load_spec(self, key: str) -> CalibrationSpec:
+        """The spec the entry ``key`` was computed from, as a record of how it was computed.
+
+        ``spec.json`` is read as written, except that an entry under a code tag of
+        :data:`PRE_ESTIMATOR_CODE_TAGS` that names no estimator reads ``estimator="sorted"``
+        (:func:`record_estimator`): loading its mapping as a config would give the current
+        default, ``"binned"``, which is not how it was computed.  Nothing is rewritten.  The key
+        of such an entry is not reproduced by ``spec_key`` of the record under any tag (its
+        payload had no such field): the key of an entry is its directory name."""
+        d = self.root / key
+        if not self.has_key(key):
+            raise CacheMissError(key)
+        path = d / SPEC_NAME
+        if not path.is_file():
+            raise ValueError(f"{path}: the entry has no stored spec")
+        data = json.loads(path.read_text())
+        particle = dict(data.get("particle") or {})
+        particle["estimator"] = record_estimator(
+            particle, stored_code_tag(d / LEVERAGE_NAME), where=str(path)
+        )
+        return from_mapping(CalibrationSpec, {**data, "particle": particle}, path=str(path))
 
     def load_report(self, spec: CalibrationSpec) -> CalibrationReport | None:
         p = self.entry_dir(spec) / DIAGNOSTICS_NAME
