@@ -360,8 +360,11 @@ KOVAR_STRIKE_VOL = 0.0
 #: owner: "assert first-order agreement within 30% at +1 rota"
 FIRST_ORDER_TOLERANCE = 0.30
 #: per-calibration wall clock used by the projection when the cache manifest has no entry at
-#: the study's particle count: the manifest's 8·10⁵ median (159 s) scaled linearly in N
-FALLBACK_CALIBRATION_SECONDS_8E5 = 159.0
+#: the study's particle count, scaled linearly in N: 74 s, one 3y calibration at 8·10⁵
+#: particles with the binned estimator (code tag k5) measured on ONE thread (calibration-speed
+#: study K.5(3), 2026-10-04; 116 s each with 18 single-thread calibrations at once).  Under tag
+#: m6 the constant was the manifest's 8·10⁵ median, 159 s.
+FALLBACK_CALIBRATION_SECONDS_8E5 = 74.0
 _TOL = 1e-9
 
 

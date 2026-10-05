@@ -53,7 +53,7 @@ log = logging.getLogger(__name__)
 #: Bumped whenever the calibration numerics change; part of the cache key (SPEC §4.3).
 #: Guarded by ``tests/test_lsv.py::test_calibration_code_tag_guard`` (source hash of the
 #: calibration and stepping modules).
-CALIBRATION_CODE_TAG = "m6"
+CALIBRATION_CODE_TAG = "k5"
 
 
 @njit(parallel=True, cache=True)
@@ -246,9 +246,9 @@ def conditional_variance_estimate(
     interpolated onto ``grid``, the tails are extended flat or log-linearly / log-quadratically
     (SPEC §4.1 and :class:`~volsto.config.ParticleConfig`).
 
-    Two stages: the regression at the nodes — on the sorted particles
-    (:func:`_sorted_regression`, the default) or without a sort (``cfg.estimator == "binned"``,
-    :func:`volsto.calibration.binned.binned_regression`) — and :func:`_finish_estimate`, shared.
+    Two stages: the regression at the nodes — without a sort (``cfg.estimator == "binned"``, the
+    default, :func:`volsto.calibration.binned.binned_regression`) or on the sorted particles
+    (``"sorted"``, :func:`_sorted_regression`) — and :func:`_finish_estimate`, shared.
     """
     if cfg.estimator == "binned":
         reg = binned_regression(k, v, h, cfg)
@@ -437,10 +437,8 @@ def calibrate_leverage(
             "code_tag": CALIBRATION_CODE_TAG,
             "scheme": scheme.__dict__.copy(),
             "schedule": repr(sim.step_schedule),
+            "estimator": cfg.estimator,
         }
-        if cfg.estimator is not None:
-            # written only when the switch is set: a default calibration's file is unchanged
-            metadata["estimator"] = cfg.estimator
         results.append(LeverageFunction(times, k_grid, L, fc, metadata))
         log.info("particle pass %d/%d done (%d steps, N=%d)", p + 1, n_pass, n_steps, N)
     lev = results[0] if n_pass == 1 else LeverageFunction.average(results[0], results[1])

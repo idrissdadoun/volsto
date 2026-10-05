@@ -26,8 +26,9 @@ order; unfloored nodes carry the binning error, a relative 1e-6 (first steps) to
 ``E[V|k]`` at ``h/4`` and 8·10⁵ particles (measured on real clouds, K.1 / K.5 of the calibration
 speed study).  Linear binning also smooths every particle over one bin, which acts as a kernel of
 variance ``h² + d²/6`` (``d`` the bin width): a uniform −0.0003 vol-point shift of the repriced
-surface.  ``deflate=True`` evaluates the unfloored kernel sums with the bandwidth
-``sqrt(h² − d²/6)``, which removes it (off by default).
+surface.  The unfloored kernel sums are therefore evaluated with the deflated bandwidth
+``sqrt(h² − d²/6)``, which removes it (paired mean against the sorted path within 0.00003 vol
+points on every pillar, 24 calibrations); ``deflate=False`` gives the undeflated sums.
 
 Everything after the regression (bad-node interpolation, bias correction, interpolation onto
 the leverage grid, tails) is shared with the sorted path
@@ -322,13 +323,14 @@ def _exact_nodes(
 
 
 def binned_regression(
-    k: FloatArray, v: FloatArray, h: float, cfg: ParticleConfig, *, deflate: bool = False
+    k: FloatArray, v: FloatArray, h: float, cfg: ParticleConfig, *, deflate: bool = True
 ) -> tuple[FloatArray, float, float, FloatArray, FloatArray] | None:
     """The regression stage on unsorted particles: ``(kreg, q_lo, q_hi, m, slope)`` — the
     nodes, the trusted quantile range, ``E[v | k]`` at the nodes (``nan`` where a window is empty)
     and its slope — or ``None`` for a degenerate cloud (the caller then uses the plain mean).
 
-    ``deflate``: unfloored kernel sums with the bandwidth ``sqrt(h² − d²/6)`` (module docstring).
+    ``deflate`` (default on): unfloored kernel sums with the bandwidth ``sqrt(h² − d²/6)``
+    (module docstring); the floored nodes are summed over particles and need none.
     """
     n = k.size
     i_lo = min(int(cfg.quantile_clip * n), n - 1)
