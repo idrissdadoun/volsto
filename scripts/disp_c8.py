@@ -1,0 +1,214 @@
+"""Dispersion study, check C8 (spec §10): the copula against the library's multi-asset local vol.
+
+    python scripts/disp_c8.py [--dates 12] [--paths 100000]
+
+On dates spread over the sample: the three-month Palladium forward, the call at the forward's
+price, the basket straddle and the single-name strip from the study's Gaussian copula against
+``volsto.multi`` — one Dupire local-vol model per name, built from the same smiles, driven by
+Brownians of constant correlation ``ρ_mark``.  The library's Dupire needs a smooth implied
+surface: each listed expiry of each name is fitted with an SVI slice (least squares on the
+study's vols within three standard deviations of the money), total variance linear in time
+between the slices.  Writes ``c8.json`` and ``c8.csv``; the differences are reported, there is
+no pass or fail (a terminal copula and a diffusion with the same marginals and the same
+correlation parameter are different joint laws).
+"""
+
+# ruff: noqa: E501
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pickle
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+for _v in ("OMP_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "OPENBLAS_NUM_THREADS"):
+    os.environ[_v] = "1"
+
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
+from scipy.optimize import least_squares  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import disp_entries as de  # noqa: E402
+
+from volsto.config import LocalVolConfig, SimConfig  # noqa: E402
+from volsto.market.curves import DiscountCurve, ForwardCurve  # noqa: E402
+from volsto.market.dupire import LocalVolSurface  # noqa: E402
+from volsto.market.surface import ImpliedSurface  # noqa: E402
+from volsto.models.localvol import LocalVol  # noqa: E402
+from volsto.multi.draws import constant_correlation  # noqa: E402
+from volsto.multi.mc import MultiAssetMonteCarlo  # noqa: E402
+from volsto.multi.model import MultiAssetModel  # noqa: E402
+from volsto.multi.products import BasketStraddle, Palladium, SingleNameStraddles  # noqa: E402
+from volsto.studies import disp_data as dd  # noqa: E402
+from volsto.studies import disp_smile as ds  # noqa: E402
+
+
+def svi(p: np.ndarray, k: np.ndarray) -> np.ndarray:
+    a, b, rho, m, s = p
+    return a + b * (rho * (k - m) + np.sqrt((k - m) ** 2 + s * s))
+
+
+def fit_svi(e: ds.ExpirySmile) -> tuple[np.ndarray, float]:
+    """Raw-SVI parameters of one expiry's total variance, fitted on the strikes within three
+    standard deviations of the money (at least ±0.15), and the root-mean-square error in vol
+    points."""
+    atm = float(np.interp(0.0, e.k, e.vol))
+    width = max(3.0 * atm * np.sqrt(e.T), 0.15)
+    sel = np.abs(e.k) <= width
+    if sel.sum() < 5:
+        sel = np.ones(e.k.size, dtype=bool)
+    k, w = e.k[sel], e.vol[sel] ** 2 * e.T
+    w0 = atm * atm * e.T
+    x0 = np.array([0.5 * w0, max(w0, 1e-4) / 0.2, -0.4, 0.0, 0.2])
+    lo = np.array([-w0, 1e-6, -0.999, -1.0, 1e-3])
+    hi = np.array([4.0 * w0 + 1e-6, 10.0, 0.999, 1.0, 3.0])
+    fit = least_squares(lambda p: svi(p, k) - w, x0, bounds=(lo, hi))
+    vol_fit = np.sqrt(np.maximum(svi(fit.x, k), 1e-10) / e.T)
+    return fit.x, float(100.0 * np.sqrt(np.mean((vol_fit - e.vol[sel]) ** 2)))
+
+
+class SviSlices(ImpliedSurface):
+    """Total variance from SVI slices, linear in time between them at fixed log-moneyness
+    (proportional to time before the first slice and after the last)."""
+
+    def __init__(
+        self,
+        times: np.ndarray,
+        params: np.ndarray,
+        forward_curve: ForwardCurve,
+        max_maturity: float,
+    ) -> None:
+        super().__init__(forward_curve, forward_curve.rate_curve, max_maturity)
+        self.times, self.params = times, params
+
+    def total_variance(self, k: Any, T: Any) -> Any:
+        k = np.asarray(k, dtype=np.float64)
+        T = np.asarray(T, dtype=np.float64)
+        k_b, T_b = np.broadcast_arrays(k, T)
+        slices = np.stack([np.maximum(svi(p, k_b), 1e-8) for p in self.params])  # (n_slices, …)
+        j = (
+            np.clip(np.searchsorted(self.times, T_b), 1, len(self.times) - 1)
+            if len(self.times) > 1
+            else np.zeros_like(T_b, dtype=int)
+        )
+        if len(self.times) == 1:
+            return slices[0] * T_b / self.times[0]
+        t0, t1 = self.times[j - 1], self.times[j]
+        w0 = np.take_along_axis(slices, (j - 1)[None, ...], axis=0)[0]
+        w1 = np.take_along_axis(slices, j[None, ...], axis=0)[0]
+        inside = w0 + (w1 - w0) * (T_b - t0) / (t1 - t0)
+        before = slices[0] * T_b / self.times[0]
+        after = slices[-1] * T_b / self.times[-1]
+        return np.where(
+            T_b <= self.times[0],
+            before,
+            np.where(T_b >= self.times[-1], after, np.maximum(inside, 1e-8)),
+        )
+
+
+def run_date(date: str, n_paths: int) -> dict[str, Any]:
+    t0 = time.time()
+    with (dd.OUT / "entries" / "3m" / f"{date}.pkl").open("rb") as fh:
+        r = pickle.load(fh)
+    names, T, w = r["names"], r["T"], r["w_B1"]
+    got = de.marginals_for(date, names, T)
+    assert got is not None
+    models = []
+    rms = []
+    for t in names:
+        m, _, smiles = got[t]
+        use = [e for e in smiles if e.T >= 10 / 365.0]
+        keep = [e for e in use if e.T <= T] + [e for e in use if e.T > T][:2]
+        fits = [fit_svi(e) for e in keep]
+        rms += [f[1] for f in fits]
+        times = np.array([e.T for e in keep])
+        rate = m.rate
+        q = rate - float(np.log(m.f)) / T
+        fc = ForwardCurve.flat(1.0, rate, q)
+        surf = SviSlices(
+            times, np.stack([f[0] for f in fits]), fc, max_maturity=max(float(times[-1]), T) + 0.05
+        )
+        cfg = LocalVolConfig(
+            t_min=1.0 / 365.0, t_max=T + 0.02, n_t=120, k_min=-2.0, k_max=2.0, n_k=1601
+        )
+        models.append(LocalVol(LocalVolSurface.from_implied(surf, cfg), fc))
+    rho = float(r["rho_cop"])
+    mm = MultiAssetModel(models, constant_correlation(len(names), rho), names=names)
+    zero = DiscountCurve.flat(0.0)
+    base = r["B1"]
+    prods = [
+        Palladium(w, 0.0, T, zero),
+        Palladium(w, float(base["strikes"][2]), T, zero),
+        BasketStraddle(w, T, zero),
+        SingleNameStraddles(w, T, zero),
+    ]
+    mc = MultiAssetMonteCarlo(
+        SimConfig(
+            n_paths=n_paths,
+            chunk_size=25_000,
+            seed=int(date.replace("-", "")) % 100_000,
+            dt_max=1.0 / 365.0,
+        )
+    )
+    res = mc.price_many(prods, mm)
+    out = {
+        "date": date, "rho_mark": rho, "svi_rms_vp_median": float(np.median(rms)), "svi_rms_vp_max": float(np.max(rms)),
+        "copula_P_D": base["P_D"], "lv_P_D": res[0].mean, "lv_P_D_se": res[0].stderr,
+        "copula_C1": float(base["calls"][2]), "lv_C1": res[1].mean, "lv_C1_se": res[1].stderr,
+        "copula_Str_B": base["Str_B"], "lv_Str_B": res[2].mean, "lv_Str_B_se": res[2].stderr,
+        "smile_SS": base["SS_mkt"], "lv_SS": res[3].mean, "lv_SS_se": res[3].stderr,
+        "seconds": time.time() - t0,
+    }  # fmt: skip
+    out["P_D_lv_over_copula"] = out["lv_P_D"] / out["copula_P_D"]
+    out["C1_lv_over_copula"] = out["lv_C1"] / out["copula_C1"]
+    out["Str_B_lv_over_copula"] = out["lv_Str_B"] / out["copula_Str_B"]
+    out["SS_lv_over_smile"] = out["lv_SS"] / out["smile_SS"]
+    return out
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=(__doc__ or "").split("\n")[0])
+    ap.add_argument("--dates", type=int, default=12)
+    ap.add_argument("--paths", type=int, default=100_000)
+    ap.add_argument("--force", action="store_true")
+    args = ap.parse_args()
+    lock = dd.OUT / "c8.started"
+    if (lock.exists() or (dd.OUT / "c8.json").exists()) and not args.force:
+        print("C8 has run or is running (c8.started / c8.json): nothing to do; --force reruns it")
+        return
+    lock.write_text(time.strftime("%Y-%m-%d %H:%M"))
+    files = sorted(p.stem for p in (dd.OUT / "entries" / "3m").glob("*.pkl"))
+    pick = [files[i] for i in np.linspace(0, len(files) - 2, args.dates).round().astype(int)]
+    rows = []
+    for d in pick:
+        try:
+            rows.append(run_date(d, args.paths))
+            r = rows[-1]
+            print(
+                f"{d}: P_D LV/copula {r['P_D_lv_over_copula']:.4f}, call {r['C1_lv_over_copula']:.3f}, basket straddle {r['Str_B_lv_over_copula']:.4f}, strip LV/smile {r['SS_lv_over_smile']:.4f}, SVI rms {r['svi_rms_vp_median']:.2f} vp ({r['seconds']:.0f} s)",
+                flush=True,
+            )
+        except Exception as exc:
+            print(f"{d}: failed ({type(exc).__name__}: {exc})", flush=True)
+    out = pd.DataFrame(rows)
+    out.to_csv(dd.OUT / "c8.csv", index=False)
+    if len(out):
+        summary = {
+            "dates": len(out), "paths": args.paths,
+            "P_D LV / copula: mean, min, max": [float(out["P_D_lv_over_copula"].mean()), float(out["P_D_lv_over_copula"].min()), float(out["P_D_lv_over_copula"].max())],
+            "call at the forward LV / copula: mean, min, max": [float(out["C1_lv_over_copula"].mean()), float(out["C1_lv_over_copula"].min()), float(out["C1_lv_over_copula"].max())],
+            "basket straddle LV / copula: mean, min, max": [float(out["Str_B_lv_over_copula"].mean()), float(out["Str_B_lv_over_copula"].min()), float(out["Str_B_lv_over_copula"].max())],
+            "single-name strip LV / smile: mean, min, max": [float(out["SS_lv_over_smile"].mean()), float(out["SS_lv_over_smile"].min()), float(out["SS_lv_over_smile"].max())],
+            "SVI fit, rms in vol points: median, max": [float(out["svi_rms_vp_median"].median()), float(out["svi_rms_vp_max"].max())],
+        }  # fmt: skip
+        (dd.OUT / "c8.json").write_text(json.dumps(summary, indent=1))
+        print(json.dumps(summary, indent=1))
+
+
+if __name__ == "__main__":
+    main()

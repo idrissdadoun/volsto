@@ -596,6 +596,28 @@ def third_phase(rep: Report, d: pd.DataFrame, tenor: str) -> None:
             ms["T11_model_S"],
             "Relative dispersion by basket performance (T11) with model S's forward and its conditional profile.",
         )
+    c8 = dd.OUT / "c8.csv"
+    if c8.exists():
+        x8 = pd.read_csv(c8)
+        if len(x8):
+            show = pd.DataFrame(
+                {
+                    "date": x8["date"], "ρ_mark": x8["rho_mark"].round(3),
+                    "forward: copula": (100 * x8["copula_P_D"]).round(3), "local vol": (100 * x8["lv_P_D"]).round(3), "± s.e.": (100 * x8["lv_P_D_se"]).round(3),
+                    "LV / copula": x8["P_D_lv_over_copula"].round(3),
+                    "call at the forward's price: LV / copula": x8["C1_lv_over_copula"].round(3),
+                    "basket straddle: LV / copula": x8["Str_B_lv_over_copula"].round(3),
+                    "single-name strip: LV / smile": x8["SS_lv_over_smile"].round(3),
+                    "forward ratio over strip ratio": (x8["P_D_lv_over_copula"] / x8["SS_lv_over_smile"]).round(3),
+                    "SVI rms, vp (median / max)": x8["svi_rms_vp_median"].round(2).astype(str) + " / " + x8["svi_rms_vp_max"].round(2).astype(str),
+                }
+            )  # fmt: skip
+            rep.add("## Check C8: the copula against the library's multi-asset local vol\n")
+            rep.table(
+                "C8",
+                show,
+                "Three-month prices (% of notional) from the Gaussian copula at ρ_mark and from `volsto.multi`: one Dupire local-vol model per name (SVI slices fitted to the study's smiles), Brownian correlation ρ_mark, 10^5 paths. The strip column says how well the local vols reproduce the single-name straddles (the SVI fit and the time stepping); the last column removes that level effect from the forward's ratio. Reported, no pass or fail: a terminal copula and a diffusion with the same marginals and the same correlation number are different joint laws.",
+            )
     mk = t2.marks_table(d, tenor)
     if len(mk):
         rep.add("## Marks during the life\n")
@@ -744,6 +766,22 @@ def second_phase(rep: Report, d0: pd.DataFrame, tenor: str, dec: pd.DataFrame) -
         p15,
         "Today: prices, sensitivities, forecast edges, and what the rules select.",
     )
+    rob = t2.fhs_robustness(d, tenor)
+    if len(rob) > 1:
+        rep.table(
+            "T18_fhs_robustness",
+            rob,
+            "The FHS under the robustness settings of spec §7.2 beside the base one: forecasts (%, pooled) and the calibration slope of the realised P&L on the forecast edge (all windows).",
+        )
+    con = t2.contrasts(d, tenor)
+    if len(con):
+        top = con.sort_values("q (Benjamini–Hochberg)").head(25)
+        rep.table(
+            "T13_contrasts",
+            con,
+            f"Every conditional cell outside the five primary tests: top minus bottom in-sample tercile of each indicator, for twelve structures, in sample and out of sample ({len(con)} cells; % of notional, VD in vega-notional units), with Benjamini–Hochberg q-values over all the cells. Shown: the 25 smallest q-values; {int((con['q (Benjamini–Hochberg)'] < 0.10).sum())} cells have q below 0.10. The CSV has every cell.",
+            show=top,
+        )
     safe(rep, "costs", lambda: costs(rep, d, tenor, r1, r2, has_fhs))
     safe(rep, "other runs", lambda: multi(rep, tenor))
     safe(rep, "figures", lambda: figures(rep, d, tenor, dec))
@@ -880,6 +918,25 @@ def first_page_calls(sec: dict[str, Any]) -> str:
     return (
         f"Calls, Σ payoff / Σ price: {t5.get('0.75 × forward price', '–')} at 0.75, {t5.get('1 × forward price', '–')} at the forward's price, "
         f"{t5.get('1.25 × forward price', '–')} at 1.25, {t5.get('1.5 × forward price', '–')} at 1.5 (T5; the intervals are wide)."
+    )
+
+
+def first_page_model_s(sec: dict[str, Any] | None, tenor: str) -> str:
+    path = dd.OUT / f"model_s_{tenor}.parquet"
+    if sec is None or not path.exists():
+        return ""
+    import disp_tables2 as t2
+
+    ms = t2.model_s_tables(sec["d"], tenor)
+    if not ms:
+        return ""
+    a = ms["model_S"].iloc[0]
+    r = ms["T4_model_S"].iloc[0]
+    c = ms["T5_model_S"].set_index("strike")
+    return (
+        f" With a copula that also reprices the DJX 90 % put (model S, monthly subset, {a['converged']} of {a['monthly dates']} dates converged): the forward is {a['P_D^S / P_D']} of the base price and the call at the forward's price {a['C^S / C at 1']} of it; "
+        f"price over realised becomes {r['model S: P_D / D']} (convexity factor {r['model S: convexity κ_Q/κ_P']}) against {r['base: P_D / D']} for the base copula on the same windows, "
+        f"and Σ payoff / Σ price of the call at the forward's price {c.loc['1 × forward price', 'model S, all']} against {c.loc['1 × forward price', 'base, all']}."
     )
 
 
@@ -1166,7 +1223,8 @@ def build(version: int, tenor: str, pdf: bool) -> None:
         f"1. **Richness.** Priced at the correlation that reprices the DJX straddle, the Palladium forward cost {tb.pct(o['P_D'].mean(), 2)} on average and paid {tb.pct(o['D'].mean(), 2)}: "
         f"price over realised {rall['richness']:.3f} = variance factor {rall['variance factor']:.3f} (the vanilla strips' squared dispersion against the realised one) × convexity factor {rall['convexity factor']:.3f} "
         f"(κ_Q {rall['kappa_Q']:.3f} against κ_P {rall['kappa_P']:.3f}). In sample {r_is['richness']:.3f} = {r_is['variance factor']:.3f} × {r_is['convexity factor']:.3f}; out of sample {r_oos['richness']:.3f} = {r_oos['variance factor']:.3f} × {r_oos['convexity factor']:.3f} (T4). "
-        + ("Calls by strike: T5 (version 2)." if sec is None else first_page_calls(sec)),
+        + ("Calls by strike: T5 (version 2)." if sec is None else first_page_calls(sec))
+        + first_page_model_s(sec, tenor),
         f"2. **Palladium or package.** The gap (Palladium forward minus the vega-neutral package, which pays exactly G) cost {tb.pct(o['P_G'].mean(), 2)} and paid {tb.pct(o['G'].mean(), 2)}: mean P&L {tb.pct(full['mean'])} (t {full['t']:.2f}, hit rate {full['hit']:.2f}); "
         f"in sample {tb.pct(g_is['mean'])} (t {g_is['t']:.2f}), out of sample {tb.pct(g_oos['mean'])} (t {g_oos['t']:.2f}) (T17). Conditions: T17b; primary test Q2 (GP_G): {q4.loc['Q2', 'verdict'] if 'Q2' in q4.index else 'not testable'}.",
         f"3. **Horizon.** Unhedged minus hedged Palladium forward: {tb.pm(*st.mean_se(o['PF_U'] - o['PF_H'], lag)[:2])}; primary test Q3 (trailing VR_cs): {q4.loc['Q3', 'verdict'] if 'Q3' in q4.index else 'not testable'}. "

@@ -676,3 +676,61 @@ def marks_table(d: pd.DataFrame, tenor: str) -> pd.DataFrame:
         row["entries"] = len(dates)
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+def contrasts(d: pd.DataFrame, tenor: str) -> pd.DataFrame:
+    """Every conditional cell outside the five primary tests: top minus bottom in-sample
+    tercile of each indicator for the main structures, with its Hansen–Hodrick t and the
+    Benjamini–Hochberg q-value over all the cells of the table (spec §8)."""
+    from scipy.special import ndtr
+
+    o = d[d["has_outcome"]]
+    rows = []
+    for ilabel, icol in tb.INDICATORS.items():
+        if icol not in o or o[icol].notna().sum() < 120:
+            continue
+        for label in tb.MAIN:
+            col = tb.STRUCTS[label]
+            for sample in ("IS", "OOS"):
+                c = tb.tercile_contrast(d, icol, o[col], tenor, sample)
+                rows.append({"indicator": ilabel, "structure": label, "sample": sample, "low": c["low"], "mid": c["mid"], "high": c["high"],
+                             "high − low": c["diff"], "se": c["se"], "t": c["t"], "n": int(c["n"])})  # fmt: skip
+    out = pd.DataFrame(rows)
+    if len(out):
+        p = 2.0 * (1.0 - ndtr(out["t"].abs().to_numpy(float)))
+        out["p"] = p
+        out["q (Benjamini–Hochberg)"] = st.bh_qvalues(p)
+        scale = np.where(out["structure"].str.startswith("VD"), 1.0, 100.0)
+        for c in ("low", "mid", "high", "high − low", "se"):
+            out[c] = (out[c] * scale).round(3)
+        out[["t", "p", "q (Benjamini–Hochberg)"]] = out[["t", "p", "q (Benjamini–Hochberg)"]].round(
+            3
+        )
+    return out
+
+
+def fhs_robustness(d: pd.DataFrame, tenor: str) -> pd.DataFrame:
+    """The FHS forecasts under the two robustness settings of spec §7.2 (mean block 21 days;
+    undemeaned standardised returns) beside the base one: mean forecast and its calibration
+    slope for the forward, the theta-neutral package and the gap."""
+    o = d[d["has_outcome"]]
+    rows = []
+    for tag, label in (
+        ("", "base: mean block 10 days, demeaned"),
+        ("_block21", "mean block 21 days"),
+        ("_undemeaned", "undemeaned"),
+    ):
+        path = dd.OUT / f"fhs_{tenor}{tag}.parquet"
+        if not path.exists():
+            continue
+        f = pd.read_parquet(path)
+        f = f[f["basket"] == "B1"].set_index("date")
+        row: dict[str, Any] = {"FHS setting": label, "dates": int(f["fhs_E_D"].notna().sum()), "mean E[D]": tb.pct(f["fhs_E_D"].mean()),
+                               "mean E[V]^½": tb.pct(float(np.sqrt(f["fhs_E_V"].mean()))), "mean κ_fc": tb.num(f["fhs_kappa_fc"].mean()), "mean E[G]": tb.pct(f["fhs_E_G"].mean())}  # fmt: skip
+        for s, col in (("PF", "PF_U"), ("PKG_theta", "PKG_theta_U"), ("GAP", "GAP_U")):
+            e = o["date"].map(f[f"fedge_{s}"])
+            fit = st.ols(o[col], np.column_stack([np.ones(len(o)), e]), tb.LAG[tenor])
+            row[f"mean edge {s}"] = tb.pct(float(e.mean()))
+            row[f"slope b, {s}"] = f"{fit['coef'][1]:.2f} ± {fit['se'][1]:.2f}"
+        rows.append(row)
+    return pd.DataFrame(rows)
