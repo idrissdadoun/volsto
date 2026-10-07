@@ -13,6 +13,7 @@ import disp_tables as tb
 import numpy as np
 import pandas as pd
 
+from volsto.studies import disp_copula as dc
 from volsto.studies import disp_data as dd
 from volsto.studies import disp_stats as st
 
@@ -35,6 +36,82 @@ def add_fhs(d: pd.DataFrame, tenor: str, basket: str = "B1") -> pd.DataFrame:
     f = pd.read_parquet(path)
     f = f[f["basket"] == basket].drop(columns=["basket", "tenor"])
     return d.merge(f, on="date", how="left")
+
+
+#: Strikes of the call leaf of R1 (spec v2.3, T14), furthest first; the pricing floor is the
+#: study's (``disp_copula.MIN_CALL``, 0.05 % of notional: T5's "dates priced", Q4).
+CALL_LEAF_STRIKES = ("150", "125", "100")
+
+
+def prepare(d: pd.DataFrame, tenor: str, basket: str = "B1") -> pd.DataFrame:
+    """The frame of the second phase: the FHS columns and the statically hedged calls at 1.25
+    and 1.5 times the forward's price (``PC_125_S``, ``PC_150_S``), built as ``PC_100_S`` is in
+    ``disp_outcomes`` (call P&L minus the common-move delta times the basket's return)."""
+    x = add_fhs(d, tenor, basket)
+    if x is d:
+        x = d.copy()
+    for m in ("125", "150"):
+        if f"PC_{m}_S" not in x and {f"PC_{m}_U", f"delta_c_{m}", "Rb"} <= set(x.columns):
+            x[f"PC_{m}_S"] = x[f"PC_{m}_U"] - x[f"delta_c_{m}"] * x["Rb"]
+    return x
+
+
+def call_leaf(d: pd.DataFrame) -> str:
+    """The call leaf of R1 at this tenor (spec v2.3): the statically hedged call at the furthest
+    strike among 1.5, 1.25 and 1.0 times the forward's price whose price is at or above the
+    study's floor on every entry date with an outcome, so that the leaf is one structure at a
+    tenor (``PC(1)`` at 1m, 3m and 6m; ``PC(1.25)`` at 12m and 24m)."""
+    o = d[d["has_outcome"]]
+    for m in CALL_LEAF_STRIKES:
+        if f"PC_{m}_S" in d and len(o) and bool((o[f"C_{m}"] >= dc.MIN_CALL).all()):
+            return f"PC_{m}_S"
+    return "PC_100_S"
+
+
+def priced_shares(d: pd.DataFrame) -> dict[str, float]:
+    """Share of the entry dates with an outcome on which the call at each strike of
+    :data:`CALL_LEAF_STRIKES` is at or above the pricing floor."""
+    o = d[d["has_outcome"]]
+    return {
+        m: float((o[f"C_{m}"] >= dc.MIN_CALL).mean()) if len(o) else float("nan")
+        for m in CALL_LEAF_STRIKES
+    }
+
+
+def priced_text(d: pd.DataFrame) -> str:
+    sh = priced_shares(d)
+    return ", ".join(f"{int(m) / 100:g}× on {100 * v:.1f} %" for m, v in sh.items())
+
+
+def expanding_cuts(values: pd.Series, min_obs: int = 104) -> pd.DataFrame:
+    """Tercile cut points of each entry from the values of the entries strictly before it (at
+    least ``min_obs`` of them: two years of weekly entries); NaN before that."""
+    v = values.to_numpy(float)
+    lo = np.full(v.size, np.nan)
+    hi = np.full(v.size, np.nan)
+    for i in range(v.size):
+        past = v[:i]
+        past = past[np.isfinite(past)]
+        if past.size >= min_obs:
+            lo[i], hi[i] = np.quantile(past, [1.0 / 3.0, 2.0 / 3.0])
+    return pd.DataFrame({"lo": lo, "hi": hi}, index=values.index)
+
+
+def tercile_labels(d: pd.DataFrame, col: str, cuts: str) -> pd.Series:
+    """``low`` / ``mid`` / ``high`` of an indicator on the in-sample cut points (``cuts =
+    "is"``) or on the expanding-window ones (``"expanding"``); NaN where the indicator or the
+    history is missing."""
+    if cuts == "is":
+        return st.tercile(d[col], tb.is_cuts(d, col))
+    c = expanding_cuts(d[col])
+    v = d[col]
+    out = pd.Series(
+        np.where(v <= c["lo"], "low", np.where(v > c["hi"], "high", "mid")),
+        index=d.index,
+        dtype=object,
+    )
+    out[v.isna() | c["lo"].isna()] = np.nan
+    return out
 
 
 def t5(d: pd.DataFrame, tenor: str) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -205,13 +282,30 @@ def risk_scale(d: pd.DataFrame, col: str) -> pd.Series:
     return pd.Series(out, index=d.index)
 
 
-def rule_r1(d: pd.DataFrame) -> pd.Series:
-    """The leaf of rule R1 at each entry (spec T14): a structure column, or NaN when an
-    indicator on the path is NaN (no position)."""
-    cuts = {c: tb.is_cuts(d, c) for c in ("CRP", "GP_G", "variability", "vol_premium")}
-    lab = {c: st.tercile(d[c], cuts[c]) for c in cuts}
+def rule_r1(d: pd.DataFrame, root: str = "absolute", cuts: str = "is") -> pd.Series:
+    """The leaf of rule R1 at each entry (spec T14, v2.3): a structure column, or NaN when an
+    indicator on the path is NaN (no position).
+
+    ``root``: ``"absolute"`` sends ``CRP < 0`` (implied correlation below its forecast) to the
+    reverse trade, as the spec v2.3 prescribes; ``"tercile"`` is the earlier bottom-tercile
+    root, kept as a sensitivity.  ``cuts``: ``"is"`` labels the terciles on the in-sample cut
+    points (R1: out of sample a real-time rule, in sample not), ``"expanding"`` on the cut points
+    of the entries before each date with at least two years of history (R1-rt, the in-sample
+    version).  The call leaf is :func:`call_leaf`."""
+    leaf_call = call_leaf(d)
+    lab = {c: tercile_labels(d, c, cuts) for c in ("CRP", "GP_G", "variability", "vol_premium")}
+    # on the expanding terciles the whole tree starts once two years of history exist: a rule
+    # whose only possible leaf is the root's would be another rule
+    ready = (
+        expanding_cuts(d["CRP"])["lo"].notna()
+        if cuts == "expanding"
+        else pd.Series(True, index=d.index)
+    )
     out = pd.Series(np.nan, index=d.index, dtype=object)
     for i in d.index:
+        if not ready[i]:
+            continue
+        crp_v = d.at[i, "CRP"]
         crp, gp, var, vp, vr = (
             lab["CRP"][i],
             lab["GP_G"][i],
@@ -219,18 +313,25 @@ def rule_r1(d: pd.DataFrame) -> pd.Series:
             lab["vol_premium"][i],
             d.at[i, "VR_cs"],
         )
-        if pd.isna(crp):
-            continue
-        if crp == "low":
-            out[i] = "REV_H"
-            continue
+        if root == "absolute":
+            if not np.isfinite(crp_v):
+                continue
+            if crp_v < 0:
+                out[i] = "REV_H"
+                continue
+        else:
+            if pd.isna(crp):
+                continue
+            if crp == "low":
+                out[i] = "REV_H"
+                continue
         if pd.isna(gp) or not np.isfinite(vr):
             continue
         if gp == "low" or vr > 1.1:
             if pd.isna(var):
                 continue
             if var == "high":
-                out[i] = "PC_100_S"
+                out[i] = leaf_call
                 continue
             if pd.isna(vp):
                 continue
@@ -240,6 +341,65 @@ def rule_r1(d: pd.DataFrame) -> pd.Series:
             if pd.isna(vp):
                 continue
             out[i] = "PKG_theta_H" if vp == "high" else "PKG_v_H"
+    return out
+
+
+#: The rules of T14 and the samples in which each is a real-time rule: R1 (in-sample
+#: terciles) out of sample only; R1-rt (expanding terciles) and R2 (FHS forecasts) in both.
+RULES = {
+    "R1-rt": ("absolute", "expanding", ("IS", "OOS")),
+    "R1": ("absolute", "is", ("OOS",)),
+    "R1-rt, tercile root (sensitivity)": ("tercile", "expanding", ("IS", "OOS")),
+    "R1, tercile root (sensitivity)": ("tercile", "is", ("OOS",)),
+}
+
+
+def rules(d: pd.DataFrame, with_r2: bool) -> dict[str, pd.Series]:
+    """Every rule's pick at each entry: the R1 variants of :data:`RULES` and R2 (NaN picks
+    where a rule is not computed)."""
+    out = {name: rule_r1(d, root, cuts) for name, (root, cuts, _) in RULES.items()}
+    out["R2"] = rule_r2(d) if with_r2 else pd.Series(np.nan, index=d.index, dtype=object)
+    return out
+
+
+def samples_of(name: str) -> tuple[str, ...]:
+    return RULES[name][2] if name in RULES else ("IS", "OOS")
+
+
+def episodes(mask: pd.Series, step: int) -> int:
+    """Number of non-overlapping windows among the dates of ``mask`` (weekly entries; a window
+    spans ``step`` entries): the leaf's number of independent episodes, which its t does not
+    see when the dates cluster."""
+    idx = np.flatnonzero(mask.to_numpy(bool))
+    count, last = 0, -np.inf
+    for i in idx:
+        if i >= last + step:
+            count += 1
+            last = i
+    return count
+
+
+def leaf_stats(y: pd.Series, mask: pd.Series, lag: int) -> dict[str, float]:
+    """Mean P&L of a leaf (the rows of ``mask``) with a time-aware standard error: the
+    Newey–West (Bartlett) long-run variance at ``2·lag`` of the leaf's residuals at their place
+    in the weekly series.  A leaf's dates cluster in a few episodes; on such a subset the
+    equal-weight Hansen–Hodrick kernel of ``disp_stats.subset_mean_se`` can sum negative
+    autocovariances to nearly nothing (a t of −10^9 on one 24m leaf), so T14 uses the Bartlett
+    kernel, which is positive semi-definite."""
+    v = y.to_numpy(float)
+    m = mask.to_numpy(bool) & np.isfinite(v)
+    n = int(m.sum())
+    out = st.describe(v[m], 0)
+    if n < 3:
+        return out
+    mean = float(v[m].mean())
+    u = np.where(m, v - mean, 0.0)[:, None]
+    var = float(st._long_run(u, 2 * lag, True)[0, 0]) / n**2
+    # a long-run variance below the iid one is a small-sample artefact on a clustered subset
+    # (the residuals of a cluster sum to zero): the standard error is floored at sd/√n
+    iid = float(np.var(v[m], ddof=1)) / n
+    se = float(np.sqrt(max(var, iid, 0.0)))
+    out["t"] = mean / se if se > 0 else float("nan")
     return out
 
 
@@ -268,7 +428,11 @@ def rule_r2(d: pd.DataFrame) -> pd.Series:
 def stream(d: pd.DataFrame, pick: pd.Series, scaled: bool) -> pd.Series:
     """P&L per entry of a rule's picks (NaN where it has no position); ``scaled`` divides each
     position by its trailing risk (unit notional until the risk exists)."""
-    cols = [c for c in pick.dropna().unique() if c in d.columns]
+    names = [c for c in pick.dropna().unique() if c != "none"]
+    missing = [c for c in names if c not in d.columns]
+    if missing:
+        raise KeyError(f"picks name columns the frame does not have: {missing} (use prepare())")
+    cols = names
     out = pd.Series(np.nan, index=d.index)
     scales = {c: risk_scale(d, c) for c in cols} if scaled else {}
     for c in cols:
@@ -293,25 +457,29 @@ def stream_stats(y: pd.Series, d: pd.DataFrame, tenor: str, scale: float = 100.0
 
 def t14(
     d: pd.DataFrame, tenor: str, with_r2: bool
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, pd.Series]]:
+    """T14: the rules against the always-strategies (rows), the leaves, and the picks.  A rule
+    appears only in the samples where it is a real-time rule (:data:`RULES`)."""
     o = d[d["has_outcome"]]
-    r1 = rule_r1(d)
-    r2 = rule_r2(d) if with_r2 else pd.Series(np.nan, index=d.index, dtype=object)
+    picks = rules(d, with_r2)
+    rule_names = [k for k, v in picks.items() if v.notna().any()]
     rows = []
     for scaled, unit in (
         (False, "unit notional, % of notional"),
         (True, "constant risk, in trailing standard deviations"),
     ):
         sc = 1.0 if scaled else 100.0
-        strategies: list[tuple[str, pd.Series]] = [("R1", stream(d, r1, scaled))]
-        if with_r2:
-            strategies.append(("R2", stream(d, r2, scaled)))
+        strategies: list[tuple[str, pd.Series]] = [
+            (name, stream(d, picks[name], scaled)) for name in rule_names
+        ]
         for label, col in ALWAYS.items():
             if not scaled and label == "VD":
                 continue
             strategies.append((f"always {label}", stream(d, pd.Series(col, index=d.index), scaled)))
         for name, y in strategies:
             for sample, sel in (("IS", o["IS"]), ("OOS", ~o["IS"])):
+                if sample not in samples_of(name):
+                    continue
                 yy = y.reindex(o.index)[sel]
                 rows.append(
                     {
@@ -321,30 +489,39 @@ def t14(
                         **stream_stats(yy, o[sel], tenor, sc),
                     }
                 )
-            if name in ("R1", "R2"):
+            if name in rule_names:
                 for other in ("PF_U", "PKG_theta_H"):
                     base = stream(d, pd.Series(other, index=d.index), scaled)
                     for sample, sel in (("IS", o["IS"]), ("OOS", ~o["IS"])):
+                        if sample not in samples_of(name):
+                            continue
                         diff = (y - base).reindex(o.index)[sel]
                         s = st.describe(diff, tb.LAG[tenor])
                         rows.append({"strategy": f"{name} minus always {other.replace('_', ' ')}", "units": unit, "sample": sample, "mean": f"{sc * s['mean']:.3f}", "t": tb.num(s["t"], 2),
                                      "sd": f"{sc * s['sd']:.3f}", "mean/sd": tb.num(s["mean/sd"], 2), "5 %": "", "worst": "", "max drawdown (non-overlapping)": "", "positions": int(s["n"])})  # fmt: skip
     leaves = []
-    for name, pick in (("R1", r1), ("R2", r2)):
-        if pick.notna().sum() == 0:
-            continue
+    for name in rule_names:
+        pick = picks[name]
         p = pick.reindex(o.index)
+        missing = (
+            "no position (fewer than two years of history, or an indicator is missing)"
+            if "rt" in name
+            else "no position (an indicator is missing)"
+        )
         for sample, sel in (("IS", o["IS"]), ("OOS", ~o["IS"])):
+            if sample not in samples_of(name):
+                continue
             n = int(sel.sum())
             leaves.append(
                 {
                     "rule": name,
                     "sample": sample,
-                    "leaf": "no position (an indicator is missing)",
+                    "leaf": missing,
                     "share of dates": tb.num(p[sel].isna().mean(), 2),
                     "mean P&L": "",
                     "t": "",
                     "n": int(p[sel].isna().sum()),
+                    "episodes": "",
                 }
             )
             for leaf in sorted(p[sel].dropna().unique()):
@@ -359,10 +536,12 @@ def t14(
                             "mean P&L": "",
                             "t": "",
                             "n": int(m.sum()),
+                            "episodes": "",
                         }
                     )
                     continue
-                s = st.describe_subset(o[leaf], m, tb.LAG[tenor])
+                s = leaf_stats(o[leaf], m, tb.LAG[tenor])
+                ep = episodes(m, tb.STEP[tenor])
                 leaves.append(
                     {
                         "rule": name,
@@ -370,14 +549,15 @@ def t14(
                         "leaf": leaf.replace("_", " "),
                         "share of dates": tb.num(m.sum() / n, 2),
                         "mean P&L": tb.pct(s["mean"]),
-                        "t": tb.num(s["t"], 2),
+                        "t": tb.num(s["t"], 2) if ep >= 3 else "–",
                         "n": int(m.sum()),
+                        "episodes": ep,
                     }
                 )
-    return pd.DataFrame(rows), pd.DataFrame(leaves), r1, r2
+    return pd.DataFrame(rows), pd.DataFrame(leaves), picks
 
 
-def t15(d: pd.DataFrame, r1: pd.Series, r2: pd.Series) -> tuple[pd.DataFrame, pd.DataFrame]:
+def t15(d: pd.DataFrame, picks: dict[str, pd.Series]) -> tuple[pd.DataFrame, pd.DataFrame]:
     last = d.index[-1]
     row = d.loc[last]
     ind = []
@@ -412,22 +592,15 @@ def t15(d: pd.DataFrame, r1: pd.Series, r2: pd.Series) -> tuple[pd.DataFrame, pd
         f, sr = row.get(f"fedge_{s}", np.nan), row.get(f"fsr_{s}", np.nan)
         e["value"] = f"{tb.pct(g0)} / {tb.pct(g1)} / {tb.pct(f)} ({tb.num(sr, 2)})"
         px.append(e)
-    px.append(
-        {
-            "quantity": "R1 selects",
-            "value": str(r1.iloc[-1]).replace("_", " ")
-            if pd.notna(r1.iloc[-1])
-            else "no position (an indicator is missing)",
-        }
-    )
-    px.append(
-        {
-            "quantity": "R2 selects",
-            "value": str(r2.iloc[-1]).replace("_", " ")
-            if pd.notna(r2.iloc[-1])
-            else "not available",
-        }
-    )
+    for name in ("R1", "R1-rt", "R2"):
+        pick = picks.get(name)
+        if pick is None or pick.notna().sum() == 0:
+            value = "not available"
+        elif pd.notna(pick.iloc[-1]):
+            value = str(pick.iloc[-1]).replace("_", " ")
+        else:
+            value = "no position (an indicator is missing)"
+        px.append({"quantity": f"{name} selects", "value": value})
     return pd.DataFrame(ind), pd.DataFrame(px)
 
 
@@ -515,11 +688,13 @@ def net_of_costs(d: pd.DataFrame, margin: str = "2 correlation points") -> pd.Da
         x[f"REV_{tag}"] -= ss + bs
     for m in tb.MULT:
         x[f"PC_{m}_U"] -= m_c[m]
-    x["PC_100_S"] -= m_c["100"]
+    for m in CALL_LEAF_STRIKES:
+        if f"PC_{m}_S" in x:
+            x[f"PC_{m}_S"] -= m_c[m]
     return x
 
 
-def break_even(d: pd.DataFrame, tenor: str, r1: pd.Series, r2: pd.Series) -> pd.DataFrame:
+def break_even(d: pd.DataFrame, tenor: str, picks: dict[str, pd.Series]) -> pd.DataFrame:
     """The dealer margin at which the mean P&L (or the advantage over always-PKG_theta H) is
     zero: in correlation points (mean P&L over mean ``|∂P/∂ρ|``) and in % of the premium, with
     block-bootstrap 95 % intervals.  A negative margin: the structure lost money at mid."""
@@ -542,17 +717,26 @@ def break_even(d: pd.DataFrame, tenor: str, r1: pd.Series, r2: pd.Series) -> pd.
         row(f"PC(1) U, {sample}", o["PC_100_U"], o["dC_drho_100"], o["C_100"], sel)
         row(f"GAP, {sample}", o["GAP_U"], o["dPD_drho"], o["P_D"], sel)
     base = o["PKG_theta_H"]
-    for name, pick in (("R1", r1), ("R2", r2)):
+    for name in ("R1-rt", "R1", "R2"):
+        pick = picks.get(name)
+        if pick is None:
+            continue
         p = pick.reindex(o.index)
         if p.notna().sum() == 0:
             continue
         y = stream(d, pick, False).reindex(o.index)
-        pall = p.isin(
-            ["PF_U", "PF_H", "PF_v_U", "PF_v_H", "PC_100_S"]
-        )  # the leaves that buy a Palladium
-        sens = o["dPD_drho"].abs().where(pall, 0.0)
-        prem = o["P_D"].where(pall, 0.0)
+        # the leaves that buy a Palladium: the forward's sensitivity and premium for the forward
+        # leaves, the call's own for a call leaf (the base net_of_costs uses)
+        forward_leaf = p.isin(["PF_U", "PF_H", "PF_v_U", "PF_v_H"])
+        sens = o["dPD_drho"].abs().where(forward_leaf, 0.0)
+        prem = o["P_D"].where(forward_leaf, 0.0)
+        for m in CALL_LEAF_STRIKES:
+            call_leaf_m = p == f"PC_{m}_S"
+            sens = sens.where(~call_leaf_m, o[f"dC_drho_{m}"].abs())
+            prem = prem.where(~call_leaf_m, o[f"C_{m}"])
         for sample, sel in (("IS", o["IS"]), ("OOS", ~o["IS"])):
+            if sample not in samples_of(name):
+                continue
             m = sel & y.notna()
             if sens[m].sum() > 0:
                 row(

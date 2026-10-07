@@ -403,6 +403,54 @@ def sensitivities(rep: Report, d: pd.DataFrame, tenor: str) -> None:
         )
 
 
+def t14_other_tenors(rep: Report, tenor: str) -> None:
+    """T14 (rules, leaves, costs) at every other tenor of B1, from the stored outcomes; R2 where
+    the FHS exists (1m, 6m)."""
+    import disp_tables2 as t2
+
+    rules_, leaves_, costs_, shares = [], [], [], []
+    for t in (x for x in ("1m", "3m", "6m", "12m", "24m") if x != tenor):
+        if not (dd.OUT / f"outcomes_{t}.parquet").exists():
+            continue
+        x = t2.prepare(tb.load(t, "B1"), t)
+        if int(x["has_outcome"].sum()) < 30:
+            continue
+        has_fhs = "fsr_PF" in x and x["fsr_PF"].notna().any()
+        a, b, picks = t2.t14(x, t, has_fhs)
+        a.insert(0, "run", f"B1 {t}")
+        b.insert(0, "run", f"B1 {t}")
+        a.insert(2, "call leaf", t2.call_leaf(x).replace("_", " "))
+        shares.append(f"{t}: {t2.priced_text(x)}")
+        rules_.append(a)
+        leaves_.append(b)
+        nets = {m: t2.net_of_costs(x, m) for m in ("2 correlation points", "5 % of the premium")}
+        c = pd.DataFrame(cost_rows(x, t, picks, nets))
+        c.insert(0, "run", f"B1 {t}")
+        costs_.append(c)
+    if not rules_:
+        return
+    rep.add("## The rules at every tenor\n")
+    rep.add(
+        f"T14 recomputed from the stored outcomes of each tenor (spec v2.3, item 6): the same trees, the terciles of each tenor's own indicators, the call leaf the furthest strike whose call is at or above the floor on every date of the tenor; R2 where the FHS exists. The {tenor} tables are above. "
+        f"Share of dates on which each strike is priced — {'; '.join(shares)}. The 1.25× call is priced on nearly every date from three months on (the spec's premise that those strikes sit below the floor at three months does not hold in these data: the leaf follows the all-dates rule, which gives the spec's own list, PC(1) at 1m–6m and PC(1.25) at 12m and 24m); the 1.5× call is priced on a minority of dates at every tenor.\n"
+    )
+    rep.table(
+        "T14_other_tenors",
+        pd.concat(rules_, ignore_index=True),
+        "T14 by tenor (B1), at unit notional (% of notional) and at constant risk: the rules in the samples where they are real-time rules, against the always-strategies.",
+    )
+    rep.table(
+        "T14_leaves_other_tenors",
+        pd.concat(leaves_, ignore_index=True),
+        "The leaves of the rules by tenor: share of dates, each leaf's own P&L (% of notional), its t (Bartlett kernel, floored at the iid standard error; shown with three or more non-overlapping episodes) and its number of episodes.",
+    )
+    rep.table(
+        "T14_costs_other_tenors",
+        pd.concat(costs_, ignore_index=True),
+        "T14 at mid and net of costs by tenor (half the listed bid-ask on every straddle leg, 1 bp on hedges, a dealer margin on the Palladium).",
+    )
+
+
 def multi(rep: Report, tenor: str) -> None:
     """The other tenors of B1 and the equally weighted B2: T2, T4, T6-style horizon, T13, T17."""
     runs = [
@@ -484,8 +532,41 @@ def multi(rep: Report, tenor: str) -> None:
         )
 
 
+def cost_rows(
+    d: pd.DataFrame, tenor: str, picks: dict[str, pd.Series], nets: dict[str, pd.DataFrame]
+) -> list[dict[str, Any]]:
+    """T14 at mid and net of costs: the rules (each in the samples where it is a real-time
+    rule) and three always-strategies."""
+    import disp_tables2 as t2
+
+    lag = tb.LAG[tenor]
+    o = d[d["has_outcome"]]
+    rows = []
+    strategies = [(k, v) for k, v in picks.items() if v.notna().sum() > 0] + [
+        ("always PF U", pd.Series("PF_U", index=d.index)),
+        ("always PKG_theta H", pd.Series("PKG_theta_H", index=d.index)),
+        ("always PKG_v H", pd.Series("PKG_v_H", index=d.index)),
+    ]
+    for name, pick in strategies:
+        row = {"strategy": name}
+        for sample, sel in (("IS", o["IS"]), ("OOS", ~o["IS"])):
+            if sample not in t2.samples_of(name):
+                row[f"{sample} at mid"] = "–"
+                for m in nets:
+                    row[f"{sample} net, margin {m}"] = "–"
+                continue
+            y0 = t2.stream(d, pick, False).reindex(o.index)[sel]
+            s0 = st.describe(y0, lag)
+            row[f"{sample} at mid"] = f"{tb.pct(s0['mean'])} ({s0['t']:.1f})"
+            for m, dn in nets.items():
+                s1 = st.describe(t2.stream(dn, pick, False).reindex(o.index)[sel], lag)
+                row[f"{sample} net, margin {m}"] = f"{tb.pct(s1['mean'])} ({s1['t']:.1f})"
+        rows.append(row)
+    return rows
+
+
 def costs(
-    rep: Report, d: pd.DataFrame, tenor: str, r1: pd.Series, r2: pd.Series, has_fhs: bool
+    rep: Report, d: pd.DataFrame, tenor: str, picks: dict[str, pd.Series], has_fhs: bool
 ) -> None:
     """Spec §11: the decision table, the rules, the gap and the calibration net of costs, and
     the break-even dealer margins."""
@@ -530,36 +611,27 @@ def costs(
         pd.DataFrame(rows),
         "The decision table and the gap (T13, T17) at mid and net of costs: mean P&L in % of notional with its Hansen–Hodrick t; the two dealer margins change the Palladium structures only.",
     )
-    rows = []
-    for name, pick in (
-        ("R1", r1),
-        ("R2", r2),
-        ("always PF U", pd.Series("PF_U", index=d.index)),
-        ("always PKG_theta H", pd.Series("PKG_theta_H", index=d.index)),
-        ("always PKG_v H", pd.Series("PKG_v_H", index=d.index)),
-    ):
-        if pick.notna().sum() == 0:
-            continue
-        row = {"strategy": name}
-        for sample, sel in (("IS", o["IS"]), ("OOS", ~o["IS"])):
-            y0 = t2.stream(d, pick, False).reindex(o.index)[sel]
-            s0 = st.describe(y0, lag)
-            row[f"{sample} at mid"] = f"{tb.pct(s0['mean'])} ({s0['t']:.1f})"
-            for m, dn in nets.items():
-                s1 = st.describe(t2.stream(dn, pick, False).reindex(o.index)[sel], lag)
-                row[f"{sample} net, margin {m}"] = f"{tb.pct(s1['mean'])} ({s1['t']:.1f})"
-        rows.append(row)
+    rows = cost_rows(d, tenor, picks, nets)
     try:
         c14 = pd.DataFrame(rows).set_index("strategy")
         col_is, col_oos = (
             "IS net, margin 2 correlation points",
             "OOS net, margin 2 correlation points",
         )
+
+        def clause(k: str) -> str:
+            parts = []
+            if "IS" in t2.samples_of(k):
+                parts.append(f"{c14.loc[k, col_is]} in sample")
+            if "OOS" in t2.samples_of(k):
+                parts.append(f"{c14.loc[k, col_oos]} out of sample")
+            return f"{k} " + ", ".join(parts)
+
         rep._costs = (
             "; ".join(
-                f"{k} {c14.loc[k, col_is]} in sample, {c14.loc[k, col_oos]} out of sample"
+                clause(k)
                 for k in c14.index
-                if k in ("R1", "R2", "always PF U", "always PKG_theta H")
+                if k in ("R1-rt", "R1", "R2", "always PF U", "always PKG_theta H")
             )
             + " (mean, % of notional, t in brackets)."
         )  # type: ignore[attr-defined]
@@ -568,7 +640,7 @@ def costs(
     rep.table(
         "T14_costs",
         pd.DataFrame(rows),
-        "The rules and three always-strategies (T14) at mid and net of costs, unit notional: mean P&L in % of notional with its t. The picks are those made at mid.",
+        "The rules and three always-strategies (T14) at mid and net of costs, unit notional: mean P&L in % of notional with its t. The picks are those made at mid; a rule is shown in the samples where it is a real-time rule (R1 out of sample, R1-rt and R2 in both).",
     )
     if has_fhs:
         dn = nets["2 correlation points"].copy()
@@ -587,7 +659,7 @@ def costs(
         )
     rep.table(
         "break_even_margin",
-        t2.break_even(d, tenor, r1, r2),
+        t2.break_even(d, tenor, picks),
         "Break-even dealer margin: the margin at which the mean P&L at mid (or a rule's advantage over always-PKG_theta H) is zero, in correlation points and in % of the Palladium premium, with block-bootstrap 95 % intervals. A negative number: the structure lost at mid, so any margin makes it worse; the PM knows the quote at which the choice flips.",
     )
 
@@ -647,7 +719,8 @@ def pm_summary(rep: Report, d: pd.DataFrame, PT: pd.DataFrame, tenor: str) -> No
         )
 
     names = {
-        "R1": "R1, the pre-registered leaf list on the indicators",
+        "R1-rt": "R1-rt, the pre-registered leaf list (`CRP < 0` → the reverse trade at the root, the other nodes on expanding-window terciles: a real-time rule in both samples)",
+        "R1": "R1, the same tree on in-sample terciles (a real-time rule out of sample only)",
         "R2": "R2, the structure with the best forecast Sharpe from the filtered historical simulation",
     }
     for name, label in names.items():
@@ -655,13 +728,17 @@ def pm_summary(rep: Report, d: pd.DataFrame, PT: pd.DataFrame, tenor: str) -> No
             lines.append(
                 f"- **{label}**: {rule_text(name, True)}; against always the hedged theta-neutral package: {rule_text(f'{name} minus always PKG theta H', False)}."
             )
+    if (unit["strategy"] == "R1, tercile root (sensitivity)").any():
+        lines.append(
+            f"- *Sensitivity*: with the earlier bottom-tercile root (selling dispersion on a third of the dates) R1 earns {rule_text('R1, tercile root (sensitivity)', False)} out of sample, R1-rt {rule_text('R1-rt, tercile root (sensitivity)', False)}."
+        )
     lines.append(
         f"- **Always the same structure**: hedged theta-neutral package {rule_text('always PKG_theta H', False)}; hedged vega-neutral package {rule_text('always PKG_v H', False)}; "
         f"Palladium forward held to expiry {rule_text('always PF U', False)}; hedged {rule_text('always PF H', False)}."
     )
     p15 = sec["p15"].set_index("quantity")["value"]
     lines.append(
-        f"\nToday R1 selects **{p15.get('R1 selects', 'not available')}**, R2 selects **{p15.get('R2 selects', 'not available')}**.\n"
+        f"\nToday R1 selects **{p15.get('R1 selects', 'not available')}** (R1-rt: {p15.get('R1-rt selects', 'not available')}), R2 selects **{p15.get('R2 selects', 'not available')}**.\n"
     )
     cost = getattr(rep, "_costs", None)
     if cost is not None:
@@ -792,7 +869,7 @@ def third_phase(rep: Report, d: pd.DataFrame, tenor: str) -> None:
 def second_phase(rep: Report, d0: pd.DataFrame, tenor: str, dec: pd.DataFrame) -> None:
     import disp_tables2 as t2
 
-    d = t2.add_fhs(d0, tenor)
+    d = t2.prepare(d0, tenor)
     has_fhs = "fsr_PF" in d and d["fsr_PF"].notna().any()
     a, b = t2.t5(d, tenor)
     rep.table(
@@ -825,14 +902,20 @@ def second_phase(rep: Report, d0: pd.DataFrame, tenor: str, dec: pd.DataFrame) -
         t2.t11(d, tenor),
         "D11, correlation skew on relative dispersion: realised D/B over its forward by the basket's performance, raw and divided by realised over implied average single-name vol, beside the copula's own conditional profile.",
     )
-    t14, leaves, r1, r2 = t2.t14(d, tenor, has_fhs)
+    t14, leaves, picks = t2.t14(d, tenor, has_fhs)
+    leaf_name = t2.call_leaf(d).replace("_", " ")
     rep.table(
         "T14_rules",
         t14,
-        "Rules R1 (pre-registered leaf list on in-sample terciles) and R2 (highest positive FHS forecast Sharpe) against the always-strategies: per-entry P&L at unit notional (% of notional) and at constant risk (each position over the standard deviation of its structure over the windows expired in the trailing three years; unit notional until 52 such windows exist).",
+        "Rules against the always-strategies (spec v2.3): R1 is the pre-registered tree with `CRP < 0 → REV H` at the root and the other nodes on in-sample terciles (a real-time rule out of sample only, so shown out of sample); "
+        "R1-rt is the same tree on expanding-window terciles (at least two years of history), the in-sample version, also shown out of sample; the bottom-tercile root of the earlier spec is a sensitivity row; "
+        f"the call leaf is the statically hedged call at the furthest strike whose price is at or above the study's floor (0.05 % of notional) on every date of the tenor (here {leaf_name}; share of dates priced: {t2.priced_text(d)}); R2 is the highest positive FHS forecast Sharpe. "
+        "Per-entry P&L at unit notional (% of notional) and at constant risk (each position over the standard deviation of its structure over the windows expired in the trailing three years), IS and OOS; the minus rows are the rule against an always-strategy on the same dates.",
     )
     rep.table(
-        "T14_leaves", leaves, "Share of dates in each leaf and each leaf's own P&L (% of notional)."
+        "T14_leaves",
+        leaves,
+        "Share of dates in each leaf and each leaf's own P&L (% of notional). The t is time-aware (Bartlett kernel at twice the overlap, floored at the iid standard error) and shown only for leaves with three or more non-overlapping episodes ('episodes': the number of non-overlapping windows among the leaf's dates; a leaf whose dates sit in one episode is one observation whatever a t says).",
     )
     if has_fhs:
         c, dec2 = t2.t18_fhs(d, tenor)
@@ -876,7 +959,7 @@ def second_phase(rep: Report, d0: pd.DataFrame, tenor: str, dec: pd.DataFrame) -
         rp,
         "The static replica of the Palladium forward in straddles, estimated on windows expired by 2016-12-31 and applied out of sample.",
     )
-    i15, p15 = t2.t15(d, r1, r2)
+    i15, p15 = t2.t15(d, picks)
     rep.table(
         "T15_indicators",
         i15,
@@ -903,8 +986,9 @@ def second_phase(rep: Report, d0: pd.DataFrame, tenor: str, dec: pd.DataFrame) -
             f"Every conditional cell outside the five primary tests: top minus bottom in-sample tercile of each indicator, for twelve structures, in sample and out of sample ({len(con)} cells; % of notional, VD in vega-notional units), with Benjamini–Hochberg q-values over all the cells. Shown: the 25 smallest q-values; {int((con['q (Benjamini–Hochberg)'] < 0.10).sum())} cells have q below 0.10. The CSV has every cell.",
             show=top,
         )
-    safe(rep, "costs", lambda: costs(rep, d, tenor, r1, r2, has_fhs))
+    safe(rep, "costs", lambda: costs(rep, d, tenor, picks, has_fhs))
     safe(rep, "other runs", lambda: multi(rep, tenor))
+    safe(rep, "rules at every tenor", lambda: t14_other_tenors(rep, tenor))
     safe(rep, "figures", lambda: figures(rep, d, tenor, dec))
     rep._second = {
         "t14": t14,
@@ -913,8 +997,7 @@ def second_phase(rep: Report, d0: pd.DataFrame, tenor: str, dec: pd.DataFrame) -
         "p15": p15,
         "t5": a,
         "d": d,
-        "r1": r1,
-        "r2": r2,
+        "picks": picks,
     }  # type: ignore[attr-defined]
 
 
@@ -1018,7 +1101,7 @@ def second_verdicts(sec: dict[str, Any], tenor: str, v_row: Any) -> None:
               "D11 predicts lower in sell-offs holding vols fixed (the vol-adjusted row); standard errors of the two groups combined as if independent")  # fmt: skip
     t14 = sec["t14"]
     g = t14[t14["units"].str.startswith("unit")]
-    for name in ("R1", "R2"):
+    for name in ("R1-rt", "R1", "R2"):
         for other in ("PF U", "PKG theta H"):
             h = g[g["strategy"] == f"{name} minus always {other}"]
             if h.empty:
@@ -1027,9 +1110,11 @@ def second_verdicts(sec: dict[str, Any], tenor: str, v_row: Any) -> None:
             v_row(
                 "headline",
                 f"{name} minus always-{other}, mean P&L at unit notional, % of notional (T14)",
-                f"{r['IS']['mean']} (t {r['IS']['t']})",
+                f"{r['IS']['mean']} (t {r['IS']['t']})"
+                if "IS" in r
+                else "– (not a real-time rule in sample)",
                 "",
-                f"{r['OOS']['mean']} (t {r['OOS']['t']})",
+                f"{r['OOS']['mean']} (t {r['OOS']['t']})" if "OOS" in r else "–",
                 note="no expected sign",
             )
 
@@ -1083,14 +1168,16 @@ def first_page_rules(sec: dict[str, Any]) -> str:
         )
 
     return (
-        f"Mean P&L at unit notional, % of notional: R1 {line('R1')}; R2 {line('R2')}; always-PF {line('always PF U')}; always-PKG_θ H {line('always PKG_theta H')}; "
-        f"R1 minus always-PKG_θ H {line('R1 minus always PKG theta H')}; R2 minus always-PKG_θ H {line('R2 minus always PKG theta H')} (T14, with the leaves; net of costs: T14_costs)."
+        f"Mean P&L at unit notional, % of notional: R1-rt (expanding terciles, the in-sample version) {line('R1-rt')}; R1 (in-sample terciles, out of sample only) {line('R1')}; R2 {line('R2')}; "
+        f"always-PF {line('always PF U')}; always-PKG_θ H {line('always PKG_theta H')}; "
+        f"R1-rt minus always-PKG_θ H {line('R1-rt minus always PKG theta H')}; R1 minus always-PKG_θ H {line('R1 minus always PKG theta H')}; R2 minus always-PKG_θ H {line('R2 minus always PKG theta H')} "
+        "(T14, with the leaves; net of costs: T14_costs; every tenor: T14_other_tenors)."
     )
 
 
 def first_page_today(sec: dict[str, Any]) -> str:
     p15 = sec["p15"].set_index("quantity")["value"]
-    return f"R1 selects **{p15.get('R1 selects', '–')}**, R2 selects **{p15.get('R2 selects', '–')}** (T15 has every indicator with its percentile and the forecast edges)."
+    return f"R1 selects **{p15.get('R1 selects', '–')}** (R1-rt: {p15.get('R1-rt selects', '–')}), R2 selects **{p15.get('R2 selects', '–')}** (T15 has every indicator with its percentile and the forecast edges)."
 
 
 def mean_verdict(
@@ -1352,6 +1439,10 @@ def build(version: int, tenor: str, pdf: bool) -> None:
         rep.add(
             "**This version supersedes the numbers of v1 and v2.** A check of phase 4 (C8) found vendor expiries that are not smiles (strikes far from the money only, or a vol several times their neighbours'): two guards were added and the entry dates they touch priced again. "
             'The headline moves little and no conclusion changes except the verdict of primary test Q3 (section "Before and after the expiry guards").\n'
+        )
+    if version >= 4:
+        rep.add(
+            "**v4 applies item 6 of the spec changes v2.3 to v3** (PROGRESS_Q2, \"v2.3 applied: item 6\"): rule R1's root is `CRP < 0 → REV H`, its call leaf the furthest strike priced at the tenor, and R1-rt (expanding-window terciles) is the in-sample version; T14 (rules, leaves, costs) is recomputed at every tenor from the stored outcomes and T15's rule picks updated. Nothing else changed since v3.\n"
         )
     rep.add("## The six questions\n")
     q4 = PT.set_index("test")
