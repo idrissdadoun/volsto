@@ -207,19 +207,24 @@ def test_convert_fails_loudly(dirs: tuple[Path, Path]) -> None:
     fx.write_day(raw_dir, dt.date(2024, 1, 9))
     reverify(raw_dir)
     rep = store.convert(raw_dir, store_dir, workers=1)
-    assert rep.converted == ["2024-01-09"] and not rep.clean
-    why = {fx.FILE_NAME.format(d): rep.failed[fx.FILE_NAME.format(d)] for d in DAYS}
+    # owner's instruction 2026-10-04: SPX rows without an OPRA symbol are converted
+    assert sorted(rep.converted) == [ISO[1], "2024-01-09"] and not rep.clean
+    blank = store.read_manifest(store_dir)["files"][ISO[1]]
+    assert blank["copra_empty"] > 0 and blank["key_duplicates"] > 0  # SPX and SPXW share strikes
+    why = {fx.FILE_NAME.format(d): rep.failed[fx.FILE_NAME.format(d)] for d in (DAYS[0], DAYS[2])}
     assert "schema drift" in why[fx.FILE_NAME.format(DAYS[0])]
     assert "missing ['cMidIv']" in why[fx.FILE_NAME.format(DAYS[0])]
     assert "unexpected ['newCol']" in why[fx.FILE_NAME.format(DAYS[0])]
-    assert "SPX rows without an OPRA symbol" in why[fx.FILE_NAME.format(DAYS[1])]
     assert "ArrowInvalid" in why[fx.FILE_NAME.format(DAYS[2])]  # a date not in %m/%d/%Y
     assert "trade_date column" in rep.failed["ORATS_SMV_Strikes_20240105.zip"]
     assert "ArrowInvalid" in rep.failed["ORATS_SMV_Strikes_20240108.zip"]  # an int that is not
-    assert sorted(store.read_manifest(store_dir)["files"]) == ["2024-01-09"]
-    assert [p.name for p in store_dir.rglob("*.parquet")] == ["2024-01-09.parquet"]
+    assert sorted(store.read_manifest(store_dir)["files"]) == [ISO[1], "2024-01-09"]
+    assert sorted(p.name for p in store_dir.rglob("*.parquet")) == [
+        f"{ISO[1]}.parquet",
+        "2024-01-09.parquet",
+    ]
     text = store.format_convert(rep)
-    assert text.count("FAILED") == 5 and "NOT CLEAN" in text
+    assert text.count("FAILED") == 4 and "NOT CLEAN" in text
     # a raw file edited after verify-raw but with size and mtime kept: the hash catches it
     victim = raw_dir / fx.FILE_NAME.format(dt.date(2024, 1, 9))
     st = victim.stat()
@@ -231,7 +236,8 @@ def test_convert_fails_loudly(dirs: tuple[Path, Path]) -> None:
     os.utime(victim, ns=(st.st_atime_ns, st.st_mtime_ns))
     rep = store.convert(raw_dir, store_dir, workers=1, force=True)
     assert "changed since verify-raw" in rep.failed[victim.name]
-    assert store.read_manifest(store_dir)["files"] == {}  # a failed file is vouched for by nothing
+    # a failed file is vouched for by nothing
+    assert sorted(store.read_manifest(store_dir)["files"]) == [ISO[1]]
 
 
 def test_convert_reports_copra_violations_and_duplicate_dates(dirs: tuple[Path, Path]) -> None:
@@ -387,11 +393,7 @@ def test_extract_per_ticker(dirs: tuple[Path, Path]) -> None:
         extract.parse_tickers("SPX,../x")
     with pytest.raises(DataError, match="no ticker"):
         extract.parse_tickers(" , ")
-    man = store.read_manifest(store_dir)
-    man["files"][ISO[0]]["schema_version"] = 2
-    store.write_manifest(store_dir, man)
-    with pytest.raises(DataError, match=r"schema versions \[1, 2\]"):
-        extract.extract(store_dir, "SPX")
+    assert again.tickers["SPX"]["schema_versions"] == [1]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -484,3 +486,51 @@ def test_convert_the_sample(tmp_path: Path) -> None:
     check = store.verify_store(raw_dir, store_dir, workers=1)
     print(store.format_verify(check))
     assert check.clean
+
+
+def test_older_layout_becomes_nulls_and_the_key_falls_back(dirs: tuple[Path, Path]) -> None:
+    """Owner's instruction 2026-10-04: the 37-column layout (no OPRA columns) is schema
+    version 2; its absent columns are null in the store, which keeps one schema; the uniqueness
+    key is ``cOpra`` when present, otherwise (ticker, expirDate, strike); the extract spans
+    both layouts."""
+    raw_dir, store_dir = dirs
+
+    def old(df: pd.DataFrame) -> pd.DataFrame:
+        # the old files: no OPRA columns, the PM third-Friday series under its own ticker
+        pm = df["cOpra"].map(orats.opra_root) == "SPXW"
+        df = df.assign(ticker=df["ticker"].where(~((df["ticker"] == "SPX") & pm), "SPXPM"))
+        return df.drop(columns=["cOpra", "pOpra"])
+
+    def old_repeated(df: pd.DataFrame) -> pd.DataFrame:
+        df = df.drop(columns=["cOpra", "pOpra"])  # SPX and SPXW rows now share their keys
+        return df
+
+    for day in DAYS:  # the fixture's files move into the year folder
+        (raw_dir / fx.FILE_NAME.format(day)).unlink()
+    fx.write_day(raw_dir / "2024", DAYS[0], mutate=old)
+    fx.write_day(raw_dir / "2024", DAYS[1], mutate=old_repeated)
+    fx.write_day(raw_dir / "2024", DAYS[2])
+    assert orats.schema_version_of(orats.schema_columns(2)) == 2
+    assert not reverify(raw_dir).findings()
+    rep = store.convert(raw_dir, store_dir, workers=1)
+    assert sorted(rep.converted) == ISO and not rep.failed
+    files = store.read_manifest(store_dir)["files"]
+    assert [files[d]["schema_version"] for d in ISO] == [2, 2, 1]
+    frame = fx.day_frame(DAYS[0])
+    assert files[ISO[0]]["copra_empty"] == len(frame) and files[ISO[0]]["key_duplicates"] == 0
+    shared = frame[frame["ticker"] == "SPX"].duplicated(["expirDate", "strike"]).sum()
+    assert files[ISO[1]]["key_duplicates"] == shared > 0
+    assert (
+        list(rep.violations) == [ISO[1]] and "without a symbol repeating" in rep.violations[ISO[1]]
+    )
+    got = pq.read_table(store.day_path(store_dir, ISO[0]))
+    assert got.schema.remove_metadata() == store.arrow_schema()
+    assert got["cOpra"].null_count == got["pOpra"].null_count == got.num_rows == len(frame)
+    assert got["cMidIv"].null_count == 0
+    assert store.verify_store(raw_dir, store_dir, workers=1).clean
+    out = extract.extract(store_dir, ["SPX", "SPXPM"])
+    assert out.tickers["SPX"]["n_dates"] == 3 and out.tickers["SPX"]["schema_versions"] == [1, 2]
+    assert out.tickers["SPXPM"]["n_dates"] == 1
+    spx = pq.read_table(extract.ticker_path(store_dir, "SPX"))
+    assert spx.schema.remove_metadata() == store.arrow_schema()
+    assert 0 < spx["cOpra"].null_count < spx.num_rows

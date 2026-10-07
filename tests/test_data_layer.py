@@ -298,10 +298,16 @@ def test_verify_raw_content_findings(raw_dir: Path) -> None:
     assert "columns absent: ['cOpra', 'pOpra']" in rep.opra_missing[names[DAYS[0]]]
     assert "SPX rows without an OPRA symbol" in rep.opra_missing[names[DAYS[1]]]
     assert set(rep.opra_missing) == {names[DAYS[0]], names[DAYS[1]]}
+    # owner's instruction 2026-10-04: a day without OPRA symbols is a note, not a finding, and
+    # the layout without the two columns is schema version 2, not drift
+    by_name = {f.file: f for f in rep.files}
+    assert by_name[names[DAYS[0]]].schema_version == 2
+    assert rep.manifest()["notes"]["opra_missing"] == rep.opra_missing
+    assert "note: 2 files without OPRA symbols on SPX" in raw.format_report(rep)
     assert "file name says 2024-01-04, the trade_date column 2024-01-09" in (
         rep.date_mismatch[names[DAYS[2]]]
     )
-    assert set(rep.drift) == {names[DAYS[0]], names[DAYS[3]]}
+    assert set(rep.drift) == {names[DAYS[3]]}
     assert "missing ['spot_px']" in rep.drift[names[DAYS[3]]]
     assert "unexpected ['spotPx', 'newCol']" in rep.drift[names[DAYS[3]]]
     assert list(rep.unreadable) == ["ORATS_SMV_Strikes_20231229.zip"]
@@ -312,7 +318,6 @@ def test_verify_raw_content_findings(raw_dir: Path) -> None:
         "unreadable files",
         "trade_date mismatches",
         "schema drift",
-        "files without OPRA symbols on SPX",
     }
     with pytest.raises(DataError, match="does not exist"):
         raw.verify_raw(raw_dir / "nope")
@@ -474,3 +479,30 @@ def test_cli_fetch(
     assert cli.main(argv) == 0
     assert (tmp_path / "raw" / "orats" / "ORATS_SMV_Strikes_20240102.zip").exists()
     assert cli.main([*argv, "--", "--delete"]) == 2
+
+
+def test_verify_raw_reads_year_folders_and_ignores_other_files(raw_dir: Path) -> None:
+    """The archive's layout: zips in year folders, a ``.docx`` beside them, an unfinished
+    download (``.zip.<suffix>``), and a zip carrying a ``__MACOSX`` resource fork."""
+    import zipfile
+
+    for d in DAYS:  # the fixture's files move into the year folder
+        (raw_dir / fx.FILE_NAME.format(d)).unlink()
+    for d in DAYS[:3]:
+        fx.write_day(raw_dir / str(d.year), d)
+    path = fx.write_day(raw_dir / str(DAYS[3].year), DAYS[3])
+    with zipfile.ZipFile(path, "a") as zf:
+        zf.writestr(f"__MACOSX/._{path.with_suffix('.csv').name}", b"\x00\x05\x16\x07")
+    (raw_dir / "ORATS column definitions.docx").write_bytes(b"PK not a data file")
+    (raw_dir / "2024" / "ORATS_SMV_Strikes_20240108.zip.5a13CBd8").write_bytes(b"partial")
+    rep = verify(raw_dir)
+    assert [f.file for f in rep.files] == [f"2024/{fx.FILE_NAME.format(d)}" for d in DAYS]
+    assert not rep.findings(), rep.findings()
+    last = rep.files[-1]
+    assert last.error is None and last.rows == len(fx.day_frame(DAYS[3]))
+    assert last.ignored_members == (f"__MACOSX/._{path.with_suffix('.csv').name}",)
+    assert list(rep.manifest()["notes"]["ignored_members"]) == [last.file]
+    assert "__MACOSX member (ignored)" in raw.format_report(rep)
+    raw.write_manifest(raw_dir, rep.manifest())
+    again = verify(raw_dir)  # the manifest entry, ignored member included, is reused
+    assert again.reused == 4 and again.files == rep.files

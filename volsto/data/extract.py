@@ -10,8 +10,9 @@ count, dates and sha256; an extract whose store digest is not the current one is
 (:func:`extract_state`) and is rebuilt by the same command.  Files are written to a temporary
 name in their directory and renamed.
 
-A ticker that appears on no date fails loudly (no empty file is written).  Dates of different
-schema versions cannot be concatenated yet and are refused, naming the versions.
+A ticker that appears on no date fails loudly (no empty file is written).  Every store file
+has the store's one schema, so dates of different raw layouts concatenate; the manifest lists
+the layouts met (``schema_versions``).
 """
 
 from __future__ import annotations
@@ -98,14 +99,8 @@ def extract(store_dir: Path, tickers: Sequence[str]) -> ExtractReport:
         raise DataError(
             f"the store {store_dir} is empty: run volsto-data convert --vendor orats first"
         )
-    versions = sorted({e["schema_version"] for e in files.values()})
-    if len(versions) > 1:
-        raise DataError(
-            f"the store holds schema versions {versions}: a per-ticker file across versions "
-            "needs a rule for the differing columns, which is not decided yet"
-        )
     digest = storemod.store_digest(manifest)
-    schema = storemod.arrow_schema(versions[0])
+    schema = storemod.arrow_schema()
     out_dir = ensure_dir(store_dir / BY_TICKER_DIR)
     # an extract is at most the whole store (one ticker never is); refuse if even that is short
     require_free_space(
@@ -113,7 +108,9 @@ def extract(store_dir: Path, tickers: Sequence[str]) -> ExtractReport:
     )
     tmp = {t: out_dir / f".{t}.parquet.{os.getpid()}.tmp" for t in wanted}
     writers: dict[str, pq.ParquetWriter] = {}
-    stats: dict[str, dict[str, Any]] = {t: {"rows": 0, "dates": []} for t in wanted}
+    stats: dict[str, dict[str, Any]] = {
+        t: {"rows": 0, "dates": [], "versions": set()} for t in wanted
+    }
     layout = storemod.LAYOUT
     try:
         for date in sorted(files):
@@ -142,6 +139,7 @@ def extract(store_dir: Path, tickers: Sequence[str]) -> ExtractReport:
                 writers[t].write_table(part, row_group_size=max(part.num_rows, 1))
                 stats[t]["rows"] += part.num_rows
                 stats[t]["dates"].append(date)
+                stats[t]["versions"].add(int(files[date]["schema_version"]))
         for w in writers.values():
             w.close()
         rep = ExtractReport(store_dir, dates=len(files))
@@ -162,7 +160,7 @@ def extract(store_dir: Path, tickers: Sequence[str]) -> ExtractReport:
                 "last": stats[t]["dates"][-1],
                 "bytes": dest.stat().st_size,
                 "sha256": rawmod.sha256_file(dest),
-                "schema_version": versions[0],
+                "schema_versions": sorted(stats[t]["versions"]),
                 "store_digest": digest,
                 "built_utc": _dt.datetime.now(_dt.UTC).isoformat(timespec="seconds"),
             }

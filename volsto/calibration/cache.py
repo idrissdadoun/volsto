@@ -568,9 +568,12 @@ class LeverageCache:
 # code-tag guard (owner request before M4)
 # --------------------------------------------------------------------------------------------
 
-#: Modules whose source defines the calibration numerics and the shared stepping routine.
+#: Modules whose source defines the calibration numerics, the normal draws the particles are
+#: stepped with (a calibrated leverage is a function of them) and the shared stepping routine.
 GUARDED_MODULES: tuple[str, ...] = (
     "volsto/calibration/particle.py",
+    "volsto/calibration/binned.py",
+    "volsto/engine/rng.py",
     "volsto/models/leverage.py",
     "volsto/models/lsv.py",
     "volsto/models/bergomi.py",

@@ -39,10 +39,18 @@ contract is kept only when its own bid and ask are both positive.
    those values at the slices' maturities.  It is a prior and a cross-check: the option-implied
    funding curve supersedes it exactly as for HDN.
 
-*OPRA dependency* (decision 8): a row of the ticker without a ``cOpra`` or ``pOpra`` symbol
-fails loudly, and so does a root outside the underlying's known roots; the fallback (AM/PM from
-the expiry calendar) is a plan only (SPEC §18.6).  XSP and single stocks are out of scope
-(decision 9; SPEC §18.8 reports what breaks on three of them).
+**SPX settlement by period** (owner's instruction, 2026-10-04; SPEC §18.10), from the data of
+the day (:func:`settle`).  A row with OPRA symbols takes its root from them (``SPX`` AM,
+``SPXW`` PM), and a root outside the underlying's known roots fails loudly.  A row without
+symbols is settled by :func:`volsto.data.orats.settlement_without_opra`: ticker ``SPXPM`` is PM;
+ticker ``SPX`` on a monthly expiry is AM while ``SPXPM`` rows exist that day or before
+:data:`volsto.data.orats.SPXPM_FIRST_DATE`, PM otherwise.  Such a row is given the root of its
+settlement (``SPX`` for AM, ``SPXW`` for PM) and contract names built from it
+(:func:`volsto.data.orats.osi_symbol`).  The expiry is the last trading day
+(:func:`volsto.data.orats.canonical_expiry`: the old files date a standard expiry on the
+Saturday).  A day on which two rows claim the same (root, expiry, strike) cannot be settled
+and raises :class:`AmbiguousSettlement`: it is excluded and listed by the caller.  XSP and
+single stocks are out of scope (decision 9; SPEC §18.8 reports what breaks on three of them).
 
 **Provenance** (:func:`import_day`): vendor ``orats``, the raw file and its sha256, the store
 schema version, the close's source, and the statement that the snapshot time is the vendor's
@@ -62,7 +70,7 @@ from typing import Any, Final
 import numpy as np
 import pandas as pd
 
-from volsto.data import orats
+from volsto.data import orats, spx_settlement
 from volsto.data.roots import REPO_ROOT, DataError, DataRoots
 from volsto.market import import_hdn as ih
 from volsto.market import store as vendor_store
@@ -83,6 +91,10 @@ PRIOR_RATE_NOTE: Final = (
     "yields); a prior and a cross-check, superseded by the option-implied funding curve"
 )
 #: Vendor columns carried on the chain as cross-checks (never inputs).
+#: Tickers whose rows make an underlying's chain (the first is the underlying's own).
+FAMILY: Final[dict[str, tuple[str, ...]]] = {"SPX": ("SPX", orats.SPX_PM_TICKER)}
+#: The root a row without OPRA symbols is given, by settlement.
+ROOT_OF_SETTLEMENT: Final[dict[str, str]] = {"AM": "SPX", "PM": "SPXW"}
 CROSSCHECK_COLUMNS: Final[tuple[str, ...]] = (
     "yte",
     "stkPx",
@@ -111,13 +123,141 @@ def snapshots_dir(store: str | Path | None = None) -> Path:
     return DataRoots.resolve(store=store).store_dir(VENDOR) / "snapshots"
 
 
+class AmbiguousSettlement(DataError):  # noqa: N818 — a day to exclude and list
+    """A day whose rows cannot be told AM from PM: two rows claim one (root, expiry, strike)."""
+
+
+def _symbol(col: pd.Series) -> pd.Series:
+    """An OPRA column stripped, the empty string where the store holds null or nothing."""
+    return col.fillna("").astype(str).str.strip()
+
+
+def family_rows(
+    date: str | _dt.date, name: str, *, store: str | Path | None = None
+) -> pd.DataFrame:
+    """The store rows of ``name``'s tickers (:data:`FAMILY`) on ``date``; a family ticker the
+    day does not list is simply absent."""
+    frame = vendor_store.load_chain(VENDOR, date, name, store=store)
+    parts = [frame]
+    for ticker in FAMILY.get(name, (name,))[1:]:
+        try:
+            parts.append(vendor_store.load_chain(VENDOR, date, ticker, store=store))
+        except vendor_store.StoreMissing as exc:
+            if exc.command is not None:  # the day itself is missing: not ours to hide
+                raise
+    out = pd.concat(parts, ignore_index=True) if len(parts) > 1 else frame
+    out.attrs.update(frame.attrs)
+    return out
+
+
+def settle(frame: pd.DataFrame, name: str, *, store: str | Path | None = None) -> pd.DataFrame:
+    """``frame`` (vendor rows of ``name``'s tickers on one day) with ``root``, ``settlement``
+    (``AM``/``PM``), ``settled_by`` (``opra``, ``ticker`` or ``calendar``), ``expiration``
+    (ISO, the last trading day) and the two contract names ``c_contract`` / ``p_contract``
+    (module docstring).  Rows the settlement table cannot tell (``DROP``) are left out and
+    listed in ``attrs["dropped_expiries"]``; ``attrs["settlement_uncertain"]`` flags December
+    2010.  Raises :class:`DataError` on an unknown root, on symbols of two roots in one row or
+    on a missing settlement table, :class:`AmbiguousSettlement` on a repeated (root, expiry,
+    strike)."""
+    iso = str(frame.attrs["trade_date"])
+    trade = _dt.date.fromisoformat(iso)
+    out = frame.copy()
+    out.attrs.update(frame.attrs)
+    c_sym, p_sym = _symbol(out["cOpra"]), _symbol(out["pOpra"])
+    c_root = c_sym.map(lambda x: orats.opra_root(x) if x else "")
+    p_root = p_sym.map(lambda x: orats.opra_root(x) if x else "")
+    known = ih.INDEX_ROOTS.get(name, (name,))
+    unknown = sorted((set(c_root) | set(p_root)) - {""} - set(known))
+    if unknown:
+        raise DataError(
+            f"orats {iso}: {name} rows carry the OPRA roots {unknown}, outside the known "
+            f"{list(known)}: their settlement is not known to the importer"
+        )
+    clash = (c_root != "") & (p_root != "") & (c_root != p_root)
+    if clash.any():
+        raise DataError(
+            f"orats {iso}: {int(clash.sum())} {name} rows whose call and put roots differ"
+        )
+    sym_root = c_root.where(c_root != "", p_root)
+    canon = out["expirDate"].map(lambda d: orats.canonical_expiry(d)[0])
+    bare = sym_root == ""
+    bare_mask = bare.to_numpy()
+    settlement = np.where(sym_root.isin(AM_ROOTS), "AM", "PM").astype(object)
+    settled_by = np.full(len(out), "opra", dtype=object)
+    if bare_mask.any():
+        if name not in FAMILY:
+            raise DataError(
+                f"orats {iso}: {int(bare_mask.sum())} of {len(out)} {name} rows without an "
+                "OPRA symbol, and no settlement rule for this underlying"
+            )
+        twice = (
+            out[bare]
+            .assign(_canon=canon[bare])
+            .duplicated(["ticker", "_canon", "strike"], keep=False)
+        )
+        if twice.any():
+            ex = out[bare].loc[twice, ["ticker", "expirDate", "strike"]].head(3).to_dict("records")
+            raise AmbiguousSettlement(
+                f"orats {iso}: {int(twice.sum())} {name} rows without a symbol repeat a "
+                f"(root, expiry, strike) and nothing tells them apart, e.g. {ex}"
+            )
+        tickers = out["ticker"].to_numpy()
+        listed = bool((tickers == orats.SPX_PM_TICKER).any())
+        table = None
+        if not listed and trade >= orats.SPXPM_FIRST_DATE:
+            table = spx_settlement.load_table(DataRoots.resolve(store=store).store_dir(VENDOR))
+        try:
+            settlement[bare_mask] = [
+                orats.settlement_without_opra(t, e, trade, spxpm_listed=listed, table=table)
+                for t, e in zip(tickers[bare_mask], out["expirDate"].to_numpy()[bare_mask])
+            ]
+        except KeyError as exc:
+            raise DataError(
+                f"orats {iso}: the SPX settlement table has no entry for {exc.args[0]}: "
+                "python scripts/orats_spx_settlement.py"
+            ) from exc
+        settled_by[bare_mask] = np.where(
+            tickers[bare_mask] == orats.SPX_PM_TICKER, "ticker", "calendar"
+        )
+    keep = settlement != spx_settlement.DROP
+    dropped = sorted({d.isoformat() for d in canon[~keep]})
+    if not keep.all():
+        out, canon, sym_root = out[keep], canon[keep], sym_root[keep]
+        c_sym, p_sym, bare = c_sym[keep], p_sym[keep], bare[keep]
+        settlement, settled_by = settlement[keep], settled_by[keep]
+    out.attrs.update(frame.attrs)
+    out.attrs["dropped_expiries"] = dropped
+    out.attrs["settlement_uncertain"] = orats.settlement_uncertain(trade)
+    by_rule = pd.Series(settlement, index=out.index).map(ROOT_OF_SETTLEMENT)
+    out["root"] = sym_root.where(~bare, by_rule)
+    out["settlement"] = settlement
+    out["settled_by"] = settled_by
+    out["expiration"] = canon.map(_dt.date.isoformat)
+    dup = out.duplicated(["root", "expiration", "strike"], keep=False)
+    if dup.any():
+        ex = out.loc[dup, ["ticker", "root", "expiration", "strike"]].head(3).to_dict("records")
+        raise AmbiguousSettlement(
+            f"orats {iso}: {int(dup.sum())} {name} rows repeat a (root, expiry, strike) and "
+            f"nothing tells them apart, e.g. {ex}"
+        )
+    for c, cp, sym in (("c", 1, c_sym), ("p", -1, p_sym)):
+        built = [
+            orats.osi_symbol(r, e, cp, float(k))
+            for r, e, k in zip(out["root"], canon, out["strike"])
+        ]
+        out[f"{c}_contract"] = sym.where(sym != "", pd.Series(built, index=out.index))
+    return out
+
+
 def _side(frame: pd.DataFrame, cp: int) -> pd.DataFrame:
-    """The call (``cp`` = 1) or put side of the vendor rows as contract rows."""
+    """The call (``cp`` = 1) or put side of the settled vendor rows as contract rows."""
     c = "c" if cp == 1 else "p"
     out = pd.DataFrame(
         {
-            "contract": frame[f"{c}Opra"].str.strip(),
-            "expiration": frame["expirDate"].map(_dt.date.isoformat),
+            "contract": frame[f"{c}_contract"],
+            "root": frame["root"],
+            "settlement": frame["settlement"],
+            "expiration": frame["expiration"],
             "quote_date": frame["trade_date"].map(_dt.date.isoformat),
             "cp": cp,
             "strike": frame["strike"].astype(float),
@@ -142,31 +282,18 @@ def load_day(
 ) -> pd.DataFrame:
     """One trading day's canonical chain for ``underlying`` from the ORATS store (module
     docstring).  Raises :class:`volsto.market.store.StoreMissing` (with the ``volsto-data``
-    command) when the store does not hold the day, and :class:`DataError` on a missing OPRA
-    symbol, an unknown root or a missing close."""
+    command) when the store does not hold the day, :class:`AmbiguousSettlement` on a day that
+    cannot be settled, and :class:`DataError` on an unknown root or a missing close."""
     name = underlying.upper()
-    frame = vendor_store.load_chain(VENDOR, date, name, store=store)
+    frame = settle(family_rows(date, name, store=store), name, store=store)
     iso = str(frame.attrs["trade_date"])
-    empty = (frame["cOpra"].str.strip() == "") | (frame["pOpra"].str.strip() == "")
-    if empty.any():
-        raise DataError(
-            f"orats {iso}: {int(empty.sum())} of {len(frame)} {name} rows without an OPRA "
-            "symbol — the root is the only AM/PM marker and no fallback is implemented"
-        )
+    settled_by = {str(k): int(v) for k, v in frame["settled_by"].value_counts().items()}
     chain = pd.concat([_side(frame, 1), _side(frame, -1)], ignore_index=True)
-    chain["root"] = chain["contract"].map(orats.opra_root)
-    roots = ih.INDEX_ROOTS.get(name, (name,))
-    unknown = sorted(set(chain["root"]) - set(roots))
-    if unknown:
-        raise DataError(
-            f"orats {iso}: {name} rows carry the OPRA roots {unknown}, outside the known "
-            f"{list(roots)}: their settlement is not known to the importer"
-        )
     chain = chain[(chain["bid"] > 0) & (chain["ask"] > 0)].copy()
     chain["expiry"] = chain["root"] + "|" + chain["expiration"]
     chain["mid"] = 0.5 * (chain["bid"] + chain["ask"])
-    settlement = pd.Series(np.where(chain["root"].isin(AM_ROOTS), "AM", "PM"), index=chain.index)
-    chain["T"] = ih.time_to_expiry(chain["quote_date"], chain["expiration"], settlement)
+    chain["T"] = ih.time_to_expiry(chain["quote_date"], chain["expiration"], chain["settlement"])
+    chain = chain.drop(columns="settlement")
     chain = chain[chain["T"] > 0].copy()
     if chain.empty:
         raise DataError(f"orats {iso}: no two-sided {name} contract with a positive maturity")
@@ -191,6 +318,9 @@ def load_day(
             "spot_async_check": False,
             "raw_sha256": frame.attrs["raw_sha256"],
             "schema_version": int(frame.attrs["schema_version"]),
+            "settled_by": settled_by,
+            "dropped_expiries": list(frame.attrs.get("dropped_expiries", [])),
+            "settlement_uncertain": bool(frame.attrs.get("settlement_uncertain", False)),
             "closes": str(Path(closes) if closes is not None else HISTORY_DIR / f"{name}.csv"),
         }
     )
@@ -199,7 +329,7 @@ def load_day(
 
 def source_provenance(chain: pd.DataFrame) -> dict[str, Any]:
     """The vendor's entries of a snapshot's provenance (module docstring)."""
-    return {
+    out = {
         "vendor": VENDOR,
         "product": PRODUCT,
         "file": chain.attrs["file"],
@@ -209,6 +339,18 @@ def source_provenance(chain: pd.DataFrame) -> dict[str, Any]:
         "close_source": Path(chain.attrs["closes"]).name,
         "prior_rate_curve": PRIOR_RATE_NOTE,
     }
+    settled_by = dict(chain.attrs.get("settled_by", {}))
+    if set(settled_by) - {"opra"}:  # a day settled, in part, without OPRA symbols
+        out["settlement"] = {
+            "rule": "OPRA root where present; ticker SPXPM is PM; ticker SPX on a monthly "
+            "expiry is AM while SPXPM is listed that day or before "
+            f"{orats.SPXPM_FIRST_DATE.isoformat()}, then as the open-interest table says; "
+            f"non-monthly Fridays before {orats.WEEKLY_PM_FROM.isoformat()} are AM",
+            "vendor_rows_by_source": settled_by,
+            "dropped_expiries": list(chain.attrs.get("dropped_expiries", [])),
+            "uncertain": bool(chain.attrs.get("settlement_uncertain", False)),
+        }
+    return out
 
 
 def import_day(
@@ -220,9 +362,12 @@ def import_day(
     calendar_repair: ih.CalendarRepairConfig | None = ih.DEFAULT_CALENDAR_REPAIR,
     store: str | Path | None = None,
     closes: str | Path | None = None,
+    sabrw: bool = True,
 ) -> tuple[dict[str, Any], ih.SSVIFit, ih.SurfacePoints, pd.DataFrame]:
     """The whole pipeline for one ORATS day; returns ``(config, fit, points, chain)`` like
-    :func:`volsto.market.import_hdn.import_day`."""
+    :func:`volsto.market.import_hdn.import_day`.  ``sabrw=False`` skips the SABRW fits: the
+    snapshot's ``sabrw`` section is then written with an empty list of fits (a caller that
+    needs the surface only, such as the barrier study's day cache off its re-mark days)."""
     f = filters or ih.HdnFilters()
     chain = load_day(date, underlying, store=store, closes=closes)
     fwds = ih.implied_forwards(chain, max_years=f.max_years, band=f.near_atm_band)
@@ -230,7 +375,9 @@ def import_day(
     fit = ih.fit_ssvi(grid, points, filters=f, essvi=essvi, calendar_repair=calendar_repair)
     t_max = float(points.table["T"].max())
     fits = (
-        ih.sabrw_fits(points, t_min=ih.SABRW_T_MIN, t_max=t_max) if t_max > ih.SABRW_T_MIN else ()
+        ih.sabrw_fits(points, t_min=ih.SABRW_T_MIN, t_max=t_max)
+        if sabrw and t_max > ih.SABRW_T_MIN
+        else ()
     )
     cfg = ih.snapshot_document(chain, fit, points, f, source=source_provenance(chain), sabrw=fits)
     return cfg, fit, points, chain

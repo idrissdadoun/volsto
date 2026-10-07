@@ -23,8 +23,17 @@ when any is present):
   not hold exactly one member; a ``trade_date`` column that is absent, holds more than one
   value or disagrees with the file name.
 * **schema drift** — a header that is not a known schema version, with the difference named.
-* **OPRA dependency** — a file whose ``cOpra`` or ``pOpra`` is missing or empty on an ``SPX``
-  row (decision 8), and the coverage per year (:func:`opra_coverage_by_year`).
+
+**OPRA symbols** are reported, not required (owner's instruction, 2026-10-04; a file without
+them was a finding under decision 8): the files whose ``cOpra`` or ``pOpra`` is absent or empty
+on an ``SPX`` row are listed as a note, with the coverage per year
+(:func:`opra_coverage_by_year`).  The index importer settles such a day by the period's rule
+(:mod:`volsto.data.orats`).
+
+The archive keeps its files in year folders and comes with a ``.docx`` of column definitions:
+only ``*.zip`` below the vendor's directory is scanned, at any depth.  A zip member under
+``__MACOSX/`` (a resource fork some archive files carry) is ignored and recorded
+(``ignored_members``); the data is the one other member.
 
 An entry whose size and modification time are unchanged is reused from the existing manifest
 (``reused``); ``rehash=True`` reads every file again.  The manifest is replaced atomically.
@@ -90,6 +99,7 @@ class RawFile:
     opra_p_empty: int | None = None
     spx_rows: int | None = None
     spx_opra_empty: int | None = None  # SPX rows with either symbol empty
+    ignored_members: tuple[str, ...] = ()  # ``__MACOSX/`` members, not data
     error: str | None = None
 
     @property
@@ -113,6 +123,17 @@ def read_header(zf: zipfile.ZipFile, member: str) -> tuple[str, ...]:
     return tuple(line.split(","))
 
 
+#: Zip members that are not data: the resource forks macOS adds when it makes an archive.
+IGNORED_MEMBER_PREFIX = "__MACOSX/"
+
+
+def data_members(zf: zipfile.ZipFile) -> tuple[list[zipfile.ZipInfo], list[str]]:
+    """``(data members, names of the ignored members)`` of a raw zip."""
+    infos = [i for i in zf.infolist() if not i.is_dir()]
+    ignored = [i.filename for i in infos if i.filename.startswith(IGNORED_MEMBER_PREFIX)]
+    return [i for i in infos if not i.filename.startswith(IGNORED_MEMBER_PREFIX)], ignored
+
+
 def scan_zip(path: Path, rel: str, pattern: str) -> RawFile:
     """Hash ``path`` and stream its CSV member: header, row count, ``trade_date`` values and
     OPRA-column population.  Never raises on a bad file: the reason goes to ``error``."""
@@ -127,7 +148,8 @@ def scan_zip(path: Path, rel: str, pattern: str) -> RawFile:
     }
     try:
         with zipfile.ZipFile(path) as zf:
-            infos = [i for i in zf.infolist() if not i.is_dir()]
+            infos, ignored = data_members(zf)
+            base["ignored_members"] = tuple(ignored)
             if len(infos) != 1:
                 names = [i.filename for i in infos]
                 return RawFile(**base, error=f"expected one member, found {len(infos)}: {names}")
@@ -255,7 +277,6 @@ class RawReport:
             "unreadable files": len(self.unreadable),
             "trade_date mismatches": len(self.date_mismatch),
             "schema drift": len(self.drift),
-            "files without OPRA symbols on SPX": len(self.opra_missing),
             "files differing from the reference manifest": len(self.reference_diff),
         }
         return {k: v for k, v in kinds.items() if v}
@@ -311,8 +332,13 @@ class RawReport:
                 "unreadable": self.unreadable,
                 "date_mismatch": self.date_mismatch,
                 "drift": self.drift,
-                "opra_missing": self.opra_missing,
                 "reference_diff": self.reference_diff,
+            },
+            "notes": {
+                "opra_missing": self.opra_missing,
+                "ignored_members": {
+                    f.file: list(f.ignored_members) for f in self.files if f.ignored_members
+                },
             },
             "opra_coverage_by_year": self.opra_coverage_by_year(),
             "files": [asdict(f) for f in self.files],
@@ -338,6 +364,7 @@ def _entry_from_manifest(d: dict[str, Any]) -> RawFile:
     d = dict(d)
     d["columns"] = tuple(d["columns"])
     d["content_trade_dates"] = tuple(d["content_trade_dates"])
+    d["ignored_members"] = tuple(d.get("ignored_members", ()))
     return RawFile(**d)
 
 
@@ -522,7 +549,6 @@ def format_report(rep: RawReport) -> str:
         ("unreadable files", rep.unreadable),
         ("trade_date mismatches", rep.date_mismatch),
         ("schema drift", rep.drift),
-        ("files without OPRA symbols on SPX", rep.opra_missing),
         ("files differing from the reference manifest", rep.reference_diff),
     ]
     for title, items_d in mapped:
@@ -532,6 +558,16 @@ def format_report(rep: RawReport) -> str:
                 out.append(f"    {k}: {v}")
             if len(items_d) > 40:
                 out.append(f"    … and {len(items_d) - 40} more (all in the manifest)")
+    ignored = [f.file for f in rep.files if f.ignored_members]
+    if ignored:
+        out.append(
+            f"  note: {len(ignored)} files carry a __MACOSX member (ignored): {_ranges(ignored)}"
+        )
+    if rep.opra_missing:
+        out.append(
+            f"  note: {len(rep.opra_missing)} files without OPRA symbols on SPX (settlement by "
+            "the period's rule): " + _ranges(list(rep.opra_missing))
+        )
     out.append("  OPRA coverage per year (files | with OPRA columns | usable for SPX | rows |")
     out.append("    rows with empty cOpra | empty pOpra | SPX rows | SPX rows without a symbol):")
     for y in rep.opra_coverage_by_year():
@@ -549,5 +585,5 @@ def format_report(rep: RawReport) -> str:
     if found:
         out.append("  NOT CLEAN: " + "; ".join(f"{v} x {k}" for k, v in found.items()))
     else:
-        out.append("  clean: one file per trading day, known schema, OPRA symbols on every SPX row")
+        out.append("  clean: one file per trading day, known schema")
     return "\n".join(out)

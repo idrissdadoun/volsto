@@ -259,6 +259,13 @@ Algorithm on the shared `StepSchedule` with the shared spot step (frozen-L rule)
 
 Defaults: `N = 2·10⁵`, leverage grid floor ±2.5 in k (±2.08 made 3y variance swaps 0.18 vp rich), 3y horizon. Timings at the M4b scheme: ≈ 30 s per 3y calibration; the §9 default grid (105 points) ≈ 1 h. Production numbers — headline tables, regression baselines, viewer precompute — use `N = 8·10⁵` with a single seed (owner decision at M4b acceptance; ≈ 124 s per 3y calibration, so the §9 grid ≈ 4 h); development and fast paths keep `2·10⁵`.
 
+**Regression stage: two estimators, one switch (2026-10-04; `ParticleConfig.estimator`, calibration-speed study K).** Step 3 has two stages: the regression at the 201 nodes, then the post-processing (bad nodes, curvature correction, interpolation, tails — `particle._finish_estimate`, shared). The regression stage is computed in one of two ways.
+- **Sorted** (`estimator` `None`, the default, or `"sorted"`): the particles are sorted and each node sums the particles of its window (`particle.kernel_regression`). At 8·10⁵ particles and one thread the sort, the two gathers and the windowed sums are 125 s of a 192 s calibration (1,254 steps).
+- **Binned** (`estimator: "binned"`, `volsto/calibration/binned.py`; default off): no sort. The quantile nodes come from an exact histogram selection of the two order statistics; the floor decision and the rank window of every node from exact counts of the particles below `g − 4h`, `g`, `g + 4h` (one pass); the floor bandwidths from the exact order statistics at the window-edge ranks (a partition of the two tail subsets that hold them). Nodes, floored set and bandwidths are therefore the sorted path's, bit for bit. The kernel sums of the unfloored nodes use five arrays linearly binned at `h/4` (counts, first and second moment of `k` about the bin centre, `V` and its first moment); the floored nodes are summed over the tail particles themselves, because the floor's window is a rank window cut hard where the kernel weight is still large, which bins cannot place (measured: a symmetric `4 × bandwidth` window on bins is off by up to 21% at a node and flips a tail branch; the rank window from bins exceeds the tail fit's tolerance on 2 of 6 slices; the exact tail sum agrees to 1e-14). Measured on 3 dates × 8 seeds at 8·10⁵ particles against the sorted path, same particle seeds and the same 2·10⁵ pricing paths: every repriced pillar within 0.0005 vp (a uniform −0.0002 to −0.0005 vp shift, 0.00002–0.0001 vp across seeds: linear binning smooths each particle over one bin, a kernel of variance `h² + d²/6`); largest acceptance-region error 0.18665 against 0.18643; 74 s per calibration on one thread against 192 s, 116 s against 347 s with 18 single-thread calibrations at once. `binned_regression(..., deflate=True)` evaluates the unfloored sums with the bandwidth `sqrt(h² − d²/6)`, which removes the shift (paired mean within 0.00003 vp on every pillar); it is off here and is switched on with the default in the follow-up change, under a new code tag.
+- **Keys and tag.** The field is omitted from every mapping while `None` (`OMIT_WHEN_NONE`), so the cache key of every committed spec is unchanged (`test_keys_of_committed_specs_unchanged`); the leverage metadata carries `estimator` only when the switch is set. `binned.py` and `engine/rng.py` join the code-tag guard's modules (§4.3), and the hash recorded for `m6` was re-recorded without a bump: the default path is proven unchanged bit for bit (`tests/test_lsv.py::test_default_estimator_is_the_m6_sorted_path`, against the frozen m6 function in `tests/_particle_reference_m6.py`; at the cache settings `test_default_path_matches_the_k2_baseline_digest`, slow, platform-pinned), and the binned estimator against the study's scratch implementation (`tests/_k5_reference.py`; `test_binned_estimator_equals_the_k5_reference`, and `test_binned_estimator_equals_the_k5_run`, slow).
+- **A later option, not implemented:** the threshold counts and the binning pass visit the particles in the same order and can share one loop, bit-identically (about 1 ms of the 10 ms per step the binned stage costs). Any parallel or chunked accumulation of the bins, or a bin grid whose origin is fixed in advance, is not bit-identical.
+- **What the study found about the floor, unchanged here:** the floor window `max(2000, 0.01 N)` is a rank window centred on the node, and the trusted range ends at the 0.5% quantile, so a window of exactly 1% of `N` just reaches the most extreme particle at the edge node, whose bandwidth is then a quarter of the distance to that one particle (11.8 h at t = 0.01 against 5.4 h at its neighbour). The 1y variance-swap level moves by +0.05 to +0.18 vp when the floor fraction is set to 0.25%, 0.5%, 0.75%, 1.5%, 2% or 4% at 8·10⁵ particles (1% is an isolated trough on each of three dates), the 2000 minimum makes the fraction 2% at 10⁵ particles (the +0.09 vp "100k anomaly"), and the tail fit over the outer 20 nodes amplifies a relative node error ε to a far-put leverage change of about 50 ε at the first steps. Both estimators reproduce this rule; neither changes it.
+
 Implementation notes (M3, measured on the reference surface, see `ParticleConfig`): the regression is local-linear rather than Nadaraya–Watson (NW carries the design bias `h² m′ f′/f`, which with `c = 1.5` skewed the ±10% repricing by 0.3 vol points), with a plug-in `½ h² m″` curvature correction (otherwise a −0.10 vp level bias at 1y), a 2000-particle window floor in the tails, and `E[V|S]` extrapolated beyond the trusted quantiles with a saturating log-quadratic (the flat rule mis-priced the 3m +30% call by 1 vp and variance swaps by 0.3 vp). `E[V|S]` is estimated on the 201-point grid and interpolated onto the fine leverage grid (dk = 0.0025, the Dupire grid) where `σ_loc²` is resolved. All lookups within a simulation step use `L(t_n, ·)` (frozen-leverage rule), identically in calibration and pricing.
 
 ### 4.2 Diagnostics
@@ -324,7 +331,7 @@ Single-run spread ±0.04 vp on the variance swap. The coarse schedule is the def
 9. *Far-wing tails (owner item 4, bounded attempt; 1F, 8·10⁵, production schedule, three particle seeds × six pricing seeds).* Continuing `ln E[V|S]` beyond the trusted quantiles with the model's own conditional slope — the whole-cloud fit (`cloud_slope`) or the pure-SV Gaussian slope (`sv_slope`, which overstates the measured pure-SV slope by 28% at ω = 3) — moves the residual the *wrong way*: variance swap 1y / 18m / 2y −0.182 / −0.182 / −0.162 (`cloud_slope`) and −0.237 / −0.246 / −0.243 (`sv_slope`) against −0.080 / −0.086 / −0.084 with the default saturating log-quadratic; the −30% put at 1y −0.071 / −0.079 against −0.055. Both model-consistent tails raise `E[V|S]` in the far put wing (β < 0), lower `L` there and take more variance out of the wing, while the M3 flat rule (+0.34 vp on the variance swap) errs the other way: the far-put-wing `E[V|S]` the surface needs lies *between* the flat and the saturating-quadratic continuations, i.e. below the model's own conditional slope. **Recorded as a known far-wing bias and closed for M6**: 1y–2y variance swap −0.08 vp (1F ω = 3), 2F −0.035 at 1y–2y and +0.056 at 3y, with the |k| ≤ 0.3 smile within the gate; the default tail stays `log_quadratic`, the two model-consistent tails remain available as `ParticleConfig.tail_extrapolation` options. No code change has been made to the calibration or the kernel pending the owner's decision; the measured options are (a) the frozen SV step for pricing and calibration (converged within ±0.005 vp at 2–3y for both sets; loses the M4b 1m pure-SV gain, which the calibration absorbs for the LSV), (b) a corrected second-order step (the first-order error grows with k₁ and ν and is absent from the frozen step, which points at the step's cross / L⁰ terms rather than the factor dynamics), or (c) a finer schedule for the 2F set (halving to 1/730 halves the error to ≈ 0.1 vp at 3y, at twice the cost).
 
 ### 4.3 Cache
-Content-addressed: key = SHA-256 of (surface params, curves, model params, particle config, seed, calibration code tag). The code tag is manual (so the precompute is not invalidated by every commit); `code_tag_guard.json` stores hashes of the particle, leverage, LSV, Bergomi and local-vol modules and a test fails when they change without a tag bump. Store leverage `.npz` + diagnostics `.json` + a `manifest.parquet` row. `get_or_calibrate(cfg)` is the only entry point studies and viewers use. Calibration must never run silently inside a viewer; the viewer reads the cache and reports what is missing. **Hash re-recorded without a tag bump (2026-09-16, M10):** `calibrate_leverage` gained the study runner's calibration guard as its first statement (`volsto/calibration/guard.py`: it refuses or returns and touches no numerics), which changed the hashed source; the `m6` hash was re-recorded with `write_guard()` instead of bumping the tag, because a bump would invalidate every cached leverage for a change that cannot move a number. The rule stands: a change that can move a calibrated number bumps the tag.
+Content-addressed: key = SHA-256 of (surface params, curves, model params, particle config, seed, calibration code tag). The code tag is manual (so the precompute is not invalidated by every commit); `code_tag_guard.json` stores hashes of the particle, binned-estimator, normal-draws (`engine/rng.py`), leverage, LSV, Bergomi and local-vol modules (`cache.GUARDED_MODULES`) and a test fails when they change without a tag bump. Store leverage `.npz` + diagnostics `.json` + a `manifest.parquet` row. `get_or_calibrate(cfg)` is the only entry point studies and viewers use. Calibration must never run silently inside a viewer; the viewer reads the cache and reports what is missing. **Hash re-recorded without a tag bump (2026-09-16, M10):** `calibrate_leverage` gained the study runner's calibration guard as its first statement (`volsto/calibration/guard.py`: it refuses or returns and touches no numerics), which changed the hashed source; the `m6` hash was re-recorded with `write_guard()` instead of bumping the tag, because a bump would invalidate every cached leverage for a change that cannot move a number. The rule stands: a change that can move a calibrated number bumps the tag. **Hash re-recorded without a tag bump (2026-10-04, binned estimator and lean draws; owner decision):** `calibration/binned.py` and `engine/rng.py` joined the guarded modules (the draws were not guarded before: a change of their layout or addressing moves every leverage, and only `tests/test_engine.py` stood in its way), `conditional_variance_estimate` was split by code motion and `GaussianDraws` fills its blocks without the intermediate copies; the `m6` hash was re-recorded in the commit that carries the proof that no default-path number moved — `test_lean_draws_equal_the_reference_layout` (the draws, bit for bit against the earlier layout), `test_default_estimator_is_the_m6_sorted_path` (the estimator, bit for bit against the frozen m6 function, every post-processing option and a whole calibration), `test_keys_of_committed_specs_unchanged` (the keys), and at the cache settings `test_default_path_matches_the_k2_baseline_digest` (slow) — §4.1.
 
 ### 4.4 SSR and 2F fitting helpers
 Skew-stickiness ratio (book eq. 9.3 / 12.50):
@@ -348,7 +355,7 @@ Volatilities of ATMF volatilities: same state-bump partials, squared and combine
 ## 5. Monte Carlo engine
 
 - `TimeGrid.build(fixing_dates, dt_max, calibration_grid=None)`: union, sorted, with `fixing_index` map. When an LSV model is used the grid contains the calibration time slices (`Model.required_times()`), so that the frozen-L rule of §3.1 applies identically in calibration and pricing; interpolating `L` linearly in `t` on a finer grid is the diagnostic prescribed for the calibration-side pass (§4.2 M4b notes), not the pricing rule.
-- `GaussianDraws(seed, n_paths, n_steps, n_brownians, antithetic=True)`: PCG64 generator; the same `(seed, path index, step, brownian index)` always gives the same normal so CRN bumps are exact. Generate in blocks to bound memory; `n_paths` default 2·10⁵, chunk 5·10⁴.
+- `GaussianDraws(seed, n_paths, n_steps, n_brownians, antithetic=True)`: PCG64 generator; the same `(seed, path index, step, brownian index)` always gives the same normal so CRN bumps are exact. Generate in blocks to bound memory; `n_paths` default 2·10⁵, chunk 5·10⁴. Layout (2026-10-04): the generator produces 8 outputs per path and step (the position of a normal is fixed by the addressing scheme, so the unused ones cannot be skipped), but only the `n_brownians` columns used are converted to uniforms, `ndtri` writes straight into the rows of the independent paths of the block and the antithetic rows are their negation — the numbers of the earlier layout bit for bit (which converted all 8 columns and copied three times), 4 ms of 28 ms per step at 8·10⁵ paths and 3 Brownians (`tests/test_engine.py::test_lean_draws_equal_the_reference_layout`; checked on all 1,254 steps of a calibration and the 40 blocks of a repricing). `CoarsenedDraws` builds its blocks from its own `normals`. The module is hashed by the calibration code-tag guard since this change (§4.3): a calibrated leverage is a function of the draws.
 - `MonteCarlo.price(product, model, grid, draws, cv=None) -> PriceResult(mean, stderr, n_paths, per_path_payoffs optional)`.
 - Control variates: vanilla with the same maturity (analytic BS price under the model's implied vol at that strike from the target surface — valid because the LSV reprices the surface) and variance swap (replication strike). Coefficient estimated on the sample; report variance reduction.
 - All results carry standard errors; the library never returns a bare float for a MC quantity. `engine/stats.py` provides batch-means standard errors for variance-type statistics.
@@ -1073,6 +1080,160 @@ the 3m 103% KO var knocked out on the 13th date and settled there (desk P&L 2.68
 settlement −0.776 ± 0.023); the 6m 105% survived (1.88 ± 0.04); the puts on variance lost the desk
 0.40 / 0.26 vol pts (realised variance accruing below the strikes); the down-and-in put 1.86 ± 0.04%
 of spot (the rally).
+
+### 8.4 The barrier-versus-vanilla study (owner's question of 2026-10-03; branch `barrier-vanilla-dispersion`)
+
+**Question.** A framework deciding, from pure-vol, market and statistical metrics, whether and when
+to trade a call ratio or a call fly instead of an up-and-out call (daily or continuous observation),
+and a put ratio or put fly instead of a down-and-out put.  Theory and the decision rule:
+`docs/barrier_vs_vanilla.md`; stage 1 `scripts/barrier_vs_vanilla_study.py`
+(`volsto/studies/barrier_vs_vanilla.py`, parts `anchor`, `map`, `greeks`, `hedge`, `daily`,
+`history`; outputs under `outputs/barrier_vs_vanilla/`); stage 2
+`configs/studies/barrier_vs_vanilla/study.yaml` (`volsto/studies/barrier_vs_vanilla_report.py`,
+rendered to `outputs/studies/barrier_vs_vanilla/`).
+
+**Library additions.**
+* `volsto/products/structures.py`: `VanillaStructure` (a `Portfolio` of same-expiry European
+  options with a model-free `surface_price`), the constructors `call_spread`, `put_spread`,
+  `call_ratio`, `put_ratio`, `call_fly`, `put_fly`, `straddle`; premium matching —
+  `ratio_for_premium` (closed form), `fly_wing_for_premium` (outer wing by bisection),
+  `fly_width_for_premium` (the symmetric fly whose width matches: always solvable, because a
+  fly spanning the strike-to-barrier range with its inner strike held is worth at least the
+  European knock-out, hence never as cheap as a knock-out); `european_knock_out` (the barrier
+  observed at expiry only) and its model-free price `spread − (B − K) · digital` with the
+  skew-adjusted digital `surface_digital` (centred strike difference).
+* `volsto/studies/history_stats.py` (data from `scripts/fetch_history.py` → `data/history/`,
+  yfinance daily closes 1990–2026 of SPX, VIX, VIX3M, VVIX, SKEW and ten large caps, plus Cboe's
+  COR1M / COR3M CSVs): barrier path statistics (strict daily-close touch, the *regret*
+  indicator `touched ∧ alive at T ∧ in the money`, the structures' payoffs per unit spot),
+  regime frequency tables with block standard errors (`n / horizon` effective samples), the
+  filtered historical simulation (returns standardised by the trailing EWMA vol, the
+  standardised series normalised to unit variance — the EWMA lags on real data — rescaled to
+  a target vol, block-resampled, demeaned by default; the drift-included variant reported
+  apart), dispersion statistics of a basket.
+* Tests: `tests/test_structures.py`, `tests/test_history_stats.py`,
+  `tests/test_barrier_vs_vanilla.py`.
+
+**The framework.** `UOC = EKO − R`: the European knock-out (model-free: call spread minus the
+cliff) minus the *regret value* `R = E[(S_T − K)⁺ 1{S_T < B} 1{touched}]`, the value of the
+touch-and-return paths; the *regret share* `R/EKO` is the fraction of the European value the
+path condition destroys.  The premium-matched alternatives are the ratio (closed form) and the
+width-matched symmetric fly.  Three metric families: pure vol (ATM level, implied minus
+realised, distance to the barrier in standard deviations, 90–110 skew, fly curvature, term
+slope, the LV / 1F / 2F model spread, the regret share), market (hedging P&L std and costs,
+model-risk reserve, listed-vanilla liquidity, daily-versus-continuous convention) and
+statistical (regime-conditional 1990–2026 frequencies; the filtered historical simulation at
+the chosen vol; the P-minus-Q touch and regret gaps; the expected payoff per unit premium of
+each structure).  Decision: `edge = E^P[UOC]/P − E^P[fly]/P`; the knock-out when the edge
+exceeds the model band plus the hedging-cost share, the fly when negative, the ratio only for a
+buyer of the unbounded upside loss.
+
+**Measured (SPX 2022-12-30 desk mark, 10⁵ paths, ×100 % of spot, strike 100%, notional
+1/spot; 2026-10-03).**
+* Regret share under the 2F mark: calls 3% (3m 120%) → 72% (1y 110%); puts 22% (3m 80%) →
+  92% (1y 90%).  It falls with the distance and rises with the maturity.
+* 6m 110% up-and-out call: 2F 0.564 ± 0.005, LV 0.400, 1F 0.616, BS 0.285, continuous 0.478;
+  EKO 1.290 (surface) / 1.305 ± 0.009 (2F); the midpoint fly 100/105/110 costs 0.631 (1.1×
+  the knock-out), the premium-matched symmetric fly tops out at 109.5% of spot, the matched
+  call ratio is 1×1.45 (break-even 116%).  6m 90% down-and-out put: 2F 0.152 ± 0.003, LV
+  0.225, BS 0.365 — the model risk has opposite signs on the two sides (the up barrier is
+  reached in a low-vol state, the down barrier in a high-vol one).  The continuous twin is
+  10–50% cheaper than the daily barrier.
+* The spot × time map: the fly-to-knock-out price ratio for the 6m 110% call rises from 0.63
+  (10% below the barrier, 6m left) to 4.9 at the barrier; for the 6m 90% put from 0.4 (1m
+  left, at the barrier … ) to 13 (6m left, 10% above) — the switch point of a holder.
+* Hedging (2F world, daily, 2·10⁴ paths): 6m 110% call unhedged std 1.74, delta 1.32, the
+  put-call-symmetry replication alone 0.78, the premium-matched fly held short alone 1.32 (0.99
+  in the LV world), fly + delta 1.09; 6m 90% put unhedged 0.86, delta 0.67, PCS alone 0.32,
+  fly proxy alone 0.79, ratio proxy + delta 0.60; the fly's own delta hedge 0.79 of 1.26
+  unhedged; the 1×2 ratio's 2.50 of 5.35.
+* 2022 H2 day by day (each day's Dupire local vol, 2·10⁴ paths): the regret share of the 6m
+  110% call ran 62–77% (mean 71%), of the 6m 90% put 70–79%; the correlation of the regret
+  share with the distance in standard deviations −0.90 to −0.97, with implied-minus-realised
+  3m vol +0.70 to +0.81 (both through the implied vol level, which sets the distance).
+* Statistical layer: the 1990–2026 daily-close touch frequency of the 110% barrier over 3m is
+  15.9% against 32.3% under the 2F mark (6m: 41% vs 53%; the 90% put side 13.7% vs 32.2% at
+  3m); the demeaned FHS at the implied ATM vol touches 29% (3m 110%) and 28% (3m 90%) — the
+  drift, not the path shape, explains most of the history's gap.  Verdicts against the
+  premium-matched fly (18 barriers): FHS at implied ATM — barrier 9, fly 9 (the drift-free
+  layers favour the fly on every call-side barrier and the knock-out on every put-side one: the
+  mark's down-and-out puts are cheap against a drift-free path distribution, its up-and-out
+  calls are not); the raw history — barrier 11, fly 4, indifferent 3 (the equity drift).
+
+### 8.5 The dispersion study (owner's question of 2026-10-03; branch `barrier-vanilla-dispersion`)
+
+**Question.** A framework deciding, from parameters and market expectations, whether to buy a
+palladium — the call on dispersion `(Σ_i w_i |r_i − r_B| − K)⁺` (the owner's definition: the
+weighted sum of the names' absolute performances against the basket's) — rather than
+single-name straddles against a basket straddle.  Theory: `docs/dispersion_palladium.md`;
+stage 1 `scripts/dispersion_study.py` (`volsto/studies/dispersion.py`, parts
+`sensitivities`, `expectations`, `history`; outputs under `outputs/dispersion/`); stage 2
+`configs/studies/dispersion/study.yaml` (`volsto/studies/dispersion_report.py`, rendered to
+`outputs/studies/dispersion/`).
+
+**Library additions — the multi-asset layer `volsto/multi/`** (SPEC §3.1 allowed a second
+underlying without touching product code: it lives in a second container).
+`CorrelatedDraws` (one CRN stream per asset, seed `+ 7919 · i`, Cholesky mixing: a
+correlation bump leaves the names' draws unchanged, antithetics preserved); `MultiAssetModel`
+(factor-free single-asset kernels — Black–Scholes or Dupire local vol per name, each with its
+own skew — on correlated Brownians; stochastic-vol names are refused); `MultiPathSet`;
+`MultiAssetMonteCarlo` (the engine's chunking and stderrs); products `Palladium`,
+`BasketOption`, `BasketStraddle`, `SingleNameStraddles`, `dispersion_straddles` (`Σ w_i|r_i| −
+λ_B |r_B|`), `VarianceDispersion` (`Σ w_i RV_i − RV_B` on the fixing schedule), `MultiPortfolio`;
+Gaussian closed forms (`basket_vol`, `implied_correlation`, `gaussian_palladium_forward`
+`= √(2T/π) Σ w_i σ_{i−B}`, `gaussian_straddle_dispersion` `= √(2T/π)(Σ w_i σ_i − σ_B)`, the
+folded-normal product moments behind `gaussian_dispersion_moments` and the Bachelier
+`gaussian_palladium_call`).  The study's `World` adds the departures the question turns on on a
+one-factor equicorrelation simulator: local correlation `ρ_t = ρ − λ (B_t − 1)`, an uncertain
+realised correlation `ρ ± ρ_sd`, idiosyncratic jumps `(p_J, μ_J, σ_J)` on the terminal
+performances.  Tests: `tests/test_multi.py`, `tests/test_dispersion.py`.
+
+**The framework.** Path by path `Σ w_i|r_i| − |r_B| ≤ D ≤ Σ w_i|r_i| + |r_B|`: the straddle
+dispersion trade is the palladium's lower bound, the gap being the names that move *against*
+the basket — the palladium is a call on relative moves, the straddle package on excess
+absolute moves.  Equal vols and a constant `ρ`: palladium forward `≈ σ√(1−ρ)√(2T/π)`,
+straddle dispersion `≈ σ(1−√ρ)√(2T/π)` (2.4× at ρ = 0.5); the call struck near the forward is
+convex in the correlation's uncertainty, the forward concave.  The decision compares the
+expected P&L per unit premium of each trade bought at the market world's prices and realised
+under the expectation world (realised correlation `ρ_impl ± 0.2`, realised vols `× 0.8–1.2`,
+`λ ∈ {0, 3}`, `ρ_sd ∈ {0, 0.2}`, `p_J ∈ {0, 0.2}`; 120 cells).
+
+**Market world and its stated inputs.** Ten large caps (AAPL, MSFT, AMZN, NVDA, JPM, XOM, JNJ,
+PG, HD, UNH), equal weights, 3m; single-name implied vols = trailing 1y realised at
+2022-12-30 × 1.15 (**an input**, single-name implied vols are not in the repository);
+correlation = Cboe COR3M of 2022-12-30 (44.7%; the basket's realised 1y correlation 43.1%);
+the call's strike 80% of the forward dispersion.
+
+**Measured (10⁵ paths; per unit of basket notional; 2026-10-03).**
+* Market world: palladium forward 0.1185 ± 0.0002 (Gaussian 0.1189), call 0.0282 ± 0.0001,
+  basket straddle 0.1125 ± 0.0004, single straddles 0.1571, straddle package 0.0446, variance
+  dispersion 0.0985; the forward is 2.7× the package.  Against the correlation (0.25 → 0.65):
+  forward 0.134 → 0.100, call 0.042 → 0.015, package 0.066 → 0.027, basket straddle 0.091 →
+  0.131; per 0.1 of correlation the package loses 22% of its premium, the call 16%, the forward
+  7%.  All forwards are linear in the vol level and scale with `√T`.
+* Departures at the implied parameters (P&L per unit premium): idiosyncratic events (p 0.2,
+  10% shock) palladium call +0.14, package +0.08, basket straddle +0.01; local correlation
+  λ = 3: call +0.12, package +0.06, basket straddle −0.02; correlation uncertainty ± 0.2:
+  forward −0.01, call +0.01, package +0.04.
+* The expectations grid: at the implied vols the palladium call is the best trade per unit
+  premium when the realised correlation is at or below the implied one, the basket straddle
+  when above; with the vols 20% below implied the straddle package replaces the call
+  (vol-level loss on the call); over the 120 cells palladium call 53, basket straddle 35,
+  straddle package 32 (the zero-premium package and the variance dispersion are not ranked).
+* History 2006–2026 (3m windows): COR3M averaged 41% against a realised 29% (high-VIX tercile
+  54% vs 33%); realised dispersion 0.104 against a straddle-package payoff 0.041; the
+  palladium-to-package ratio is smallest when the basket is flat (−3..3%: 0.092 vs 0.078) and
+  largest in large moves (> 10%: 0.129 vs 0.017; < −10%: 0.136 vs 0.029).
+
+### 8.6 The barrier study on 2007–2026 (owner's specification of 2026-10-04 and its addendum; branch `barrier-vanilla-dispersion`)
+
+The study of §8.4 on every weekly entry of the ORATS history (§18.10). Specification: `outputs/interview/BARRIER_STUDY_SPEC.md` and `BARRIER_STUDY_ADDENDUM.md` (kept with the results, outside git); log, assumptions and every check: `outputs/interview/PROGRESS.md`; findings: `docs/barrier_vs_vanilla.md` §6.
+
+**Code.** `volsto/studies/barrier_history.py` — trades (entry dates, expiries, barriers in percent and in standard deviations), structures as legs (option, exact digital, forward), the model-free lower bound, knock rules on closes / highs / lows, the hedge accounting to the trade's own expiry, expanding terciles, the block bootstrap; the day market from the ORATS importer with the bad-day carry (`MovedSurface`); the day engine: one path set per (day, bump) on the future trading days, shared by every live trade, Brownian-bridge extremes sampled with common uniforms, the European knock-out as control variate. `volsto/studies/barrier_theory.py` — the forward-skew premium of the knock-out over its static hedge, the carry control (Reiner–Rubinstein against the Black–Scholes C8), touch weights and annuity, bucket statistics of a path set, the directional skew-stickiness ratio, the frozen forecast of realised vol, the local-vol restart. `scripts/barrier_*.py` — the passes (days, entries, daily, LSV entries and daily with the particle estimator read from the gate, features, buckets, touches, quotes, costs), the assembly, the checks, the report (Markdown → LaTeX → PDF through tectonic). Tests: `tests/test_barrier_history.py` (21), `tests/test_barrier_theory.py` (6).
+
+**Estimator.** `feature/binned-estimator` was merged after a gate (`scripts/barrier_gate.py`): six dates (three calm, 2008-10-06, 2018-02-05, 2020-03-02) × 4 seeds at the study's settings (100,000 particles, 1 % regression floor); knock-out prices and sticky-strike deltas agree with the sorted estimator within 0.17 bp of spot and 0.0016 on every cell, a calibration takes 0.46 of the time. Every LSV calibration of the study passes `estimator="binned"`.
+
+**Runs** (2026-10-04 / 05, one machine, 14 processes): day import 4,969 days (4,965 built); local-vol entries 1,031; local-vol daily marks and bumped marks 4,969 days (5 h 51 min); LSV entry marks 1,028 entries (71 min, binned); the LSV daily series by blocks: 2021-06-01 to 2026-10-02 done (1,342 days, 2 h 57 min, 10 processes, binned, no fallback), 2007–2011 done (07:05), 2012 → 2021-05 after it. **Addendum 2** (`outputs/interview/BARRIER_STUDY_ADDENDUM2.md`, post-processing only: `volsto/studies/barrier_attrib.py`, `scripts/barrier_attrib.py`, `scripts/barrier_report3.py`, `scripts/barrier_checks3.py`): the hedged P&L split into vol carry (entry vega × realised-minus-implied vol of the life) and the rest, the justified share / conditions / rules on the rest, realised touch frequencies against the models' probabilities, the turnover of the daily hedges and hedging costs, the framework table and `report/pm_framework.md`, predictions P12–P14; checks of its §10 in `outputs/interview/checks3.md` (10.3b fails as stated: the existing trailing realised vols remove the mean, the life's does not). Results under `outputs/interview/barrier_results/` (git-ignored; backed up outside the repository).
 
 ## 9. Viewers
 
@@ -2007,6 +2168,8 @@ Built inline (the phase-1 agent workflow failed on the account's spend limit; it
 ---
 
 ## 17. Change log v1.1 → v2.0
+- 2026-10-05 the barrier study on 2007–2026: §8.6 (new) — the study's code, the estimator gate (the binned particle estimator merged and selected), the runs; findings in `docs/barrier_vs_vanilla.md` §6.
+- 2026-10-04 the full ORATS archive: §18.10 (new) — older layouts accepted (schema version 2, absent columns null, the key's fallback), SPX settlement by period, the census of 4,970 days, the periods the data shows against the vendor's statement, the anomalous days.
 - 2026-10-04 M11 follow-up: §18.6 tolerances asserted on the sample day, the vendor's vol convention found (an American tree with `residualRateData` as the yield), the VIX-methodology check against Cboe; §18.8 as-traded closes.
 - 2026-10-04 SABRW exact zone edge: §13.5 (new) — the mechanism, the closed form, the grid test against the minimiser, the 127-date noise experiment, the tags, what was regenerated.
 - 2026-10-04 M11 Part 5 (own branch): §18.9 the vendor source — the invariant, `volsto/market/vendor.py`, the sites moved, the walking and contract tests, the same-machine proof.
@@ -2125,7 +2288,7 @@ Each vendor owns one sub-directory (`<raw>/orats/`, `<store>/orats/`). A blank v
 - *calendar*: every trading day from the first file to the last has exactly one file, the calendar being the dates of `data/history/SPX.csv` (`DEFAULT_CALENDAR`). Missing days, unexpected dates (not in the calendar), dates with more than one file, and files dated beyond the calendar's last date (refresh the calendar) are listed;
 - *names and content*: a zip the pattern does not match; an unreadable zip or one without exactly one member; a `trade_date` column that is absent, holds several values, is not `%m/%d/%Y`, or disagrees with the file name;
 - *schema drift*: named against the latest version;
-- *OPRA dependency* (decision 8): every file whose `cOpra` / `pOpra` is absent or empty on an SPX row, and the coverage per year (files, files with the columns, files usable for SPX, rows, empty symbols, SPX rows, SPX rows without a symbol).
+- *OPRA symbols* (decision 8 until 2026-10-04; since then a note, not a finding — §18.10): every file whose `cOpra` / `pOpra` is absent or empty on an SPX row, and the coverage per year (files, files with the columns, files usable for SPX, rows, empty symbols, SPX rows, SPX rows without a symbol).
 
 **`volsto-data status`**: the roots and their sources, free space, the raw zip count and bytes per vendor, the manifest's date range and findings, and whether it is stale against the directory.
 
@@ -2194,7 +2357,7 @@ Code: `volsto/data/store.py` (convert, verify, the store manifest), `volsto/data
 
 **`volsto-data convert --vendor orats [--workers N] [--force]`.** Each raw zip's CSV is read straight from the zip and written as `<store>/orats/strikes/year=YYYY/YYYY-MM-DD.parquet`: every vendor column under its original name, typed from the declared schema (`arrow_schema`; dates parsed with `%m/%d/%Y`), no derived number, rows sorted by (ticker, expirDate, strike, cOpra), in the chosen layout (`LAYOUT`). Each file carries its provenance in its Parquet metadata (`volsto.vendor`, `trade_date`, `raw_file`, `raw_sha256`, `schema_version`, `layout_version`).
 - *Inputs.* The raw manifest of `verify-raw` is required and must still describe the directory (a file added, removed or changed in size or mtime is a refusal naming `verify-raw`); each zip is hashed again as it is read and must equal the manifest's sha256. A date with more than one raw file, an unmatched name and an unreadable zip are listed as failures.
-- *Loud failures* (the file is not converted, its reason is printed, exit 1, the other files go on): schema drift, named column by column; a date or number that does not parse; a `trade_date` column that disagrees with the file name; an SPX row with an empty `cOpra` or `pOpra` (decision 8); a changed raw file. `cOpra` uniqueness is checked in every file and violations are reported (count and examples) on this and every later run; the file is still converted.
+- *Loud failures* (the file is not converted, its reason is printed, exit 1, the other files go on): schema drift, named column by column; a date or number that does not parse; a `trade_date` column that disagrees with the file name; a changed raw file (an SPX row without an OPRA symbol was one until 2026-10-04, §18.10). Uniqueness (`cOpra` when present, otherwise ticker, expiry, strike) is checked in every file and violations are reported (count and examples) on this and every later run; the file is still converted.
 - *Idempotent, atomic.* The store manifest `<store>/orats/store_manifest.json` binds each date to its raw file and raw sha256, row count, schema version, layout version, Parquet bytes and sha256. A date whose entry names the current raw sha256 and layout and whose file is on disk with the recorded size is skipped. Each Parquet file is written to a temporary name in its own directory, synced and renamed; the manifest is replaced atomically every 25 files and at the end; a failed file's entry is removed. `store_digest` (a SHA-256 over every date's raw sha256, rows, schema version and Parquet sha256) is what derived data is bound to.
 - *Space and volumes.* Refused before any write when the store volume is short of 1.14 × the zips to convert plus the 10 GiB margin. A root below `/Volumes/<name>` whose volume is not mounted is refused (`ensure_dir`), never created on the internal disk; temporary files share their destination's directory, so nothing assumes which disk holds which root.
 
@@ -2321,7 +2484,7 @@ Calendar: the unrepaired eSSVI violated (smallest `∂_T w` −2.9e-4 on |k| ≤
 
 **Where ORATS is better, worse or different.** *Better:* one synchronised snapshot — no asynchrony between the close and the quotes to correct for, and the implied spot is measured to 0.4 bp; the OPRA root gives AM/PM directly; 55 SPX expiry dates. *Worse:* no timestamp, so the snapshot time is the vendor's word; the prior rate is a step function, 25–50 bp below the implied funding to one year; beyond one year the chain has 9–38 two-sided pairs per slice against HDN's denser long end, and the forward cross-check loosens to tens of bp. *Different:* the vendor's vols follow an unknown convention 0.2–2.7 vp below ours near the money; the close is not in the file and comes from our own history.
 
-**OPRA fallback — plan only** (decision 8; nothing implemented). If a year of the archive lacks `cOpra` / `pOpra`: (i) on dates where a (ticker, expirDate, strike) key is never duplicated, assign PM to every expiry except the standard monthly (third Friday, or the preceding Thursday when that Friday is a holiday), which is AM — a calendar rule, to be checked against a year that has the symbols before it is trusted; (ii) on third Fridays where both roots list, the two rows of a key cannot be told apart by the calendar: the candidate discriminator is the vendor's own per-root `stkPx` (the AM forward is the PM forward of one day less), which must first be validated on years that carry the symbols; (iii) until both are validated the importer keeps failing loudly. `verify-raw` reports which years this concerns.
+**OPRA fallback — the plan as written in Part 4; superseded by §18.10** (the rule the owner gave on 2026-10-04 is implemented there). If a year of the archive lacks `cOpra` / `pOpra`: (i) on dates where a (ticker, expirDate, strike) key is never duplicated, assign PM to every expiry except the standard monthly (third Friday, or the preceding Thursday when that Friday is a holiday), which is AM — a calendar rule, to be checked against a year that has the symbols before it is trusted; (ii) on third Fridays where both roots list, the two rows of a key cannot be told apart by the calendar: the candidate discriminator is the vendor's own per-root `stkPx` (the AM forward is the PM forward of one day less), which must first be validated on years that carry the symbols; (iii) until both are validated the importer keeps failing loudly. `verify-raw` reports which years this concerns.
 
 **Tolerances asserted on the sample day** (owner's decision F, 2026-10-04; named constants in `tests/test_import_orats.py`, the measured values beside them): the forward against `stkPx·exp(iRate·T)` over the slices up to one year, median ≤ 3 bp and maximum ≤ 15 bp (measured 1.05 / 1.7 and 10.0 / 10.7); eSSVI RMS inside |k| ≤ 0.2, 3m–2y ≤ 0.25 vp and 6m–2y ≤ 0.20 vp (measured 0.188 and 0.154); the calendar certificate proven (no fallback, floor 1e-4 on |k| ≤ 3, lower bound at or above the floor). Everything else stays printed.
 
@@ -2370,3 +2533,27 @@ AAPL, JPM and XOM through `import_orats.import_day` with no change. **Nothing ra
 
 **HDN did not move (same machine, 2026-10-04; `main` against this branch).** 24 digests of what the consumers produce from the sample are identical: the 127 available dates; the calendar, the day-file checksums, the manifest-entry checksums and the first and last inputs digests of the toy and the 127-date backtest configs; the snapshot digest of `import_snapshot`; four `build_hdn_history` snapshots and the history frame; the raw pillar frame, its diagnostics and a `raw_day`. The toy backtest store built by `main` and by this branch is compared date by date in the PR (snapshot digests, inputs digests, fitted parameters, leverage keys, rows).
 
+
+### 18.10 The full archive: older layouts, SPX settlement by period, the census (2026-10-04)
+
+**The archive** (`aws s3 sync` into `data/raw/orats/`, year folders, one `.docx` of column definitions): 4,973 zips, 195.9 GB, 2,196,775,374 rows, trade dates 2007-01-03 → 2026-10-02. `verify-raw` reads the year folders and only final `*.zip` names; a `__MACOSX/` member (one file, 2013-04-19) is ignored and recorded. **No trading day is missing.** Four files are not trading days: 2018-12-05 (exchanges closed; 425,791 rows, no SPX row), 2022-08-06 (a Saturday; the CSV is empty), 2024-12-08 and 2024-12-15 (Sundays; a header and no row) — the last three are not converted. The `.docx` contradicts nothing in this section on substance: it gives no snapshot time ("may vary"), calls `stkPx` the stock price at the snapshot (for SPX it is the discounted parity forward, §18.1), and does not define `cOpra`, `pOpra`, `spot_px` or `trade_date`.
+
+**Layouts** (owner's instruction; `volsto/data/orats.py`). Schema version 2 is version 1 without `cOpra` and `pOpra`, the other 37 columns in the same order: 3,626 files, every day to 2021-05-27 except 2021-03-12. Version 1: 2021-03-12 and every day from **2021-05-28** (1,344 files). The store has one schema (version 1's columns); a column a layout lacks is null. The uniqueness key of a row is `cOpra` when present, otherwise (ticker, expirDate, strike); **no day of the archive violates it**. A day without OPRA symbols converts and is a note of `verify-raw`, not a finding (decision 8 no longer applies). Store: 4,970 days, 212.6 GiB of Parquet for 182.5 GiB of zips; `verify` finds every file a faithful copy (375 s on 12 workers).
+
+**SPX settlement by period** (owner's rule, `volsto.data.orats.settlement_without_opra`, applied by `import_orats.settle`): the OPRA root when the row has symbols (`SPX` AM, `SPXW` PM); ticker `SPXPM` is PM; with neither, ticker `SPX` on a monthly expiry is AM while `SPXPM` rows exist that day or before 2011-10-04, PM otherwise. A row without symbols is given the root of its settlement and OSI contract names built from it. The standard expiries are dated on the **Saturday** after the third Friday through 2015 (Friday-dated from 2010-11-23 to 2010-12-31 and progressively from 2015; none from 2017): `canonical_expiry` moves a Saturday to the Friday, and to the Thursday when that Friday is Good Friday. A day on which two rows claim one (root, expiry, strike) raises `AmbiguousSettlement`; **the census finds no such day**.
+
+**The periods the data shows** (`scripts/orats_census.py`, one row per trade date → `outputs/interview/orats_census.csv`; `scripts/orats_spx_monthly_oi.py`, open interest per monthly expiry under ticker SPX):
+
+| trade dates | days | what ticker SPX holds | evidence |
+|---|---|---|---|
+| 2007-01-03 → 2011-10-03 | 1,198 | the AM monthly (and the few non-monthly expiries) | no `SPXPM`; on a monthly expiry date the expiring series is absent from the file |
+| 2011-10-04 → 2017-05-09 | 1,408 | AM on monthly expiries, PM on the others; PM monthly under `SPXPM` | `SPXPM` listed every day |
+| 2017-05-10 → 2019-02-04 | 437 | **the AM monthly; the PM third-Friday series is absent** | `SPXPM` gone; the monthlies under `SPX` keep the AM open interest (May-17: 2.00M → 2.03M contracts across the change; `SPXPM` had 24k) |
+| 2019-02-05 → 2021-05-27 | 582 | **PM for a monthly within about five months, AM beyond** | on 2019-02-05 the open interest of Feb → Jun 2019 falls to 3–11% of the day before; each later monthly goes to zero and restarts small about five months before its expiry (27 such switches) |
+| 2021-05-28 → 2026-10-02 | 1,343 | both, told apart by the OPRA root | symbols on every SPX row; 15–20 AM slices a day |
+
+The vendor's statement ("about 2018 to 2021-05-27 only the PM series is carried under ticker SPX") is therefore not what the files hold, and the rule's "PM otherwise" is one day of `T` too long on every monthly from 2017-05-10 to 2019-02-04 and on the monthlies beyond five months from 2019-02-05 to 2021-05-27. **The rule is implemented as given; the correction is the owner's decision.** On a monthly expiry date from 2015-04 to 2019-01 the AM series is still in the file with `yte` 0 and the previous day's quotes; the importer drops it (`T` ≤ 0).
+
+**Anomalous days.** No SPX row: 2018-12-05, 2018-12-07. A partial SPX chain: 2014-10-09, 10-10, 10-13, 10-27, 10-28 (25–27 rows, three expiries, against about 2,900; `SPXPM` complete); 2018-12-04 and 2018-12-28 (monthlies only). Zero open interest on every SPX monthly: 2018-12-10. One day back on the AM series for the near monthlies: 2019-05-14, 2020-06-04, 2020-06-23, 2020-07-06, 2020-07-15, 2021-04-13; open-interest glitches of the same kind on 2020-03-09 and 2021-02-25. 2021-03-12: version 1 layout with symbols, all `SPXW` (no AM row). 2007 → late 2010: the non-monthly expiries under ticker SPX are settled PM by the rule; SPX weeklies of that period were AM-settled — one day of `T` on those slices, not corrected.
+
+**Tests**: `tests/test_data_layer.py` (year folders, the `.docx`, an unfinished download, a `__MACOSX` member), `tests/test_data_store.py` (version 2 → nulls, the key's fallback, an extract across layouts), `tests/test_import_orats.py` (the same day told with symbols, in the `SPXPM` layout with Saturday dates and in the PM-only layout gives the same chain; an ambiguous day is refused; the rule and the canonical expiry).

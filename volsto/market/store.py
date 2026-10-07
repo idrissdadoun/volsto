@@ -70,10 +70,10 @@ def _dirs(vendor: str, store: str | Path | None) -> tuple[Path, Path, str]:
     return roots.store_dir(vendor), roots.raw_dir(vendor), flags
 
 
-def _columns(columns: Sequence[str] | None, version: int) -> list[str] | None:
+def _columns(columns: Sequence[str] | None) -> list[str] | None:
     if columns is None:
         return None
-    known = orats.schema_columns(version)
+    known = orats.STORE_COLUMNS
     unknown = [c for c in columns if c not in known]
     if unknown:
         raise DataError(f"unknown columns {unknown}; the vendor's columns are {list(known)}")
@@ -139,7 +139,7 @@ def load_chain(
     path = storemod.day_path(store_dir, iso)
     name = ticker.strip().upper()
     table = pads.dataset(path, format="parquet").to_table(
-        columns=_columns(columns, int(entry["schema_version"])),
+        columns=_columns(columns),
         filter=pads.field("ticker") == name,
     )
     if table.num_rows == 0:
@@ -191,7 +191,7 @@ def load_range(
     path = extractmod.ticker_path(store_dir, name)
     day = pads.field("trade_date")
     table = pads.dataset(path, format="parquet").to_table(
-        columns=_columns(columns, int(entry["schema_version"])),
+        columns=_columns(columns),
         filter=(day >= lo) & (day <= hi),
     )
     if table.num_rows == 0:
@@ -210,7 +210,7 @@ def load_range(
             "end": hi.isoformat(),
             "store_file": str(path),
             "store_digest": entry["store_digest"],
-            "schema_version": int(entry["schema_version"]),
+            "schema_versions": list(entry.get("schema_versions", [entry.get("schema_version")])),
         }
     )
     return frame

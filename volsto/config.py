@@ -719,6 +719,18 @@ class ParticleConfig:
         second_pass: re-run with the calibrated ``L`` and a fresh seed and average the two.
         seed: seed of the particle draws (CRN key).
         antithetic: antithetic particle pairs.
+        estimator: how the regression stage is computed.  ``None`` (the default) and
+            ``"sorted"`` are the same numbers: the particles are sorted and each node sums its
+            window (:func:`volsto.calibration.particle.kernel_regression`).  ``"binned"`` is the
+            estimator of :mod:`volsto.calibration.binned`: exact quantile nodes, floor windows
+            and floor bandwidths by counting and selection, kernel sums on linear bins of width
+            ``h/4`` for the unfloored nodes and over the tail particles for the floored ones — no
+            sort, 2.6 times faster per calibration at 8·10⁵ particles on one thread, and within
+            0.0005 vol points of the sorted path on every repriced pillar (measured, 24 paired
+            calibrations).  It needs the Gaussian kernel and the local-linear regression.  The
+            field is left out of every mapping while ``None`` (:func:`omitted_when_none`), so the
+            cache key of a spec that does not set it is what it was before the field existed;
+            an explicit ``"sorted"`` is keyed, and so addresses other cache entries than ``None``.
     """
 
     n_particles: int = 200_000
@@ -740,10 +752,22 @@ class ParticleConfig:
     second_pass: bool = False
     seed: int = 12345
     antithetic: bool = True
+    estimator: str | None = None
+
+    OMIT_WHEN_NONE: ClassVar[frozenset[str]] = frozenset({"estimator"})
+    """Fields left out of every mapping while ``None`` (:func:`omitted_when_none`)."""
 
     def __post_init__(self) -> None:
         if self.n_particles < 100:
             raise ValueError("n_particles too small")
+        if self.estimator not in (None, "sorted", "binned"):
+            raise ValueError("estimator must be None, 'sorted' or 'binned'")
+        if self.estimator == "binned" and (
+            self.kernel != "gaussian" or self.regression != "local_linear"
+        ):
+            raise ValueError(
+                "estimator='binned' needs kernel='gaussian' and regression='local_linear'"
+            )
         if self.antithetic and self.n_particles % 2:
             raise ValueError("n_particles must be even when antithetic")
         if self.horizon <= 0:

@@ -19,7 +19,7 @@ import pandas as pd
 import pytest
 import yaml
 
-from volsto.data import orats, raw, roots, store
+from volsto.data import orats, raw, roots, spx_settlement, store
 from volsto.data.roots import DataError
 from volsto.market import chain as chainmod
 from volsto.market import import_hdn as ih
@@ -110,13 +110,13 @@ def test_loader_fails_loudly(root: Path) -> None:
         io.load_day(ISO, "SPX", store=root / "store", closes=root / "other.csv")
     with pytest.raises(DataError, match="no close history"):
         io.load_day(ISO, "SPX", store=root / "store", closes=root / "absent.csv")
-    # decision 8: a ticker row without its OPRA symbol (the converter refuses SPX; XSP shows
-    # the loader's own check) and a root outside the known ones
+    # a row without any OPRA symbol on an underlying that has no settlement rule (only SPX
+    # has one, owner's instruction 2026-10-04) and a root outside the known ones
     raw_dir = root / "raw" / "orats"
 
     def edit(df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
-        df.loc[df.index[df["ticker"] == "XSP"][0], "pOpra"] = ""
+        df.loc[df.index[df["ticker"] == "XSP"][0], ["cOpra", "pOpra"]] = ""
         aapl = df["ticker"] == "AAPL"
         df.loc[aapl, "cOpra"] = df.loc[aapl, "cOpra"].str.replace("AAPL", "AAPL1", n=1)
         return df
@@ -127,12 +127,151 @@ def test_loader_fails_loudly(root: Path) -> None:
     )
     assert store.convert(raw_dir, root / "store" / "orats", workers=1).converted == [ISO]
     fx.write_calendar(root / "XSP.csv", [DAY])
-    with pytest.raises(DataError, match=r"1 of .* XSP rows without an OPRA symbol"):
+    with pytest.raises(DataError, match=r"1 of .* XSP rows without an OPRA symbol, and no"):
         io.load_day(ISO, "XSP", store=root / "store", closes=root / "XSP.csv")
     with pytest.raises(DataError, match=r"OPRA roots \['AAPL1'\], outside the known \['AAPL'\]"):
         io.load_day(ISO, "AAPL", store=root / "store", closes=root / "XSP.csv")
     with pytest.raises(ValueError, match="columns missing"):
         chainmod.validate_chain(pd.DataFrame({"contract": ["x"]}))
+
+
+def _store_of(tmp: Path, mutate: object) -> Path:
+    """A store holding the fixture day edited by ``mutate`` (an older layout)."""
+    raw_dir = tmp / "raw" / "orats"
+    fx.write_day(raw_dir / "2024", DAY, mutate=mutate)  # type: ignore[arg-type]
+    fx.write_calendar(tmp / "SPX.csv", [DAY])
+    raw.write_manifest(
+        raw_dir, raw.verify_raw(raw_dir, calendar=tmp / "SPX.csv", workers=1).manifest()
+    )
+    assert not store.convert(raw_dir, tmp / "store" / "orats", workers=1).failed
+    return tmp
+
+
+def _saturday(df: pd.DataFrame, rows: pd.Series) -> pd.Series:
+    """``expirDate`` with the standard expiries of ``rows`` dated on the Saturday, as the
+    files before 2015 date them."""
+    third = {fx.us_date(d): fx.us_date(d + dt.timedelta(days=1)) for d in fx.THIRD_FRIDAYS}
+    return df["expirDate"].where(~rows, df["expirDate"].map(lambda x: third.get(x, x)))
+
+
+def test_settlement_by_period_reproduces_the_opra_chain(root: Path, tmp_path: Path) -> None:
+    """Owner's instruction 2026-10-04.  The same day told three ways gives the same chain
+    (contracts, roots, maturities, quotes): with OPRA symbols (2021-05-28 on), and without
+    them with the PM third-Friday series under ticker SPXPM and the standard expiries dated
+    on the Saturday (2011-10-04 to 2017).  With only the PM series under ticker SPX and no
+    SPXPM (2019-02-05 to 2021-05-27 for the near monthlies) the settlement of each monthly
+    comes from the open-interest table of the store: PM gives the PM part of the chain, a
+    ``DROP`` leaves the expiry out, a missing table or entry fails loudly.  A day on which
+    nothing tells the two series apart is excluded: :class:`AmbiguousSettlement`."""
+    want = load(root)
+    cols = [c for c in want.columns if c not in ("yte",)]
+
+    def spxpm_period(df: pd.DataFrame) -> pd.DataFrame:
+        spx = df["ticker"] == "SPX"
+        pm = df["cOpra"].map(orats.opra_root) == "SPXW"
+        third = df["expirDate"].isin([fx.us_date(d) for d in fx.THIRD_FRIDAYS])
+        df = df.assign(
+            ticker=df["ticker"].where(~(spx & pm & third), orats.SPX_PM_TICKER),
+            expirDate=_saturday(df, spx),
+        )
+        return df.drop(columns=["cOpra", "pOpra"])
+
+    got = io.load_day(
+        ISO, "SPX", store=_store_of(tmp_path / "a", spxpm_period) / "store", closes=root / "SPX.csv"
+    )
+    pd.testing.assert_frame_equal(got[cols], want[cols])
+    assert got.attrs["schema_version"] == 2 and set(got.attrs["settled_by"]) == {
+        "ticker",
+        "calendar",
+    }
+    assert want.attrs["settled_by"] == {"opra": int((fx.day_frame(DAY)["ticker"] == "SPX").sum())}
+    assert "settlement" not in io.source_provenance(want)
+    assert (
+        io.source_provenance(got)["settlement"]["vendor_rows_by_source"] == got.attrs["settled_by"]
+    )
+
+    def pm_only(df: pd.DataFrame) -> pd.DataFrame:
+        am = (df["ticker"] == "SPX") & (df["cOpra"].map(orats.opra_root) == "SPX")
+        return df[~am].drop(columns=["cOpra", "pOpra"])
+
+    where = _store_of(tmp_path / "b", pm_only)
+    with pytest.raises(DataError, match="no SPX settlement table"):
+        io.load_day(ISO, "SPX", store=where / "store", closes=root / "SPX.csv")
+    table = spx_settlement.table_path(where / "store" / "orats")
+    monthly = [d.isoformat() for d in fx.THIRD_FRIDAYS]
+    rows = [(ISO, monthly[0], "PM", "test"), (ISO, monthly[1], "PM", "test")]
+    pd.DataFrame(rows, columns=["date", "expiry", "settlement", "evidence"]).to_csv(
+        table, index=False
+    )
+    got = io.load_day(ISO, "SPX", store=where / "store", closes=root / "SPX.csv")
+    pm_part = want[want["root"] == "SPXW"].reset_index(drop=True)
+    pd.testing.assert_frame_equal(got[cols], pm_part[cols])
+    assert set(got["root"]) == {"SPXW"} and set(got.attrs["settled_by"]) == {"calendar"}
+    assert got.attrs["dropped_expiries"] == [] and not got.attrs["settlement_uncertain"]
+    rows[1] = (ISO, monthly[1], "DROP", "test")
+    pd.DataFrame(rows, columns=["date", "expiry", "settlement", "evidence"]).to_csv(
+        table, index=False
+    )
+    got = io.load_day(ISO, "SPX", store=where / "store", closes=root / "SPX.csv")
+    assert got.attrs["dropped_expiries"] == [monthly[1]]
+    assert monthly[1] not in set(got["expiration"]) and monthly[0] in set(got["expiration"])
+    assert io.source_provenance(got)["settlement"]["dropped_expiries"] == [monthly[1]]
+    pd.DataFrame(rows[:1], columns=["date", "expiry", "settlement", "evidence"]).to_csv(
+        table, index=False
+    )
+    with pytest.raises(DataError, match="settlement table has no entry"):
+        io.load_day(ISO, "SPX", store=where / "store", closes=root / "SPX.csv")
+
+    def no_marker(df: pd.DataFrame) -> pd.DataFrame:
+        return df.drop(columns=["cOpra", "pOpra"])  # both series under SPX, no symbol
+
+    where = _store_of(tmp_path / "c", no_marker)
+    with pytest.raises(io.AmbiguousSettlement, match=r"repeat a \(root, expiry, strike\)"):
+        io.load_day(ISO, "SPX", store=where / "store", closes=root / "SPX.csv")
+
+
+def test_settlement_rule_and_canonical_expiry() -> None:
+    d = dt.date
+    # the Saturday of an old standard expiry is its Friday; a Good Friday its Thursday
+    assert orats.canonical_expiry(d(2012, 3, 17)) == (d(2012, 3, 16), True)
+    assert orats.canonical_expiry(d(2016, 6, 17)) == (d(2016, 6, 17), True)
+    assert orats.good_friday(2014) == d(2014, 4, 18) and orats.good_friday(2019) == d(2019, 4, 19)
+    assert orats.canonical_expiry(d(2014, 4, 19)) == (d(2014, 4, 17), True)  # Saturday dated
+    assert orats.canonical_expiry(d(2019, 4, 18)) == (d(2019, 4, 18), True)  # Thursday dated
+    assert orats.canonical_expiry(d(2019, 4, 19)) == (d(2019, 4, 18), True)  # Friday dated
+    assert orats.canonical_expiry(d(2012, 12, 31)) == (d(2012, 12, 31), False)  # a quarterly
+    assert orats.canonical_expiry(d(2012, 3, 23)) == (d(2012, 3, 23), False)  # a weekly
+    rule = orats.settlement_without_opra
+    monthly, weekly = d(2012, 4, 21), d(2012, 3, 23)
+    assert rule("SPXPM", monthly, d(2012, 3, 16), spxpm_listed=True) == "PM"
+    assert rule("SPX", monthly, d(2012, 3, 16), spxpm_listed=True) == "AM"
+    assert rule("SPX", weekly, d(2012, 3, 16), spxpm_listed=True) == "PM"
+    assert rule("SPX", d(2007, 3, 17), d(2007, 1, 3), spxpm_listed=False) == "AM"  # before SPXPM
+    assert rule("SPX", d(2011, 12, 17), d(2011, 10, 3), spxpm_listed=False) == "AM"
+    # after SPXPM: what the open-interest table says, per (trade date, expiry)
+    table = {("2019-01-03", "2019-03-15"): "AM", ("2019-03-01", "2019-03-15"): "PM"}
+    assert rule("SPX", d(2019, 3, 15), d(2019, 1, 3), spxpm_listed=False, table=table) == "AM"
+    assert rule("SPX", d(2019, 3, 15), d(2019, 3, 1), spxpm_listed=False, table=table) == "PM"
+    assert rule("SPX", d(2019, 3, 15), d(2019, 3, 15), spxpm_listed=False) == "DROP"  # stale
+    with pytest.raises(ValueError, match="needs the open-interest table"):
+        rule("SPX", d(2019, 3, 15), d(2019, 1, 3), spxpm_listed=False)
+    with pytest.raises(KeyError):
+        rule("SPX", d(2019, 6, 21), d(2019, 1, 3), spxpm_listed=False, table=table)
+    # the end-of-week expirations were AM-settled before 2010-12-01; the quarterlies PM
+    assert rule("SPX", d(2007, 1, 5), d(2007, 1, 3), spxpm_listed=False) == "AM"
+    assert rule("SPX", d(2010, 12, 3), d(2010, 11, 30), spxpm_listed=False) == "AM"
+    assert rule("SPX", d(2010, 12, 10), d(2010, 12, 1), spxpm_listed=False) == "PM"
+    assert rule("SPX", d(2010, 12, 31), d(2010, 11, 1), spxpm_listed=False) == "PM"  # Friday,
+    assert orats.is_quarter_end(d(2010, 12, 31)) and orats.is_quarter_end(d(2009, 6, 30))  # Q end
+    assert not orats.is_quarter_end(d(2010, 12, 24)) and not orats.is_quarter_end(d(2010, 1, 29))
+    assert rule("SPX", d(2009, 6, 30), d(2009, 6, 1), spxpm_listed=False) == "PM"
+    assert orats.settlement_uncertain(d(2010, 12, 15)) and not orats.settlement_uncertain(
+        d(2011, 1, 3)
+    )
+    with pytest.raises(ValueError, match="not an SPX-family ticker"):
+        rule("XSP", monthly, d(2012, 3, 16), spxpm_listed=False)
+    assert orats.osi_symbol("SPXW", d(2012, 3, 16), -1, 1402.5) == "SPXW120316P01402500"
+    assert orats.opra_root(orats.osi_symbol("SPX", d(2012, 4, 20), 1, 1400.0)) == "SPX"
 
 
 def test_parity_recovers_the_fixture_market(root: Path) -> None:
@@ -258,3 +397,64 @@ def test_orats_sample_day_imports(tmp_path: Path) -> None:
         f"({sp.offset_bp:+.1f} bp, {sp.z:.1f} se); eSSVI RMS 3m-2y |k|<=0.2 "
         f"{fit.rms_error(2.0, 0.2, 0.25):.3f} vp"
     )
+
+
+def _oi(series: dict[str, list[float]], dates: list[str]) -> pd.DataFrame:
+    return pd.DataFrame(series, index=dates)
+
+
+def test_settlement_table_from_open_interest() -> None:
+    """:func:`volsto.data.spx_settlement.classify` on synthetic open interest: a switch, an
+    expiry born on the PM series, a relapse day, a day that cannot be told, growth."""
+    nan = float("nan")
+    dates = [f"2019-02-{d:02d}" for d in (1, 4, 5, 6, 7, 8, 11, 12)]
+    table = spx_settlement.classify(
+        _oi(
+            {
+                # the AM monthly switches on the third date and stays PM
+                "2019-03-15": [3.0e6, 3.1e6, 1.5e5, 1.6e5, 9.0e5, 1.7e5, 1.7e5, 1.8e5],
+                # listed after the first switch, never switches, expiry inside the horizon
+                "2019-06-21": [nan, nan, nan, 100.0, 5.0e4, 900.0, 4.0e3, 3.0e4],
+                # a far expiry: stays AM, with a one-day hole on the last-but-one date
+                "2019-12-20": [1.0e6, 1.0e6, 1.0e6, 1.0e6, 1.0e6, 1.0e6, 2.0e3, 1.0e6],
+            },
+            dates,
+        )
+    )
+    got = {(r.date, r.expiry): r.settlement for r in table.itertuples()}
+    assert got[("2019-02-01", "2019-03-15")] == "AM" and got[("2019-02-04", "2019-03-15")] == "AM"
+    assert all(got[(d, "2019-03-15")] == "PM" for d in ("2019-02-05", "2019-02-06", "2019-02-08"))
+    # 02-07: both PM-state expiries jump up and come back the next day: a relapse to AM
+    assert got[("2019-02-07", "2019-03-15")] == "AM" and got[("2019-02-07", "2019-06-21")] == "AM"
+    assert got[("2019-02-06", "2019-06-21")] == "PM" and got[("2019-02-12", "2019-06-21")] == "PM"
+    assert got[("2019-02-07", "2019-12-20")] == "AM"  # untouched by the relapse
+    assert got[("2019-02-11", "2019-12-20")] == "DROP"  # an AM series collapsing for one day
+    assert got[("2019-02-12", "2019-12-20")] == "AM"
+    info = spx_settlement.summary(table)
+    assert len(info["switches"]) == 1 and "2019-02-05" in info["switches"][0]
+    assert info["relapse_days"] == ["2019-02-07"] and info["drop_days"] == ["2019-02-11"]
+    assert ("2019-02-01", "2019-06-21") not in got  # not listed that day
+
+
+def test_settlement_table_of_the_archive() -> None:
+    """The table built from the archive (skips without the store): the switches from
+    2019-02-05, the six relapse days, the days that cannot be told."""
+    path = spx_settlement.table_path(roots.DataRoots.resolve().store_dir("orats"))
+    if not path.exists():
+        pytest.skip(f"{path} absent (scripts/orats_spx_settlement.py)")
+    table = pd.read_csv(path, dtype={"date": str, "expiry": str}).fillna({"evidence": ""})
+    info = spx_settlement.summary(table)
+    assert (table["date"].min(), table["date"].max()) == ("2017-05-10", "2021-05-27")
+    assert len(info["switches"]) == 29
+    assert min(s.split("switch on ")[1][:10] for s in info["switches"]) == "2019-02-05"
+    assert info["relapse_days"] == [
+        "2019-05-14",
+        "2020-06-04",
+        "2020-06-23",
+        "2020-07-06",
+        "2020-07-15",
+        "2021-04-13",
+    ]
+    assert info["drop_days"] == ["2018-12-10", "2020-03-09", "2021-02-25"]
+    before = table[table["date"] < "2019-02-05"]
+    assert set(before["settlement"]) <= {"AM", "DROP"}  # the AM monthly only until the switch
