@@ -556,22 +556,18 @@ def import_day(date: str, cache: Path = DAY_CACHE, *, sabrw: bool = False) -> di
     info: dict[str, Any] = {"date": date, "built": False, "sabrw": False}
     try:
         f = ih.HdnFilters()
-        chain = io.load_day(date, "SPX")
-        fwds = ih.implied_forwards(chain, max_years=f.max_years, band=f.near_atm_band)
-        grid, points = ih.to_grid_surface(chain, fwds, f)
-        fit = ih.fit_ssvi(grid, points, filters=f, essvi=True)
-        fits: tuple[Any, ...] = ()
+        # the importer is the one writer of a snapshot and of its SABRW section
+        doc, fit, points, chain = io.import_day(date, "SPX", filters=f, essvi=True, sabrw=sabrw)
         t_max = float(points.table["T"].max())
-        if sabrw and t_max > ih.SABRW_T_MIN:
-            fits = ih.sabrw_fits(points, t_min=ih.SABRW_T_MIN, t_max=t_max)
-        doc = ih.snapshot_document(
-            chain, fit, points, f, source=io.source_provenance(chain), sabrw=fits
-        )
+        # the forwards again, for the cross-check against the vendor's only (the importer
+        # does not return them; same function of the same chain)
+        fwds = ih.implied_forwards(chain, max_years=f.max_years, band=f.near_atm_band)
         xc = io.forward_crosscheck(chain, fwds)
         year = xc[xc["T"] <= 1.0]["bp"].abs()
         info.update(
             built=True,
-            sabrw=bool(fits),
+            # the section is always written; without fits its list is empty
+            sabrw=bool(doc.get("sabrw", {}).get("fits")),
             spot=float(doc["market"]["spot"]),
             close=float(chain.attrs["spot"]),
             t_max=t_max,

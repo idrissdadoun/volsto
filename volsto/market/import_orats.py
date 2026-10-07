@@ -362,9 +362,12 @@ def import_day(
     calendar_repair: ih.CalendarRepairConfig | None = ih.DEFAULT_CALENDAR_REPAIR,
     store: str | Path | None = None,
     closes: str | Path | None = None,
+    sabrw: bool = True,
 ) -> tuple[dict[str, Any], ih.SSVIFit, ih.SurfacePoints, pd.DataFrame]:
     """The whole pipeline for one ORATS day; returns ``(config, fit, points, chain)`` like
-    :func:`volsto.market.import_hdn.import_day`."""
+    :func:`volsto.market.import_hdn.import_day`.  ``sabrw=False`` skips the SABRW fits: the
+    snapshot's ``sabrw`` section is then written with an empty list of fits (a caller that
+    needs the surface only, such as the barrier study's day cache off its re-mark days)."""
     f = filters or ih.HdnFilters()
     chain = load_day(date, underlying, store=store, closes=closes)
     fwds = ih.implied_forwards(chain, max_years=f.max_years, band=f.near_atm_band)
@@ -372,7 +375,9 @@ def import_day(
     fit = ih.fit_ssvi(grid, points, filters=f, essvi=essvi, calendar_repair=calendar_repair)
     t_max = float(points.table["T"].max())
     fits = (
-        ih.sabrw_fits(points, t_min=ih.SABRW_T_MIN, t_max=t_max) if t_max > ih.SABRW_T_MIN else ()
+        ih.sabrw_fits(points, t_min=ih.SABRW_T_MIN, t_max=t_max)
+        if sabrw and t_max > ih.SABRW_T_MIN
+        else ()
     )
     cfg = ih.snapshot_document(chain, fit, points, f, source=source_provenance(chain), sabrw=fits)
     return cfg, fit, points, chain
