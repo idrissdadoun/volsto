@@ -148,13 +148,13 @@ spec:
     - -0.7999185061873121
     - -0.812913097556994
   model:
-    nu: 2.6109161214340086
-    theta: 0.19959042228332477
-    k1: 14.170259247544385
-    k2: 0.890917983002553
-    rho12: 0.0571876948690509
-    rho_SX1: -0.6910269100654329
-    rho_SX2: -0.6830716364052345
+    nu: 2.1086610858346777
+    theta: 0.12033869785554814
+    k1: 8.550180010202467
+    k2: 0.2
+    rho12: 0.6496795827802736
+    rho_SX1: -0.8730076802542837
+    rho_SX2: -0.9371557733116281
   particle:
     n_particles: 200000
     horizon: 3.0
@@ -212,12 +212,9 @@ fit:
     sabrw_power: 1.0
     atf_ref: 0.3
     k2: 0.2
-    k2_bounds:
-    - 0.05
-    - 5.0
     k1_bounds:
     - 0.3
-    - 100.0
+    - 20.0
     k1_min_gap: 0.05
     k1_grid: 25
     radicand_floor: 0.5
@@ -232,14 +229,11 @@ fit:
     weights_covar: relative
     weights_volvar: relative
     term_structure: atmf
-    kernel_curve: atmf
-    sigma0_maturity: 0.25
-    step0: sabrw
-    nu_cap: null
+    nu_cap: 3.5
     chi_bounds:
     - -0.99
     - 0.99
-    omega_max: 5.0
+    omega_max: 20.0
     stage3_tolerance: 0.1
     rho12_flag: 0.9
     n_quad: 64
@@ -249,28 +243,19 @@ fit:
     n_inner_ts: 24
   ssr_target: 1.0
   breakeven:
-    k1: 14.170259247544385
-    k2: 0.890917983002553
-    omega1: 5.0
-    omega2: 1.2468018114719184
-    lambda1: -3.455134550327165
-    lambda2: -0.851654953635134
-    chi: -0.785789192323842
+    k1: 8.550180010202467
+    k2: 0.2
+    omega1: 3.855548399228928
+    omega2: 0.5274435430445502
+    lambda1: -3.365923364118963
+    lambda2: -0.49429676146014045
+    chi: -0.99
   status: binding
   messages:
   - 'skew constraint binds at T=1 (lower edge: naked skew = (1+0.1) x Skew_SABR =
-    -0.27751): naked skew -0.27751 vs market -0.25228 (+10.0%, eps 0.1); SpotVolCovar
-    achieved vs target: 0.25y -0.07680/-0.07931 (-3.2%), 0.5y -0.06443/-0.06784 (-5.0%),
-    1y -0.05976/-0.05786 (+3.3%), 2y -0.04553/-0.03996 (+13.9%), 3y -0.03909/-0.03490
-    (+12.0%)'
-  - 'skew constraint binds at T=3 (upper edge: naked skew = (1-0.1) x Skew_SABR =
-    -0.14318): naked skew -0.14318 vs market -0.15909 (-10.0%, eps 0.1); SpotVolCovar
-    achieved vs target: 0.25y -0.07680/-0.07931 (-3.2%), 0.5y -0.06443/-0.06784 (-5.0%),
-    1y -0.05976/-0.05786 (+3.3%), 2y -0.04553/-0.03996 (+13.9%), 3y -0.03909/-0.03490
-    (+12.0%)'
-  - 'per-factor bound binds (omega1 at omega_max 5; the desk note''s bounds, omega_max
-    5): first-order break-evens biased at large vol of vol'
+    -0.29627): naked skew -0.29627 vs market -0.26933 (+10.0%, eps 0.1); SpotVolCovar
+    achieved vs target: 0.25y -0.09225/-0.08271 (+11.5%), 0.5y -0.06141/-0.07172 (-14.4%),
+    1y -0.05249/-0.05704 (-8.0%), 2y -0.04463/-0.04205 (+6.1%), 3y -0.04064/-0.03681
+    (+10.4%)'
   surface: spx
   skew_eps: 0.1
-  fit: desk
-  snapshot: configs/surfaces/snapshots/hdn_2022H2/spx_2022-12-30.yaml
