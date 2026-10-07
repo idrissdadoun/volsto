@@ -234,91 +234,84 @@ implied-minus-realised vol — the two state variables that carry most of the va
 
 Sections 1 to 5 rest on one date, 127 days of 2022 and the spot history. The same question was
 then put to every weekly entry of the ORATS history: 1,031 entry dates from 2007-01-03 to
-2026-09-28, strike at the snapshot spot, maturities 1 / 3 / 6 / 12 months, barriers at 0.25 to
-2 standard deviations and at fixed percentages, both sides — 74,232 trades, every vanilla
-structure priced off the day's surface, the knock-outs under local vol and under the desk LSV
-mark (SSR 1.2), all of them marked and delta-hedged every day to expiry. The specification is
-`outputs/interview/BARRIER_STUDY_SPEC.md` with its addendum; the code is
-`volsto/studies/barrier_history.py`, `volsto/studies/barrier_theory.py` and
-`scripts/barrier_*.py`; the report is `outputs/interview/report/report.pdf` (strict sample:
-the 744 entries whose surface meets the eSSVI tolerances) and `report_built/` (all 1,028 built
-entries). The numbers below are from the strict sample, in % of the entry spot, with block
-standard errors over entry dates. The LSV daily series (every knock-out re-marked and hedged
-each day under the LSV, leverage recalibrated daily) covers the entries from 2021-06-01 so far:
-452 of 740 entry dates at the render of 2026-10-05 08:16 (2007–2011 and 2021-06 onwards; the
-2012–2021 block was still running and `outputs/interview/after_h.sh` re-renders when it ends).
+2026-09-28, strike at the spot, maturities 1 / 3 / 6 / 12 months, barriers at 0.25 to 2 standard
+deviations and at fixed percentages, both sides — 74,232 cells, every vanilla structure priced off
+the day's eSSVI surface, the knock-outs under Dupire local vol and under the desk LSV mark (SSR 1.2,
+re-marked weekly with the leverage recalibrated daily; SSR 1.0 and 1.5 on a monthly subset agree
+within 0.6 % of the price on calls and 2 % on puts), all of them marked and delta-hedged every day
+to expiry or to the knock. The specification is `outputs/interview/BARRIER_STUDY_SPEC.md` with its
+two addenda; the code is `volsto/studies/barrier_history.py`, `barrier_theory.py`,
+`barrier_attrib.py` and `scripts/barrier_*.py`; the final report is
+`outputs/interview/pm_package_final/Q1_knockouts_vs_flies_report.pdf` (43 pages, with the slides,
+the results workbook and a web page of the trades). The numbers below are its headline cell: three
+months, barrier at one standard deviation, the strict sample (the 744 entries whose surface meets
+the fit tolerances; 732 of them finished, 716 with complete daily marks for hedging), in % of the
+entry spot per trade, with circular-block-bootstrap standard errors over entry dates (about 55
+independent three-month windows per cell).
 
 **What it confirms.**
 
-- *Two anchors, not a band.* The three desk marks (SSR 1.0, 1.2, 1.5) price the knock-outs alike;
-  local vol and the LSV are the low and high anchors of the up-and-out call and the reverse for
-  the down-and-out put. The signed gap LSV − local vol grows with maturity: 0.014, 0.063, 0.123,
-  0.209 at 1, 3, 6 and 12 months on the call side, the same on the put side. It is the price of
-  forward skew at the barrier: regressed on the "roll value" (the skew the local-vol price does
-  not charge for, times the annuity of the barrier) the slope is 0.72 ± 0.02 on calls and
-  0.62 ± 0.03 on puts.
-- *The touch test sides with the stationary smile.* On the 8,741 trades knocked on the daily
-  rule, the skew on the knock day is within a few percent of what the entry-day smile predicts
-  by moneyness (ratio 0.94–0.98 on up touches, 1.06–1.25 on down touches) and well away from
-  local vol's prediction, on both sides and at 1 and 3 months. The at-the-money vol at up
-  touches is 0.8–1.2 vol points above local vol's and 1.7 below at down touches. Getting out of
-  the static hedge C8 at an up touch costs the holder of the knock-out 0.12 (1m) and 0.28 (3m)
-  per knocked trade because of the smile, close to 0.8·w·κ·n.
+- *Two anchors, not a band.* Local vol and the LSV bracket the dealer's quote: LSV − local vol is
+  +0.153 ± 0.006 on the up-and-out call and −0.079 ± 0.004 on the down-and-out put (744 entries).
+  The gap is the price of forward skew at the barrier, and the three desk marks (SSR 1.0, 1.2, 1.5)
+  put it in the same place.
+- *The forward skew the market realised is the entry skew re-centred.* On the touch days of every
+  trailing two-year window since 2007 the realised forward-skew ratio stayed between 0.90 and 1.02
+  on calls and 0.95 and 1.23 on puts, while the LSV's implied ratio is 0.61 (calls) and 0.73 (puts)
+  at the median and local vol's 0.03 and 0.44: the dealer-style model charged 0.6–0.7 of the forward
+  skew the market then showed, at every entry date, on both sides (the premium ratio sat between 0.57
+  and 0.74 on calls and 0.60 and 0.79 on puts on four readings in five, never reaching 1). That is
+  the structural fact behind both results below; it does not time them.
+- *The up barrier was hit as often as priced.* 19.4 ± 3.5 % of the 3m 1-sd call trades knocked on a
+  close, against 19.6 % priced by local vol (17.9 by the LSV).
 
-- *The model moves the premium, not the hedge.* On the 221 entries from 2021-06 marked and
-  hedged every day under both models (daily knock-outs, standard-deviation barriers), the
-  dispersion of the hedged P&L is the same under the LSV and under local vol (0.53 against 0.53
-  at 1m, 0.70 against 0.72 at 3m, 0.94 against 0.97 at 6m on the call side; within 0.02 on the
-  put side), and the mean hedged P&L of the buyer differs by about the difference of the two
-  premiums: −0.02, −0.09, −0.19 on calls and +0.01, +0.05, +0.09 on puts at 1, 3 and 6 months,
-  for premium differences of +0.02, +0.08, +0.15 and −0.01, −0.05, −0.10.
+**What it decides.**
 
-**What it contradicts or qualifies.**
+- *Calls: buy the knock-out.* Hedged, the up-and-out call made +0.421 ± 0.143 per trade and the fly
+  −0.032 ± 0.066: knock-out − fly **+0.453 ± 0.125** (3.6 standard errors). Half of it is the vol
+  premium the short-vega knock-out collected; the rest, **+0.238 ± 0.094** ex vol carry (2.5 se), is
+  the structure. In 2017–2026 alone +0.319 ± 0.148 hedged and +0.171 ± 0.141 ex vol. The knock-out
+  stays ahead of the fly, ex vol carry, up to a quote of **local vol +0.24** (95 % range +0.07 to
+  +0.43), +0.30 once the fly's own bid-ask is counted; bought at the LSV premium (local vol +0.15)
+  and hedged with the LSV's delta it still made +0.22 ± 0.14. Continuous monitoring beat daily by
+  0.12 ± 0.04. The knock-out beat the fly in 14 of 20 entry years; 2009, 2010 and 2021 carry 65 % of
+  the cumulative lead, without them it still leads by 0.197 hedged and 0.114 ex vol.
+- *Puts: a toss-up at mid that the knock-out wins after costs.* Hedged, the down-and-out put was flat
+  (+0.011 ± 0.052) and the fly made +0.108 ± 0.039: knock-out − fly **−0.097 ± 0.061** (1.6 se),
+  −0.116 ± 0.051 ex vol carry; in 2017–2026 −0.039 ± 0.046 and −0.057 ± 0.047. The fly's lead is in
+  the 22 % of trades that knocked (−0.69 ± 0.22 per knocked trade) and 2008 alone is 64 % of it;
+  the fly's own half bid-ask (0.16, 11 % of its premium) is larger than its lead, while the knock-out
+  is costed at mid, so net of it the knock-out is ahead by about 0.06 hedged and 0.04 ex vol, inside
+  the noise. The break-even is a knock-out quote of local vol −0.115 [−0.23, −0.03] at mid, **about
+  local vol +0.04 net of the fly's spread**; the LSV marks the put knock-out at local vol −0.08, well
+  inside. The down barrier was hit 21.7 ± 3.7 % of the time against 30.3 % priced by local vol (30.9
+  by the LSV): the surface priced finishing below the barrier at 0.151 against a realised 0.078, and
+  the touched paths came back above it 65 % of the time against 50 % in the model — the vanilla
+  downside premium, not the models' forward skew. Beyond one standard deviation the hedged
+  knock-out beat the fly outright; the put ratio is the short-crash variant (it sells the far wing,
+  38 % of the fly's price) and three quarters of its hedged P&L is vol carry.
+- *No timing rule out of sample.* The three rules written down in advance sit between
+  always-knock-out and always-fly. A search over 81 entry-date indicators per side, each rule fitted
+  on 2007–2016 and applied once to 2017–2026 (318 tests in four runs), finds nothing that beats
+  always-knock-out out of sample once the number of tests is counted: the smallest false-discovery
+  q is 0.11. The one pattern that held in both halves is where the put barrier sits — fly at or
+  inside 1 sd, knock-out beyond (+0.030 ± 0.013 per trade over always-knock-out out of sample,
+  t 2.26) — and it is the strongest of 318 tests. Reading the spot-vol regime at entry does not help
+  either: the next quarter's regime is not predictable from the last one, and 65 trailing-regime
+  indicators add nothing.
+- *Today (28 September 2026).* Upside: the continuously monitored up-and-out call, three months,
+  strike at the spot, barrier 7 % up (one standard deviation at 13.8 % vol), at any offer up to the
+  LSV mark — today 0.16 above local vol against a break-even of 0.24; above local vol +0.24 (+0.30
+  net of the fly's spread) the fly instead. Downside: the down-and-out put up to about local vol
+  +0.04; today the LSV marks it 0.05 below.
 
-- *Hedged, the knock-out bought at the local-vol price beat the fly.* Section 3.4 expected the
-  fly to win when the vol responds strongly to rallies. Delta-hedged, fly (n = 2) minus knock-out
-  is negative in every tercile of every primary condition on the call side (−0.05 to −0.32), and
-  most negative in the top tercile of the upside skew-stickiness ratio (−0.20 ± 0.03 at 1m against
-  −0.08 ± 0.02 in the bottom tercile). On the put side the difference is small (0 to −0.1).
-- *What that hedged edge is made of (addendum 2, report v3).* The knock-out at one standard
-  deviation is short vega (−0.12 % of spot per vol point at 3m on the call side) and the fly is
-  not (+0.02); realised vol ran 1.4 ± 0.8 points below the entry implied vol over the lives. Read
-  as entry vega × that premium, the vol carry is +0.155 of the knock-out's +0.421 hedged P&L
-  and −0.215 of the −0.453 by which the fly trailed it; the rest, −0.238 ± 0.094, is not a
-  choice of vega sign. On that rest the justified share of the anchor gap at 3m and 1 sd is
-  1.55 [0.43, 2.81] on calls and 1.44 [0.39, 2.88] on puts (2.96 and 1.20 with the carry in),
-  beside 0.89 [0.04, 1.80] and 1.10 [0.53, 1.71] from the touch days: neither interval is inside
-  [0, 1] (P12 inconclusive), each contains the touch-day share. The carry is first order: per
-  trade, hedged knock-out = a + b·carry + c·touched gives b = 0.48 ± 0.25 with R² 0.07 (0.64 ±
-  0.07 and 0.50 for the spread), so the split is an estimate of means, not a per-trade
-  identity (P13 inconclusive). The same table by barrier, the conditions and the rules ex
-  carry, and the framework read-out are sections A2.11g–A2.12 of the report;
-  `report/pm_framework.md` is the one-page version.
-- *Touch frequencies.* At 3m and 1 sd the up barrier was touched on the daily rule in 19.4 ±
-  3.5 % of trades against a local-vol probability of 19.6 %; the down barrier in 21.7 ± 3.7 %
-  against 30.3 % (P14: confirmed on calls, contradicted on puts).
-- *Hedging costs.* The daily hedge of the 3m 1-sd call knock-out trades 4.7 times the notional
-  per trade against 3.4 for the fly; at 2 bp of the notional traded the fly-minus-knock-out
-  hedged difference moves from −0.453 to −0.428.
-- *The justified premium is above both anchors on the call side.* The knock-out premium at which
-  the knock-out would only have matched the fly, hedged, is local vol plus 0.077 at 1m and 0.179
-  at 3m, where the LSV adds 0.014 and 0.063: a share of 5.6 [3.8, 7.3] and 2.8 [1.9, 3.8] of the
-  gap between the anchors. On the put side the share is −0.9 [−1.4, −0.3] at 3m. The touch-day
-  share (what leaving C8 at the knock cost, against what each anchor charges) is between the
-  anchors at 3 months (0.63 on calls, 0.67 on puts) and outside at 1 month.
-- *Rule 4* (knock-out when the skew the dealer charges is below the skew expected at the touch,
-  nothing fitted) beats always-fly by 0.02–0.10 hedged in both halves, and does not beat
-  always-knock-out.
-- *Fly or ratio.* Beyond one standard deviation on the call side the far call W is worth less than
-  0.02 and ratio and fly are the same trade. Near the barrier the ratio earned 0.2–0.35 more than
-  the fly, hedged, at 3 months (barriers at 0.25 and 0.5 standard deviations), for a worst 1 %
-  unhedged outcome of −6 to −16 against −0.4 to −2.3 for the fly.
-
-**Limits to read these with.** The knock-out has no market price: its premium is a model's. The
-vanilla structures are priced on the fitted surface, which misses the quoted mids by 2–5 bp of
-spot on a spread or a fly at 3 months (quote-based table of the report): of the size of several
-of the differences above. The hedge is a forward to expiry rebalanced once a day at the
-snapshot, without cost. About 236 independent one-month windows and 78 three-month ones carry
-the inference; the six-month and one-year results are indicative. The verdict on the eleven
-pre-registered predictions is the report's table `verdict`.
-
+**Limits to read these with.** The knock-out has no market price: its premium is a model's, and
+the quote history is the input most likely to change the answer — the break-evens are what to test
+it against. The vanilla structures are priced on the fitted surface, which misses the quoted mids by
+a few basis points of spot on a spread or a fly at three months (quote-based table of the report).
+The hedge is a forward to expiry rebalanced once a day at the vendor's snapshot, without financing;
+a cost table charges 0.5 and 2 bp per unit of notional traded and half the quoted bid-ask of each
+vanilla leg. The strict sample is thin in 2015–2020 (10 to 31 entries a year), which is why the
+rolling books are also shown on all 1,031 built entries; twelve-month results are indicative only
+(about 12 independent windows). The verdict on the fourteen pre-registered predictions and the 24
+checks are the report's tables.

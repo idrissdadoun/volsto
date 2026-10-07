@@ -23,11 +23,81 @@ analytics, and a 1F LSV ADI PDE cross-check (M6). Smile dynamics, SSR estimators
 marking calibration by SABR break-evens (M7); the hedging framework and the M8b hedging studies
 (M8); the sharded precompute, results store and Streamlit viewers (M9); the certified eSSVI
 calendar repair, the study runner with LaTeX output, the study catalogue S1–S7 and the rolling
-backtest (M10). The barrier-versus-vanilla and dispersion decision frameworks of 2026-10-03 (vanilla structures,
-the multi-asset layer `volsto/multi/`, the statistical layer on cached price histories): SPEC §8.4–8.5,
-[docs/barrier_vs_vanilla.md](docs/barrier_vs_vanilla.md), [docs/dispersion_palladium.md](docs/dispersion_palladium.md).
-Methodology: [docs/methodology.md](docs/methodology.md); studies:
-[docs/studies.md](docs/studies.md).
+backtest (M10). Methodology: [docs/methodology.md](docs/methodology.md); the catalogue studies:
+[docs/studies.md](docs/studies.md); the two decision studies on the ORATS history: "Studies" below.
+
+## Studies
+
+Two questions answered on the ORATS end-of-day history 2007–2026 with this library (SPEC §8.4–8.5;
+the single-date frameworks of 2026-10-03 are `volsto/studies/barrier_vs_vanilla.py` and
+`volsto/studies/dispersion.py`, the backtests the modules and scripts below). The vendor data and
+every output stay out of git (see "Vendor data"); the reports are in
+`outputs/interview/pm_package_final/` (local).
+
+**Q1 — knock-outs against ratios and flies** ([docs/barrier_vs_vanilla.md](docs/barrier_vs_vanilla.md)).
+S&P 500, ORATS end-of-day strikes from 2007-01-03 to 2026-10-02, an eSSVI surface fitted each day;
+entries on the first trading day of each week with the strike at the spot, barriers at 0.25–2
+standard deviations and at fixed percentages, 1 / 3 / 6 / 12 months, daily and continuous knock;
+the knock-outs priced under Dupire local vol and under the LSV marked at skew-stickiness 1.2
+(re-marked weekly, leverage recalibrated daily), the vanilla structures off the day's surface;
+every position marked and delta-hedged daily (sticky-strike delta, forward to expiry). Code:
+`scripts/barrier_*.py`, `volsto/studies/barrier_history.py`, `barrier_theory.py`,
+`barrier_attrib.py`; the ORATS layer `volsto/data/orats.py` and `volsto/market/store.py`. Data: the
+ORATS Parquet store (`VOLSTO_DATA_STORE`), not in the repository. Reproduce, in this order (every
+pass is resumable and writes under `outputs/interview/`; the specification and the run log are
+`outputs/interview/BARRIER_STUDY_SPEC.md`, its two addenda and `PROGRESS.md`):
+
+```bash
+python scripts/barrier_history.py days    --start 2007-01-03 --end 2026-10-02   # surfaces into the day cache
+python scripts/barrier_history.py entries --start 2007-01-03 --end 2026-10-02   # cells, structures, local-vol knock-outs
+python scripts/barrier_history.py daily   --start 2007-01-03 --end 2026-10-02   # daily local-vol marks
+python scripts/barrier_features.py && python scripts/barrier_chain.py           # entry conditions; quote-based costs
+python scripts/barrier_gate.py                                                  # particle-estimator gate -> gate.json
+python scripts/barrier_lsv2.py entries --monthly && python scripts/barrier_lsv2.py entries
+python scripts/barrier_lsv2.py daily --start 2007-01-03 --end 2026-10-02        # daily LSV marks
+python scripts/barrier_features2.py && python scripts/barrier_buckets.py && python scripts/barrier_touches.py
+python scripts/barrier_quotes.py && python scripts/barrier_restarts.py
+python scripts/barrier_assemble.py                                              # outcomes, hedged P&L
+python scripts/barrier_attrib.py attrib && python scripts/barrier_attrib.py turnover
+python scripts/barrier_report3.py --out outputs/interview/report                # tables, figures, report.pdf (needs tectonic)
+python scripts/barrier_checks2.py && python scripts/barrier_checks3.py
+```
+
+The final report is `outputs/interview/pm_package_final/Q1_knockouts_vs_flies_report.pdf`, with the
+slides, the results workbook and the web page beside it (not in git); the study's own render is
+`outputs/interview/report/`.
+
+**Q2 — the Palladium (the call on dispersion) against straddle dispersion**
+([docs/dispersion_palladium.md](docs/dispersion_palladium.md)). The Dow's thirty members on each
+entry date at price weights, frozen at entry (also the equally weighted basket and ten large caps),
+DJX listed options for the basket, ORATS 2007–2026, weekly entries, three-month trades (also 1, 6,
+12 and 24 months); smiles inverted from the vendor's values with put–call-parity forwards, a
+Gaussian copula on the exact single-name marginals at the correlation that reprices the DJX
+straddle, the Palladium forward, its calls and the straddle packages priced at that mark with their
+sensitivities, every structure held and delta-hedged daily; a skew-consistent copula and a
+local-vol cross-check through `volsto/multi/`; indicators without look-ahead, Gaussian and
+filtered-historical-simulation forecasts, the pre-registered rules. Code: `scripts/disp_*.py`,
+`volsto/studies/disp_*.py` (`disp_smile`, `disp_copula`, `disp_payoff`, `disp_indicators`,
+`disp_fhs`, `disp_models`, `disp_stats`, `disp_universe`, `disp_data`) and `volsto/multi/`. Data:
+the ORATS store (the members, DJX, DIA and SPX) and, for the returns before 2007 and the
+dividends and splits, yfinance (`disp_setup.py history`); membership and corporate actions are
+in `volsto/studies/disp_universe.py`. Reproduce, in this order, from the repository root with
+`VOLSTO_DATA_STORE` set (outputs under `outputs/dispersion/`; the specification is
+`outputs/interview/DISPERSION_STUDY_SPEC.md`, the run log `outputs/dispersion/PROGRESS_Q2.md`):
+
+```bash
+python scripts/disp_setup.py prices && python scripts/disp_setup.py members && python scripts/disp_setup.py history
+python scripts/disp_c1.py && python scripts/disp_spx.py                         # forward-rule check; SPX regime vol
+python scripts/disp_entries.py --tenor 3m                                       # smiles, copula prices, sensitivities (also 1m, 6m, 12m, 24m; --vendor, --rule dividends)
+python scripts/disp_outcomes.py --tenor 3m && python scripts/disp_indicators.py --tenor 3m && python scripts/disp_fhs_run.py --tenor 3m
+python scripts/disp_models_run.py && python scripts/disp_marks.py && python scripts/disp_b3.py   # model S, marks during the life, basket B3
+python scripts/disp_c8.py && python scripts/disp_c9.py && python scripts/disp_scan_smiles.py     # checks C8, C9; the expiry scan
+python scripts/disp_deliver.py && python scripts/disp_report.py --version 4     # deliverables; report_q2.pdf (needs tectonic)
+```
+
+The final report is `outputs/interview/pm_package_final/Q2_palladium_vs_straddles_report.pdf`, with
+the slides and the results workbook beside it (not in git); the study's own render is
+`outputs/dispersion/report/`.
 
 ## Install
 
