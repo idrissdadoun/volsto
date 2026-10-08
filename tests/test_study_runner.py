@@ -1073,21 +1073,50 @@ def test_particle_kernel_reached_only_through_calibrate_leverage() -> None:
     # elsewhere in volsto/: only these names come from particle.py; the particle step is used by
     # the pricing module and particle.py only; the helpers are not referenced at all
     allowed_imports = {"calibrate_leverage", "CALIBRATION_CODE_TAG", "CalibrationResult"} | reusable
+    # M12 (SPEC §8.7, owner's decision on its review point 7): the local correlation
+    # calibration regresses two responses with the leverage's estimator and reuses the shared
+    # post-processing ``_finish_estimate`` — that module, that name, and nothing else.  It is
+    # itself a calibration: its three calibrating functions start with the guard check (below).
+    lc_rel = "volsto/calibration/local_correlation.py"
+    lc_reuses = {"_finish_estimate"}
     step_users = set()
     for path in sorted(pkg.rglob("*.py")):
         if path == particle_path:
             continue
         mod = ast.parse(path.read_text())
         rel = path.relative_to(ROOT).as_posix()
+        extra = lc_reuses if rel == lc_rel else set()
         for n in ast.walk(mod):
             if isinstance(n, ast.ImportFrom) and n.module == "volsto.calibration.particle":
-                bad = {a.name for a in n.names} - allowed_imports
+                bad = {a.name for a in n.names} - allowed_imports - extra
                 assert not bad, (rel, bad)
         used = _names(mod)
-        assert not (used & helpers), (rel, used & helpers)
+        assert not (used & helpers - extra), (rel, used & helpers - extra)
         if "step_lsv_block" in used:
             step_users.add(rel)
     assert step_users == {"volsto/models/lsv.py"}
+    lc_tree = ast.parse((ROOT / lc_rel).read_text())
+    lc_funcs = {n.name: n for n in lc_tree.body if isinstance(n, ast.FunctionDef)}
+    assert "step_lsv_block" not in _names(lc_tree)
+    for name in (
+        "calibrate_local_correlation",
+        "calibrate_parametric_lambda",
+        "calibrate_constant_lambda",
+    ):
+        fn = lc_funcs[name]
+        stmts = (
+            fn.body[1:]
+            if isinstance(fn.body[0], ast.Expr) and isinstance(fn.body[0].value, ast.Constant)
+            else fn.body
+        )
+        head = stmts[0]
+        assert (
+            isinstance(head, ast.Expr)
+            and isinstance(head.value, ast.Call)
+            and isinstance(head.value.func, ast.Name)
+            and head.value.func.id == "check_calibration_allowed"
+            and [a.value for a in head.value.args if isinstance(a, ast.Constant)] == [name]
+        ), f"the guard check must be the first statement of {name}"
     # the guard module imports nothing from volsto (no cycle with particle.py)
     guard_tree = ast.parse((pkg / "calibration" / "guard.py").read_text())
     for n in ast.walk(guard_tree):

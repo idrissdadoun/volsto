@@ -11,26 +11,67 @@ single-asset kernel on its own mixed normals (I3), one name is the single-asset 
 identical names at ``λ ≡ 1`` are one path (I5), the path-wise identities of the dispersion
 payoffs (I9), the mixed normals inside the kernel (C1), the per-particle variance terms.
 
+Part LC4 — the particle calibration: calibration and pricing share the kernel (I2), the
+regression helper is the leverage's estimator twice (I7), the row at ``t_0`` is exact (I8),
+one name is unidentified (I4), single names keep their local-vol law under a calibrated ``λ``
+(C2), the index repricing report, the constant and parametric companions, the configuration,
+the cache and the two guards.  The acceptance tests S1–S7 and S10 are slow (run them with
+``-m slow -s``: each prints its table): the round trip on a known ``λ`` (S1), the
+constant-correlation fixed point (S2), identical names (S3), the reference regression (S4),
+the Δt halving (S5), the particle doubling (S6), the bandwidth (S7) and the carry mode (S10).
+
 The synthetic world W5: five names, spots 1, zero rates, an SSVI surface per name (ATM vols
 0.20–0.40 and a skew each), weights (0.30, 0.25, 0.20, 0.15, 0.10), ``R_low`` the
-equicorrelation at 0.02, ``R_high = 11ᵀ``, daily steps.
+equicorrelation at 0.02, ``R_high = 11ᵀ``, daily steps.  Its fast index target is an SSVI
+surface within the family's reach (ATM 0.21, ρ −0.7, η 0.9: ``λ`` falls from about 0.8 at
+``k = −0.2`` to 0.15 at ``k = +0.1``, no clipping).
 
 Seeds are fixed; a statistical cell that fails is reported with its table, never re-seeded.
 """
 
 from __future__ import annotations
 
+import dataclasses
+import inspect
+import json
 from pathlib import Path
 
+import _lcm_reference as lcm
 import numpy as np
+import pandas as pd
 import pytest
 
-from volsto.config import LocalVolConfig, SchemeConfig, SimConfig, SSVIConfig
+from volsto.calibration import lc_cache
+from volsto.calibration import local_correlation as lcal
+from volsto.calibration.cache import CacheMissError
+from volsto.calibration.guard import CalibrationForbiddenError, calibration_forbidden
+from volsto.calibration.particle import _finish_estimate, conditional_variance_estimate
+from volsto.config import (
+    ConfigError,
+    CurveConfig,
+    LocalCorrelationConfig,
+    LocalCorrelationSpec,
+    LocalVolConfig,
+    MarketConfig,
+    ParametricLambdaConfig,
+    ParticleConfig,
+    SchemeConfig,
+    SimConfig,
+    SSVIConfig,
+    StepSchedule,
+    SurfacePerturbation,
+    SviSurfaceConfig,
+    from_mapping,
+    to_mapping,
+)
 from volsto.engine.grid import TimeGrid
+from volsto.engine.mc import summarize
 from volsto.engine.rng import GaussianDraws
+from volsto.market.bs import black_vega, implied_vol
 from volsto.market.curves import DiscountCurve, ForwardCurve
 from volsto.market.dupire import LocalVolSurface
-from volsto.market.surface import surface_from_config
+from volsto.market.surface import ArbitrageError, ImpliedSurface, SSVISurface, surface_from_config
+from volsto.market.svi_slices import SviSlices, fit_svi_slice
 from volsto.models.bs import BlackScholes
 from volsto.models.localvol import LocalVol
 from volsto.multi import MultiAssetModel, MultiAssetMonteCarlo, MultiPathSet, Palladium
@@ -1101,3 +1142,1638 @@ def test_lc_ab_matches_the_matrix_form(mode: str) -> None:
         np.testing.assert_allclose(b, ref_b, rtol=1e-10, atol=1e-16)
         np.testing.assert_allclose(k, basket.log_moneyness(ls, t), rtol=0, atol=1e-14)
         assert np.all(a > 0) and np.all(b >= 0)
+
+
+# ---------------------------------------------------------------------------------------------
+# LC4: the particle calibration on W5 (fast: 5·10⁴ particles)
+# ---------------------------------------------------------------------------------------------
+
+#: an index target within W5's reach (module docstring)
+W5_INDEX = SSVIConfig(W5_PILLARS, (0.21,) * len(W5_PILLARS), -0.7, 0.9, 0.5, 3.0)
+FAST_PARTICLE = ParticleConfig(n_particles=50_000, horizon=0.25, seed=12345)
+FAST_SIM = SimConfig(n_paths=100_000, dt_max=DAILY, seed=2024, chunk_size=20_000)
+
+
+def w5_basket(models: list[LocalVol], mode: str = "performance") -> BasketSpec:
+    w = W5_WEIGHTS[: len(models)] / W5_WEIGHTS[: len(models)].sum()
+    return BasketSpec(w, mode, [m.forward_curve for m in models])
+
+
+def w5_target(horizon: float, cfg: SSVIConfig = W5_INDEX) -> tuple[ImpliedSurface, LocalVolSurface]:
+    """The fast index target of W5: its implied surface and its Dupire surface on the grid."""
+    fc = ForwardCurve.flat(1.0, 0.0, 0.0)
+    surface = surface_from_config(cfg, fc, fc.rate_curve)
+    return surface, LocalVolSurface.from_implied(surface, lc_grid(horizon))
+
+
+@pytest.fixture(scope="module")
+def w5_calibration(w5_3m: list[LocalVol]) -> lcal.LCCalibrationResult:
+    """W5 at 3m against its fast target: 5·10⁴ particles, daily steps, the default settings."""
+    surface, lv = w5_target(0.25)
+    return lcal.calibrate_local_correlation(
+        w5_3m,
+        CorrelationFamily.equi(5),
+        w5_basket(w5_3m),
+        surface,
+        lv,
+        FAST_PARTICLE,
+        FAST_SIM,
+        LocalCorrelationConfig(particle=FAST_PARTICLE),
+        snapshot_times=[0.1],
+    )
+
+
+def test_calibration_and_pricing_share_the_kernel(
+    w5_3m: list[LocalVol], w5_calibration: lcal.LCCalibrationResult
+) -> None:
+    """I2: the calibrated model, simulated with the calibration's seed, particle count and grid,
+    reproduces the final particle cloud bit for bit — and the cloud kept at a snapshot time —
+    whatever the block size; the engine's pricing grid contains every ``λ`` slice."""
+    res = w5_calibration
+    fam = CorrelationFamily.equi(5)
+    model = LocalCorrelationModel(w5_3m, fam, res.lam, w5_basket(w5_3m))
+    n = FAST_PARTICLE.n_particles
+    assert res.grid.n_steps == 63 and res.lam.n_slices == 64 and res.passes == 1
+    np.testing.assert_array_equal(res.lam.times, res.grid.times)
+    grid = TimeGrid.build([FAST_PARTICLE.horizon], FAST_SIM.dt_max)
+    np.testing.assert_array_equal(grid.times, res.grid.times)
+    draws = LocalCorrelationDraws(
+        FAST_PARTICLE.seed, n, grid.n_steps, fam, FAST_PARTICLE.antithetic
+    )
+    for step_block in (64, 5):
+        paths = model.simulate_chunk(grid, draws, 0, n, FAST_SIM.scheme, step_block=step_block)
+        for i in range(5):
+            np.testing.assert_array_equal(paths.assets[i].log_spot[:, 1], res.final_log_spot[:, i])
+    ((t_snap, cloud),) = res.snapshots.items()
+    assert t_snap == res.grid.times[int(np.argmin(np.abs(res.grid.times - 0.1)))]
+    # a product fixing at the snapshot time: the engine's grid keeps every λ slice as a node
+    grid2 = TimeGrid.build(
+        [t_snap, FAST_PARTICLE.horizon], FAST_SIM.dt_max, calibration_grid=model.required_times()
+    )
+    np.testing.assert_array_equal(grid2.times, res.grid.times)
+    mid = model.simulate_chunk(grid2, draws, 0, n, FAST_SIM.scheme)
+    for i in range(5):
+        np.testing.assert_array_equal(mid.assets[i].log_spot[:, 1], cloud[:, i])
+    mc = MultiAssetMonteCarlo(FAST_SIM)
+    priced = mc.build_grid([Palladium(W5_WEIGHTS, 0.0, 0.25, DiscountCurve.flat(0.0))], model)
+    np.testing.assert_array_equal(priced.times, res.grid.times)
+    # the diagnostics of the fast calibration: no clipping on the reachable target
+    assert res.max_clipped_mass < 0.01 and not res.unidentified.any()
+    assert res.drift_abs_mean is None and res.bandwidths.shape == (63,)
+    assert np.all(res.q_lo[1:] < 0) and np.all(res.q_hi[1:] > 0) and res.q_lo[0] == res.q_hi[0]
+    assert (
+        np.all(np.diff(res.q_hi[1:]) > -1e-3) and res.lam.metadata["code_tag"] == lcal.LC_CODE_TAG
+    )
+    assert 0.3 < res.lambda_mean[-1] < 0.6 and res.wall_time > 0 and set(res.timings) == {
+        "tables", "draws", "kernel", "ab", "regression", "rows"
+    }  # fmt: skip
+    # λ falls with the basket: correlation rises on the downside
+    lam_T = res.lam(0.25, np.array([-0.15, 0.0, 0.1]))
+    assert lam_T[0] > lam_T[1] > lam_T[2]
+    frame = lcal.lambda_surface_frame(res)
+    assert list(frame.columns) == [
+        "t", "k", "lam", "lam_star", "in_trusted_range", "q_lo", "q_hi", "m_low", "m_high"
+    ]  # fmt: skip
+    assert len(frame) == 64 * 1601 and frame["lam"].between(0.0, fam.lambda_max).all()
+    inside = frame[frame["in_trusted_range"] & (frame["t"] > 0)]
+    assert np.allclose(inside["lam"], np.clip(inside["lam_star"], 0.0, fam.lambda_max))
+    assert json.loads(json.dumps(res.summary()))["n_slices"] == 64
+    assert res.clip_intervals(63) == [] or all(
+        x[0] in ("low", "high") for x in res.clip_intervals(63)
+    )
+
+
+def _ab_cloud(
+    n: int = 60_000, seed: int = 5
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    rng = np.random.default_rng(seed)
+    k = 0.1 * rng.standard_t(6, n) - 0.02 * rng.exponential(1.0, n)  # skewed, fat put tail
+    a = 0.02 * np.exp(-1.0 * k) * np.exp(rng.normal(-0.02, 0.2, n))
+    b = 0.05 * np.exp(-0.5 * k) * np.exp(rng.normal(-0.02, 0.2, n))
+    return k, a, b, np.linspace(-2.0, 2.0, 1601)
+
+
+def test_regression_helper_equals_two_estimates() -> None:
+    """I7: ``conditional_expectations_ab`` equals two calls of the leverage's
+    ``conditional_variance_estimate`` bit for bit, for every estimator and post-processing
+    option it supports; the trusted range is the sorted quantile rule; and the signature of the
+    private ``particle._finish_estimate`` it imports is pinned."""
+    assert list(inspect.signature(_finish_estimate).parameters) == [
+        "m", "slope", "kreg", "q_lo", "q_hi", "grid", "h", "cfg", "v", "tail_slope"
+    ]  # fmt: skip
+    k, a, b, grid = _ab_cloud()
+    slope_a = float(np.polyfit(k, np.log(a), 1)[0])
+    slope_b = float(np.polyfit(k, np.log(b), 1)[0])
+    cases: list[tuple[dict, tuple[float | None, float | None]]] = [({}, (None, None))]
+    cases += [({"tail_extrapolation": t}, (None, None)) for t in ("flat", "log_linear", "adaptive")]
+    cases += [
+        ({"tail_extrapolation": "cloud_slope"}, (slope_a, slope_b)),
+        ({"bias_correction": False}, (None, None)),
+        ({"kernel": "quartic"}, (None, None)),
+        ({"regression": "nadaraya_watson", "tail_extrapolation": "flat"}, (None, None)),
+        ({"min_window": 500, "min_window_fraction": 0.002}, (None, None)),
+        ({"quantile_clip": 0.02, "n_regression_points": 51}, (None, None)),
+        ({"estimator": "sorted"}, (None, None)),
+        ({"estimator": "binned"}, (None, None)),
+        ({"estimator": "binned", "tail_extrapolation": "flat"}, (None, None)),
+    ]
+    for changes, slopes in cases:
+        cfg = ParticleConfig(n_particles=k.size, horizon=1.0, **changes)
+        for h in (0.003, 0.02):
+            ea, eb, q_lo, q_hi = lcal.conditional_expectations_ab(k, a, b, grid, h, cfg, slopes)
+            np.testing.assert_array_equal(
+                ea,
+                conditional_variance_estimate(k, a, grid, h, cfg, slopes[0]),
+                err_msg=str(changes),
+            )
+            np.testing.assert_array_equal(
+                eb,
+                conditional_variance_estimate(k, b, grid, h, cfg, slopes[1]),
+                err_msg=str(changes),
+            )
+            ks = np.sort(k)
+            assert q_lo == ks[int(cfg.quantile_clip * k.size)]
+            assert q_hi == ks[int((1.0 - cfg.quantile_clip) * k.size) - 1]
+            assert np.all(ea > 0) and np.all(eb > 0)
+    # a degenerate cloud (one point) and a response that is zero everywhere (one name)
+    one = np.full(4000, 0.1)
+    for estimator in (None, "binned"):
+        cfg = ParticleConfig(n_particles=4000, estimator=estimator)
+        ea, eb, q_lo, q_hi = lcal.conditional_expectations_ab(
+            one, np.full(4000, 0.04), np.full(4000, 0.01), grid, 0.01, cfg
+        )
+        assert np.all(ea == 0.04) and np.all(eb == 0.01) and q_lo == q_hi == 0.1
+        ea, eb, _, _ = lcal.conditional_expectations_ab(
+            k[:4000], a[:4000], np.zeros(4000), grid, 0.01, cfg
+        )
+        assert np.all(eb == 0.0) and np.all(ea > 0)
+
+
+@pytest.mark.parametrize("average", ["step", "point"])
+def test_lambda_t0_exact(w5_3m: list[LocalVol], average: str) -> None:
+    """I8: the row at ``t_0`` is one value, ``clip((σ̄²_B(0) − a_0)/b_0, 0, λ_max)`` with ``u_i =
+    w_i·σ̄_i(0)`` — the averages over the first step for ``"step"``, the values at ``t_0`` for
+    ``"point"`` — computed here from the surfaces."""
+    surface, lv = w5_target(0.25)
+    fam = CorrelationFamily.equi(5)
+    cfg = ParticleConfig(n_particles=2000, horizon=0.02, seed=1, min_window=200)
+    lc = LocalCorrelationConfig(particle=cfg, target_average=average)
+    res = lcal.calibrate_local_correlation(
+        w5_3m, fam, w5_basket(w5_3m), surface, lv, cfg, FAST_SIM, lc
+    )
+    row = res.lam.values[0]
+    assert np.all(row == row[0]) and np.all(res.lambda_star[0] == res.lambda_star[0, 0])
+    first = [0.0, float(res.grid.times[1])]
+
+    def at_money(s: LocalVolSurface) -> float:
+        table = s.var_time_average(first)[0] if average == "step" else s.var_at_times([0.0])[0]
+        return float(np.interp(0.0, s.k_grid, table))
+
+    u = W5_WEIGHTS * np.sqrt([at_money(m.local_vol) for m in w5_3m])
+    a0, b0 = fam.variance_terms(u)
+    expected = (at_money(lv) - float(a0)) / float(b0)
+    assert 0.0 < expected < fam.lambda_max
+    # to 1e-10: the kernel's uniform-grid lookup reads the grid step off the grid, so k = 0 is
+    # 1e-10 of a cell away from its node (measured difference 4e-12 relative)
+    assert row[0] == pytest.approx(expected, rel=1e-10)
+    assert res.lambda_mean[0] == row[0] and res.clipped_low[0] == res.clipped_high[0] == 0.0
+    assert res.mean_a[0] == pytest.approx(float(a0), rel=1e-10)
+    assert res.mean_b[0] == pytest.approx(float(b0), rel=1e-10)
+
+
+def test_single_name_calibration(w5_3m: list[LocalVol]) -> None:
+    """I4 (the calibration's half): with one name ``b ≡ 0``, so ``λ`` is not identified — the
+    calibration returns ``λ ≡ 0`` and flags every slice."""
+    name = w5_3m[2]
+    surface, lv = w5_target(0.25)
+    cfg = ParticleConfig(n_particles=4000, horizon=0.05, seed=3)
+    basket = BasketSpec([1.0], "performance", [name.forward_curve])
+    res = lcal.calibrate_local_correlation(
+        [name], CorrelationFamily.equi(1), basket, surface, lv, cfg, FAST_SIM,
+        LocalCorrelationConfig(particle=cfg),
+    )  # fmt: skip
+    assert np.all(res.lam.values == 0.0) and res.unidentified.all()
+    assert np.all(res.mean_b == 0.0) and np.all(res.mean_a > 0) and res.max_clipped_mass == 0.0
+    # and the calibrated model is the single-asset model on the asset stream (the kernel's half)
+    model = LocalCorrelationModel([name], CorrelationFamily.equi(1), res.lam, basket)
+    grid = res.grid
+    paths = model.simulate_chunk(
+        grid, model.draws_for(grid, cfg.seed, 4000), 0, 4000, FAST_SIM.scheme
+    )
+    alone = name.simulate_chunk(
+        grid, GaussianDraws(cfg.seed, 4000, grid.n_steps, 1), 0, 4000, FAST_SIM.scheme
+    )
+    np.testing.assert_array_equal(paths.assets[0].log_spot, alone.log_spot)
+    np.testing.assert_array_equal(res.final_log_spot[:, 0], alone.log_spot[:, 1])
+
+
+def test_single_names_match_local_vol(
+    w5_3m: list[LocalVol], w5_calibration: lcal.LCCalibrationResult
+) -> None:
+    """C2 (W5): under the calibrated ``λ`` every single-name out-of-the-money vanilla — strikes
+    ``k ∈ {−0.15, −0.05, 0, 0.05, 0.15}·√(T/0.25)``, maturities ``T/3``, ``2T/3`` and ``T`` —
+    is the single-asset ``LocalVol`` Monte Carlo price on an independent seed: ``|z| < 3`` in
+    each of the 75 cells, with the combined standard errors."""
+    horizon = 0.25
+    model = LocalCorrelationModel(
+        w5_3m, CorrelationFamily.equi(5), w5_calibration.lam, w5_basket(w5_3m)
+    )
+    maturities = [horizon / 3, 2 * horizon / 3, horizon]
+    strikes = np.array([-0.15, -0.05, 0.0, 0.05, 0.15]) * np.sqrt(horizon / 0.25)
+    grid = TimeGrid.build(maturities, FAST_SIM.dt_max, calibration_grid=model.required_times())
+    sim = FAST_SIM
+    paths = MultiAssetMonteCarlo(sim).simulate(model, grid)
+    rows = []
+    for i, name in enumerate(w5_3m):
+        alone_draws = GaussianDraws(900_000 + i, sim.n_paths, grid.n_steps, 1)
+        alone = name.simulate_chunk(grid, alone_draws, 0, sim.n_paths, sim.scheme)
+        for T in maturities:
+            col = grid.fixing_index[T]
+            for k in strikes:
+                cp = 1.0 if k >= 0 else -1.0
+                got = summarize(
+                    np.maximum(cp * (paths.assets[i].spot_at(col) - np.exp(k)), 0.0), True
+                )
+                ref = summarize(np.maximum(cp * (alone.spot_at(col) - np.exp(k)), 0.0), True)
+                z = (got.mean - ref.mean) / float(np.hypot(got.stderr, ref.stderr))
+                rows.append((i, T, k, got.mean, got.stderr, ref.mean, ref.stderr, z))
+    table = pd.DataFrame(rows, columns=["name", "T", "k", "lc", "lc_se", "lv", "lv_se", "z"])
+    print(
+        f"C2 (W5): {len(table)} cells, worst |z| {table['z'].abs().max():.2f}, "
+        f"rms z {np.sqrt((table['z'] ** 2).mean()):.2f}, mean z {table['z'].mean():+.2f}"
+    )
+    assert len(table) == 75
+    assert table["z"].abs().max() < 3.0, table.to_string()
+
+
+def test_index_repricing_report() -> None:
+    """The report on a model whose basket law is known: one Black–Scholes name, so every strike
+    reprices the flat vol and the forward is 1, within the Monte Carlo error; the pass rule
+    fails a cell only when it exceeds both its tolerance and ``z`` standard errors."""
+    fc = ForwardCurve.flat(1.0, 0.0, 0.0)
+    name = flat_local_vol(0.2, lc_grid(0.25), fc)
+    flat = SSVISurface.flat_atm(0.2, 0.0, 0.0, 0.5, fc, fc.rate_curve, max_maturity=1.0)
+    lam = LocalCorrelationFunction.constant(0.0, [0.0, 0.25], name.local_vol.k_grid)
+    model = LocalCorrelationModel(
+        [name], CorrelationFamily.equi(1), lam, BasketSpec([1.0], "performance", [fc])
+    )
+    sim = SimConfig(n_paths=40_000, dt_max=DAILY, seed=5, chunk_size=20_000)
+    rep = lcal.reprice_index_smile(model, flat, sim, maturities=[0.1, 0.25], pricing_seeds=(5, 6))
+    assert len(rep.table) == 2 * 11 and rep.seeds == (5, 6) and rep.n_paths == 40_000
+    assert np.allclose(rep.table["target_vol"], 0.2) and np.all(rep.table["stderr_vp"] > 0)
+    np.testing.assert_allclose(
+        rep.table["k"], rep.table["sd"] * 0.2 * np.sqrt(rep.table["T"]), rtol=1e-12, atol=1e-15
+    )
+    assert (rep.table["error_vp"].abs() < 4.0 * rep.table["stderr_vp"]).all(), rep.summary()
+    assert (rep.forwards["forward_error"].abs() < 4.0 * rep.forwards["forward_error_se"]).all()
+    assert rep.passes() and rep.violations().empty and rep.max_abs_error(1.5) < 0.15
+    assert rep.pivot().shape == (2, 11) and "index implied-vol error" in rep.summary()
+    assert json.loads(json.dumps(rep.to_dict()))["seeds"] == [5, 6]
+    one = lcal.reprice_index_smile(
+        model, flat, sim, maturities=[0.25], sd_multiples=(-1.0, 0.0, 1.0)
+    )
+    two = lcal.reprice_index_smile(
+        model, flat, sim, maturities=[0.25], sd_multiples=(-1.0, 0.0, 1.0), pricing_seeds=(5, 6)
+    )
+    assert (two.table["stderr_vp"] < 0.8 * one.table["stderr_vp"]).all()  # two seeds pooled
+    # the pass rule on a doctored table
+    bad = dataclasses.replace(rep, table=rep.table.copy())
+    cell = (bad.table["T"] == 0.25) & (bad.table["sd"] == 1.0)
+    bad.table.loc[cell, "error_vp"] = 0.2  # above 0.15, and above 3 se?
+    bad.table.loc[cell, "stderr_vp"] = 0.1
+    assert bad.passes()  # 0.2 < 3 × 0.1: within the noise
+    bad.table.loc[cell, "stderr_vp"] = 0.01
+    assert not bad.passes() and len(bad.violations()) == 1
+    outer = (bad.table["T"] == 0.25) & (bad.table["sd"] == 2.5)
+    bad.table.loc[cell, "error_vp"] = 0.0
+    bad.table.loc[outer, ["error_vp", "stderr_vp"]] = [0.25, 0.01]
+    assert bad.passes() and not bad.passes(tol_outer=0.2)  # the outer cells have their own gate
+    bad.table.loc[outer, "error_vp"] = np.nan
+    assert not bad.passes()  # a vol that could not be inverted is a violation
+    assert lcal.straddle_vol(2.0 * (2.0 * 0.5398278372770290 - 1.0), 1.0) == pytest.approx(0.2)
+
+
+def test_constant_and_parametric_lambda(w5_3m: list[LocalVol]) -> None:
+    """The two fitted companions on W5: the constant ``λ`` reprices the index at-the-money
+    straddle to 2e-7 in vol on its own draws; the two-parameter family reprices the straddle and
+    the 90 % put to 2e-6, converges, and falls with the basket as the target's skew asks."""
+    surface, lv = w5_target(0.25)
+    fam = CorrelationFamily.equi(5)
+    times = TimeGrid.build([0.25], DAILY).times
+    zero = LocalCorrelationFunction.constant(0.0, times, lv.k_grid)
+    model = LocalCorrelationModel(w5_3m, fam, zero, w5_basket(w5_3m))
+    sim = SimConfig(n_paths=20_000, dt_max=DAILY, seed=11, chunk_size=20_000)
+    lam_c = lcal.calibrate_constant_lambda(model, surface, 0.25, sim)
+    assert 0.3 < lam_c < 0.7
+    sampler = lcal.BasketSampler(model, sim, [0.25])
+    const = LocalCorrelationFunction.constant(lam_c, times, lv.k_grid)
+    vol, se, price = sampler.straddle(sampler.levels(const)[:, 0], 0.25)
+    assert abs(vol - float(surface.atm_vol(0.25))) < 2e-7 and 0 < se < 0.01 and price > 0
+    # the constant correlation leaves the 90 % put too cheap: the index skew is not repriced
+    put_cc = sampler.otm_vol(sampler.levels(const)[:, 0], 0.9, 0.25)[0]
+    assert put_cc < float(surface.implied_vol_k(np.log(0.9), 0.25)) - 0.005
+    cfg = ParametricLambdaConfig(n_paths=20_000)
+    fit = lcal.calibrate_parametric_lambda(model, surface, 0.25, cfg, sim, seed=11)
+    assert fit.converged and len(fit.history) <= cfg.maxit and fit.jacobian.shape == (2, 2)
+    assert max(abs(v - t) for v, t in zip(fit.vols, fit.targets, strict=True)) < cfg.tol
+    assert fit.targets == (
+        float(surface.implied_vol_k(0.0, 0.25)),
+        float(surface.implied_vol_k(np.log(0.9), 0.25)),
+    )
+    assert fit.c > 0 and fit.lam.slope > 0 and fit.lam.lam_hi == fam.lambda_max
+    assert fit.lam == ParametricLambda.from_rho(fit.rho0, fit.c, 0.02, 0.98)
+    assert fit.start[0] == pytest.approx(0.02 + 0.98 * lam_c, abs=1e-5)  # ρ_ATM: the constant fit
+    assert all(s > 0 for s in fit.vol_stderrs) and fit.n_evaluations > 5
+    tab = fit.function(times, lv.k_grid)
+    np.testing.assert_array_equal(tab.values[0], fit.lam(lv.k_grid))
+    assert json.loads(json.dumps(fit.to_dict()))["converged"] is True
+    # the parametric model reprices both targets on its own draws; the sampler's λ must hold
+    # the model's slices
+    level = sampler.levels(tab)[:, 0]
+    assert abs(sampler.strike_vol(level, 0.9, 0.25)[0] - fit.targets[1]) < cfg.tol
+    with pytest.raises(ValueError, match="slice"):
+        sampler.levels(LocalCorrelationFunction.constant(0.3, [0.0, 0.1234, 0.25], lv.k_grid))
+
+
+def test_calibration_guard_validation_and_options(w5_3m: list[LocalVol]) -> None:
+    """The three calibrating functions are refused while calibration is forbidden; the inputs
+    are validated; ``clip_policy = "raise"`` fails on a target out of the family's reach;
+    ``lambda_tail = "flat"`` holds the row beyond the trusted range; a second pass averages two
+    seeds; injected draws must match."""
+    surface, lv = w5_target(0.25)
+    fam = CorrelationFamily.equi(5)
+    basket = w5_basket(w5_3m)
+    cfg = ParticleConfig(n_particles=6000, horizon=0.04, seed=2)
+    lc = LocalCorrelationConfig(particle=cfg)
+    args = (w5_3m, fam, basket, surface, lv, cfg, FAST_SIM)
+    times = TimeGrid.build([cfg.horizon], DAILY).times
+    model = LocalCorrelationModel(
+        w5_3m, fam, LocalCorrelationFunction.constant(0.0, times, lv.k_grid), basket
+    )
+    with calibration_forbidden():
+        with pytest.raises(CalibrationForbiddenError, match="calibrate_local_correlation"):
+            lcal.calibrate_local_correlation(*args, lc)
+        with pytest.raises(CalibrationForbiddenError, match="calibrate_constant_lambda"):
+            lcal.calibrate_constant_lambda(model, surface, cfg.horizon, FAST_SIM)
+        with pytest.raises(CalibrationForbiddenError, match="calibrate_parametric_lambda"):
+            lcal.calibrate_parametric_lambda(
+                model, surface, cfg.horizon, ParametricLambdaConfig(), FAST_SIM, seed=1
+            )
+    with pytest.raises(ValueError, match="mode"):
+        lcal.calibrate_local_correlation(*args, dataclasses.replace(lc, mode="carry"))
+    short = LocalVolSurface.from_implied(
+        surface,
+        LocalVolConfig(t_min=1 / 365, t_max=cfg.horizon, n_t=20, k_min=-2.0, k_max=2.0, n_k=1601),
+    )
+    with pytest.raises(ValueError, match="horizon plus"):
+        lcal.calibrate_local_correlation(w5_3m, fam, basket, surface, short, cfg, FAST_SIM, lc)
+    with pytest.raises(ValueError, match="sv_slope"):
+        LocalCorrelationConfig(particle=dataclasses.replace(cfg, tail_extrapolation="sv_slope"))
+    base = lcal.calibrate_local_correlation(*args, lc)
+    # the tail rule: "flat" holds λ* at its values at the ends of the trusted range
+    flat = lcal.calibrate_local_correlation(*args, dataclasses.replace(lc, lambda_tail="flat"))
+    j = base.grid.n_steps
+    k = lv.k_grid
+    inside = (k >= base.q_lo[j]) & (k <= base.q_hi[j])
+    np.testing.assert_array_equal(flat.lam.values[1][(k >= base.q_lo[1]) & (k <= base.q_hi[1])],
+                                  base.lam.values[1][(k >= base.q_lo[1]) & (k <= base.q_hi[1])])  # fmt: skip
+    left, right = flat.lambda_star[1][k < base.q_lo[1]], flat.lambda_star[1][k > base.q_hi[1]]
+    assert np.all(left == left[0]) and np.all(right == right[0])
+    assert not np.all(
+        base.lambda_star[1][k < base.q_lo[1]] == base.lambda_star[1][k < base.q_lo[1]][0]
+    )
+    assert inside.sum() > 10 and flat.lam.metadata["lambda_tail"] == "flat"
+    # a second pass: the average of the tables of seeds s and s + 1
+    cfg2 = dataclasses.replace(cfg, second_pass=True)
+    both = lcal.calibrate_local_correlation(w5_3m, fam, basket, surface, lv, cfg2, FAST_SIM, lc)
+    other = lcal.calibrate_local_correlation(
+        w5_3m, fam, basket, surface, lv, dataclasses.replace(cfg, seed=cfg.seed + 1), FAST_SIM, lc
+    )
+    assert both.passes == 2
+    np.testing.assert_allclose(
+        both.lam.values, 0.5 * (base.lam.values + other.lam.values), rtol=0, atol=1e-15
+    )
+    np.testing.assert_array_equal(both.final_log_spot, other.final_log_spot)
+    # injected draws: the default draws give the default result; a mismatch is refused
+    own = LocalCorrelationDraws(cfg.seed, cfg.n_particles, base.grid.n_steps, fam, cfg.antithetic)
+    again = lcal.calibrate_local_correlation(*args, lc, draws=own)
+    np.testing.assert_array_equal(again.lam.values, base.lam.values)
+    wrong = LocalCorrelationDraws(cfg.seed, cfg.n_particles, base.grid.n_steps + 1, fam)
+    with pytest.raises(ValueError, match="draws"):
+        lcal.calibrate_local_correlation(*args, lc, draws=wrong)
+    # a target out of the family's reach (a skew far steeper than the names can deliver)
+    steep = SSVIConfig(W5_PILLARS, (0.21,) * len(W5_PILLARS), -0.8, 1.3, 0.5, 3.0)
+    s_surface, s_lv = w5_target(0.25, steep)
+    reported = lcal.calibrate_local_correlation(
+        w5_3m, fam, basket, s_surface, s_lv, cfg, FAST_SIM, lc
+    )
+    assert reported.clipped_high.max() > 0.05 and reported.clipped_low.max() > 0.05
+    assert reported.overshoot_high.max() > 0 and reported.overshoot_low.min() < 0
+    worst = int(np.argmax(reported.clipped_high))
+    kinds = {x[0] for x in reported.clip_intervals(worst)}
+    assert "high" in kinds and reported.max_clipped_mass == max(
+        reported.clipped_low.max(), reported.clipped_high.max()
+    )
+    with pytest.raises(lcal.ClippedMassError, match="out of the"):
+        lcal.calibrate_local_correlation(
+            w5_3m,
+            fam,
+            basket,
+            s_surface,
+            s_lv,
+            cfg,
+            FAST_SIM,
+            dataclasses.replace(lc, clip_policy="raise"),
+        )
+
+
+# ---------------------------------------------------------------------------------------------
+# LC4: the configuration, the cache and the code-tag guard
+# ---------------------------------------------------------------------------------------------
+
+SVI_PILLARS = (1 / 12, 2 / 12, 3 / 12, 6 / 12)
+
+
+def svi_config(
+    surface: ImpliedSurface, pillars: tuple[float, ...] = SVI_PILLARS
+) -> SviSurfaceConfig:
+    """An SVI-slice configuration fitted to a smooth surface at the pillars (41 strikes over
+    ±3.5 at-the-money standard deviations each): how a synthetic name enters a specification."""
+    params = []
+    for T in pillars:
+        sd = float(surface.atm_vol(T)) * np.sqrt(T)
+        k = np.linspace(-3.5 * sd, 3.5 * sd, 41)
+        params.append(fit_svi_slice(k, surface.implied_vol_k(k, T), T).params)
+    return SviSurfaceConfig(tuple(pillars), tuple(params), max(pillars) + 0.05)
+
+
+@pytest.fixture(scope="module")
+def toy_spec() -> LocalCorrelationSpec:
+    """Three W5 names and an index target as SVI slices: a small specification for the cache."""
+    flat = MarketConfig(1.0, CurveConfig.flat(0.0), CurveConfig.flat(0.0))
+    fc = ForwardCurve.flat(1.0, 0.0, 0.0)
+    index = surface_from_config(
+        SSVIConfig(W5_PILLARS, (0.20,) * len(W5_PILLARS), -0.7, 0.9, 0.5, 3.0), fc, fc.rate_curve
+    )
+    particle = ParticleConfig(n_particles=20_000, horizon=0.1, seed=3)
+    return LocalCorrelationSpec(
+        names=("AAA", "BBB", "CCC"),
+        weights=(0.40, 0.35, 0.25),
+        markets=(flat, flat, flat),
+        surfaces=tuple(svi_config(s) for s in w5_surfaces(3)),
+        index_surface=svi_config(index),
+        lc=LocalCorrelationConfig(
+            particle=particle, parametric=ParametricLambdaConfig(n_paths=20_000)
+        ),
+        sim=SimConfig(n_paths=20_000, dt_max=DAILY, seed=7, chunk_size=10_000),
+        local_vol=LocalVolConfig(t_min=1 / 365, t_max=0.12, n_t=40, k_min=-2.0, k_max=2.0, n_k=801),
+        index_forward_ratios=((1 / 12, 1.0), (0.25, 1.02)),
+        label="toy 2026-10-08 3 names",
+    )
+
+
+def test_lc_configuration(toy_spec: LocalCorrelationSpec) -> None:
+    """The configuration dataclasses: validation, the strict mapping round trip, and what the
+    cache key holds — everything that determines ``λ`` and nothing else."""
+    spec = toy_spec
+    assert from_mapping(LocalCorrelationSpec, to_mapping(spec)) == spec  # strict YAML round trip
+    default = to_mapping(LocalCorrelationConfig())
+    assert "lambda_max" not in default and "lambda_grid" not in default  # omitted while None
+    assert (
+        default["family"] == "particle"
+        and default["r_low"] == "equi"
+        and default["rho_min"] == 0.02
+    )
+    assert default["lambda_tail"] == "regressions" and default["target_average"] == "step"
+    assert "maturity" not in default["parametric"] and default["parametric"]["strikes"] == [
+        1.0,
+        0.9,
+    ]
+    with pytest.raises(ConfigError, match="unknown keys"):
+        from_mapping(LocalCorrelationConfig, {"familly": "particle"})
+    key = lc_cache.lc_spec_key(spec)
+    assert len(key) == 64 and lc_cache.lc_spec_key(spec, "lc2") != key
+
+    def keyed(**changes: object) -> str:
+        return lc_cache.lc_spec_key(dataclasses.replace(spec, **changes))  # type: ignore[arg-type]
+
+    # not keyed: the label, the report-only forwards, the pricing-only simulation fields, the
+    # slices' provenance, the leverage-only particle fields, a market's fixing level
+    assert keyed(label="another") == key and keyed(index_forward_ratios=()) == key
+    assert keyed(sim=dataclasses.replace(spec.sim, n_paths=10, seed=99, chunk_size=2, antithetic=False,
+                                         chunk_memory_mb=64, record_all_steps=True)) == key  # fmt: skip
+    with_keys = dataclasses.replace(spec.index_surface, record_keys=("a" * 64,) * 4)
+    assert keyed(index_surface=with_keys) == key
+    lev = dataclasses.replace(
+        spec.lc.particle, leverage_dk=0.01, l_max=5.0, l_min=0.2, leverage_std_span=4.0
+    )
+    assert keyed(lc=dataclasses.replace(spec.lc, particle=lev)) == key
+    closed = dataclasses.replace(spec.markets[0], close=1.01)
+    assert keyed(markets=(closed, *spec.markets[1:])) == key
+    # keyed: everything else
+    bumped = list(spec.surfaces[1].params)
+    bumped[2] = (float(np.nextafter(bumped[2][0], 1.0)), *bumped[2][1:])
+    one_ulp = dataclasses.replace(spec.surfaces[1], params=tuple(bumped))
+    changes: list[dict[str, object]] = [
+        {"weights": (0.41, 0.34, 0.25)},
+        {"names": ("AAA", "BBB", "DDD")},
+        {"surfaces": (spec.surfaces[0], one_ulp, spec.surfaces[2])},
+        {"index_surface": dataclasses.replace(spec.index_surface, max_maturity=0.6)},
+        {
+            "markets": (
+                MarketConfig(1.0, CurveConfig.flat(0.01), CurveConfig.flat(0.0)),
+                *spec.markets[1:],
+            )
+        },
+        {"sim": dataclasses.replace(spec.sim, dt_max=1 / 504)},
+        {"sim": dataclasses.replace(spec.sim, dt_max=StepSchedule.uniform(1 / 365))},
+        {"sim": dataclasses.replace(spec.sim, weak_order2=False)},
+        {"local_vol": dataclasses.replace(spec.local_vol, n_k=1601)},
+        {"perturbations": (SurfacePerturbation("parallel", {"size": 0.01}), None, None)},
+        {"perturbations": (None, None, None)},
+        {"index_perturbation": SurfacePerturbation("parallel", {"size": 0.01})},
+    ]
+    for name, value in (
+        ("family", "parametric"), ("family", "constant"), ("rho_min", 0.0), ("rho_max", 0.9),
+        ("mode", "carry"), ("lambda_tail", "flat"), ("target_average", "point"),
+        ("clip_policy", "raise"), ("max_clipped_mass", 0.02), ("arbitrage", "raise"),
+        ("lambda_grid", dataclasses.replace(spec.local_vol, n_k=401)),
+        ("parametric", ParametricLambdaConfig(n_paths=40_000)),
+        ("particle", dataclasses.replace(spec.lc.particle, seed=4)),
+        ("particle", dataclasses.replace(spec.lc.particle, n_particles=40_000)),
+        ("particle", dataclasses.replace(spec.lc.particle, bandwidth_factor=2.0)),
+        ("particle", dataclasses.replace(spec.lc.particle, estimator="binned")),
+        ("particle", dataclasses.replace(spec.lc.particle, horizon=0.09)),
+    ):  # fmt: skip
+        changes.append({"lc": dataclasses.replace(spec.lc, **{name: value})})
+    keys = {keyed(**c) for c in changes}
+    assert key not in keys and len(keys) == len(changes)
+    payload = spec.key_payload()
+    assert "leverage_dk" not in payload["lc"]["particle"] and "label" not in payload
+    assert "n_paths" not in json.dumps(payload["schedule"]) and "seed" in payload["lc"]["particle"]
+    # validation
+    for bad in (
+        {"weights": (0.5, 0.3, 0.3)},
+        {"weights": (0.7, 0.5, -0.2)},
+        {"weights": (0.5, 0.5)},
+        {"names": ("AAA", "AAA", "CCC")},
+        {"perturbations": (None, None)},
+        {"local_vol": dataclasses.replace(spec.local_vol, t_max=0.1)},  # no room for the last step
+        {"local_vol": dataclasses.replace(spec.local_vol, t_max=0.9)},  # beyond the surfaces
+        {"lc": dataclasses.replace(spec.lc, r_low="matrix:/tmp/low.npy")},  # no r_low_source
+    ):
+        with pytest.raises(ValueError):
+            dataclasses.replace(spec, **bad)  # type: ignore[arg-type]
+    for bad_lc in (
+        {"family": "copula"}, {"r_low": "identity"}, {"r_high": "twos"}, {"rho_min": 0.5, "rho_max": 0.5},
+        {"lambda_max": 0.9}, {"mode": "spot"}, {"clip_policy": "ignore"}, {"lambda_tail": "linear"},
+        {"target_average": "mid"}, {"arbitrage": "ignore"}, {"max_clipped_mass": 1.5},
+        {"r_low": "matrix:/tmp/low.npy", "lambda_max": 1.5},
+    ):  # fmt: skip
+        with pytest.raises(ValueError):
+            LocalCorrelationConfig(**bad_lc)  # type: ignore[arg-type]
+    assert (
+        LocalCorrelationConfig(r_low="historical-scaled:252,0.05", lambda_max=0.9).lambda_max == 0.9
+    )
+    for bad_svi in (
+        {"times": (0.25, 0.1)}, {"params": ((0.0, 0.1, 0.0, 0.0, 0.1),)}, {"max_maturity": 0.1},
+        {"record_keys": ("x",)},
+    ):  # fmt: skip
+        base = {
+            "times": (0.1, 0.25),
+            "params": ((0.0, 0.1, 0.0, 0.0, 0.1),) * 2,
+            "max_maturity": 0.3,
+        }
+        with pytest.raises(ValueError):
+            SviSurfaceConfig(**{**base, **bad_svi})  # type: ignore[arg-type]
+    for bad_par in ({"strikes": (0.9, 1.0)}, {"strikes": (1.0, 1.0)}, {"n_paths": 3}, {"tol": 0.0},
+                    {"h": (0.0, 0.04)}, {"maxit": 0}, {"maturity": -1.0}):  # fmt: skip
+        with pytest.raises(ValueError):
+            ParametricLambdaConfig(**bad_par)  # type: ignore[arg-type]
+
+
+def test_lc_cache_round_trip(toy_spec: LocalCorrelationSpec, tmp_path: Path) -> None:
+    """The cache: a miss without permission names the key and writes nothing; a calibration
+    stores the entry's files, its diagnostics and its manifest row; a hit reads ``λ`` back bit
+    for bit and calibrates nothing; the fitted families go through the same door."""
+    from volsto.calibration import guard
+
+    spec = toy_spec
+    cache = lc_cache.LocalCorrelationCache(tmp_path / "cache" / "lc")
+    key = cache.key(spec)
+    assert key == lc_cache.lc_spec_key(spec) and not cache.has(spec)
+    with pytest.raises(CacheMissError, match=key):
+        cache.get_or_calibrate(spec, allow_calibrate=False)
+    assert not cache.root.exists() and cache.manifest().empty
+    assert cache.svi_records().root == cache.root / "svi_fits"
+    started = guard.calibrations()
+    model, diag = cache.get_or_calibrate(spec, run_diagnostics=True)
+    assert guard.calibrations() == started + 1 and cache.has(spec) and diag is not None
+    entry = cache.entry_dir(spec)
+    assert sorted(p.name for p in entry.iterdir()) == [
+        "diagnostics.json", "lambda.npz", "lambda_surface.parquet", "r_low.npy", "spec.json"
+    ]  # fmt: skip
+    assert model.names == spec.names and model.lam.metadata["cache_key"] == key
+    assert (
+        model.lam.metadata["lc_code_tag"] == lcal.LC_CODE_TAG and "git_commit" in model.lam.metadata
+    )
+    np.testing.assert_array_equal(np.load(entry / "r_low.npy"), constant_correlation(3, 0.02))
+    frame = pd.read_parquet(entry / "lambda_surface.parquet")
+    assert len(frame) == model.lam.values.size and set(frame.columns) >= {
+        "t",
+        "k",
+        "lam",
+        "lam_star",
+    }
+    rec = diag.record
+    assert rec["key"] == key and rec["lc_code_tag"] == "lc1" and rec["particle_seed"] == 3
+    assert rec["pricing_seed"] == 7 and rec["n_particles"] == 20_000 and rec["n_paths"] == 20_000
+    assert (
+        rec["threads"] >= 1 and rec["machine"] and rec["git_commit"] and rec["label"] == spec.label
+    )
+    assert diag.calibration["family"] == "particle" and 0.0 <= diag.max_clipped_mass <= 1.0
+    assert diag.market["arbitrage_ok"] and diag.market["flagged"] == []
+    assert set(diag.market["dupire"]) == {"AAA", "BBB", "CCC", "index"}
+    # the alignment of the listed index forwards: zero carry, so δ = −ln(F_I/I_0)
+    align = diag.market["alignment"]
+    assert [a["T"] for a in align] == [1 / 12, 0.25]
+    assert align[0]["delta"] == pytest.approx(0.0, abs=1e-15) and not align[0]["flagged"]
+    assert align[1]["delta"] == pytest.approx(-np.log(1.02)) and align[1]["flagged"]
+    assert diag.index_report is not None and diag.max_index_error_vp is not None
+    assert [round(t, 6) for t in sorted(set(diag.index_report["table"]["T"]))] == [0.083333, 0.1]
+    man = cache.manifest()
+    assert list(man.columns) == [
+        "key", "created_utc", "git_commit", "lc_code_tag", "label", "n_names", "family", "r_low",
+        "mode", "n_particles", "seed", "horizon", "max_clipped_mass", "max_index_error_vp", "wall_time",
+    ]  # fmt: skip
+    assert len(man) == 1 and man.iloc[0]["key"] == key and man.iloc[0]["n_names"] == 3
+    # a hit: nothing is calibrated, λ is the stored one, the diagnostics are read back
+    again, diag2 = cache.get_or_calibrate(spec, allow_calibrate=False)
+    assert guard.calibrations() == started + 1
+    np.testing.assert_array_equal(again.lam.values, model.lam.values)
+    np.testing.assert_array_equal(again.lam.times, model.lam.times)
+    assert diag2 is not None and diag2.to_dict() == json.loads(
+        json.dumps(diag.to_dict(), default=str)
+    )
+    with calibration_forbidden():
+        cache.get_or_calibrate(spec)  # a hit never reaches the calibration
+        other = dataclasses.replace(spec, lc=dataclasses.replace(spec.lc, rho_min=0.05))
+        with pytest.raises(CalibrationForbiddenError):
+            cache.get_or_calibrate(other)
+    # the model prices: the basket forward is 1 within the noise
+    rep = lcal.reprice_index_smile(again, lc_cache.build_lc_market(spec).index_surface, spec.sim,
+                                   maturities=[0.1], sd_multiples=(0.0,))  # fmt: skip
+    assert abs(rep.forwards["forward_error"][0]) < 4 * rep.forwards["forward_error_se"][0]
+    # the two fitted families
+    const_spec = dataclasses.replace(spec, lc=dataclasses.replace(spec.lc, family="constant"))
+    const_model, const_diag = cache.get_or_calibrate(const_spec)
+    assert const_diag is not None and const_diag.calibration["family"] == "constant"
+    assert np.all(const_model.lam.values == const_diag.calibration["lambda"])
+    assert (
+        const_model.lam.metadata["kind"] == "constant"
+        and not (cache.entry_dir(const_spec) / "lambda_surface.parquet").exists()
+    )
+    np.testing.assert_array_equal(const_model.lam.times, model.lam.times)  # the same slices
+    par_spec = dataclasses.replace(spec, lc=dataclasses.replace(spec.lc, family="parametric"))
+    par_model, par_diag = cache.get_or_calibrate(par_spec)
+    assert par_diag is not None and par_diag.calibration["family"] == "parametric"
+    assert par_diag.calibration["converged"] and par_model.lam.metadata["kind"] == "parametric"
+    assert par_diag.calibration["c"] > 0 and len(cache.manifest()) == 3
+    assert set(cache.manifest()["family"]) == {"particle", "constant", "parametric"}
+
+
+def test_build_lc_market_policies(toy_spec: LocalCorrelationSpec, tmp_path: Path) -> None:
+    """The market of a specification: perturbations move one name's local vol; an SVI surface
+    with an arbitrage is flagged (or raises under ``arbitrage = "raise"``); a matrix ``R_low`` is
+    read from its file; a historical-scaled one must be given; carry mode puts the index target
+    on the basket's forward curve."""
+    spec = toy_spec
+    market = lc_cache.build_lc_market(spec)
+    assert market.family.low_equi and market.basket.mode == "performance" and not market.flagged
+    assert market.index_lv.k_grid.size == 801 and market.summary()["arbitrage_ok"]
+    assert all(0.0 <= d["floored_fraction"] < 0.01 for d in market.dupire.values())
+    up = dataclasses.replace(
+        spec, perturbations=(SurfacePerturbation("parallel", {"size": 0.01}), None, None)
+    )
+    bumped = lc_cache.build_lc_market(up)
+    assert float(bumped.surfaces[0].atm_vol(0.1)) == pytest.approx(
+        float(market.surfaces[0].atm_vol(0.1)) + 0.01
+    )
+    np.testing.assert_array_equal(
+        bumped.models[1].local_vol.local_var, market.models[1].local_vol.local_var
+    )
+    assert (
+        np.mean(bumped.models[0].local_vol.local_var > market.models[0].local_vol.local_var) > 0.9
+    )
+    index_up = dataclasses.replace(
+        spec, index_perturbation=SurfacePerturbation("parallel", {"size": 0.01})
+    )
+    assert float(lc_cache.build_lc_market(index_up).index_surface.atm_vol(0.1)) == pytest.approx(
+        float(market.index_surface.atm_vol(0.1)) + 0.01
+    )
+    # a calendar crossed in the put wing on one name
+    crossed = SviSurfaceConfig(
+        (0.25, 0.5), ((0.002, 0.10, -0.6, 0.0, 0.1), (0.010, 0.03, -0.3, 0.0, 0.1)), 0.6
+    )
+    bad = dataclasses.replace(spec, surfaces=(spec.surfaces[0], crossed, spec.surfaces[2]))
+    flagged = lc_cache.build_lc_market(bad)
+    assert flagged.flagged == ["BBB"] and not flagged.summary()["arbitrage_ok"]
+    assert flagged.summary()["violations"]["BBB"][0].startswith("calendar")
+    with pytest.raises(ArbitrageError, match="BBB"):
+        lc_cache.build_lc_market(
+            dataclasses.replace(bad, lc=dataclasses.replace(spec.lc, arbitrage="raise"))
+        )
+    # a matrix R_low from its file, keyed by the file's digest
+    low = np.array([[1.0, 0.3, 0.1], [0.3, 1.0, 0.2], [0.1, 0.2, 1.0]])
+    np.save(tmp_path / "low.npy", low)
+    digest = file_sha256(tmp_path / "low.npy")
+    matrix_lc = dataclasses.replace(spec.lc, r_low=f"matrix:{tmp_path / 'low.npy'}")
+    matrix_spec = dataclasses.replace(spec, lc=matrix_lc, r_low_source=digest)
+    m = lc_cache.build_lc_market(matrix_spec)
+    assert not m.family.low_equi and m.family.lambda_max == 1.0
+    np.testing.assert_array_equal(m.family.r_low, low)
+    assert lc_cache.lc_spec_key(dataclasses.replace(matrix_spec, r_low_source="0" * 64)) != (
+        lc_cache.lc_spec_key(matrix_spec)
+    )
+    # a historical-scaled R_low: the matrix is given on a miss, stored, and read back on a hit
+    hist_lc = dataclasses.replace(spec.lc, r_low="historical-scaled:252,0.05")
+    hist_spec = dataclasses.replace(
+        spec, lc=hist_lc, r_low_source="sha256 of the panel|252|2026-10-01"
+    )
+    with pytest.raises(ValueError, match="must be given"):
+        lc_cache.build_lc_market(hist_spec)
+    rng = np.random.default_rng(3)
+    returns = 0.01 * (rng.standard_normal((252, 1)) * 0.8 + rng.standard_normal((252, 3)))
+    given = historical_scaled_correlation(returns, np.array(spec.weights), 0.05).r_low
+    cache = lc_cache.LocalCorrelationCache(tmp_path / "cache")
+    with pytest.raises(ValueError, match="must be given"):
+        cache.get_or_calibrate(hist_spec)
+    first, _ = cache.get_or_calibrate(hist_spec, r_low_matrix=given)
+    back, _ = cache.get_or_calibrate(hist_spec, allow_calibrate=False)  # no matrix: the stored one
+    np.testing.assert_array_equal(back.family.r_low, given)
+    np.testing.assert_array_equal(back.lam.values, first.lam.values)
+    # carry mode: the index target sits on the basket's forward curve
+    div = MarketConfig(1.0, CurveConfig.flat(0.04), CurveConfig.flat(0.03))
+    carry = dataclasses.replace(
+        spec,
+        markets=(spec.markets[0], div, spec.markets[2]),
+        lc=dataclasses.replace(spec.lc, mode="carry"),
+    )
+    cm = lc_cache.build_lc_market(carry)
+    f_basket = 0.40 + 0.35 * np.exp(0.01 * 1.0) + 0.25
+    assert float(cm.index_surface.forward_curve.forward(1.0)) == pytest.approx(f_basket, rel=1e-12)
+    assert float(cm.basket.log_basket_forward([1.0])[0]) == pytest.approx(
+        np.log(f_basket), rel=1e-12
+    )
+    assert float(lc_cache.build_lc_market(spec).index_surface.forward_curve.forward(1.0)) == 1.0
+
+
+def test_lc_code_tag_guard() -> None:
+    """The sources that can move a calibrated ``λ`` are hashed; a change without a bump of
+    ``LC_CODE_TAG`` (and a refreshed ``lc_code_tag_guard.json``) fails here.  The leverage's own
+    guard is untouched by M12 (``tests/test_lsv.py::test_calibration_code_tag_guard``)."""
+    assert lc_cache.LC_GUARD_FILE.exists(), "lc_code_tag_guard.json missing: run write_lc_guard()"
+    assert lcal.LC_CODE_TAG == "lc1" and lcal.LC_CODE_TAG in lc_cache.read_lc_guard()
+    assert len(lc_cache.lc_source_hash()) == 64
+    root = Path(__file__).resolve().parents[1]
+    assert all((root / rel).is_file() for rel in lc_cache.LC_GUARDED_MODULES)
+    assert {"volsto/multi/lc_kernel.py", "volsto/calibration/local_correlation.py",
+            "volsto/calibration/particle.py", "volsto/market/svi_slices.py"} <= set(
+        lc_cache.LC_GUARDED_MODULES
+    )  # fmt: skip
+    lc_cache.check_lc_guard()
+
+
+# ---------------------------------------------------------------------------------------------
+# LC4 acceptance (slow): helpers
+# ---------------------------------------------------------------------------------------------
+
+PRODUCTION = 800_000  # particles and pricing paths of the acceptance tests (SPEC §11)
+PRICING_SEED = 2024
+PARTICLE_SEED = 12345
+TRUTH_SEED = 777
+SD_INNER = (-1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5)
+ZERO = DiscountCurve.flat(0.0)
+
+
+def production_sim(
+    dt: float = DAILY, n_paths: int = PRODUCTION, seed: int = PRICING_SEED
+) -> SimConfig:
+    return SimConfig(n_paths=n_paths, dt_max=dt, seed=seed, chunk_size=20_000)
+
+
+def index_smile_by_simulation(
+    model: LocalCorrelationModel, sim: SimConfig, pillars: tuple[float, ...], seed: int = TRUTH_SEED
+) -> tuple[SviSlices, pd.DataFrame]:
+    """The index smile a model produces, as a target: at each pillar the Black vols of 41
+    out-of-the-money options on the basket over ±3.5 at-the-money standard deviations (inverted
+    strike by strike), then an SVI slice per pillar.  Returns the surface (on a zero-carry curve
+    of spot 1: the basket's forward moneyness) and the fits' table."""
+    sampler = lcal.BasketSampler(model, sim, list(pillars), seed=seed)
+    level = sampler.levels()
+    times, params, rows = [], [], []
+    for i, T in enumerate(pillars):
+        atm = sampler.straddle(level[:, i], T)[0]
+        k = np.linspace(-3.5, 3.5, 41) * atm * np.sqrt(T)
+        vol = np.array([sampler.otm_vol(level[:, i], float(np.exp(x)), T)[0] for x in k])
+        keep = np.isfinite(vol) & (vol > 0)
+        fit = fit_svi_slice(k[keep], vol[keep], T)
+        times.append(T)
+        params.append(fit.params)
+        rows.append({"T": T, "atm_vol": atm, "svi_rms_vp": fit.rms_vp, "n_strikes": fit.n_points})
+    fc = ForwardCurve(1.0, ZERO, ZERO)
+    return SviSlices(times, params, fc, max(pillars) + 0.05), pd.DataFrame(rows)
+
+
+def calibrate(
+    models: list[LocalVol],
+    family: CorrelationFamily,
+    basket: BasketSpec,
+    index_surface: ImpliedSurface,
+    horizon: float,
+    *,
+    n_particles: int = PRODUCTION,
+    sim: SimConfig | None = None,
+    draws: LocalCorrelationDraws | None = None,
+    **options: object,
+) -> lcal.LCCalibrationResult:
+    """A particle calibration at the acceptance settings (``options`` change the particle or the
+    local correlation configuration: ``bandwidth_factor``, ``lambda_tail``, ``target_average``)."""
+    particle_fields = {f.name for f in dataclasses.fields(ParticleConfig)}
+    p_opts = {k: v for k, v in options.items() if k in particle_fields}
+    l_opts = {k: v for k, v in options.items() if k not in particle_fields}
+    cfg = ParticleConfig(n_particles=n_particles, horizon=horizon, seed=PARTICLE_SEED, **p_opts)  # type: ignore[arg-type]
+    lc = LocalCorrelationConfig(particle=cfg, mode=basket.mode, **l_opts)  # type: ignore[arg-type]
+    index_lv = LocalVolSurface.from_implied(index_surface, lc_grid(horizon))
+    return lcal.calibrate_local_correlation(
+        models,
+        family,
+        basket,
+        index_surface,
+        index_lv,
+        cfg,
+        sim or production_sim(),
+        lc,
+        draws=draws,
+    )
+
+
+def clip_table(res: lcal.LCCalibrationResult) -> str:
+    """The clipped mass per step, summarised: the maxima, where they are, and the profile at a
+    few slices."""
+    t = res.grid.times
+    lo, hi = int(np.argmax(res.clipped_low)), int(np.argmax(res.clipped_high))
+    picks = sorted({0, 1, 2, 5, 10, 21, 42, len(t) // 2, len(t) - 1} & set(range(len(t))))
+    lines = [
+        f"clipped mass per slice: max low {res.clipped_low.max():.5f} at t={t[lo]:.4f}, max high "
+        f"{res.clipped_high.max():.5f} at t={t[hi]:.4f}; mean low {res.clipped_low.mean():.5f}, "
+        f"mean high {res.clipped_high.mean():.5f}; slices above 1 %: "
+        f"{int(np.sum(np.maximum(res.clipped_low, res.clipped_high) > 0.01))} of {len(t)}"
+    ]
+    lines += [
+        f"  t={t[j]:.4f}: low {res.clipped_low[j]:.5f} high {res.clipped_high[j]:.5f} "
+        f"mean lambda {res.lambda_mean[j]:.4f} trusted [{res.q_lo[j]:+.3f}, {res.q_hi[j]:+.3f}]"
+        for j in picks
+    ]
+    return "\n".join(lines)
+
+
+def lambda_error_table(
+    res: lcal.LCCalibrationResult, truth: object, index_surface: ImpliedSurface, t_min: float
+) -> pd.DataFrame:
+    """``max |λ̂ − λ_true|`` over ``k`` within ±1.5 at-the-money standard deviations, per slice
+    from ``t_min`` on (``truth`` maps ``k`` to the true ``λ``)."""
+    rows = []
+    for t in res.grid.times:
+        if t < t_min - 1e-12:
+            continue
+        sd = float(index_surface.atm_vol(t)) * np.sqrt(t)
+        k = np.linspace(-1.5 * sd, 1.5 * sd, 61)
+        err = res.lam(t, k) - truth(k)  # type: ignore[operator]
+        i = int(np.argmax(np.abs(err)))
+        rows.append({"t": t, "sd": sd, "max_abs_err": float(np.abs(err).max()), "at_k": float(k[i]),
+                     "err_atm": float(err[30]), "err_m1p5": float(err[0]), "err_p1p5": float(err[-1])})  # fmt: skip
+    return pd.DataFrame(rows)
+
+
+def dispersion_payoffs(
+    model: LocalCorrelationModel,
+    sim: SimConfig,
+    weights: np.ndarray,
+    horizon: float,
+    strikes: tuple[float, ...] = (),
+    *,
+    draws: object = None,
+) -> np.ndarray:
+    """Per-path payoffs ``(n_paths, 1 + len(strikes))`` of the Palladium forward and calls."""
+    mc = MultiAssetMonteCarlo(sim)
+    products = [Palladium(weights, k, horizon, ZERO) for k in (0.0, *strikes)]
+    grid = mc.build_grid(products, model)
+    res = mc.price_many(products, model, grid=grid, draws=draws, keep_payoffs=True)
+    return np.column_stack([np.asarray(r.payoffs) for r in res])
+
+
+def paired(a: np.ndarray, b: np.ndarray) -> tuple[float, float]:
+    """Mean and standard error of ``a − b`` on antithetic pair means (the same paths)."""
+    return lcm.pair_mean(a - b)
+
+
+def smile_cells(level: np.ndarray, pillars: tuple[float, ...], atm: list[float]) -> np.ndarray:
+    """Per-path out-of-the-money payoffs on the basket at the pillars and at the strikes of
+    ``SD_INNER``: ``(n_paths, n_pillars, 7)``, with the strikes' ``(k, cp)``."""
+    out = np.empty((level.shape[0], len(pillars), len(SD_INNER)))
+    for i, T in enumerate(pillars):
+        for j, m in enumerate(SD_INNER):
+            k = m * atm[i] * np.sqrt(T)
+            cp = 1.0 if k >= 0 else -1.0
+            out[:, i, j] = np.maximum(cp * (level[:, i] - np.exp(k)), 0.0)
+    return out
+
+
+def smile_difference(
+    level_a: np.ndarray, level_b: np.ndarray, pillars: tuple[float, ...], surface: ImpliedSurface
+) -> pd.DataFrame:
+    """The basket's implied vols under two models on the same paths, cell by cell inside ±1.5
+    sd: the two vols, their difference in vol points and its paired standard error (the paired
+    price difference through the vega)."""
+    atm = [float(surface.atm_vol(T)) for T in pillars]
+    pa, pb = smile_cells(level_a, pillars, atm), smile_cells(level_b, pillars, atm)
+    rows = []
+    for i, T in enumerate(pillars):
+        for j, m in enumerate(SD_INNER):
+            k = m * atm[i] * np.sqrt(T)
+            cp = 1.0 if k >= 0 else -1.0
+            va = float(implied_vol(pa[:, i, j].mean(), 1.0, np.exp(k), T, cp))
+            vb = float(implied_vol(pb[:, i, j].mean(), 1.0, np.exp(k), T, cp))
+            _, se = paired(pa[:, i, j], pb[:, i, j])
+            vega = float(black_vega(1.0, np.exp(k), T, va))
+            rows.append({"T": T, "sd": m, "vol_a": va, "vol_b": vb, "diff_vp": 100 * (va - vb),
+                         "se_vp": 100 * se / vega})  # fmt: skip
+    return pd.DataFrame(rows)
+
+
+def basket_levels(
+    model: LocalCorrelationModel, sim: SimConfig, pillars: tuple[float, ...], draws: object = None
+) -> np.ndarray:
+    """``e^{k_B}`` at the pillars on the pricing draws (or on given draws: the Δt check)."""
+    grid = TimeGrid.build(list(pillars), sim.dt_max, calibration_grid=model.required_times())
+    d = draws if draws is not None else model.draws_for(grid, sim.seed, sim.n_paths, sim.antithetic)
+    cols = [grid.fixing_index[T] for T in pillars]
+    out = np.empty((sim.n_paths, len(pillars)))
+    for p0, p1 in sim.chunk_ranges(grid.n_records * model.n_assets, 0):
+        paths = model.simulate_chunk(grid, d, p0, p1, sim.scheme)
+        assert paths.aux is not None
+        out[p0:p1] = np.exp(paths.aux["k_basket"][:, cols])
+    return out
+
+
+# ---------------------------------------------------------------------------------------------
+# S4: the reference regression
+# ---------------------------------------------------------------------------------------------
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("tag", lcm.TAGS)
+def test_s4_reference_regression(tag: str) -> None:
+    """S4: the parametric model at the reference's ``(ρ0, c)`` and the constant correlation at
+    its ``ρ_CC`` reproduce the reference's numbers within three combined standard errors
+    (``√(se_volsto² + se_ref²)``): ``E^CC[D]``, ``E^LC[D]`` and their ratio on the four dates; on
+    2026-10-02 also the calls at the reference's cash strikes, the LC basket's at-the-money and
+    90 % implied vols and the CC basket's 90 % vol.  (The deltas are part LC6's.)"""
+    world = lcm.reference_world(tag)
+    anchors = world.fx["anchors"]
+    T = float(world.fx["T"])
+    d_cc, b_cc = lcm.simulate_terminal(world, world.cc)
+    d_lc, b_lc = lcm.simulate_terminal(world, world.lc)
+    rows: list[tuple[str, float, float, float, float]] = []
+
+    def check(name: str, value: float, se: float, anchor: list[float]) -> None:
+        rows.append((name, value, se, anchor[0], anchor[1]))
+
+    check("E_CC[D]", *lcm.pair_mean(d_cc), anchors["mom.cc.ED"])
+    check("E_LC[D]", *lcm.pair_mean(d_lc), anchors["mom.lc.ED"])
+    check("LC/CC", *lcm.pair_ratio(d_lc, d_cc), anchors["forward_ratio"])
+    if tag == "today":
+        for m, c in anchors["calls"].items():
+            check(f"call {m} CC", *lcm.pair_mean(np.maximum(d_cc - c["K"], 0.0)), c["cc"])
+            check(f"call {m} LC", *lcm.pair_mean(np.maximum(d_lc - c["K"], 0.0)), c["lc"])
+            check(
+                f"call {m} LC/CC",
+                *lcm.pair_ratio(np.maximum(d_lc - c["K"], 0.0), np.maximum(d_cc - c["K"], 0.0)),
+                c["ratio"],
+            )
+        for label, b, key in (("LC", b_lc, "fit.lc.iv_put"), ("CC", b_cc, "fit.cc.iv_put")):
+            p, se = lcm.pair_mean(np.maximum(0.9 - b, 0.0))
+            vol = float(implied_vol(p, 1.0, 0.9, T, -1.0))
+            check(
+                f"{label} basket 90% vol",
+                vol,
+                se / float(black_vega(1.0, 0.9, T, vol)),
+                anchors[key],
+            )
+        p, se = lcm.pair_mean(np.abs(b_lc - 1.0))
+        vol = lcal.straddle_vol(p, T)
+        vega = 2.0 * np.exp(-0.125 * vol * vol * T) * np.sqrt(T / (2.0 * np.pi))
+        check("LC basket ATM vol", vol, se / vega, anchors["fit.lc.iv_str"])
+    table = pd.DataFrame(rows, columns=["quantity", "volsto", "se", "reference", "ref_se"])
+    table["z"] = (table["volsto"] - table["reference"]) / np.hypot(table["se"], table["ref_se"])
+    print(
+        f"\nS4 {tag} ({world.fx['date']}, T={T:.6f}, {world.fx['steps']} steps, {lcm.N_PATHS} paths)"
+    )
+    print(table.to_string(index=False, float_format=lambda x: f"{x:.6g}"))
+    assert table["z"].abs().max() < 3.0, table.to_string()
+
+
+@pytest.mark.slow
+def test_s4_recalibrated_variant() -> None:
+    """S4, the looser variant, on 2026-10-02: ``(ρ0, c)`` and ``ρ_CC`` fitted by the library on
+    its own paths to the reference's two index targets; ``E^LC[D]`` within 0.3 % and the ratio
+    within 0.002 of the reference (the reference's own independent re-simulation moved them by
+    up to 0.185 % and 0.0011)."""
+    world = lcm.reference_world("today")
+    fx = world.fx
+    T = float(fx["T"])
+    target = lcm.TwoPointIndex(fx["targets"]["sigB"], fx["targets"]["v90B"])
+    skeleton = world.lc.with_lambda(
+        LocalCorrelationFunction.constant(0.0, world.grid.times, world.models[0].local_vol.k_grid)
+    )
+    lam_c = lcal.calibrate_constant_lambda(skeleton, target, T, world.sim)
+    rho_cc = float(world.family.equicorrelation(lam_c))
+    fit = lcal.calibrate_parametric_lambda(
+        skeleton, target, T, ParametricLambdaConfig(n_paths=lcm.N_PATHS), world.sim, seed=lcm.SEED
+    )
+    assert fit.converged
+    k_grid = world.models[0].local_vol.k_grid
+    lc = skeleton.with_lambda(fit.function(world.grid.times, k_grid))
+    cc = skeleton.with_lambda(LocalCorrelationFunction.constant(lam_c, world.grid.times, k_grid))
+    d_cc, _ = lcm.simulate_terminal(world, cc)
+    d_lc, _ = lcm.simulate_terminal(world, lc)
+    ed_lc, ratio = lcm.pair_mean(d_lc), lcm.pair_ratio(d_lc, d_cc)
+    ref_ed, ref_ratio = fx["anchors"]["mom.lc.ED"][0], fx["anchors"]["forward_ratio"][0]
+    print(
+        f"\nS4 recalibrated (2026-10-02): rho_cc {rho_cc:.8f} (reference {fx['rho_cc']:.8f}), "
+        f"(rho0, c) = ({fit.rho0:.8f}, {fit.c:.8f}) (reference {fx['rho0']:.8f}, {fx['c']:.8f}), "
+        f"{len(fit.history)} Newton iterations, {fit.n_evaluations} simulations, {fit.wall_time:.0f} s\n"
+        f"  E_LC[D] {ed_lc[0]:.6f} ({ed_lc[1]:.6f}) against {ref_ed:.6f}: {100 * (ed_lc[0] / ref_ed - 1):+.3f} %\n"
+        f"  LC/CC   {ratio[0]:.5f} ({ratio[1]:.5f}) against {ref_ratio:.5f}: {ratio[0] - ref_ratio:+.5f}"
+    )
+    assert abs(ed_lc[0] / ref_ed - 1.0) < 0.003
+    assert abs(ratio[0] - ref_ratio) < 0.002
+
+
+# ---------------------------------------------------------------------------------------------
+# S1, S2, S3: round trips on known worlds
+# ---------------------------------------------------------------------------------------------
+
+
+@pytest.mark.slow
+def test_s1_round_trip() -> None:
+    """S1: W5 at 1y under the known ``λ_true(t, k) = 0.5 − 0.4·tanh(k/0.25)``; its index smiles
+    at 1m, 2m, 3m, 6m, 9m and 1y from 2·10⁶ paths, fitted with SVI slices; the particle
+    calibration at 8·10⁵ particles.  Pass: the index reprices within 0.15 vp inside ±1.5 sd and
+    0.30 vp inside ±2.5 sd (noise-aware, 8·10⁵ pricing paths); the clipped mass is at most 1 %
+    at every step; ``|λ̂ − λ_true| ≤ 0.05`` on ±1.5 sd for ``t ≥ 1m``."""
+    horizon = 1.0
+    pillars = (1 / 12, 2 / 12, 3 / 12, 6 / 12, 9 / 12, 1.0)
+    models = w5_models(horizon)
+    fam = CorrelationFamily.equi(5)
+    basket = w5_basket(models)
+
+    def truth(k: np.ndarray) -> np.ndarray:
+        return np.asarray(0.5 - 0.4 * np.tanh(np.asarray(k) / 0.25))
+
+    k_grid = k_grid_of(models)
+    lam_true = LocalCorrelationFunction([0.0, horizon], k_grid, np.tile(truth(k_grid), (2, 1)))
+    true_model = LocalCorrelationModel(models, fam, lam_true, basket)
+    index_surface, fits = index_smile_by_simulation(
+        true_model, production_sim(n_paths=2_000_000), pillars
+    )
+    print("\nS1 target (2e6 paths):\n" + fits.to_string(index=False))
+    res = calibrate(models, fam, basket, index_surface, horizon)
+    model = true_model.with_lambda(res.lam)
+    rep = lcal.reprice_index_smile(model, index_surface, production_sim(), maturities=pillars)
+    err = lambda_error_table(res, truth, index_surface, 1 / 12)
+    at_pillars = err[np.isin(np.round(err["t"], 9), np.round(pillars, 9))]
+    print(f"S1 calibration: {res.wall_time:.0f} s, timings {res.timings}")
+    print("S1 " + rep.summary())
+    print("S1 " + clip_table(res))
+    print("S1 lambda error against the truth at the pillars (max over ±1.5 sd):")
+    print(at_pillars.to_string(index=False, float_format=lambda x: f"{x:+.4f}"))
+    worst = err.loc[err["max_abs_err"].idxmax()]
+    print(
+        f"S1 worst |lambda error| over all {len(err)} slices from 1m: {worst['max_abs_err']:.4f} at "
+        f"t={worst['t']:.4f}, k={worst['at_k']:+.4f}; median over slices {err['max_abs_err'].median():.4f}"
+    )
+    assert res.max_clipped_mass <= 0.01, clip_table(res)
+    assert rep.passes(), rep.summary()
+    assert err["max_abs_err"].max() <= 0.05, err.to_string()
+
+
+@pytest.mark.slow
+def test_s2_constant_correlation_fixed_point() -> None:
+    """S2: W5 at 3m under the constant correlation 0.5 (``λ = 0.48/0.98``); its index smile from
+    2·10⁶ paths; the calibration must find the constant back — ``|λ̂ − 0.4898| ≤ 0.03`` inside
+    ±1.5 sd for ``t ≥ 1m`` — and price the Palladium forward within 0.5 % of the true model's
+    (paired)."""
+    horizon = 0.25
+    pillars = (1 / 12, 2 / 12, 0.25)
+    models = w5_models(horizon)
+    fam = CorrelationFamily.equi(5)
+    basket = w5_basket(models)
+    lam_c = (0.5 - 0.02) / 0.98
+    const = LocalCorrelationFunction.constant(lam_c, [0.0, horizon], k_grid_of(models))
+    true_model = LocalCorrelationModel(models, fam, const, basket)
+    index_surface, fits = index_smile_by_simulation(
+        true_model, production_sim(n_paths=2_000_000), pillars
+    )
+    print("\nS2 target (2e6 paths):\n" + fits.to_string(index=False))
+    res = calibrate(models, fam, basket, index_surface, horizon)
+    err = lambda_error_table(res, lambda k: np.full(np.shape(k), lam_c), index_surface, 1 / 12)
+    model = true_model.with_lambda(res.lam)
+    cc = true_model.with_lambda(
+        LocalCorrelationFunction.constant(lam_c, res.lam.times, k_grid_of(models))
+    )
+    sim = production_sim()
+    d_lc = dispersion_payoffs(model, sim, W5_WEIGHTS, horizon)[:, 0]
+    d_cc = dispersion_payoffs(cc, sim, W5_WEIGHTS, horizon)[:, 0]
+    ratio, ratio_se = lcm.pair_ratio(d_lc, d_cc)
+    rep = lcal.reprice_index_smile(model, index_surface, sim, maturities=pillars)
+    worst = err.loc[err["max_abs_err"].idxmax()]
+    print("S2 " + rep.summary())
+    print("S2 " + clip_table(res))
+    print(
+        f"S2 lambda against {lam_c:.4f}: worst |error| {worst['max_abs_err']:.4f} at t={worst['t']:.4f}, "
+        f"k={worst['at_k']:+.4f}; at 3m ATM {err.iloc[-1]['err_atm']:+.4f}, -1.5 sd "
+        f"{err.iloc[-1]['err_m1p5']:+.4f}, +1.5 sd {err.iloc[-1]['err_p1p5']:+.4f}\n"
+        f"S2 E_LC[D]/E_CC[D] = {ratio:.5f} ({ratio_se:.5f}); E_CC[D] = {lcm.pair_mean(d_cc)[0]:.6f}"
+    )
+    assert err["max_abs_err"].max() <= 0.03, err.to_string()
+    assert abs(ratio - 1.0) <= 0.005
+
+
+@pytest.mark.slow
+def test_s3_identical_names() -> None:
+    """S3: five identical names whose common smile is the index smile (the truth is ``λ ≡ 1``;
+    ``rho_max = 1`` so that the cap does not bind): ``λ̂ ≥ 0.99`` on the trusted range and the
+    index reprices within 0.05 vp (noise-aware)."""
+    horizon = 0.25
+    name_surface = w5_surfaces(2)[1]
+    name = LocalVol(
+        LocalVolSurface.from_implied(name_surface, lc_grid(horizon)), name_surface.forward_curve
+    )
+    models = [name] * 5
+    fam = CorrelationFamily.equi(5, 0.02, 1.0)
+    basket = w5_basket(models)
+    res = calibrate(models, fam, basket, name_surface, horizon, rho_max=1.0)
+    k = res.lam.k_grid
+    low = min(
+        float(res.lam.values[j][(k >= res.q_lo[j]) & (k <= res.q_hi[j])].min())
+        for j in range(1, res.lam.n_slices)
+    )
+    model = LocalCorrelationModel(models, fam, res.lam, basket)
+    rep = lcal.reprice_index_smile(
+        model, name_surface, production_sim(), maturities=(1 / 12, 2 / 12, 0.25)
+    )
+    print("\nS3 " + rep.summary())
+    print(
+        f"S3 smallest lambda on the trusted range over the slices: {low:.6f}; lambda at t0 "
+        f"{res.lam.values[0, 0]:.6f}; clipped high mass max {res.clipped_high.max():.4f} with "
+        f"overshoot {res.overshoot_high.max():.2e} (lambda* against the cap of 1)"
+    )
+    assert low >= 0.99
+    assert rep.passes(tol_inner=0.05, tol_outer=0.05), rep.summary()
+
+
+# ---------------------------------------------------------------------------------------------
+# S5, S6, S7: step, particles, bandwidth (W5 at 3m against its reachable target)
+# ---------------------------------------------------------------------------------------------
+
+W5_3M_PILLARS = (1 / 12, 2 / 12, 0.25)
+
+
+def _dt_halving(
+    models: list[LocalVol],
+    fam: CorrelationFamily,
+    basket: BasketSpec,
+    surface: ImpliedSurface,
+    weights: np.ndarray,
+    horizon: float,
+    pillars: tuple[float, ...],
+    *,
+    n_particles: int,
+    n_paths: int,
+    dt: float = DAILY,
+    **options: object,
+) -> dict[str, object]:
+    """Calibrate and price at ``dt`` and ``dt/2`` on common random numbers (the coarse runs use
+    the Brownian-consistent coarsening of the fine runs' draws, in the calibration and in
+    pricing): the Palladium forward and calls, and the basket smile, at both steps."""
+    fine_sim = production_sim(dt / 2, n_paths)
+    coarse_sim = production_sim(dt, n_paths)
+    n_fine = TimeGrid.build([horizon], dt / 2).n_steps
+    cal_fine = LocalCorrelationDraws(PARTICLE_SEED, n_particles, n_fine, fam)
+    res_f = calibrate(models, fam, basket, surface, horizon, n_particles=n_particles, sim=fine_sim,
+                      draws=cal_fine, **options)  # fmt: skip
+    res_c = calibrate(models, fam, basket, surface, horizon, n_particles=n_particles, sim=coarse_sim,
+                      draws=cal_fine.coarsened(2), **options)  # fmt: skip
+    m_f = LocalCorrelationModel(models, fam, res_f.lam, basket)
+    m_c = LocalCorrelationModel(models, fam, res_c.lam, basket)
+    grid_f = TimeGrid.build(list(pillars), dt / 2, calibration_grid=m_f.required_times())
+    grid_c = TimeGrid.build(list(pillars), dt, calibration_grid=m_c.required_times())
+    assert grid_f.n_steps == 2 * grid_c.n_steps
+    price_fine = m_f.draws_for(grid_f, PRICING_SEED, n_paths)
+    price_coarse = price_fine.coarsened(2)
+    lev_f = basket_levels(m_f, fine_sim, pillars, price_fine)
+    lev_c = basket_levels(m_c, coarse_sim, pillars, price_coarse)
+    mc_f, mc_c = MultiAssetMonteCarlo(fine_sim), MultiAssetMonteCarlo(coarse_sim)
+    fwd = Palladium(weights, 0.0, horizon, ZERO)
+    base = mc_c.price(fwd, m_c, grid=grid_c, draws=price_coarse).mean
+    strikes = tuple(m * base for m in (0.75, 1.0, 1.25, 1.5))
+    prods = [Palladium(weights, k, horizon, ZERO) for k in (0.0, *strikes)]
+    pay_f = np.column_stack(
+        [
+            np.asarray(r.payoffs)
+            for r in mc_f.price_many(prods, m_f, grid=grid_f, draws=price_fine, keep_payoffs=True)
+        ]
+    )
+    pay_c = np.column_stack(
+        [
+            np.asarray(r.payoffs)
+            for r in mc_c.price_many(prods, m_c, grid=grid_c, draws=price_coarse, keep_payoffs=True)
+        ]
+    )
+    rows = []
+    for j, label in enumerate(("E[D]", "call 0.75", "call 1.00", "call 1.25", "call 1.50")):
+        coarse, fine = lcm.pair_mean(pay_c[:, j]), lcm.pair_mean(pay_f[:, j])
+        diff, se = paired(pay_f[:, j], pay_c[:, j])
+        rows.append({"quantity": label, "dt": coarse[0], "dt/2": fine[0], "diff": diff, "diff_se": se,
+                     "rel_%": 100 * diff / coarse[0], "rel_se_%": 100 * se / coarse[0]})  # fmt: skip
+    smile = smile_difference(lev_f, lev_c, pillars, surface)
+    return {
+        "prices": pd.DataFrame(rows),
+        "smile": smile,
+        "coarse": res_c,
+        "fine": res_f,
+        "report_coarse": lcal.reprice_index_smile(m_c, surface, coarse_sim, maturities=pillars),
+        "report_fine": lcal.reprice_index_smile(m_f, surface, fine_sim, maturities=pillars),
+    }
+
+
+def _print_dt(label: str, out: dict[str, object]) -> None:
+    prices, smile = out["prices"], out["smile"]
+    assert isinstance(prices, pd.DataFrame) and isinstance(smile, pd.DataFrame)
+    print(f"\n{label}: prices at dt and dt/2 (common random numbers; diff = dt/2 minus dt)")
+    print(prices.to_string(index=False, float_format=lambda x: f"{x:.6g}"))
+    print(f"{label}: basket implied vol, dt/2 minus dt, in vol points (paired se in brackets)")
+    piv = smile.pivot(index="T", columns="sd", values="diff_vp")
+    se = smile.pivot(index="T", columns="sd", values="se_vp")
+    cells = piv.copy().astype(object)
+    for i in piv.index:
+        for j in piv.columns:
+            cells.loc[i, j] = f"{piv.loc[i, j]:+.3f} ({se.loc[i, j]:.3f})"
+    print(cells.to_string())
+    for name in ("report_coarse", "report_fine"):
+        rep = out[name]
+        assert isinstance(rep, lcal.IndexRepricingReport)
+        print(f"{label} {name}: max |error| against the target within 1.5 sd "
+              f"{rep.max_abs_error(1.5):.3f} vp, within 2.5 sd {rep.max_abs_error(2.5):.3f} vp")  # fmt: skip
+
+
+@pytest.mark.slow
+def test_s5_dt_halving_w5() -> None:
+    """S5 on W5 at 3m: calibrated and priced at ``dt = 1/252`` and at ``dt/2`` on common random
+    numbers — ``|E[D](dt/2) − E[D](dt)| < 0.2 %`` of ``E[D]`` and the index smile within 0.10 vp
+    inside ±1.5 sd.  Also printed: the same with the point-value target (SPEC §8.7, review
+    point 3)."""
+    models = w5_models(0.25)
+    fam = CorrelationFamily.equi(5)
+    basket = w5_basket(models)
+    surface, _ = w5_target(0.25)
+    args = (models, fam, basket, surface, W5_WEIGHTS, 0.25, W5_3M_PILLARS)
+    out = _dt_halving(*args, n_particles=PRODUCTION, n_paths=PRODUCTION)
+    _print_dt("S5 W5 3m, step-averaged target", out)
+    point = _dt_halving(*args, n_particles=PRODUCTION, n_paths=PRODUCTION, target_average="point")
+    _print_dt("S5 W5 3m, point target (diagnostic)", point)
+    prices, smile = out["prices"], out["smile"]
+    assert isinstance(prices, pd.DataFrame) and isinstance(smile, pd.DataFrame)
+    assert abs(prices.iloc[0]["rel_%"]) < 0.2, prices.to_string()
+    assert (smile["diff_vp"].abs() <= np.maximum(0.10, 3 * smile["se_vp"])).all(), smile.to_string()
+
+
+@pytest.mark.slow
+def test_s6_particle_doubling() -> None:
+    """S6 on W5 at 3m: calibrations at 4·10⁵ and 8·10⁵ particles of the same seed, priced on
+    the same paths — ``E[D]``, the calls and the index smile agree within the Monte Carlo error
+    of the paired difference (``|z| < 3``)."""
+    horizon = 0.25
+    models = w5_models(horizon)
+    fam = CorrelationFamily.equi(5)
+    basket = w5_basket(models)
+    surface, _ = w5_target(horizon)
+    sim = production_sim()
+    out = {}
+    for n in (400_000, PRODUCTION):
+        res = calibrate(models, fam, basket, surface, horizon, n_particles=n)
+        model = LocalCorrelationModel(models, fam, res.lam, basket)
+        out[n] = (res, model)
+    base = float(dispersion_payoffs(out[PRODUCTION][1], sim, W5_WEIGHTS, horizon)[:, 0].mean())
+    strikes = tuple(m * base for m in (0.75, 1.0, 1.25, 1.5))
+    pay = {n: dispersion_payoffs(m, sim, W5_WEIGHTS, horizon, strikes) for n, (_, m) in out.items()}
+    rows = []
+    for j, label in enumerate(("E[D]", "call 0.75", "call 1.00", "call 1.25", "call 1.50")):
+        diff, se = paired(pay[PRODUCTION][:, j], pay[400_000][:, j])
+        value, value_se = lcm.pair_mean(pay[PRODUCTION][:, j])
+        rows.append({"quantity": label, "8e5": value, "se": value_se, "8e5 - 4e5": diff,
+                     "paired_se": se, "z": diff / se, "rel_%": 100 * diff / value})  # fmt: skip
+    prices = pd.DataFrame(rows)
+    lev = {n: basket_levels(m, sim, W5_3M_PILLARS) for n, (_, m) in out.items()}
+    smile = smile_difference(lev[PRODUCTION], lev[400_000], W5_3M_PILLARS, surface)
+    smile["z"] = smile["diff_vp"] / smile["se_vp"]
+    lam_diff = np.abs(out[PRODUCTION][0].lam.values - out[400_000][0].lam.values)
+    res8 = out[PRODUCTION][0]
+    kg = res8.lam.k_grid
+    inside = np.array(
+        [(kg >= res8.q_lo[j]) & (kg <= res8.q_hi[j]) for j in range(res8.lam.n_slices)]
+    )
+    print("\nS6 W5 3m: 8e5 against 4e5 particles, the same pricing paths")
+    print(prices.to_string(index=False, float_format=lambda x: f"{x:.6g}"))
+    print("S6 basket implied vol, 8e5 minus 4e5 particles (vol points):")
+    print(smile.to_string(index=False, float_format=lambda x: f"{x:+.4f}"))
+    print(f"S6 max |lambda(8e5) - lambda(4e5)| on the trusted range {lam_diff[inside].max():.4f}, "
+          f"mean {lam_diff[inside].mean():.4f}")  # fmt: skip
+    assert prices["z"].abs().max() < 3.0, prices.to_string()
+    assert smile["z"].abs().max() < 3.0, smile.to_string()
+
+
+@pytest.mark.slow
+def test_s7_bandwidth() -> None:
+    """S7 on W5 at 3m: bandwidth factors 1, 1.5 and 2 — the index smiles agree pairwise within
+    0.10 vp inside ±1.5 sd (the same particles, the same pricing paths)."""
+    horizon = 0.25
+    models = w5_models(horizon)
+    fam = CorrelationFamily.equi(5)
+    basket = w5_basket(models)
+    surface, _ = w5_target(horizon)
+    sim = production_sim()
+    lev, ed = {}, {}
+    for c in (1.0, 1.5, 2.0):
+        res = calibrate(models, fam, basket, surface, horizon, bandwidth_factor=c)
+        model = LocalCorrelationModel(models, fam, res.lam, basket)
+        lev[c] = basket_levels(model, sim, W5_3M_PILLARS)
+        ed[c] = dispersion_payoffs(model, sim, W5_WEIGHTS, horizon)[:, 0]
+    print("\nS7 W5 3m: basket implied vol differences between bandwidth factors (vol points)")
+    worst = 0.0
+    for a, b in ((1.0, 1.5), (1.5, 2.0), (1.0, 2.0)):
+        smile = smile_difference(lev[a], lev[b], W5_3M_PILLARS, surface)
+        piv = smile.pivot(index="T", columns="sd", values="diff_vp")
+        d, se = paired(ed[a], ed[b])
+        print(f"factor {a} minus factor {b}: max |diff| {smile['diff_vp'].abs().max():.4f} vp; "
+              f"E[D] diff {d:+.3e} ({se:.1e}), {100 * d / ed[1.5].mean():+.4f} %")  # fmt: skip
+        print(piv.to_string(float_format=lambda x: f"{x:+.4f}"))
+        worst = max(worst, float(smile["diff_vp"].abs().max()))
+    assert worst <= 0.10
+
+
+# ---------------------------------------------------------------------------------------------
+# S10: carry mode
+# ---------------------------------------------------------------------------------------------
+
+
+@pytest.mark.slow
+def test_s10_carry_mode() -> None:
+    """S10: W5 with a rate of 4 % and dividend yields of 0–4 % in carry mode (the basket is the
+    price basket, whose drift the calibration ignores).  The index smile of a known sloped ``λ``
+    (2·10⁶ paths) is the target.  Pass: ``E[B_T]/F_B(T) − 1`` within 3 standard errors and the
+    index at-the-money error at most 0.15 vp at every pillar.  Printed: the per-step mean of
+    ``|δ_t|`` and the carry-mode ``λ`` against the performance-mode ``λ`` on the same particles."""
+    horizon = 0.25
+    yields = (0.00, 0.01, 0.02, 0.03, 0.04)
+    curves = [ForwardCurve.flat(1.0, 0.04, q) for q in yields]
+    cfg = lc_grid(horizon)
+    models = [
+        LocalVol(LocalVolSurface.from_implied(w5_surfaces(i + 1, curves[i])[i], cfg), curves[i])
+        for i in range(5)
+    ]
+    fam = CorrelationFamily.equi(5)
+    basket = BasketSpec(W5_WEIGHTS, "carry", curves)
+    k_grid = k_grid_of(models)
+    lam_true = LocalCorrelationFunction.parametric(
+        ParametricLambda(0.45, 2.0, 0.0, fam.lambda_max), [0.0, horizon], k_grid
+    )
+    true_model = LocalCorrelationModel(models, fam, lam_true, basket)
+    index_surface, fits = index_smile_by_simulation(
+        true_model, production_sim(n_paths=2_000_000), W5_3M_PILLARS
+    )
+    print("\nS10 target (carry mode, 2e6 paths):\n" + fits.to_string(index=False))
+    res = calibrate(models, fam, basket, index_surface, horizon)
+    assert res.drift_abs_mean is not None
+    model = true_model.with_lambda(res.lam)
+    rep = lcal.reprice_index_smile(model, index_surface, production_sim(), maturities=W5_3M_PILLARS)
+    perf = calibrate(models, fam, basket.with_mode("performance"), index_surface, horizon)
+    kg = res.lam.k_grid
+    inside = np.array(
+        [(kg >= res.q_lo[j]) & (kg <= res.q_hi[j]) for j in range(1, res.lam.n_slices)]
+    )
+    gap = np.abs(res.lam.values[1:] - perf.lam.values[1:])[inside]
+    print("S10 " + rep.summary())
+    print("S10 " + clip_table(res))
+    print(
+        f"S10 mean |delta_t| over the cloud, per year: max over steps {res.drift_abs_mean.max():.3e}, "
+        f"at 1m {res.drift_abs_mean[21]:.3e}, at 3m {res.drift_abs_mean[-1]:.3e}\n"
+        f"S10 carry-mode against performance-mode lambda on the trusted range: max |diff| "
+        f"{gap.max():.4f}, mean {gap.mean():.5f}\n"
+        f"S10 forward: "
+        + ", ".join(
+            f"T={r['T']:.4f}: {r['forward_error']:+.2e} ({r['forward_error_se']:.1e})"
+            for _, r in rep.forwards.iterrows()
+        )
+    )
+    z = rep.forwards["forward_error"] / rep.forwards["forward_error_se"]
+    assert z.abs().max() < 3.0, rep.forwards.to_string()
+    atm = rep.table[rep.table["sd"] == 0.0]
+    assert (atm["error_vp"].abs() <= np.maximum(0.15, 3 * atm["stderr_vp"])).all(), atm.to_string()
+
+
+# ---------------------------------------------------------------------------------------------
+# the Dow from the study's data (slow; skipped when the data is absent)
+# ---------------------------------------------------------------------------------------------
+
+STUDY = Path(__file__).resolve().parents[1] / "outputs" / "dispersion"
+TODAY = "2026-10-02"
+
+
+def _study_data_present() -> bool:
+    from volsto.studies import disp_data as dd
+
+    return (
+        (STUDY / "prices.parquet").exists()
+        and (STUDY / "entries" / "3m" / f"{TODAY}.pkl").exists()
+        and dd.day_path(TODAY).exists()
+    )
+
+
+needs_study_data = pytest.mark.skipif(
+    not _study_data_present(), reason="the dispersion study's data is absent"
+)
+
+
+def dow_inputs(date: str, tenor: str) -> dict[str, object]:
+    """The study's inputs of a date: the entry's names, maturity and price weights, and the
+    expiry smiles of the names and of DJX through the study's own loader
+    (``scripts/disp_entries.py::marginals_for``, as check C8 does; the forward rule and the
+    expiry guards are the study's)."""
+    import pickle
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    import disp_entries as de
+
+    from volsto.studies import disp_data as dd
+
+    with (dd.OUT / "entries" / tenor / f"{date}.pkl").open("rb") as fh:
+        entry = pickle.load(fh)
+    names = list(entry["names"])
+    T = float(entry["T"])
+    got = de.marginals_for(date, [*names, "DJX"], T)
+    assert got is not None
+    panel = dd.prices().ffill()
+    return {
+        "names": names,
+        "T": T,
+        "weights": np.asarray(entry["w_B1"], dtype=float),
+        "spots": [float(panel.at[date, t]) for t in names],
+        "smiles": {t: got[t][2] for t in names},
+        "index_smiles": got["DJX"][2],
+        "index_spot": float(panel.at[date, "DJX"]),
+    }
+
+
+def dow_spec(
+    date: str, tenor: str, *, n_particles: int, records: object = None, **lc_options: object
+) -> tuple[LocalCorrelationSpec, dict[str, object], dict[str, object]]:
+    from volsto.studies.disp_lc import lc_spec_from_smiles
+
+    data = dow_inputs(date, tenor)
+    particle = ParticleConfig(n_particles=n_particles, horizon=float(data["T"]), seed=PARTICLE_SEED)  # type: ignore[arg-type]
+    lc = LocalCorrelationConfig(particle=particle, **lc_options)  # type: ignore[arg-type]
+    spec, info = lc_spec_from_smiles(
+        data["names"],  # type: ignore[arg-type]
+        data["weights"],  # type: ignore[arg-type]
+        data["spots"],  # type: ignore[arg-type]
+        data["smiles"],  # type: ignore[arg-type]
+        data["index_smiles"],  # type: ignore[arg-type]
+        data["index_spot"],  # type: ignore[arg-type]
+        float(data["T"]),  # type: ignore[arg-type]
+        lc=lc,
+        sim=production_sim(),
+        records=records,  # type: ignore[arg-type]
+        label=f"{date} B1 {tenor}",
+    )
+    return spec, info, data
+
+
+@pytest.mark.slow
+@needs_study_data
+def test_dow_specification_from_the_study(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The Dow of 2026-10-02 at 3m as a specification: every name's curve reproduces its listed
+    forwards (1e-12); the SVI slices are C8's selection; the second build reads every slice from
+    the records and fits nothing, and its key is the first's; the alignment of the listed DJX
+    forwards with the basket's is reported for each expiry (all within the 1 % flag)."""
+    from volsto.calibration.fit_records import FitRecords
+    from volsto.market import svi_slices as sv
+
+    records = FitRecords(tmp_path / "lc" / "svi_fits")
+    spec, info, data = dow_spec(TODAY, "3m", n_particles=PRODUCTION, records=records)
+    assert (
+        spec.n_names == 30 and spec.lc.particle.horizon == 0.25 and spec.label == f"{TODAY} B1 3m"
+    )
+    assert abs(sum(spec.weights) - 1.0) < 1e-12 and spec.local_vol.n_k == 1601
+    smiles = data["smiles"]
+    assert isinstance(smiles, dict)
+    worst = 0.0
+    for name, market, surface, spot in zip(spec.names, spec.markets, spec.surfaces, data["spots"]):  # type: ignore[arg-type]
+        curve = ForwardCurve.from_config(market)
+        listed = smiles[name]
+        ratio = np.array([e.forward / spot for e in listed])
+        got = np.asarray(curve.forward(np.array([e.T for e in listed])))
+        worst = max(worst, float(np.max(np.abs(got / ratio - 1.0))))
+        kept = [e.T for e in listed if e.T >= 10 / 365]
+        expected = [t for t in kept if t <= 0.25] + [t for t in kept if t > 0.25][:2]
+        assert list(surface.times) == expected and surface.record_keys is not None
+        assert surface.max_maturity == max(expected[-1], 0.25) + 0.05
+    assert worst < 1e-12
+    n_slices = sum(len(s.times) for s in spec.surfaces) + len(spec.index_surface.times)
+    assert len(records.keys()) == n_slices
+    assert len(spec.index_forward_ratios) == len(spec.index_surface.times)
+
+    def no_fit(*args: object, **kwargs: object) -> object:
+        raise AssertionError("a recorded slice was fitted again")
+
+    monkeypatch.setattr(sv, "fit_svi_slice", no_fit)
+    again, _, _ = dow_spec(TODAY, "3m", n_particles=PRODUCTION, records=records)
+    assert again == spec and lc_cache.lc_spec_key(again) == lc_cache.lc_spec_key(spec)
+    monkeypatch.undo()
+    market = lc_cache.build_lc_market(spec)
+    deltas = [(round(a["T"], 4), round(100 * a["delta"], 3)) for a in market.alignment]
+    print(f"\nDow {TODAY} 3m: SVI rms median {info['svi_rms_vp_median']:.2f} vp, max "
+          f"{info['svi_rms_vp_max']:.2f} vp; {n_slices} slices; forwards reproduced to {worst:.1e}; "
+          f"alignment delta (%) by listed DJX expiry {deltas}; flagged for arbitrage on |k| <= 1: "
+          f"{len([x for x in market.flagged if x != 'index'])} names, index {'index' in market.flagged}")  # fmt: skip
+    assert all(abs(a["delta"]) < 0.01 and not a["flagged"] for a in market.alignment)
+    assert info["n_names_extrapolated"] == 0 and not info["index_extrapolated"]
+
+
+@pytest.mark.slow
+@needs_study_data
+def test_single_names_match_local_vol_on_the_dow() -> None:
+    """C2 on the thirty Dow names of 2026-10-02 (3m): under a calibrated ``λ`` every single-name
+    out-of-the-money vanilla — forward log-moneyness ``k ∈ {−0.15, −0.05, 0, 0.05, 0.15}``,
+    maturities ``T/3``, ``2T/3``, ``T`` — is the single-asset ``LocalVol`` Monte Carlo price on
+    an independent seed: ``|z| < 3`` in each of the 450 cells, with the combined standard
+    errors.  (The index target only shapes ``λ``; the names' law does not depend on it.)"""
+    spec, _, _ = dow_spec(TODAY, "3m", n_particles=200_000)
+    market = lc_cache.build_lc_market(spec)
+    res = lcal.calibrate_local_correlation(
+        market.models, market.family, market.basket, market.index_surface, market.index_lv,
+        spec.lc.particle, spec.sim, spec.lc,
+    )  # fmt: skip
+    model = LocalCorrelationModel(market.models, market.family, res.lam, market.basket, spec.names)
+    horizon = 0.25
+    maturities = [horizon / 3, 2 * horizon / 3, horizon]
+    strikes = np.array([-0.15, -0.05, 0.0, 0.05, 0.15]) * np.sqrt(horizon / 0.25)
+    sim = production_sim(n_paths=400_000)
+    grid = TimeGrid.build(maturities, sim.dt_max, calibration_grid=model.required_times())
+    cols = [grid.fixing_index[T] for T in maturities]
+    draws = model.draws_for(grid, sim.seed, sim.n_paths)
+    n = model.n_assets
+    spots = np.empty((n, sim.n_paths, len(cols)))
+    for p0, p1 in sim.chunk_ranges(grid.n_records * n, 0):
+        paths = model.simulate_chunk(grid, draws, p0, p1, sim.scheme)
+        for i in range(n):
+            spots[i, p0:p1] = paths.assets[i].spot_at(cols)
+    rows = []
+    for i, name in enumerate(market.models):
+        alone_draws = GaussianDraws(900_000 + i, sim.n_paths, grid.n_steps, 1)
+        alone = np.empty((sim.n_paths, len(cols)))
+        for p0, p1 in sim.chunk_ranges(grid.n_records, 0):
+            alone[p0:p1] = name.simulate_chunk(grid, alone_draws, p0, p1, sim.scheme).spot_at(cols)
+        for j, T in enumerate(maturities):
+            fwd = float(name.forward_curve.forward(T))
+            for k in strikes:
+                cp = 1.0 if k >= 0 else -1.0
+                got = summarize(np.maximum(cp * (spots[i, :, j] / fwd - np.exp(k)), 0.0), True)
+                ref = summarize(np.maximum(cp * (alone[:, j] / fwd - np.exp(k)), 0.0), True)
+                z = (got.mean - ref.mean) / float(np.hypot(got.stderr, ref.stderr))
+                rows.append((spec.names[i], T, k, got.mean, got.stderr, ref.mean, ref.stderr, z))
+    table = pd.DataFrame(rows, columns=["name", "T", "k", "lc", "lc_se", "lv", "lv_se", "z"])
+    over = table[table["z"].abs() >= 3.0]
+    print(
+        f"\nC2 (Dow {TODAY}, 30 names): {len(table)} cells, worst |z| {table['z'].abs().max():.2f}, "
+        f"rms z {np.sqrt((table['z'] ** 2).mean()):.2f}, mean z {table['z'].mean():+.2f}, cells with "
+        f"|z| >= 2: {int((table['z'].abs() >= 2).sum())} (expected {0.0455 * len(table):.0f}), "
+        f">= 3: {len(over)} (expected {0.0027 * len(table):.1f})"
+    )
+    if len(over):
+        print(over.to_string(index=False))
+    assert len(table) == 450
+    assert table["z"].abs().max() < 3.0, over.to_string()

@@ -125,6 +125,38 @@ class BasketSpec:
         return f"BasketSpec(n={self.n}, mode={self.mode!r})"
 
 
+def grid_arrays(
+    models: Sequence[LocalVol], basket: BasketSpec, times: FloatArray
+) -> tuple[FloatArray, FloatArray, FloatArray, FloatArray]:
+    """The deterministic arrays of a grid: each name's ``ln F_i`` at the nodes ``(n, n_t)`` and
+    its drift per step ``(n, n_t − 1)`` (the difference of consecutive nodes, as in
+    ``LocalVol.simulate_chunk``), the basket's shifts ``(n, n_t)`` and ``ln F_B`` ``(n_t,)``.
+    Pricing and the particle calibration slice the same arrays, so they see the same doubles."""
+    ln_f = np.empty((len(models), times.size))
+    for i, m in enumerate(models):
+        ln_f[i] = np.asarray(m.forward_curve.log_forward(times), dtype=np.float64)
+    drifts = np.ascontiguousarray(np.diff(ln_f, axis=1))
+    return ln_f, drifts, basket.shifts(times), basket.log_basket_forward(times)
+
+
+def block_tables(
+    models: Sequence[LocalVol], t_nodes: FloatArray, scheme: SchemeConfig, with_record: bool
+) -> tuple[FloatArray, FloatArray, FloatArray]:
+    """``(var_a, var_b, var_rec)`` of a block of steps, each ``(n, n_block, n_k)``: per name the
+    tables of ``LocalVol.simulate_chunk`` (:func:`~volsto.models.localvol.
+    step_variance_tables` and, when a step of the block is recorded, the instantaneous variance
+    at the step ends; ``var_a`` otherwise, unread)."""
+    tables = [step_variance_tables(m.local_vol, t_nodes, scheme) for m in models]
+    var_a = np.ascontiguousarray(np.stack([t[0] for t in tables]))
+    var_b = np.ascontiguousarray(np.stack([t[1] for t in tables]))
+    if not with_record:
+        return var_a, var_b, var_a
+    var_rec = np.ascontiguousarray(
+        np.stack([m.local_vol.var_at_times(t_nodes[1:]) for m in models])
+    )
+    return var_a, var_b, var_rec
+
+
 class LocalCorrelationModel:
     """``models[i]`` (a :class:`~volsto.models.localvol.LocalVol`) drives asset ``i``; the
     Brownians have the correlation ``family.correlation(λ)`` with ``λ = lam(t, k)`` read on the
@@ -242,18 +274,14 @@ class LocalCorrelationModel:
         out_lam = np.empty((n_paths, n_cols))
         out_kb = np.empty((n_paths, n_cols))
         ls = np.empty((n_paths, n))
-        ln_f = np.empty((n, times.size))
         for i, m in enumerate(self.models):
             state = m.initial_state(n_paths)
             out_ls[i, :, 0] = state.log_spot
             out_var[i, :, 0] = state.variance
             ls[:, i] = state.log_spot
-            ln_f[i] = np.asarray(m.forward_curve.log_forward(times), dtype=np.float64)
         out_iv[:, :, 0] = 0.0
         out_sq[:, :, 0] = 0.0
-        drifts = np.ascontiguousarray(np.diff(ln_f, axis=1))
-        shifts = self.basket.shifts(times)
-        ln_fb = self.basket.log_basket_forward(times)
+        ln_f, drifts, shifts, ln_fb = grid_arrays(self.models, self.basket, times)
         out_lam[:, 0] = 0.0
         out_kb[:, 0] = self.basket.log_moneyness(ls, 0.0)
         iv = np.zeros((n_paths, n))
@@ -267,16 +295,8 @@ class LocalCorrelationModel:
             s1 = min(s0 + nb_max, grid.n_steps)
             t_nodes = times[s0 : s1 + 1]
             rec = grid.step_record[s0:s1]
-            any_rec = bool(np.any(rec >= 0))
-            tables = [step_variance_tables(m.local_vol, t_nodes, scheme) for m in self.models]
-            var_a = np.ascontiguousarray(np.stack([t[0] for t in tables]))
-            var_b = np.ascontiguousarray(np.stack([t[1] for t in tables]))
-            var_rec = (
-                np.ascontiguousarray(
-                    np.stack([m.local_vol.var_at_times(t_nodes[1:]) for m in self.models])
-                )
-                if any_rec
-                else var_a
+            var_a, var_b, var_rec = block_tables(
+                self.models, t_nodes, scheme, bool(np.any(rec >= 0))
             )
             lc_diffuse_block(
                 ls,
@@ -378,4 +398,10 @@ class LocalCorrelationModel:
         )
 
 
-__all__ = ["BASKET_MODES", "BasketSpec", "LocalCorrelationModel"]
+__all__ = [
+    "BASKET_MODES",
+    "BasketSpec",
+    "LocalCorrelationModel",
+    "block_tables",
+    "grid_arrays",
+]

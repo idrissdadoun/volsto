@@ -27,3 +27,11 @@ def njit(**options: Any) -> Callable[[Callable[P, R]], Callable[P, R]]:
 
 
 prange: Any = numba.prange
+
+_get_num_threads: Any = numba.get_num_threads
+
+
+def num_threads() -> int:
+    """The number of threads numba's parallel kernels use now (recorded with every artefact of
+    the local correlation model, SPEC §8.7)."""
+    return int(_get_num_threads())

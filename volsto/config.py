@@ -867,3 +867,280 @@ class CalibrationSpec:
         if self.perturbation is not None:
             payload["perturbation"] = to_mapping(self.perturbation)
         return payload
+
+
+# --------------------------------------------------------------------------------------------
+# Local correlation model (SPEC §8.7, M12)
+# --------------------------------------------------------------------------------------------
+
+#: Values of :attr:`LocalCorrelationConfig.family`.
+LC_FAMILIES: tuple[str, ...] = ("particle", "parametric", "constant")
+#: ``ParticleConfig`` fields the local correlation calibration does not read (the leverage
+#: grid and its clip bounds): left out of :meth:`LocalCorrelationSpec.key_payload`.
+LC_UNUSED_PARTICLE_FIELDS: tuple[str, ...] = ("leverage_std_span", "leverage_dk", "l_min", "l_max")
+
+
+@dataclass(frozen=True)
+class SviSurfaceConfig:
+    """An SVI-slice surface (:class:`volsto.market.svi_slices.SviSlices`): the slices'
+    maturities, their raw SVI parameters ``(a, b, ρ, m, σ)`` and the surface's last maturity.
+
+    ``record_keys``: provenance — the fit-record key of each slice when the parameters were read
+    from records (SPEC §13.4 pattern); left out of every mapping while ``None`` and never part
+    of a cache key (the parameters are)."""
+
+    times: tuple[float, ...]
+    params: tuple[tuple[float, float, float, float, float], ...]
+    max_maturity: float
+    record_keys: tuple[str, ...] | None = None
+
+    OMIT_WHEN_NONE: ClassVar[frozenset[str]] = frozenset({"record_keys"})
+
+    def __post_init__(self) -> None:
+        if not self.times or len(self.times) != len(self.params):
+            raise ValueError("times and params must be non-empty and of equal length")
+        if any(t <= 0 for t in self.times) or any(np.diff(self.times) <= 0):
+            raise ValueError("slice times must be positive and strictly increasing")
+        if any(len(p) != 5 or not all(math.isfinite(x) for x in p) for p in self.params):
+            raise ValueError("each slice has five finite SVI parameters (a, b, rho, m, sigma)")
+        if not self.max_maturity >= self.times[-1]:
+            raise ValueError("max_maturity must cover the last slice")
+        if self.record_keys is not None and len(self.record_keys) != len(self.times):
+            raise ValueError("one record key per slice")
+
+
+@dataclass(frozen=True)
+class ParametricLambdaConfig:
+    """Settings of the two-parameter fit ``λ(t, k) = clip(λ0 − slope·k, 0, λ_max)``
+    (:func:`volsto.calibration.local_correlation.calibrate_parametric_lambda`; the reference
+    implementation's values).
+
+    ``strikes``: the two fitted strikes as fractions of the basket forward — the
+    at-the-money-forward straddle and the 90 % put.  ``maturity``: the fitted maturity (``None``:
+    the calibration horizon).  ``n_paths``: paths of the fit's common random numbers.  ``h``:
+    forward-difference steps of the Jacobian in ``(ρ0, c)``.  ``tol``: stopping tolerance on the
+    implied-vol residuals (decimal: 0.0002 vol points).  ``maxit``: iterations at most.
+    ``fd_iters``: iterations on which the Jacobian is recomputed before it is held."""
+
+    strikes: tuple[float, ...] = (1.0, 0.9)
+    maturity: float | None = None
+    n_paths: int = 400_000
+    h: tuple[float, float] = (0.004, 0.04)
+    tol: float = 2e-6
+    maxit: int = 15
+    fd_iters: int = 2
+
+    OMIT_WHEN_NONE: ClassVar[frozenset[str]] = frozenset({"maturity"})
+
+    def __post_init__(self) -> None:
+        if len(self.strikes) != 2 or self.strikes[0] != 1.0:
+            raise ValueError("strikes must be (1.0, K): the ATM-forward straddle and one strike")
+        if not (self.strikes[1] > 0 and self.strikes[1] != 1.0):
+            raise ValueError("the second strike must be positive and differ from 1")
+        if self.maturity is not None and self.maturity <= 0:
+            raise ValueError("maturity must be positive")
+        if self.n_paths <= 0 or self.n_paths % 2:
+            raise ValueError("n_paths must be positive and even")
+        if any(x <= 0 for x in self.h) or self.tol <= 0:
+            raise ValueError("Jacobian steps and tolerance must be positive")
+        if self.maxit < 1 or self.fd_iters < 1:
+            raise ValueError("need maxit >= 1 and fd_iters >= 1")
+
+
+@dataclass(frozen=True)
+class LocalCorrelationConfig:
+    """The local correlation model's settings (SPEC §8.7).
+
+    Attributes:
+        family: how ``λ`` is obtained — ``"particle"`` (the particle calibration to the whole
+            index smile), ``"parametric"`` (two parameters fitted to two index vols) or
+            ``"constant"`` (one constant fitted to the index at-the-money straddle).
+        r_low: ``"equi"`` (the equicorrelation at ``rho_min``),
+            ``"historical-scaled:<window>,<target>"`` or ``"matrix:<path>"``.
+        r_high: ``"ones"`` or ``"matrix:<path>"``.
+        rho_min: level of the ``"equi"`` ``R_low`` (0.02: the reference's floor).
+        rho_max: cap of the equicorrelation ``ρ(λ)`` for ``"equi"`` — ``λ_max = (rho_max −
+            rho_min)/(1 − rho_min)`` (0.98: the reference's cap).
+        lambda_max: the cap for a non-``"equi"`` ``R_low`` (``None``: 1.0); must be left unset
+            for ``"equi"``.
+        mode: the basket state — ``"performance"`` (the study's convention) or ``"carry"``.
+        particle: the particle settings; the leverage-only fields are not read.
+        lambda_grid: the ``λ`` grid (the Dupire grid of the index target); ``None``: the shared
+            local-vol grid of the names.
+        clip_policy: ``"report"`` (clip and record) or ``"raise"`` (fail when the clipped mass
+            of a slice exceeds ``max_clipped_mass``).
+        max_clipped_mass: the threshold of ``"raise"`` and of the acceptance gates (1 %).
+        lambda_tail: beyond the trusted quantiles, ``"regressions"`` (``λ*`` from the
+            extrapolated regressions and the target, then clipped) or ``"flat"`` (``λ`` held at
+            its values at the ends of the trusted range).
+        target_average: ``"step"`` (every variance averaged over the step the row governs) or
+            ``"point"`` (values at the step start; a diagnostic).
+        arbitrage: ``"flag"`` (an SVI surface with a butterfly or calendar violation is priced
+            and reported) or ``"raise"``.
+        parametric: the settings of the parametric family.
+    """
+
+    family: str = "particle"
+    r_low: str = "equi"
+    r_high: str = "ones"
+    rho_min: float = 0.02
+    rho_max: float = 0.98
+    lambda_max: float | None = None
+    mode: str = "performance"
+    particle: ParticleConfig = field(default_factory=ParticleConfig)
+    lambda_grid: LocalVolConfig | None = None
+    clip_policy: str = "report"
+    max_clipped_mass: float = 0.01
+    lambda_tail: str = "regressions"
+    target_average: str = "step"
+    arbitrage: str = "flag"
+    parametric: ParametricLambdaConfig = field(default_factory=ParametricLambdaConfig)
+
+    OMIT_WHEN_NONE: ClassVar[frozenset[str]] = frozenset({"lambda_max", "lambda_grid"})
+
+    def __post_init__(self) -> None:
+        # the specification strings are parsed by the family module (imported here, at call
+        # time: volsto.multi imports this module)
+        from volsto.multi.family import parse_r_high_spec, parse_r_low_spec
+
+        if self.family not in LC_FAMILIES:
+            raise ValueError(f"family must be one of {LC_FAMILIES}")
+        low_kind, _ = parse_r_low_spec(self.r_low)
+        parse_r_high_spec(self.r_high)
+        if not 0.0 <= self.rho_min < self.rho_max <= 1.0:
+            raise ValueError("need 0 <= rho_min < rho_max <= 1")
+        if self.lambda_max is not None:
+            if low_kind == "equi":
+                raise ValueError("r_low = 'equi' sets the cap from rho_max: leave lambda_max unset")
+            if not 0.0 < self.lambda_max <= 1.0:
+                raise ValueError("lambda_max must lie in (0, 1]")
+        if self.mode not in ("performance", "carry"):
+            raise ValueError("mode must be 'performance' or 'carry'")
+        if self.clip_policy not in ("report", "raise"):
+            raise ValueError("clip_policy must be 'report' or 'raise'")
+        if not 0.0 <= self.max_clipped_mass <= 1.0:
+            raise ValueError("max_clipped_mass must lie in [0, 1]")
+        if self.lambda_tail not in ("regressions", "flat"):
+            raise ValueError("lambda_tail must be 'regressions' or 'flat'")
+        if self.target_average not in ("step", "point"):
+            raise ValueError("target_average must be 'step' or 'point'")
+        if self.arbitrage not in ("flag", "raise"):
+            raise ValueError("arbitrage must be 'flag' or 'raise'")
+        if self.particle.tail_extrapolation == "sv_slope":
+            raise ValueError("tail_extrapolation 'sv_slope' is the leverage's: not available here")
+
+
+@dataclass(frozen=True)
+class LocalCorrelationSpec:
+    """Everything that determines a calibrated ``λ`` (the local correlation cache key, SPEC
+    §8.7): the names and their index weights, one market (spot 1 and the curves that reproduce
+    the listed forwards) and one SVI surface per name, the index target surface in its own
+    forward moneyness, the model settings, the simulation settings (the step schedule and the
+    scheme are keyed) and the shared local-vol grid.
+
+    ``perturbations`` (one per name or ``None``) and ``index_perturbation`` are the additive
+    surface bumps of the vegas; ``r_low_source`` the digest of the data behind a
+    ``"historical-scaled"`` ``R_low`` (file SHA-256, window, end date) or the SHA-256 of a
+    ``"matrix"`` file — the matrix itself is machine-dependent in its last bits and is never
+    hashed (SPEC §13.3).  ``index_forward_ratios`` (``(T_e, F_I(T_e)/I_0)`` per listed index
+    expiry) and ``label`` are for reports only and are not keyed.
+
+    The calibration seed is ``lc.particle.seed`` (keyed); the pricing seed is ``sim.seed`` (not
+    keyed)."""
+
+    names: tuple[str, ...]
+    weights: tuple[float, ...]
+    markets: tuple[MarketConfig, ...]
+    surfaces: tuple[SviSurfaceConfig, ...]
+    index_surface: SviSurfaceConfig
+    lc: LocalCorrelationConfig
+    sim: SimConfig
+    local_vol: LocalVolConfig
+    perturbations: tuple[SurfacePerturbation | None, ...] | None = None
+    index_perturbation: SurfacePerturbation | None = None
+    r_low_source: str | None = None
+    index_forward_ratios: tuple[tuple[float, float], ...] = ()
+    label: str = ""
+
+    OMIT_WHEN_NONE: ClassVar[frozenset[str]] = frozenset(
+        {"perturbations", "index_perturbation", "r_low_source"}
+    )
+
+    def __post_init__(self) -> None:
+        n = len(self.names)
+        if n == 0 or len(set(self.names)) != n:
+            raise ValueError("names must be non-empty and distinct")
+        if not (len(self.weights) == len(self.markets) == len(self.surfaces) == n):
+            raise ValueError("names, weights, markets and surfaces must have the same length")
+        if self.perturbations is not None and len(self.perturbations) != n:
+            raise ValueError("perturbations: one entry (or None) per name")
+        if any(not math.isfinite(w) or w < 0 for w in self.weights):
+            raise ValueError("weights must be finite and non-negative")
+        if abs(math.fsum(self.weights) - 1.0) > 1e-12:
+            raise ValueError(f"weights must sum to 1 (sum = {math.fsum(self.weights)!r})")
+        horizon = self.lc.particle.horizon
+        schedule = self.sim.step_schedule
+        starts = (0.0, *schedule.breaks)
+        max_dt = max(d for s, d in zip(starts, schedule.dts) if s < horizon)
+        if self.local_vol.t_max < horizon + max_dt - 1e-12:
+            raise ValueError(
+                f"local_vol.t_max = {self.local_vol.t_max:g} must reach the calibration horizon "
+                f"plus one step ({horizon:g} + {max_dt:g}): the last row averages over it"
+            )
+        if self.lc.lambda_grid is not None and self.lc.lambda_grid.t_max < horizon + max_dt - 1e-12:
+            raise ValueError("lc.lambda_grid.t_max must reach the horizon plus one step")
+        for name, s in (*zip(self.names, self.surfaces), ("the index", self.index_surface)):
+            if s.max_maturity < self.local_vol.t_max:
+                raise ValueError(
+                    f"{name}: the surface ends at {s.max_maturity:g}y, before local_vol.t_max = "
+                    f"{self.local_vol.t_max:g}y"
+                )
+        if self.r_low_source is None and not self.lc.r_low == "equi":
+            raise ValueError(
+                f"r_low = {self.lc.r_low!r} needs r_low_source (the digest of its data or file)"
+            )
+
+    @property
+    def n_names(self) -> int:
+        return len(self.names)
+
+    def key_payload(self) -> dict[str, Any]:
+        """What the cache key hashes: everything except ``label`` and ``index_forward_ratios``,
+        the slices' ``record_keys`` (provenance), the pricing-only fields of ``sim`` (as in
+        :meth:`CalibrationSpec.key_payload`: ``n_paths``, ``seed``, ``chunk_size``,
+        ``antithetic``, ``chunk_memory_mb``, ``record_all_steps``) and the particle fields the
+        calibration does not read (:data:`LC_UNUSED_PARTICLE_FIELDS`)."""
+
+        def surface(s: SviSurfaceConfig) -> dict[str, Any]:
+            m: dict[str, Any] = to_mapping(s)
+            m.pop("record_keys", None)
+            return m
+
+        def market(m: MarketConfig) -> dict[str, Any]:
+            out: dict[str, Any] = to_mapping(m)
+            out.pop("close", None)
+            return out
+
+        lc: dict[str, Any] = to_mapping(self.lc)
+        for name in LC_UNUSED_PARTICLE_FIELDS:
+            lc["particle"].pop(name)
+        payload: dict[str, Any] = {
+            "names": list(self.names),
+            "weights": [float(w) for w in self.weights],
+            "markets": [market(m) for m in self.markets],
+            "surfaces": [surface(s) for s in self.surfaces],
+            "index_surface": surface(self.index_surface),
+            "lc": lc,
+            "schedule": to_mapping(self.sim.step_schedule),
+            "scheme": to_mapping(self.sim.scheme),
+            "local_vol": to_mapping(self.local_vol),
+        }
+        if self.perturbations is not None:
+            payload["perturbations"] = [
+                None if p is None else to_mapping(p) for p in self.perturbations
+            ]
+        if self.index_perturbation is not None:
+            payload["index_perturbation"] = to_mapping(self.index_perturbation)
+        if self.r_low_source is not None:
+            payload["r_low_source"] = self.r_low_source
+        return payload
