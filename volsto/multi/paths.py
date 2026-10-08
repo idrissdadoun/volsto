@@ -1,6 +1,11 @@
 """The multi-asset path container: one :class:`~volsto.engine.paths.PathSet` per asset on a
 shared record grid, with the accessors the basket and dispersion products use (performances
-``S_t / S_0 − 1`` against the initial spots or against given reference levels)."""
+``S_t / S_0 − 1`` against the initial spots or against given reference levels).
+
+``aux`` (optional, SPEC §8.7) carries per-path diagnostics of the model that made the paths,
+keyed by name, each an array whose first axis is the paths — the local correlation model's
+``"lam_int"`` (the cumulative ``Σ λ·Δt``) and ``"k_basket"`` (the basket log-moneyness) at the
+record columns.  :meth:`MultiPathSet.concat` concatenates it; the products ignore it."""
 
 from __future__ import annotations
 
@@ -21,6 +26,7 @@ class MultiPathSet:
 
     assets: tuple[PathSet, ...]
     names: tuple[str, ...]
+    aux: dict[str, FloatArray] | None = None
 
     def __post_init__(self) -> None:
         if not self.assets:
@@ -32,6 +38,9 @@ class MultiPathSet:
                 raise ValueError("every asset must share the record times and the path count")
         if len(self.names) != len(self.assets):
             raise ValueError("one name per asset")
+        for key, a in (self.aux or {}).items():
+            if a.shape[0] != n:
+                raise ValueError(f"aux[{key!r}] must have one row per path")
 
     @property
     def times(self) -> FloatArray:
@@ -83,7 +92,15 @@ class MultiPathSet:
             raise ValueError("nothing to concatenate")
         n = parts[0].n_assets
         assets = tuple(PathSet.concat([p.assets[i] for p in parts]) for i in range(n))
-        return MultiPathSet(assets, parts[0].names)
+        first = parts[0].aux
+        if first is None:
+            if any(p.aux is not None for p in parts):
+                raise ValueError("all parts must carry the same aux entries")
+            return MultiPathSet(assets, parts[0].names)
+        if any(p.aux is None or set(p.aux) != set(first) for p in parts):
+            raise ValueError("all parts must carry the same aux entries")
+        aux = {k: np.concatenate([p.aux[k] for p in parts if p.aux is not None]) for k in first}
+        return MultiPathSet(assets, parts[0].names, aux)
 
     def __repr__(self) -> str:
         return (

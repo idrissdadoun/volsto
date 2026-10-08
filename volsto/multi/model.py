@@ -12,7 +12,7 @@ required.  Checked by ``tests/test_multi.py``.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, Protocol
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -24,6 +24,34 @@ from volsto.multi.draws import CorrelatedDraws, check_correlation
 from volsto.multi.paths import MultiPathSet
 
 FloatArray = NDArray[np.float64]
+
+
+class MultiModel(Protocol):
+    """What :class:`~volsto.multi.mc.MultiAssetMonteCarlo` uses of a multi-asset model (SPEC
+    §8.7): satisfied by :class:`MultiAssetModel` (one constant correlation, assets stepped one
+    after another) and by :class:`~volsto.multi.lc_model.LocalCorrelationModel` (a joint
+    kernel).  ``draws_for`` returns the model's own draws object (with ``n_paths`` and
+    ``n_steps``), which ``simulate_chunk`` takes back."""
+
+    @property
+    def n_assets(self) -> int: ...
+
+    def required_times(self) -> FloatArray: ...
+
+    def draws_for(
+        self, grid: TimeGrid, seed: int, n_paths: int, antithetic: bool = True
+    ) -> Any: ...
+
+    def simulate_chunk(
+        self,
+        grid: TimeGrid,
+        draws: Any,
+        p0: int,
+        p1: int,
+        scheme: SchemeConfig,
+        *,
+        step_block: int = 64,
+    ) -> MultiPathSet: ...
 
 
 class MultiAssetModel:
@@ -107,4 +135,4 @@ class MultiAssetModel:
         return f"MultiAssetModel({list(self.names)}, {[repr(m) for m in self.models]})"
 
 
-__all__ = ["MultiAssetModel"]
+__all__ = ["MultiAssetModel", "MultiModel"]
