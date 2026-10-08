@@ -164,6 +164,35 @@ class ForwardCurve:
     def flat(cls, spot: float, r: float, q: float) -> ForwardCurve:
         return cls(spot, DiscountCurve.flat(r), DiscountCurve.flat(q))
 
+    @classmethod
+    def from_forwards(
+        cls,
+        spot: float,
+        times: Sequence[float] | FloatArray,
+        forwards: Sequence[float] | FloatArray,
+        rate_curve: DiscountCurve,
+    ) -> ForwardCurve:
+        """The forward curve through listed forwards ``F_e`` at the expiries ``T_e`` (SPEC §8.7,
+        M12): the dividend curve has the zero rates
+
+            z_q(T_e) = z_r(T_e) − ln(F_e / spot) / T_e
+
+        at the expiries (derived: ``ln F(T) = ln S₀ + z_r(T)·T − z_q(T)·T``), so by the
+        :class:`DiscountCurve` semantics the carry is piecewise flat between expiries and flat
+        beyond the last.  One expiry is a flat carry.  Every listed forward is reproduced to
+        rounding (``tests/test_curves.py::test_forward_curve_from_forwards``: 1e-12)."""
+        t = _as_float_array(times).ravel()
+        f = _as_float_array(forwards).ravel()
+        if t.size == 0 or t.shape != f.shape:
+            raise ValueError("times and forwards must be non-empty with equal length")
+        if not np.all(np.isfinite(f)) or np.any(f <= 0):
+            raise ValueError("forwards must be positive and finite")
+        if not np.isfinite(spot) or spot <= 0:
+            raise ValueError("spot must be positive")
+        # DiscountCurve validates the times (positive, strictly increasing)
+        z_q = rate_curve.zero_rate(t) - np.log(f / float(spot)) / t
+        return cls(spot, rate_curve, DiscountCurve(t, z_q))
+
     def drift(self, t1: ArrayLike, t2: ArrayLike) -> FloatArray:
         """``∫_{t1}^{t2} (r − q) du``: the log-forward increment used by the log-Euler step."""
         return self.rate_curve.integrated(t1, t2) - self.dividend_curve.integrated(t1, t2)

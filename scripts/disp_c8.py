@@ -11,6 +11,11 @@ study's vols within three standard deviations of the money), total variance line
 between the slices.  Writes ``c8.json`` and ``c8.csv``; the differences are reported, there is
 no pass or fail (a terminal copula and a diffusion with the same marginals and the same
 correlation parameter are different joint laws).
+
+The SVI code lives in the library since M12 (``volsto/market/svi_slices.py``, SPEC §8.7): ``svi``,
+``fit_svi`` and ``SviSlices`` below are its aliases, and the numbers are unchanged
+(``tests/test_svi_slices.py::test_svi_matches_c8``, against the frozen copy of the code that was
+here).
 """
 
 # ruff: noqa: E501
@@ -30,7 +35,6 @@ for _v in ("OMP_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "OPENBLAS_NUM_THREADS"):
 
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
-from scipy.optimize import least_squares  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import disp_entries as de  # noqa: E402
@@ -38,7 +42,12 @@ import disp_entries as de  # noqa: E402
 from volsto.config import LocalVolConfig, SimConfig  # noqa: E402
 from volsto.market.curves import DiscountCurve, ForwardCurve  # noqa: E402
 from volsto.market.dupire import LocalVolSurface  # noqa: E402
-from volsto.market.surface import ImpliedSurface  # noqa: E402
+from volsto.market.svi_slices import (  # noqa: E402
+    SviSlices,
+    fit_svi_slice,
+    fit_svi_surface,
+    svi_total_variance,
+)
 from volsto.models.localvol import LocalVol  # noqa: E402
 from volsto.multi.draws import constant_correlation  # noqa: E402
 from volsto.multi.mc import MultiAssetMonteCarlo  # noqa: E402
@@ -47,68 +56,18 @@ from volsto.multi.products import BasketStraddle, Palladium, SingleNameStraddles
 from volsto.studies import disp_data as dd  # noqa: E402
 from volsto.studies import disp_smile as ds  # noqa: E402
 
+#: C8's three SVI names, kept as aliases of the library's (``SviSlices`` is the library's class).
+__all__ = ["SviSlices", "fit_svi", "run_date", "svi"]
 
-def svi(p: np.ndarray, k: np.ndarray) -> np.ndarray:
-    a, b, rho, m, s = p
-    return a + b * (rho * (k - m) + np.sqrt((k - m) ** 2 + s * s))
+#: Raw SVI total variance: the library's (C8's name kept).
+svi = svi_total_variance
 
 
 def fit_svi(e: ds.ExpirySmile) -> tuple[np.ndarray, float]:
-    """Raw-SVI parameters of one expiry's total variance, fitted on the strikes within three
-    standard deviations of the money (at least ±0.15), and the root-mean-square error in vol
-    points."""
-    atm = float(np.interp(0.0, e.k, e.vol))
-    width = max(3.0 * atm * np.sqrt(e.T), 0.15)
-    sel = np.abs(e.k) <= width
-    if sel.sum() < 5:
-        sel = np.ones(e.k.size, dtype=bool)
-    k, w = e.k[sel], e.vol[sel] ** 2 * e.T
-    w0 = atm * atm * e.T
-    x0 = np.array([0.5 * w0, max(w0, 1e-4) / 0.2, -0.4, 0.0, 0.2])
-    lo = np.array([-w0, 1e-6, -0.999, -1.0, 1e-3])
-    hi = np.array([4.0 * w0 + 1e-6, 10.0, 0.999, 1.0, 3.0])
-    fit = least_squares(lambda p: svi(p, k) - w, x0, bounds=(lo, hi))
-    vol_fit = np.sqrt(np.maximum(svi(fit.x, k), 1e-10) / e.T)
-    return fit.x, float(100.0 * np.sqrt(np.mean((vol_fit - e.vol[sel]) ** 2)))
-
-
-class SviSlices(ImpliedSurface):
-    """Total variance from SVI slices, linear in time between them at fixed log-moneyness
-    (proportional to time before the first slice and after the last)."""
-
-    def __init__(
-        self,
-        times: np.ndarray,
-        params: np.ndarray,
-        forward_curve: ForwardCurve,
-        max_maturity: float,
-    ) -> None:
-        super().__init__(forward_curve, forward_curve.rate_curve, max_maturity)
-        self.times, self.params = times, params
-
-    def total_variance(self, k: Any, T: Any) -> Any:
-        k = np.asarray(k, dtype=np.float64)
-        T = np.asarray(T, dtype=np.float64)
-        k_b, T_b = np.broadcast_arrays(k, T)
-        slices = np.stack([np.maximum(svi(p, k_b), 1e-8) for p in self.params])  # (n_slices, …)
-        j = (
-            np.clip(np.searchsorted(self.times, T_b), 1, len(self.times) - 1)
-            if len(self.times) > 1
-            else np.zeros_like(T_b, dtype=int)
-        )
-        if len(self.times) == 1:
-            return slices[0] * T_b / self.times[0]
-        t0, t1 = self.times[j - 1], self.times[j]
-        w0 = np.take_along_axis(slices, (j - 1)[None, ...], axis=0)[0]
-        w1 = np.take_along_axis(slices, j[None, ...], axis=0)[0]
-        inside = w0 + (w1 - w0) * (T_b - t0) / (t1 - t0)
-        before = slices[0] * T_b / self.times[0]
-        after = slices[-1] * T_b / self.times[-1]
-        return np.where(
-            T_b <= self.times[0],
-            before,
-            np.where(T_b >= self.times[-1], after, np.maximum(inside, 1e-8)),
-        )
+    """Raw-SVI parameters of one expiry's total variance and the root-mean-square error in vol
+    points (:func:`volsto.market.svi_slices.fit_svi_slice`; C8's signature kept)."""
+    f = fit_svi_slice(e.k, e.vol, e.T)
+    return np.array(f.params), f.rms_vp
 
 
 def run_date(date: str, n_paths: int) -> dict[str, Any]:
@@ -122,17 +81,12 @@ def run_date(date: str, n_paths: int) -> dict[str, Any]:
     rms = []
     for t in names:
         m, _, smiles = got[t]
-        use = [e for e in smiles if e.T >= 10 / 365.0]
-        keep = [e for e in use if e.T <= T] + [e for e in use if e.T > T][:2]
-        fits = [fit_svi(e) for e in keep]
-        rms += [f[1] for f in fits]
-        times = np.array([e.T for e in keep])
         rate = m.rate
         q = rate - float(np.log(m.f)) / T
         fc = ForwardCurve.flat(1.0, rate, q)
-        surf = SviSlices(
-            times, np.stack([f[0] for f in fits]), fc, max_maturity=max(float(times[-1]), T) + 0.05
-        )
+        # expiries from ten days, those up to T and the next two; no fit records (a report)
+        surf, fits = fit_svi_surface(smiles, fc, horizon=T, origin="disp_c8")
+        rms += [f.rms_vp for f in fits]
         cfg = LocalVolConfig(
             t_min=1.0 / 365.0, t_max=T + 0.02, n_t=120, k_min=-2.0, k_max=2.0, n_k=1601
         )

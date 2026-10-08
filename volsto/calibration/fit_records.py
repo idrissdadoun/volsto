@@ -271,14 +271,22 @@ class FitRecords:
         return doc
 
     def put(
-        self, key: str, inputs: Mapping[str, Any], summary: Mapping[str, Any], *, origin: str
+        self,
+        key: str,
+        inputs: Mapping[str, Any],
+        summary: Mapping[str, Any],
+        *,
+        origin: str,
+        code_tag: str = FIT_CODE_TAG,
     ) -> dict[str, Any]:
         """Write the record of ``key`` unless one exists; returns the stored record (the
-        existing one when there is one: the first writer wins)."""
+        existing one when there is one: the first writer wins).  ``code_tag`` is the numerics
+        tag of the fit the record holds: the marking fit's by default, the SVI slice fit's
+        (:data:`volsto.market.svi_slices.SVI_FIT_CODE_TAG`) for the records of SPEC §8.7."""
         doc = {
             "version": RECORD_VERSION,
             "key": key,
-            "fit_code_tag": FIT_CODE_TAG,
+            "fit_code_tag": code_tag,
             "inputs": input_digests(inputs),
             "origin": origin,
             "host": socket.gethostname(),
