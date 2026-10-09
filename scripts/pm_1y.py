@@ -55,6 +55,17 @@ specification-only build of ``scripts/pm_1y_slices.py``; its specification key i
 with the row's); without it the page prints what the row gives and says that the list is not
 available.
 
+The index level.  Under 2a and 3a a second table gives, per date, the at-the-money vol of the
+model's index target at the horizon (the row's ``index_errors``), ``sig_B_DJX`` of the study's
+entry, their difference, ``rho_cc`` and ``rho_cop``: LC/copula and CC/copula carry that gap,
+only LC/CC is a local-correlation effect.
+
+Flagged rows.  A row flagged for the clipped mass stays in every table; its records say so in
+their notes (``row flagged: …``), and so do the records of the summary over every priced date.
+A cell of the index errors is marked when its model vol is not invertible, when its target vol
+is below a quarter of the slice's at-the-money target vol (degenerate) or below half of it
+(thin); the CSVs carry one ``<column>_mark`` per index-error cell.
+
 Section 1's "before" row is the one of the old defaults (no calendar repair of the names or of
 DJX, no unscreened fallback): ``rows/<tenor>_production_norepair/<date>.json``, else
 ``rows/<tenor>_development_norepair/<date>.json``; it is compared with the column of the same
@@ -121,6 +132,13 @@ GATE_VP = 0.15
 NAN_EXEMPT = ("align_", "C_200", "Cfwd", "profile_")
 #: a target vol below this share of the slice's at-the-money target vol is called degenerate
 DEGENERATE_TARGET = 0.25
+#: a target vol below this share of the slice's at-the-money target vol (and not degenerate) is
+#: called thin
+THIN_TARGET = 0.5
+#: the short marks of a cell of ``index_errors`` (the CSVs' mark columns)
+MARK_NOT_INVERTIBLE = "model vol not invertible"
+MARK_DEGENERATE = "target degenerate"
+MARK_THIN = "thin target"
 NOT_INVERTIBLE = (
     "model vol not invertible (no Monte Carlo payoff beyond the strike); error = −target"
 )
@@ -337,9 +355,10 @@ class Quantity:
     kind: str = "float"  # "float" | "int" | "bool"
     no_se: str = ""  # why the number has no standard error
     summarise: bool = True
-    #: ``(row, value, se) -> (cell text, note)``: what replaces the plain ``value ± se`` in a
+    #: ``(row, value, se) -> (cell text, note, mark)``: what replaces the plain ``value ± se`` in a
     #: table cell and what the record's notes say of it (empty strings: nothing to say)
-    annotate: Callable[[dict[str, Any], float, float | None], tuple[str, str]] | None = None
+    #: and its short mark (``cell_flags`` joined; empty: a usable cell)
+    annotate: Callable[[dict[str, Any], float, float | None], tuple[str, str, str]] | None = None
 
 
 def _row(key: str, se: str | None = None) -> Getter:
@@ -410,23 +429,51 @@ def index_cells(row: dict[str, Any] | None) -> list[dict[str, Any]]:
     return list(cells) if isinstance(cells, list) else []
 
 
-def cell_mark(row: dict[str, Any], cell: dict[str, Any]) -> str:
-    """What a reader must know of one cell of ``index_errors`` beyond its number: the model vol
-    is not invertible (0 in the row), or the target vol is below ``DEGENERATE_TARGET`` of the
-    slice's at-the-money target vol.  Empty when neither."""
+def cell_flags(row: dict[str, Any], cell: dict[str, Any]) -> list[str]:
+    """The short marks of one cell of ``index_errors``: the model vol is not invertible (0 in
+    the row); the target vol is below ``DEGENERATE_TARGET`` of the slice's at-the-money target
+    vol (degenerate) or between that and ``THIN_TARGET`` of it (thin).  Empty: a usable cell."""
     marks = []
-    model, target = _number(cell, "model_vol"), _number(cell, "target_vol")
-    if not model > 0:
+    if not _number(cell, "model_vol") > 0:
+        marks.append(MARK_NOT_INVERTIBLE)
+    atm = [c for c in index_cells(row) if c["T"] == cell["T"] and c["strike"] == "+0.0"]
+    if atm and _number(atm[0], "target_vol") > 0:
+        share = _number(cell, "target_vol") / _number(atm[0], "target_vol")
+        if share < DEGENERATE_TARGET:
+            marks.append(MARK_DEGENERATE)
+        elif share < THIN_TARGET:
+            marks.append(MARK_THIN)
+    return marks
+
+
+def cell_mark(row: dict[str, Any], cell: dict[str, Any]) -> str:
+    """What a reader must know of one cell of ``index_errors`` beyond its number, in words
+    (:func:`cell_flags`).  Empty when the cell is usable."""
+    flags = cell_flags(row, cell)
+    marks = []
+    target = _number(cell, "target_vol")
+    if MARK_NOT_INVERTIBLE in flags:
         marks.append(NOT_INVERTIBLE)
     atm = [c for c in index_cells(row) if c["T"] == cell["T"] and c["strike"] == "+0.0"]
-    if atm and target < DEGENERATE_TARGET * _number(atm[0], "target_vol"):
+    if MARK_DEGENERATE in flags:
         text = f"target vol {100 * target:.2f} % against {100 * _number(atm[0], 'target_vol'):.2f} % at the money: degenerate"
         at_horizon = math.isclose(float(cell["T"]), _number(row, "T"), abs_tol=1e-9)
         if at_horizon and str(cell["strike"]).startswith("+"):
             repaired = "repaired " if (row.get("n_dropped_calendar_index") or 0) > 0 else ""
             text += f"; the {repaired}DJX target is not usable on the upside on this date"
         marks.append(text)
+    if MARK_THIN in flags:
+        marks.append(f"thin target: target vol {100 * target:.2f} % against {100 * _number(atm[0], 'target_vol'):.2f} % at the money, below half of it")  # fmt: skip
     return "; ".join(marks)
+
+
+def horizon_cell(row: dict[str, Any] | None, strike: str) -> dict[str, Any] | None:
+    """The cell of ``index_errors`` at the horizon at ``strike`` (a label of the list)."""
+    if row is None:
+        return None
+    T = _number(row, "T")
+    cells = [c for c in index_cells(row) if c["strike"] == strike and math.isclose(float(c["T"]), T, abs_tol=1e-9)]  # fmt: skip
+    return cells[0] if cells else None
 
 
 def _where(row: dict[str, Any], cell: dict[str, Any]) -> str:
@@ -439,42 +486,59 @@ def _vols(cell: dict[str, Any]) -> str:
     return f"model vol {100 * _number(cell, 'model_vol'):.2f} %, target vol {100 * _number(cell, 'target_vol'):.2f} %"
 
 
-def _mark_at_horizon(
-    strike: str,
-) -> Callable[[dict[str, Any], float, float | None], tuple[str, str]]:
+Annotate = Callable[[dict[str, Any], float, float | None], tuple[str, str, str]]
+
+
+def _mark_at_horizon(strike: str) -> Annotate:
     """The cell text of the index error at ``strike`` (a label of ``index_errors``) at the
     horizon when the cell is marked (:func:`cell_mark`)."""
 
-    def annotate(row: dict[str, Any], value: float, se: float | None) -> tuple[str, str]:
-        T = _number(row, "T")
-        cells = [c for c in index_cells(row) if c["strike"] == strike and math.isclose(float(c["T"]), T, abs_tol=1e-9)]  # fmt: skip
-        if not cells:
-            return "", ""
-        mark = cell_mark(row, cells[0])
+    def annotate(row: dict[str, Any], value: float, se: float | None) -> tuple[str, str, str]:
+        cell = horizon_cell(row, strike)
+        if cell is None:
+            return "", "", ""
+        mark, short = cell_mark(row, cell), "; ".join(cell_flags(row, cell))
         if not mark:
-            return "", _vols(cells[0])
-        if _number(cells[0], "model_vol") > 0:
-            return f"{pc.pm(value, se, 3)} ({mark})", f"{_vols(cells[0])}; {mark}"
-        return f"{mark} ({value:.3f})", f"{_vols(cells[0])}; {mark}"
+            return "", _vols(cell), ""
+        if _number(cell, "model_vol") > 0:
+            return f"{pc.pm(value, se, 3)} ({mark})", f"{_vols(cell)}; {mark}", short
+        return f"{mark} ({value:.3f})", f"{_vols(cell)}; {mark}", short
 
     return annotate
 
 
-def _mark_max(limit: float) -> Callable[[dict[str, Any], float, float | None], tuple[str, str]]:
-    """The cell text of the row's largest |index error| inside ±``limit`` sd over the slices:
-    the value, the slice and the strike where it sits (found in ``index_errors``), the error of
-    that cell, and its mark."""
+def sd_cells(
+    row: dict[str, Any] | None, limit: float, usable: bool = False
+) -> list[dict[str, Any]]:
+    """The cells of ``index_errors`` at the strikes in at-the-money sd inside ±``limit``, over
+    the slices; with ``usable``, only those that carry no mark (:func:`cell_flags`)."""
+    cells = [c for c in index_cells(row) if c["strike"] != "90%" and abs(float(c["strike"])) <= limit + 1e-9]  # fmt: skip
+    return [c for c in cells if not cell_flags(row or {}, c)] if usable else cells
 
-    def annotate(row: dict[str, Any], value: float, se: float | None) -> tuple[str, str]:
-        cells = [c for c in index_cells(row) if c["strike"] != "90%" and abs(float(c["strike"])) <= limit + 1e-9]  # fmt: skip
+
+def _usable_max(r: dict[str, Any] | None, e: dict[str, Any] | None) -> tuple[float, None]:
+    if not index_cells(r):
+        raise KeyError("index_errors")
+    cells = sd_cells(r, 2.5, usable=True)
+    return (max(abs(_number(c, "error_vp")) for c in cells) if cells else float("nan")), None
+
+
+def _mark_max(limit: float, usable: bool = False) -> Annotate:
+    """The cell text of the row's largest |index error| inside ±``limit`` sd over the slices
+    (over the usable cells only with ``usable``): the value, the slice and the strike where it
+    sits (found in ``index_errors``), the error of that cell, and its mark."""
+
+    def annotate(row: dict[str, Any], value: float, se: float | None) -> tuple[str, str, str]:
+        cells = sd_cells(row, limit, usable)
         if not cells:
             return (
                 "",
                 "the row does not carry the list of cells: where the maximum sits is not known",
+                "",
             )
         worst = max(cells, key=lambda c: abs(_number(c, "error_vp")))
         if not math.isclose(abs(_number(worst, "error_vp")), value, rel_tol=1e-9, abs_tol=1e-12):
-            return "", "the row's maximum is not a cell of its index_errors list"
+            return "", "the row's maximum is not a cell of its index_errors list", ""
         cell_se = _number(worst, "stderr_vp")
         text = f"{value:.3f} at {_where(row, worst)}"
         note = f"sits at {_where(row, worst)}: error {_number(worst, 'error_vp'):+.3f} vol points, {_vols(worst)}"
@@ -485,9 +549,24 @@ def _mark_max(limit: float) -> Callable[[dict[str, Any], float, float | None], t
         if mark:
             text += f" — {mark}"
             note += f"; {mark}"
-        return text, note
+        return text, note, "; ".join(cell_flags(row, worst))
 
     return annotate
+
+
+def _target_atm(r: dict[str, Any] | None, e: dict[str, Any] | None) -> tuple[float, None]:
+    cell = horizon_cell(r, "+0.0")
+    if cell is None:
+        raise KeyError("index_errors")
+    return 100 * _number(cell, "target_vol"), None
+
+
+def _study_atm(r: dict[str, Any] | None, e: dict[str, Any] | None) -> tuple[float, None]:
+    return 100 * _number(e, "sig_B_DJX"), None
+
+
+def _atm_gap(r: dict[str, Any] | None, e: dict[str, Any] | None) -> tuple[float, None]:
+    return _target_atm(r, e)[0] - _study_atm(r, e)[0], None
 
 
 NO_SE_STUDY = "read from the study's table, which carries no standard error for it"
@@ -569,6 +648,15 @@ INDEX_MORE = [
     Quantity("idx_err_p25", "+2.5 sd", f"{_IDX}, at the horizon at +2.5 sd", _row("idx_err_p25", "idx_err_p25_se"), unit="vol points", digits=3, summarise=False, annotate=_mark_at_horizon("+2.5")),
     Quantity("idx_err_max_1p5", "largest absolute error inside ±1.5 sd, all slices", f"the largest absolute value of {_IDX} over the kept DJX slices up to the horizon and the strikes at 0, ±0.5, ±1 and ±1.5 sd (the row's idx_err_max_1p5)", _row("idx_err_max_1p5"), unit="vol points", digits=3, no_se=NO_SE_MAX, summarise=False, annotate=_mark_max(1.5)),
     Quantity("idx_err_max_2p5", "largest absolute error inside ±2.5 sd, all slices", f"the largest absolute value of {_IDX} over the kept DJX slices up to the horizon and the strikes at 0, ±0.5, …, ±2.5 sd (the row's idx_err_max_2p5)", _row("idx_err_max_2p5"), unit="vol points", digits=3, no_se=NO_SE_MAX, summarise=False, annotate=_mark_max(2.5)),
+    Quantity("idx_err_max_2p5_usable", "largest absolute error inside ±2.5 sd over the usable cells, all slices", f"the largest absolute value of {_IDX} over the cells of the row's index_errors list (kept DJX slices up to the horizon, strikes at 0, ±0.5, …, ±2.5 sd) that carry no mark: model vol invertible and target vol at least half the slice's at-the-money target vol (computed here from the list)", _usable_max, unit="vol points", digits=3, no_se=NO_SE_MAX, summarise=False, annotate=_mark_max(2.5, usable=True)),
+]  # fmt: skip
+_NO_SE_INPUT = "the calibration's target, an input of the model: not a Monte Carlo estimate"
+LEVEL = [
+    Quantity("target_atm_vol", "index target ATM vol at the horizon (model)", "the at-the-money (log-forward-moneyness 0) vol of the model's index target — its SVI surface of the kept DJX slices — at the horizon, in percent (the target_vol of the row's index_errors list at the horizon, strike +0.0)", _target_atm, unit="vol in %", digits=2, no_se=_NO_SE_INPUT, summarise=False),
+    Quantity("study_atm_vol", "index ATM vol of the study's entry", "sig_B_DJX of the study's entry, basket B1, in percent: the implied vol at K = S_0 (the spot) of the study's DJX marginal at the entry's maturity (scripts/disp_entries.py: the marginal's atm_vol; for B1 it is the study's sig_B)", _study_atm, origin="study", unit="vol in %", digits=2, no_se=NO_SE_STUDY, summarise=False),
+    Quantity("target_minus_study_atm", "target minus study, ATM", "the model's index target at-the-money vol at the horizon minus sig_B_DJX of the study's entry, in vol points (the first at the forward, the second at the spot)", _atm_gap, origin="both", unit="vol points", digits=2, no_se="a difference of two inputs, not a Monte Carlo estimate", summarise=False),
+    Quantity("rho_cc", "ρ_CC", "the constant correlation of the companion model, the one that reprices the index at-the-money straddle (the row's rho_cc)", _row("rho_cc"), unit="correlation", no_se="a fitted parameter: the row carries no standard error for it", summarise=False),
+    Quantity("rho_cop", "ρ_cop", "the copula's correlation of the study's entry, basket B1 (rho_cop)", _study("rho_cop"), origin="study", unit="correlation", no_se=NO_SE_STUDY, summarise=False),
 ]  # fmt: skip
 DELTAS = [
     Quantity("delta_fwd_lc", "Δ forward LC", "sticky-strike common delta of the forward under LC: percent of the model's price per +1 % of every spot", _row("delta_fwd_lc", "delta_fwd_lc_se"), unit="% per %"),
@@ -598,6 +686,7 @@ GROUPS: dict[str, list[Quantity]] = {
     "index": INDEX,
     "gate": GATE,
     "index_more": INDEX_MORE,
+    "level": LEVEL,
     "deltas": DELTAS,
     "flags": FLAGS,
 }
@@ -620,6 +709,7 @@ class Cell:
     state: str  # "value" | "pending" | "failed" | "absent"
     note: str = ""
     text: str = ""  # what a table cell shows instead of ``value ± se`` (``Quantity.annotate``)
+    mark: str = ""  # the short mark of an index-error cell (empty: usable)
 
 
 def evaluate(q: Quantity, slot: Slot) -> Cell:
@@ -646,8 +736,8 @@ def evaluate(q: Quantity, slot: Slot) -> Cell:
     if se is not None and not math.isfinite(se):
         se = None
     if q.annotate is not None and slot.row is not None:
-        text, note = q.annotate(slot.row, float(value), se)
-        return Cell(float(value), se, "value", note, text)
+        text, note, mark = q.annotate(slot.row, float(value), se)
+        return Cell(float(value), se, "value", note, text, mark)
     return Cell(float(value), se, "value")
 
 
@@ -666,6 +756,28 @@ def show(q: Quantity, cell: Cell) -> str:
     if q.kind == "bool":
         return "yes" if cell.value else "no"
     return pc.pm(cell.value, cell.se, q.digits)
+
+
+RUNAWAY_NOTE = "high-strike call: a few runaway paths carry part of it (section V3 of the main package, measured at 3m; not measured at 12m); its ± is not a usable error"
+SECOND_MOMENT_NOTE = "a second-moment quantity carried by a few paths, like the high-strike calls: its ± is not a usable error (see 'What the ± is')"
+SECOND_MOMENT_KEYS = ("kappa_lc", "kappa_cc", "EV_over_EQV_lc", "EV_over_EQV_cc", "ED_eqv", "ED_eqv_over_cc", "ED_eqv_over_copula", "EV_single_part", "EV_single_part_over_EQV")  # fmt: skip
+
+
+def key_notes(q: Quantity) -> list[str]:
+    """What the notes of every record of a quantity say, whatever the date: the runaway caveat
+    of the calls at K_125 and K_150 (the model's, not the copula's), the caveat of the
+    second-moment quantities."""
+    if q.origin != "study" and q.key.startswith(("C_125", "C_150")):
+        return [RUNAWAY_NOTE]
+    return [SECOND_MOMENT_NOTE] if q.key in SECOND_MOMENT_KEYS else []
+
+
+def flag_note(slot: Slot) -> str:
+    """``row flagged: …`` for a priced row flagged for the clipped mass (owner's decision 5)."""
+    if not clip_flagged(slot):
+        return ""
+    low, high = _number(slot.row, "clip_low_inner_max"), _number(slot.row, "clip_high_inner_max")
+    return f"row flagged: clipped mass {low:.4f} at λ = 0 / {high:.4f} at the cap inside ±2.5 sd (flagged above {CLIP_FLAG_MASS})"
 
 
 def clip_flagged(slot: Slot) -> bool | None:
@@ -714,6 +826,11 @@ class Builder:
             notes.append(STUDY_NOTE)
         if slot.priced and q.origin != "study" and slot.row and slot.row.get("status") != "ok":
             notes.append(f"row status {slot.row.get('status')}: {slot.row.get('reason', '')}")
+        if q.origin != "study":
+            notes += [n for n in (flag_note(slot), *key_notes(q)) if n]
+        elif flag_note(slot):
+            # a number of the study's entry on a date whose model row is flagged
+            notes.append(f"the model's row of this date and budget is flagged ({flag_note(slot)})")
         self.records.append(
             pc.record(
                 f"{SECTION}.{slot.group}.{slot.date}.{q.key}",
@@ -778,7 +895,8 @@ DEFINITIONS = {
     "split": "The split of the LC figure: E_LC[V] − EQV = single-name part − basket part, with single-name part = Σ w E_LC[R_i²] − Σ w M_i^listed and basket part = E_LC[R̄²] − M_B^listed (both in squared returns); each also over EQV (so that E_LC[V]/EQV − 1 = single-name part/EQV − basket part/EQV), and the basket part over M_B^listed.",
     "calls": "C = E[(D − K)⁺] at the study's cash strikes K_m = m × P_D under LC, CC and the copula (the entry's C_m ± C_se_m), in fractions of the notional; LC/copula carries the delta-method error of two independent estimates, LC/CC is paired on common paths.",
     "calibration": "Clipped mass: the share of the particles that are inside ±2.5 at-the-money sd of the basket and whose λ is clipped at 0, resp. at the cap, the largest over the calibration's slices (fractions; a date is flagged above 0.01); index errors: the model's implied vol of the index at the horizon minus its target, in vol points; names beyond last kept expiry: the number of names whose last expiry kept after the screen and the calendar repair is before the horizon (a count: the row does not name the names).",
-    "gate": "Index gate (the row's check_index): the index errors at the money and at the 90 % strike at the horizon, each within 0.15 vol points in absolute value; it is waived whenever the wing binds (the row's wing_binds: clipped mass above 1 % inside ±2.5 sd), so check_index true and status ok do not mean that the index smile is repriced. 'Outside 0.15 vp' says whether either of the two numbers is beyond 0.15, waived or not. +1.5 sd and +2.5 sd: the index error at the horizon on the upside. Largest absolute error: the row's idx_err_max_1p5 and idx_err_max_2p5, over the kept DJX slices up to the horizon and the strikes in at-the-money sd, with the slice and the strike where it sits (found in the row's index_errors list) and that cell's own error ± its standard error; a maximum over cells has no standard error of its own. A cell marked 'model vol not invertible (no Monte Carlo payoff beyond the strike); error = −target' is a far out-of-the-money strike with a negligible price: the Monte Carlo option has no payoff beyond the strike, the row stores a model vol of 0, and the 'error' equals minus the target vol; it is not a mispriced smile. A cell marked 'target vol … degenerate' is one where the target vol itself is below a quarter of the slice's at-the-money target vol: the DJX target is not usable at that strike.",
+    "gate": "Index gate (the row's check_index): the index errors at the money and at the 90 % strike at the horizon, each within 0.15 vol points in absolute value; it is waived whenever the wing binds (the row's wing_binds: clipped mass above 1 % inside ±2.5 sd), so check_index true and status ok do not mean that the index smile is repriced. 'Outside 0.15 vp' says whether either of the two numbers is beyond 0.15, waived or not. +1.5 sd and +2.5 sd: the index error at the horizon on the upside. Largest absolute error: the row's idx_err_max_1p5 and idx_err_max_2p5, over the kept DJX slices up to the horizon and the strikes in at-the-money sd, with the slice and the strike where it sits (found in the row's index_errors list) and that cell's own error ± its standard error; a maximum over cells has no standard error of its own. A cell marked 'model vol not invertible (no Monte Carlo payoff beyond the strike); error = −target' is a far out-of-the-money strike with a negligible price: the Monte Carlo option has no payoff beyond the strike, the row stores a model vol of 0, and the 'error' equals minus the target vol; it is not a mispriced smile. A cell marked 'target vol … degenerate' is one where the target vol itself is below a quarter of the slice's at-the-money target vol: the DJX target is not usable at that strike. A cell marked 'thin target' is one where the target vol is between a quarter and a half of the slice's at-the-money target vol. The largest absolute error over the usable cells is the maximum over the cells that carry none of the three marks (computed here from the row's index_errors list). The CSVs carry one mark column per index-error cell (`<column>_mark`).",
+    "level": "Index target ATM vol at the horizon (model): the at-the-money vol (log-forward-moneyness 0) of the model's index target — its SVI surface of the kept DJX slices, after the screen and the repair — at the horizon, in percent (the target_vol of the row's index_errors list). Index ATM vol of the study's entry: sig_B_DJX of basket B1, in percent — the implied vol at K = S_0 (the spot) of the study's DJX marginal at the entry's maturity (`scripts/disp_entries.py`: the marginal's atm_vol; for B1 it is the study's sig_B). Their difference is in vol points (the first is at the forward, the second at the spot). ρ_CC: the companion's constant correlation, the one that reprices the index at-the-money straddle (the row's rho_cc; the row carries no standard error for it). ρ_cop: the copula's correlation of the study's entry.",
     "deltas": f"Sticky-strike common deltas as elasticities (percent of each model's price per +1 % of every spot, central difference of ±1 %); the forward's LC delta = homogeneity (exactly 1) + skew channel (Δ^CC − 1) + correlation channel (Δ^LC − Δ^CC, paired). {STICKY}",
     "flags": f"{STATUS_NOTE} Row written: the time of the row's file, New York (month-day hour:minute); a name beyond its last kept expiry: n_names_extrapolated > 0, a count of names whose last expiry kept after the screen and the calendar repair is before the horizon (the row does not name them; the names in brackets are the specification build's, when its table is there); DJX target extrapolated: the last DJX slice kept is before the horizon; DJX target repaired: the calendar repair dropped at least one DJX expiry (n_dropped_calendar_index > 0; which ones: table 4b); a name kept unscreened: the quote screen emptied the name and it is kept on its unscreened expiries (decision 2); wing binds: the row's wing_binds; index gate: the index errors at the money and at the 90 % strike at the horizon, in vol points; outside 0.15 vp: either is beyond 0.15 in absolute value, waived or not; clip flags: the share clipped at λ = 0, resp. at the cap, exceeds 1 % inside ±2.5 sd (strictly).",
 }
@@ -827,10 +945,35 @@ def reads_nonfinite(q: Quantity, slot: Slot) -> bool:
     return not math.isfinite(value) or (se is not None and not math.isfinite(se))
 
 
-def check_detail(slot: Slot) -> str:
+def unusable_upside(slot: Slot, peers: Sequence[Slot]) -> str:
+    """For a date whose index target is degenerate on the upside at the horizon: the target
+    vols there against the at-the-money one, and where the date's CC/copula and LC/copula stand
+    among its set of dates.  Empty when the target is not degenerate there."""
+    r = slot.row or {}
+    atm = horizon_cell(r, "+0.0")
+    up = [(k, horizon_cell(r, k)) for k in ("+1.0", "+1.5", "+2.0", "+2.5")]
+    if atm is None or not any(c is not None and MARK_DEGENERATE in cell_flags(r, c) for _, c in up):  # fmt: skip
+        return ""
+    vols = ", ".join(f"{k} sd {100 * _number(c, 'target_vol'):.2f} %" for k, c in up[:3] if c is not None)  # fmt: skip
+    repaired = "repaired " if (r.get("n_dropped_calendar_index") or 0) > 0 else ""
+    text = f"on this date the {repaired}DJX target is not usable on the upside at the horizon (target vols: {vols}, against {100 * _number(atm, 'target_vol'):.2f} % at the money) and that target feeds every LC and CC number of the row"
+    ranks = []
+    for q in (FORWARD[5], FORWARD[4]):
+        mine = evaluate(q, slot).value
+        others = [v for v in (evaluate(q, s).value for s in peers if s.priced) if v is not None]
+        if mine is not None and others:
+            ranks.append((q.label, mine, 1 + sum(v > mine for v in others), len(others)))
+    if ranks and all(rank == 1 for _, _, rank, _ in ranks):
+        text += f" (its {' and '.join(f'{label} {value:.3f}' for label, value, _, _ in ranks)} are the highest of the {ranks[0][3]} {slot.budget} dates)"
+    elif ranks:
+        text += " (" + "; ".join(f"its {label} {value:.3f} is number {rank} of the {n} {slot.budget} dates from the top" for label, value, rank, n in ranks) + ")"  # fmt: skip
+    return text
+
+
+def check_detail(slot: Slot, peers: Sequence[Slot] = ()) -> str:
     """For a priced row whose status is not ok: which gating check fails and, for
     ``check_no_nan``, which columns are not finite and which printed cells read them — computed
-    from the row."""
+    from the row; ``peers``: the dates of the row's set (for the standing of its ratios)."""
     r = slot.row or {}
     parts = []
     for check in (c for c in GATING if r.get(c) is False):
@@ -848,9 +991,12 @@ def check_detail(slot: Slot) -> str:
                 text += f" — the standard error of the index error at {' and '.join(dead)} at the horizon, where the model's implied vol is not invertible (model vol 0 in the row: no vega, no standard error)"
             affected = [q.label for q in ALL if q.origin != "study" and reads_nonfinite(q, slot)]
             if affected:
-                text += f". Printed cells that read these columns: {', '.join(repr(a) for a in affected)} of the index tables (marked there); no other printed number is affected"
+                text += f". Printed cells that read these columns: {', '.join(repr(a) for a in affected)} of the index tables (marked there); no other printed cell reads these columns"
             else:
-                text += ". No printed number is affected"
+                text += ". No printed cell reads these columns"
+            upside = unusable_upside(slot, peers)
+            if upside:
+                text += f"; {upside}"
             parts.append(text)
         elif check == "check_forward":
             parts.append(
@@ -1032,7 +1178,7 @@ def djx_statement(d: Djx, date: str, tenor: str) -> list[str]:
             out.append(
                 f"The slices the repair drops are the better fitted ones (SVI rms {float(cal['svi_rms_vp'].min()):.2f} to {float(cal['svi_rms_vp'].max()):.2f} vp) and the slices it keeps above the horizon the worse fitted ones "
                 f"({years(above['T'])}: SVI rms {float(above['svi_rms_vp'].min()):.2f} to {float(above['svi_rms_vp'].max()):.2f} vp): of a crossing pair the rule drops the shorter slice when both are third-Friday expiries. "
-                "This is the opposite of what an earlier review recommended (drop the long, badly fitted slices)."
+                "This is the opposite of what the earlier review recommended (SPEC 8.7, [review] LC4G-g: drop the long, badly fitted slices)."
             )
     elif hi is None:
         out.append(f"No kept DJX slice lies above the horizon: the target is extrapolated beyond {lo:.3f}y." if lo is not None else "No DJX slice is kept on either side of the horizon.")  # fmt: skip
@@ -1071,6 +1217,7 @@ def budget_gap_3m(b: Builder) -> str:
     """The 3m fact on the budget: development minus production in LC/CC on the reference dates,
     from the main package's rows (one record per date); empty when a row is not there."""
     gaps = []
+    commits: dict[str, set[str]] = {"development": set(), "production": set()}
     for date in pc.REFERENCE_DATES:
         paths = {k: d / f"{date}.json" for k, d in ROWS_3M.items()}
         if not all(p.exists() for p in paths.values()):
@@ -1081,6 +1228,8 @@ def budget_gap_3m(b: Builder) -> str:
         gap = float(rows["development"]["ratio"]) - float(rows["production"]["ratio"])
         se = float(rows["development"]["ratio_se"])
         gaps.append((gap, se))
+        commits["development"].add(str(rows["development"].get("git_commit", "")))
+        commits["production"].add(str(rows["production"].get("git_commit", "")))
         b.records.append(
             pc.record(
                 f"{SECTION}.budget_3m.{date}.lc_over_cc_dev_minus_prod", SECTION, "3m: LC/CC at the development budget minus LC/CC at the production budget", gap, None, date=date, tenor="3m", unit="ratio",
@@ -1093,7 +1242,7 @@ def budget_gap_3m(b: Builder) -> str:
     times = [abs(g) / s for g, s in gaps]
     return (
         f"At 3m, development minus production in LC/CC is {lo:.4f} to {hi:.4f} on the {len(gaps)} reference dates, several times the printed error "
-        f"({min(times):.1f} to {max(times):.1f} times the ± of the development rows; rows of the main package: `{ROWS_3M['development']}` and `{ROWS_3M['production']}`)."
+        f"({min(times):.1f} to {max(times):.1f} times the ± of the development rows; rows of the main package: `{ROWS_3M['development']}`, written at commit {', '.join(sorted(commits['development']))}, and `{ROWS_3M['production']}`, written at commit {', '.join(sorted(commits['production']))})."
     )
 
 
@@ -1119,6 +1268,277 @@ def budget_gap_12m(b: Builder, prod: Sequence[Slot], dev: Sequence[Slot]) -> str
     if not out:
         return f"At {b.tenor} no date is priced at both budgets yet: the difference is not measured at {b.tenor}."
     return f"At {b.tenor}, development minus production in LC/CC on the dates priced at both budgets — {'; '.join(out)}."
+
+
+def flag_line(slots: Sequence[Slot], short: bool = False) -> str:
+    """One line under a table of a set of dates: which of its priced dates are flagged for the
+    clipped mass (with the two masses) and which have gate numbers outside 0.15 vp; ``short``:
+    the count and the dates not flagged only (the twenty dates)."""
+    priced = [s for s in slots if s.priced and s.row]
+    if not priced:
+        return ""
+    budget = priced[0].budget
+    flagged = [s for s in priced if clip_flagged(s)]
+    if short:
+        clear = [s.date for s in priced if not clip_flagged(s)]
+        n_out = sum(bool(_gate_outside(s.row, None)[0]) for s in priced if "idx_err_atm" in (s.row or {}))  # fmt: skip
+        return (
+            f"Flagged rows stay in this table: {len(flagged)} of the {len(priced)} priced {budget} dates are flagged for the clipped mass "
+            f"(not flagged: {', '.join(clear) if clear else 'none'}); {n_out} have gate numbers outside 0.15 vp. The two masses are in table 3e, the gate numbers in table 3e-2, the flags in table 4a."
+        )
+    head = f"all {len(priced)}" if len(flagged) == len(priced) else f"{len(flagged)} of the {len(priced)}"  # fmt: skip
+    text = f"Flagged rows stay in this table: {head} priced {budget} dates are flagged for the clipped mass"
+    if flagged:
+        text += " (at λ = 0 / at the cap, flagged above 0.01: " + "; ".join(f"{s.date} {_number(s.row, 'clip_low_inner_max'):.4f} / {_number(s.row, 'clip_high_inner_max'):.4f}" for s in flagged) + ")"  # fmt: skip
+    outside = [s for s in priced if "idx_err_atm" in (s.row or {}) and _gate_outside(s.row, None)[0]]  # fmt: skip
+    if outside:
+        text += ". Gate numbers outside 0.15 vp: " + "; ".join(f"{s.date} ({gate_numbers(s)}; {'waived, the wing binds' if (s.row or {}).get('wing_binds') else 'not waived'})" for s in outside)  # fmt: skip
+    else:
+        text += ". Gate numbers outside 0.15 vp: none"
+    return text + "."
+
+
+def level_table(b: Builder, slots: Sequence[Slot], by_date: bool) -> None:
+    """The second table of sections 2a and 3a: the index level behind the ratios to the copula."""
+    columns = [(q.label, q) for q in LEVEL]
+    if by_date:
+        b.table(["date", *(c[0] for c in columns)], [[s.date, *(show(q, b.add(q, s)) for _, q in columns)] for s in slots])  # fmt: skip
+    else:
+        b.table(["quantity", *(s.date for s in slots)], [[label, *(show(q, b.add(q, s)) for s in slots)] for label, q in columns])  # fmt: skip
+
+
+def level_sentence(b: Builder, slot: Slot, d: Djx) -> str:
+    """Under 2a, for one production date: LC/copula split into LC/CC and CC/copula, and what
+    the second factor carries (the index level of the model's target against the study's)."""
+    r, e = slot.row, slot.entry
+    if not slot.priced or r is None or e is None or horizon_cell(r, "+0.0") is None:
+        return ""
+    lc_cop, cc_cop, lc_cc = _number(r, "ED_lc") / _number(e, "P_D"), _number(r, "ED_cc") / _number(e, "P_D"), _number(r, "ratio")  # fmt: skip
+    share = math.log(cc_cop) / math.log(lc_cop)
+    b.records.append(
+        pc.record(
+            f"{SECTION}.{slot.group}.{slot.date}.log_share_cc_over_copula", SECTION, "share of ln(LC/copula) that is ln(CC/copula)", share, None, date=slot.date, tenor=b.tenor, unit="ratio",
+            definition="ln(E_CC[D]/P_D) / ln(E_LC[D]/P_D): the part of the log gap between the LC forward and the copula's price that the constant-correlation companion already has",
+            budget=f"{pc.BUDGETS.get(slot.budget, slot.budget)}; denominator: {pc.BUDGETS['study']}", commit=slot.commit, source=f"{slot.source}; {b.entries_path} (basket B1)",
+            notes="; ".join(filter(None, ["no standard error: a ratio of logs of two ratios, none computed", flag_note(slot)])),
+        )
+    )  # fmt: skip
+    atm, sig = _target_atm(r, e)[0], _study_atm(r, e)[0]
+    n_rep = r.get("n_dropped_calendar_index") or 0
+    low, high = _number(r, "clip_low_inner_max"), _number(r, "clip_high_inner_max")
+    text = (
+        f"{slot.date}: LC/copula = LC/CC × CC/copula ({lc_cop:.3f} = {lc_cc:.3f} × {cc_cop:.3f}); in logs {100 * share:.0f} % of the gap between LC and the copula is CC against the copula (ln {cc_cop:.3f} / ln {lc_cop:.3f}). "
+        f"CC sits on the listed EQV (E_CC[V]/EQV {_number(r, 'EV_cc') / _number(r, 'EQV'):.3f}) while the copula's E[V] is {100 * (_number(e, 'EV') / _number(e, 'EQV') - 1):.0f} % above it (EV/EQV {_number(e, 'EV') / _number(e, 'EQV'):.3f}). "
+        f"The model's {'repaired ' if n_rep else ''}index target has an at-the-money vol of {atm:.2f} % at the horizon against the study's {sig:.2f} % ({atm - sig:+.2f} vp); ρ_CC is {_number(r, 'rho_cc'):.3f} against ρ_cop {_number(e, 'rho_cop'):.3f}. "
+    )
+    if d.build is not None:
+        lo, hi, _ = d.bracket()
+        passed = d.build[(d.build["status"] != "dropped") | (d.build["rule"] == "calendar")]
+        below, above = passed[passed["T"] <= d.horizon + 1e-9], passed[passed["T"] > d.horizon + 1e-9]  # fmt: skip
+        if len(below) and len(above) and lo is not None and hi is not None:
+            near = [below.iloc[-1], above.iloc[0]]
+            gone = [g for g in near if g["rule"] == "calendar"]
+            kept = f"the kept slices nearest the horizon are at {lo:.3f}y and {hi:.3f}y"
+            if len(gone) == 2:
+                text += f"The two DJX expiries bracketing the horizon ({float(near[0]['T']):.3f}y and {float(near[1]['T']):.3f}y) are dropped by the calendar repair (`tables/{SLICES_TABLE}.csv`); {kept}. "
+            elif gone:
+                text += f"The DJX expiry nearest the horizon at {float(gone[0]['T']):.3f}y is dropped by the calendar repair (`tables/{SLICES_TABLE}.csv`); {kept}. "
+            else:
+                text += (
+                    f"The calendar repair drops neither DJX expiry bracketing the horizon; {kept}. "
+                )
+    outside = bool(_gate_outside(r, None)[0])
+    text += (
+        f"The date is {'flagged' if clip_flagged(slot) else 'not flagged'} for the clipped mass ({low:.4f} at λ = 0, {high:.4f} at the cap) and its gate numbers ({gate_numbers(slot)}) are "
+        + (
+            f"outside 0.15 vp ({'waived: the wing binds' if r.get('wing_binds') else 'not waived'})."
+            if outside
+            else "within 0.15 vp."
+        )
+    )
+    return text
+
+
+LEVEL_CLOSE = "Only LC/CC is a local-correlation effect; LC/copula and CC/copula also carry the gap between the model's index target and the study's index level."
+
+
+def level_dev_sentence(b: Builder, dev: Sequence[Slot]) -> str:
+    """Under 3a: the range of CC/copula over the priced dates and its correlation with the gap
+    between the model's index target and the study's index level, with the two extremes."""
+    points = []
+    for s in dev:
+        gap, cc = evaluate(LEVEL[2], s), evaluate(FORWARD[5], s)
+        if gap.value is not None and cc.value is not None:
+            points.append((s.date, gap.value, cc.value))
+    if len(points) < 3:
+        return ""
+    frame = pd.DataFrame(points, columns=["date", "gap", "cc"])
+    corr = float(frame["gap"].corr(frame["cc"]))
+    lo, hi = frame.loc[frame["cc"].idxmin()], frame.loc[frame["cc"].idxmax()]
+    commits = ", ".join(sorted({s.commit for s in dev if s.row and s.commit}))
+    b.records.append(
+        pc.record(
+            f"{SECTION}.dev.level.corr_cc_over_copula_vs_atm_gap", SECTION, "correlation across the dates between CC/copula and (index target ATM vol minus the study's)", corr, None, tenor=b.tenor, unit="correlation",
+            definition="the Pearson correlation, across the priced yearly dates, between E_CC[D]/P_D and the model's index target at-the-money vol at the horizon minus sig_B_DJX of the study's entry",
+            budget=f"{pc.BUDGETS['development']}; {pc.BUDGETS['study']}", commit=commits, source=f"the development rows of section 3; {b.entries_path} (basket B1)", n=len(frame),
+            notes="no standard error: a sample correlation across the dates",
+        )
+    )  # fmt: skip
+    return (
+        f"CC/copula runs from {lo['cc']:.3f} ({lo['date']}: target minus study {lo['gap']:+.2f} vp) to {hi['cc']:.3f} ({hi['date']}: {hi['gap']:+.2f} vp) over the {len(frame)} dates "
+        f"and moves with the gap between the model's index target and the study's index level ({'the higher the target against the study, the lower CC/copula' if corr < 0 else 'the higher the target against the study, the higher CC/copula'}): the correlation across the {len(frame)} dates between CC/copula and (target ATM vol minus the study's) is {corr:.2f}. {LEVEL_CLOSE}"
+    )
+
+
+SECOND_MOMENT = (("κ_LC", "kappa_lc"), ("κ_CC", "kappa_cc"), ("E_LC[V]/EQV", "EV_over_EQV_lc"), ("E_CC[V]/EQV", "EV_over_EQV_cc"), ("ED_eqv", "ED_eqv"), ("single-name part", "EV_single_part"))  # fmt: skip
+
+
+def second_moment_sentence(b: Builder, prod: Sequence[Slot], dev: Sequence[Slot]) -> str:
+    """The ± of the second-moment quantities on a date priced at both budgets: the production
+    row's against the development row's (one record per ratio); empty when no date has both."""
+    by_key = {q.key: q for q in ALL}
+    for p in prod:
+        d = next((s for s in dev if s.date == p.date), None)
+        if d is None or not (p.priced and d.priced) or p.row is None or d.row is None:
+            continue
+        times = _number(p.row, "n_paths") / _number(d.row, "n_paths")
+        ref_p, ref_d = evaluate(by_key["ED_lc"], p).se, evaluate(by_key["ED_lc"], d).se
+        pairs = []
+        for label, key in SECOND_MOMENT:
+            q = by_key[key]
+            a, c = evaluate(q, p).se, evaluate(q, d).se
+            if not a or not c:
+                continue
+            pairs.append(f"{label} ± {a:.3g} against ± {c:.3g} (ratio {a / c:.2f})")
+            b.records.append(
+                pc.record(
+                    f"{SECTION}.budget.{p.date}.{key}.se_prod_over_dev", SECTION, f"{label}: the production row's ± over the development row's", a / c, None, date=p.date, tenor=b.tenor, unit="ratio",
+                    definition=f"the standard error of the production row over that of the development row, same date and seeds, of: {q.definition}",
+                    budget=f"{pc.BUDGETS['production']} over {pc.BUDGETS['development']}", commit=f"{p.commit} (production), {d.commit} (development)", source=f"{p.source}; {d.source}",
+                    notes=f"no standard error: a ratio of two standard errors; with {times:.0f} times the paths an error that falls as 1/√paths would give {1 / math.sqrt(times):.2f}",
+                )
+            )  # fmt: skip
+        if not pairs or not ref_p or not ref_d:
+            continue
+        return (
+            f"κ, E[V]/EQV, ED_eqv and the single-name part are carried by a few paths, like the high-strike calls. On {p.date} the production row has {times:.0f} times the paths of the development row: an error that falls as 1/√paths would be {1 / math.sqrt(times):.2f} times the development row's "
+            f"(E_LC[D]: ± {ref_p:.6f} against ± {ref_d:.6f}, ratio {ref_p / ref_d:.2f}). On these quantities, production against development: {'; '.join(pairs)}. Their ± is not a usable error."
+        )
+    return ""
+
+
+D5_STRIKES = (("+0.0", "atm", "at the money"), ("-1.5", "m15", "−1.5 sd"), ("-2.5", "m25", "−2.5 sd"), ("+1.5", "p15", "+1.5 sd"), ("+2.5", "p25", "+2.5 sd"))  # fmt: skip
+
+
+def target_change(
+    b: Builder, on: Slot, old: Slot, on_slots: Sequence[Slot], date: str
+) -> list[str]:
+    """Section 1: the index target at the horizon with the decisions on against the old
+    defaults (a table, one record per number) and what it means for the before/after; returns
+    the sentences (empty when a row does not carry the cells)."""
+    if on.row is None or old.row is None or not (on.priced and old.priced):
+        return []
+    rows, parts, vals = [], [], {}
+    common = {"date": date, "tenor": b.tenor, "budget": pc.BUDGETS.get(on.budget, on.budget)}
+    for strike, tag, label in D5_STRIKES:
+        a, c = horizon_cell(on.row, strike), horizon_cell(old.row, strike)
+        if a is None or c is None:
+            return []
+        ta, tc = 100 * _number(a, "target_vol"), 100 * _number(c, "target_vol")
+        vals[strike] = (ta, tc)
+        rows.append([label, f"{ta:.2f}", f"{tc:.2f}", f"{ta - tc:+.2f}", f"{_number(a, 'k'):+.4f}", f"{_number(c, 'k'):+.4f}"])  # fmt: skip
+        parts.append(f"{label} {ta:.2f} % against {tc:.2f} % ({ta - tc:+.2f} vp)")
+        what = f"the vol of the index target at the horizon at the strike {label} (in the run's own at-the-money sd; the target_vol of the row's index_errors list)"
+        for name, value, unit, commit, source in (
+            ("on", ta, "vol in %", on.commit, on.source),
+            ("old", tc, "vol in %", old.commit, old.source),
+            ("on_minus_old", ta - tc, "vol points", f"{on.commit} (on), {old.commit} (old defaults)", f"{on.source}; {old.source}"),
+        ):  # fmt: skip
+            b.records.append(
+                pc.record(
+                    f"{SECTION}.d5.{date}.target_vol.{tag}.{name}", SECTION, f"index target vol at the horizon, {label}: {name.replace('_', ' ')}", value, None, unit=unit,
+                    definition=f"{what}: {'the row with decisions 1, 2 and 5 on' if name == 'on' else 'the row of the old defaults' if name == 'old' else 'decisions on minus the old defaults (each at its own strike)'}",
+                    commit=commit, source=source, notes="no standard error: the calibration's target, an input of the model", **common,
+                )
+            )  # fmt: skip
+    b.text(f"Table 1a-2. The {b.tenor} index target itself at the horizon, with the decisions on and at the old defaults ({on.budget} rows; the production row with the decisions on has the same target):")  # fmt: skip
+    b.table(["strike", "target vol, decisions on (%)", "target vol, old defaults (%)", "difference (vol points)", "log-moneyness k, decisions on", "log-moneyness k, old defaults"], rows)  # fmt: skip
+    out = [
+        f"The repair changes the {b.tenor} target itself. Target vol at the horizon with the decisions on against the old defaults: {'; '.join(parts)} (each run's strikes are in its own at-the-money sd: table 1a-2 gives their log-moneyness).",
+        "The clipped mass and LC/CC before and after are measured against different targets: the model follows its own target in both runs.",
+    ]
+    skew_on, skew_old = vals["-2.5"][0] - vals["+0.0"][0], vals["-2.5"][1] - vals["+0.0"][1]
+    low_on, low_old = _number(on.row, "clip_low_inner_max"), _number(old.row, "clip_low_inner_max")
+    if skew_old:
+        ratio = skew_on / skew_old
+        out.append(
+            f"The mass clipped at λ = 0 goes from {low_old:.3f} to {low_on:.3f} ({on.budget} budget) against a target whose downside skew is {'about half as steep: ' if 0.4 <= ratio <= 0.6 else ''}{ratio:.2f} times that of the old defaults "
+            f"(target vol at −2.5 sd minus at the money: {skew_on:.2f} vp with the decisions on, {skew_old:.2f} vp at the old defaults). It is not a better fit to the same target."
+        )
+    still = []
+    for s in on_slots:
+        if s.priced and s.row:
+            lo, hi = _number(s.row, "clip_low_inner_max"), _number(s.row, "clip_high_inner_max")
+            sides = "both sides" if lo > CLIP_FLAG_MASS and hi > CLIP_FLAG_MASS else "λ = 0 only" if lo > CLIP_FLAG_MASS else "the cap only" if hi > CLIP_FLAG_MASS else "neither side"  # fmt: skip
+            still.append((s.budget, lo, hi, sides))
+    if still:
+        same = {x[3] for x in still}
+        head = f"With the decisions on the date is {'still flagged on ' + still[0][3] if same != {'neither side'} and len(same) == 1 else 'flagged as follows'}" if same != {"neither side"} else "With the decisions on the date is not flagged"  # fmt: skip
+        out.append(head + ": " + "; ".join(f"{bud} {lo:.4f} at λ = 0 and {hi:.4f} at the cap" + (f" ({sides})" if len(same) > 1 else "") for bud, lo, hi, sides in still) + f", against {CLIP_FLAG_MASS}.")  # fmt: skip
+    uns_on, uns_old = on.row.get("n_names_unscreened") or 0, old.row.get("n_names_unscreened") or 0
+    n_idx = on.row.get("n_dropped_calendar_index") or 0
+    n_names = (on.row.get("n_dropped_calendar") or 0) - n_idx
+    two = "decision 2 is inert (no name is kept unscreened in either run)" if not (uns_on or uns_old) else f"decision 2 acts ({uns_on} names kept unscreened with the decisions on: {on.row.get('names_unscreened', '')})"  # fmt: skip
+    out.append(f"Which decisions act on this date: {two}; the change is decision 1 (the calendar repair drops {n_names} slices of the names: the row's n_dropped_calendar − n_dropped_calendar_index) plus decision 5 ({n_idx} DJX slices).")  # fmt: skip
+    rel = {}
+    for key, label in (("ED_cc", "E_CC[D]"), ("ED_lc", "E_LC[D]")):
+        rel[key] = 100 * (_number(on.row, key) / _number(old.row, key) - 1)
+        b.records.append(
+            pc.record(
+                f"{SECTION}.d5.{date}.{key}.rel_change_pct", SECTION, f"{label}: relative change, decisions on against the old defaults", rel[key], None, unit="%",
+                definition=f"100 × ({label} of the row with decisions 1, 2 and 5 on / {label} of the row of the old defaults − 1), same budget and seeds",
+                commit=f"{on.commit} (on), {old.commit} (old defaults)", source=f"{on.source}; {old.source}",
+                notes="; ".join(filter(None, ["no standard error: the two runs share their seeds and their covariance is not in the rows", "each number is against its own run's target", flag_note(on)])), **common,
+            )
+        )  # fmt: skip
+    line = f"The move of LC/CC from {_number(old.row, 'ratio'):.5f} to {_number(on.row, 'ratio'):.5f} ({_number(on.row, 'ratio') - _number(old.row, 'ratio'):+.5f}): E_CC[D] changes by {rel['ED_cc']:+.2f} % and E_LC[D] by {rel['ED_lc']:+.2f} %"
+    if on.row.get("rho_cc") is not None and old.row.get("rho_cc") is not None:
+        line += (
+            f"; ρ_CC goes from {_number(old.row, 'rho_cc'):.3f} to {_number(on.row, 'rho_cc'):.3f}"
+        )
+    out.append(line + ".")
+    return out
+
+
+def carries(slot: Slot, d: Djx, frame: pd.DataFrame) -> str:
+    """What a date of the left block of the summaries carries: its other flags, the kept DJX
+    slices around its horizon, its index error at +2.5 sd and its Monte Carlo errors on κ and
+    E[V]/EQV against the medians of the priced dates."""
+    r = slot.row or {}
+    parts = []
+    names = str(d.build["names_extrapolated"].iloc[0]).replace(",", ", ") if d.build is not None and d.key_match else ""  # fmt: skip
+    if (r.get("n_names_extrapolated") or 0) > 0:
+        parts.append(f"{names or r.get('n_names_extrapolated')} priced beyond {'its' if r.get('n_names_extrapolated') == 1 else 'their'} last kept expiry")  # fmt: skip
+    if (r.get("n_names_unscreened") or 0) > 0:
+        parts.append(f"{r.get('names_unscreened')} kept unscreened")
+    if (r.get("n_dropped_calendar_index") or 0) > 0:
+        parts.append(f"DJX target repaired ({r.get('n_dropped_calendar_index')} slice{'s' if r.get('n_dropped_calendar_index') != 1 else ''} dropped)")  # fmt: skip
+    if r.get("index_extrapolated"):
+        parts.append("DJX target extrapolated")
+    if r.get("status") != "ok":
+        parts.append(f"status {r.get('status')}")
+    lo, hi, origin = d.bracket()
+    if origin == "specification build" and lo is not None and hi is not None:
+        parts.append(
+            f"no kept DJX slice between {lo:.2f}y and {hi:.2f}y (horizon {d.horizon:.2f}y)"
+        )
+    parts.append(f"index error at +2.5 sd at the horizon {show(INDEX_MORE[1], evaluate(INDEX_MORE[1], slot))} vp")  # fmt: skip
+    priced = frame[frame["priced"] == "yes"]
+    for q in (KAPPA[0], KAPPA[3]):
+        cell = evaluate(q, slot)
+        if cell.se is not None and f"{q.key}_se" in priced:
+            parts.append(f"{q.label} {show(q, cell)} (median ± over the {len(priced)} priced dates: {float(priced[f'{q.key}_se'].median()):.4f})")  # fmt: skip
+    return f"{slot.date}: " + "; ".join(parts)
 
 
 def by_quantity(b: Builder, slots: Sequence[Slot], quantities: Sequence[Quantity]) -> None:
@@ -1153,6 +1573,9 @@ def frame_of(slots: Sequence[Slot], tenor: str) -> pd.DataFrame:
             rec[q.key] = cell.value
             if not q.no_se:
                 rec[f"{q.key}_se"] = cell.se
+            if q.annotate is not None:
+                # the short mark of an index-error cell (empty: a usable cell)
+                rec[f"{q.key}_mark"] = cell.mark or None
         if s.row:
             for key in ("n_particles", "n_paths", "companion_paths", "T", "rho_cc", "lambda_c", "names_unscreened", "n_dropped", "n_dropped_calendar", "clip_low_max", "clip_high_max", "risk"):  # fmt: skip
                 rec[key] = s.row.get(key)
@@ -1233,7 +1656,7 @@ def summaries(
                         f"{SECTION}.dev.summary.{q.key}.total.{sample}", SECTION, f"{q.label}: total over {label}", total, None, tenor=b.tenor, unit=q.unit,
                         definition=f"the sum over {label} (yearly dates, first monthly entry of each year 2007–2026) of: {q.definition}",
                         budget=pc.BUDGETS["development"], commit=commits, source=f"{csv} (from {rows_dir})", n=len(x),
-                        notes="; ".join(filter(None, [none if sample == "unflagged" and not len(x) else "", partial if len(x) else "", f"{int((x > 0).sum())} dates with at least one", "no standard error: a count"])),
+                        notes="; ".join(filter(None, [none if sample == "unflagged" and not len(x) else "", partial if len(x) else "", f"{len(flagged)} of {len(slots)} dates flagged for the clipped mass ({len(priced)} priced): flagged rows are in this total" if sample == "all" and len(x) else "", f"{int((x > 0).sum())} dates with at least one", "no standard error: a count"])),
                     )
                 )  # fmt: skip
                 line += [str(len(x)), f"total {total:.0f} (on {n_dates(int((x > 0).sum()))})" if len(x) else empty, "", "", ""]  # fmt: skip
@@ -1255,6 +1678,9 @@ def summaries(
                         notes.append("no date in the sample has this quantity")
                 elif partial:
                     notes.append(partial)
+                if sample == "all" and stats[stat] is not None:
+                    notes.append(f"{len(flagged)} of {len(slots)} dates flagged for the clipped mass ({len(priced)} priced): flagged rows are in this summary")  # fmt: skip
+                notes += key_notes(q)
                 if stat != "mean":
                     notes.append(
                         "an order statistic over the dates (linear interpolation): no standard error"
@@ -1327,7 +1753,7 @@ def decision5(
     """Section 1: the clipped mass by side, the forward, the index errors and the DJX slices on
     the check's date, per variant (``(label, slot, text when there is no row)``), and the
     difference ``compare[0] − compare[1]`` (decisions on minus the old defaults, same budget)."""
-    quantities = [*CLIP, FLAGS[5], FLAGS[6], GATE[0], FORWARD[0], FORWARD[1], FORWARD[3], *INDEX[:5], *INDEX_MORE, FLAGS[2], FLAGS[3], FLAGS[1], FLAGS[0], FLAGS[4], INDEX[5]]  # fmt: skip
+    quantities = [*CLIP, FLAGS[5], FLAGS[6], GATE[0], FORWARD[0], FORWARD[1], FORWARD[3], LEVEL[3], LEVEL[0], *INDEX[:5], *INDEX_MORE, FLAGS[2], FLAGS[3], FLAGS[1], FLAGS[0], FLAGS[4], INDEX[5]]  # fmt: skip
     rows, out = [], []
     for q in quantities:
         line = [q.label]
@@ -1347,7 +1773,13 @@ def decision5(
         else:
             on, old = compare
             a, c = evaluate(q, on), evaluate(q, old)
-            if a.value is None or c.value is None:
+            over_slices = q.key.startswith("idx_err_max")
+            against_target = q.key.startswith("idx_err") and not over_slices
+            if over_slices:
+                # the two maxima are over different sets of slices: no difference
+                line.append("n/a (maxima over different sets of slices)")
+                diff = None
+            elif a.value is None or c.value is None:
                 line.append("pending" if "pending" in (a.state, c.state) else "n/a")
                 diff = None
             else:
@@ -1359,7 +1791,13 @@ def decision5(
                     f"{SECTION}.d5.{date}.{q.key}.on_minus_old", SECTION, f"{q.label}: decisions 1, 2 and 5 on minus the old defaults", diff, None, date=date, tenor=b.tenor, unit=q.unit,
                     definition=f"the {on.budget}-budget row with decisions 1, 2 and 5 on minus the {old.budget}-budget row of the old defaults (no calendar repair of the names or of DJX, no unscreened fallback), of: {q.definition}",
                     budget=pc.BUDGETS.get(on.budget, on.budget), commit=f"{on.commit} (on), {old.commit} (old defaults)", source=f"{on.source or on.waits_for}; {old.source}",
-                    notes=("no standard error: the two runs share the particle and pricing seeds and their covariance is not in the rows; each row's own ± is in its column" if diff is not None else (a.note or c.note or "pending")),
+                    notes="; ".join(filter(None, [
+                        "n/a: the two maxima are over different sets of slices (the kept DJX slices of the two runs differ), so no difference is given" if over_slices
+                        else "no standard error: the two runs share the particle and pricing seeds and their covariance is not in the rows; each row's own ± is in its column" if diff is not None
+                        else (a.note if a.state != "value" else c.note if c.state != "value" else "") or "pending",
+                        "each error is against its own run's target" if against_target and diff is not None else "",
+                        flag_note(on),
+                    ])),
                 )
             )  # fmt: skip
         rows.append(line)
@@ -1494,7 +1932,7 @@ def djx_section(
 
 def checks_section(b: Builder, slots: Sequence[Slot]) -> None:
     """Under the flags: for each priced row whose status is not ok, which check and why."""
-    lines = [f"- {s.budget} {s.date}, status {s.row.get('status')}: {check_detail(s)}" for s in slots if s.priced and s.row and s.row.get("status") != "ok"]  # fmt: skip
+    lines = [f"- {s.budget} {s.date}, status {s.row.get('status')}: {check_detail(s, [x for x in slots if x.group == s.group])}" for s in slots if s.priced and s.row and s.row.get("status") != "ok"]  # fmt: skip
     if lines:
         b.text("Rows whose status is check — which check, and what it touches:", *lines)
     elif any(s.priced for s in slots):
@@ -1607,6 +2045,8 @@ def build(
         f"Rows at this writing — production budget, four reference dates: {count(prod)}; development budget, {len(dev)} yearly dates: {count(dev)}.",
         "A cell reads *pending* when its row is not there yet (the file it waits for is under the table), *failed* when the date's run failed, *not run* when the row does not carry the column. Every number is in `numbers_1y.json` with its standard error, definition, budget, commit and source.",
     )
+    if pc.STUDY.is_symlink():
+        b.text(f"`{pc.STUDY}` is a link to the dispersion study's own folder (`{pc.STUDY.resolve()}`), read only: the study's table `entries_{tenor}.parquet` and its entries are read from there.")  # fmt: skip
     if not strict:
         b.text("**TEST RENDER (`--no-strict`): rows that do not carry the owner's decisions 1, 2 and 5 are accepted. Not for the package.**")  # fmt: skip
     for year in dates[dates["date"] == ""]["year"]:
@@ -1617,7 +2057,8 @@ def build(
     first_at = len(b.md)  # where the block "Read this first" goes, once the page is built
     se_3m = budget_gap_3m(b)
     se_12m = budget_gap_12m(b, prod, dev)
-    se_note = " ".join(filter(None, [PM_SE, se_3m or "The 3m rows of the main package that measure the budget's effect are not all there: no figure is quoted.", se_12m]))  # fmt: skip
+    second = second_moment_sentence(b, prod, dev)
+    se_note = " ".join(filter(None, [PM_SE, se_3m or "The 3m rows of the main package that measure the budget's effect are not all there: no figure is quoted.", se_12m, second]))  # fmt: skip
     caveat = call_caveat()
 
     # --- 1. decision 5
@@ -1650,20 +2091,35 @@ def build(
     if before is not None and before.priced:
         same = after_dev if before.budget == "development" else after_prod
         compare = (same, before) if same is not None else None
+    b.text(f"### 1a. Before and after on {check_date}: the clipped mass, the forward, the index errors and the target")  # fmt: skip
     tables["1y_decision5"] = decision5(b, variants, check_date, compare)
+    max_note = ""
+    if compare is not None and compare[0].priced:
+        worst = max(sd_cells(before.row if before else None, 2.5), key=lambda c: abs(_number(c, "error_vp")), default=None)  # fmt: skip
+        if worst is not None:
+            kept_on = {round(float(c["T"]), 9) for c in index_cells(compare[0].row)}
+            gone = round(float(worst["T"]), 9) not in kept_on
+            max_note = f"No difference is printed for the largest errors over the slices: the two maxima are over different sets of slices (at the old defaults the largest inside ±2.5 sd sits at {float(worst['T']):.3f}y, a slice the run with the decisions on {'no longer has' if gone else 'also has'}). "
     d5 = [f"Clipped mass: the share of the particles that are inside ±2.5 at-the-money sd of the basket and whose λ is clipped at 0, resp. at the cap, the largest over the calibration's slices (fractions; flagged above 0.01); E_LC[D], E_CC[D] in fractions of the notional; index errors in vol points (model minus target at the horizon; the largest over the kept slices up to the horizon); DJX slices dropped by the repair: n_dropped_calendar_index; last DJX slice: index_last_slice, in years (horizon {float(entries.loc[check_date, 'T']):.4f}y)."]  # fmt: skip
     if before is not None:
         d5.append(
             f"The last column is the {compare[0].budget if compare else before.budget}-budget column with the decisions on minus the old-defaults column (same budget, same seeds). "
             "The before/after is decisions 1, 2 and 5 together, not decision 5 alone: the old-defaults run has the calendar repair of the names, the calendar repair of DJX and the unscreened fallback all off. "
             "A difference has no standard error (the two runs share their seeds; their covariance is not in the rows): each row's own ± is in its column. "
+            "The differences of the index errors at the horizon are differences of errors each measured against its own run's target. "
+            + max_note
             + old_defaults_config(before.row or {}, tenor)
         )
-    d5.append(footer([after_prod], False, entries_path, prod_dir))
+    d5.append("Production column — " + footer([after_prod], False, entries_path, prod_dir))
     if after_dev is not None:
         d5.append("Development column — " + footer([after_dev], False, entries_path, dev_dir))
     d5.append(f"Old defaults: {'`' + before.source + '`' if before else f'not run at {tenor} (no row of the old defaults at ' + ' or '.join(f'`{d}/{check_date}.json`' for d in before_dirs) + ')'}.")  # fmt: skip
     b.text(" ".join(d5))
+    target_lines = target_change(b, compare[0], compare[1], [s for s in (after_prod, after_dev) if s is not None], check_date) if compare is not None else []  # fmt: skip
+    if target_lines:
+        b.text(" ".join(target_lines) + f" Sources: the two {compare[0].budget if compare else ''}-budget rows of table 1a (their index_errors lists at the horizon, clip_low_inner_max, clip_high_inner_max, n_dropped_calendar, n_dropped_calendar_index, n_names_unscreened, ED_cc, ED_lc, ratio, rho_cc) and, for the production figures, the production row.")  # fmt: skip
+    elif before is not None:
+        b.text("The target with the decisions on against the old defaults: pending (it needs the row with the decisions on at the budget of the old-defaults row).")  # fmt: skip
     # the DJX slices on the check's date: the specification build, and what the rows give
     b.text(f"### 1b. The DJX slices on {check_date}: what the repair drops and what brackets the horizon")  # fmt: skip
     djx_check = djx_of(
@@ -1680,9 +2136,13 @@ def build(
               f"{float(g['svi_rms_vp']):.2f} ({g['rms_source']})" if pd.notna(g["svi_rms_vp"]) else "not fitted (dropped by the screen)"] for _, g in djx_check.build.iterrows()],
         )  # fmt: skip
         keys = [f"{s.budget}: {'yes' if djx_of(s, slices).key_match else 'no'}" for s in (after_prod, after_dev) if s is not None and s.priced]  # fmt: skip
+        odd = [(str(g["expiry"]), dt.date.fromisoformat(str(g["expiry"])).strftime("%A")) for _, g in djx_check.build.iterrows() if str(g["third_friday"]) == "True"]  # fmt: skip
+        odd = [(e, day) for e, day in odd if day != "Friday"]
+        weekday_note = "".join(f"{e} is a {day}: the third-Friday rule counts it as the standard monthly expiry of its month (the Thursday before, or the Saturday after, a third Friday that is not itself among the listed DJX expiries). " for e, day in odd)  # fmt: skip
         b.text(
             f"Source: `{slices_path}`, a specification-only build under the current defaults (`{CONFIG}`) by `scripts/pm_1y_slices.py` run from the worktree at commit {djx_check.build['git_commit'].iloc[0]}, built {djx_check.build['built'].iloc[0]} New York: no calibration, no Monte Carlo; the same slices at both budgets. "
             "SVI rms: the root-mean-square error of the slice's own SVI fit in vol points (fit record: read from the runs' fit records; fitted here: the runs never fitted the slice). "
+            + weekday_note
             + (
                 f"The build's specification key is the row's — {'; '.join(keys)}. "
                 if keys
@@ -1712,12 +2172,24 @@ def build(
         ("2e. Clipped mass, index errors, names priced beyond their last kept expiry", [*CLIP, *INDEX], "calibration", False),
         ("2f. Sticky-strike deltas", DELTAS, "deltas", False),
     ]  # fmt: skip
+    prod_flags = flag_line(prod)
     for title, quantities, key, study in plan:
         b.text(f"### {title}")
         by_quantity(b, prod, quantities)
-        b.text(f"{DEFINITIONS[key]} {caveat + ' ' if key == 'calls' else ''}{PM_SE} {footer(prod, study, entries_path, prod_dir)}")  # fmt: skip
+        extra = (caveat + " " if key == "calls" else "") + (second + " " if second and key in ("listed", "kappa", "split") else "")  # fmt: skip
+        b.text(f"{DEFINITIONS[key]} {extra}{PM_SE} {footer(prod, study, entries_path, prod_dir)}")
+        if key != "calibration" and prod_flags:
+            b.text(prod_flags)
+        if key == "forward":
+            b.text("Table 2a-2. The index level behind the ratios to the copula:")
+            level_table(b, prod, by_date=False)
+            worst = min((s for s in prod if s.priced), key=lambda s: evaluate(FORWARD[4], s).value or float("inf"), default=None)  # fmt: skip
+            sentence = level_sentence(b, worst, djx_of(worst, slices)) if worst is not None else ""
+            b.text(" ".join(filter(None, [DEFINITIONS["level"], LEVEL_CLOSE, f"The date with the lowest LC/copula — {sentence}" if sentence else "", footer(prod, True, entries_path, prod_dir)])))  # fmt: skip
         if key == "calibration":
-            b.text("The index gate and the index errors on the upside and over the slices:")
+            b.text(
+                "Table 2e-2. The index gate and the index errors on the upside and over the slices:"
+            )
             gate_table(b, prod, by_date=False)
             b.text(f"{DEFINITIONS['gate']} {footer(prod, False, entries_path, prod_dir)}")
     tables["1y_production"] = frame_of(prod, tenor)
@@ -1748,13 +2220,23 @@ def build(
         ("3e. Clipped mass, index errors, names priced beyond their last kept expiry", [*CLIP, *INDEX], "calibration", False),
         ("3f. Sticky-strike deltas", DELTAS, "deltas", False),
     ]  # fmt: skip
+    dev_flags = flag_line(dev, short=True)
     for title, quantities, key, study in plan3:
         b.text(f"### {title}")
         by_date(b, dev, quantities)
         high_strike = key == "calls" and title.startswith(("3d-125", "3d-150"))
-        b.text(f"{DEFINITIONS[key]} {caveat + ' ' if high_strike else ''}{PM_SE} {footer(dev, study, entries_path, dev_dir)}")  # fmt: skip
+        extra = (caveat + " " if high_strike else "") + (second + " " if second and key in ("listed", "kappa", "split") else "")  # fmt: skip
+        b.text(f"{DEFINITIONS[key]} {extra}{PM_SE} {footer(dev, study, entries_path, dev_dir)}")
+        if key != "calibration" and dev_flags:
+            b.text(dev_flags)
+        if key == "forward":
+            b.text("Table 3a-2. The index level behind the ratios to the copula:")
+            level_table(b, dev, by_date=True)
+            b.text(" ".join(filter(None, [DEFINITIONS["level"], level_dev_sentence(b, dev) or LEVEL_CLOSE, footer(dev, True, entries_path, dev_dir)])))  # fmt: skip
         if key == "calibration":
-            b.text("The index gate and the index errors on the upside and over the slices:")
+            b.text(
+                "Table 3e-2. The index gate and the index errors on the upside and over the slices:"
+            )
             gate_table(b, dev, by_date=True)
             b.text(f"{DEFINITIONS['gate']} {footer(dev, False, entries_path, dev_dir)}")
     dev_frame = frame_of(dev, tenor)
@@ -1783,18 +2265,25 @@ def build(
                 notes="no standard error: a share of the calibration's particles" if n_priced else "pending: no priced row yet",
             )
         )  # fmt: skip
+    unflagged = [s for s in dev if s.priced and clip_flagged(s) is False]
+    carried = "; ".join(carries(s, djx_of(s, slices), dev_frame) for s in unflagged)
+    if len(unflagged) == 1:
+        left += f" It is one observation, not a summary — {carried}."
+    elif unflagged:
+        left += f" What each of them carries — {carried}."
     b.text(
         f"{left} Right block: all priced dates ({n_priced} of {len(dev)}; {n_flagged} of them flagged), flagged or not; it is not the summary the owner defined. "
         "A date is out of the left block for one flag only: the clip flag of decision 5 (the mass clipped at λ = 0 or at the cap exceeds 1 % inside ±2.5 sd). No other flag excludes a date. "
         f"For information, the priced dates that carry the other flags — {other_flags(dev)}. "
         f"n is the number of dates behind each figure ({len(dev)} dates asked); mean ± the standard error of the mean across dates (sd/√n: the dispersion over the dates, not a Monte Carlo error); quartiles linearly interpolated. "
-        "A count (names beyond last kept expiry) is given as its total over the dates; the homogeneity term (exactly 1 on every date) is not summarised; the index errors at +1.5 and +2.5 sd and the largest errors over the slices are not summarised (on some dates the cell is a strike where the model vol is not invertible: table 3e). "
+        "A count (names beyond last kept expiry) is given as its total over the dates; the homogeneity term (exactly 1 on every date) is not summarised; the index errors at +1.5 and +2.5 sd and the largest errors over the slices are not summarised (on some dates the cell is a strike where the model vol is not invertible: table 3e-2); the index level of table 3a-2 is not summarised. "
         f"The rows for K_125 and K_150: {caveat} "
         f"{footer(dev, True, entries_path, dev_dir)} The CSV behind: `{csv}`."
     )
 
     # --- 4. flags
     b.text("## 4. Flags per date")
+    b.text("### 4a. The flags")
     everyone = [*prod, *dev]
     tables["1y_flags"] = flags_section(b, everyone, slices)
     for q in FLAGS:
@@ -1846,20 +2335,27 @@ def build(
         if lo is not None and horizon - lo > 0.5:
             far.append(f"{s.date} ({lo:.3f}y)")
     far_line = f" Dates whose nearest kept DJX slice below the horizon is more than 0.5y before it (nearest kept slice below): {', '.join(far)}." if far else ""  # fmt: skip
+    wide = []
+    for s in [*dev, *(x for x in prod if x.date not in dev_dates)]:
+        lo, hi, _ = djx_of(s, slices).bracket()
+        if lo is not None and hi is not None and hi - lo > 0.75:
+            wide.append(f"{s.date} ({lo:.3f}y / {hi:.3f}y)")
+    if wide:
+        far_line += f" Dates whose two nearest kept DJX slices around the horizon are more than 0.75y apart (below / above): {', '.join(wide)}."
     first = [
         "## Read this first",
         "",
         f"- **Status.** {STATUS_NOTE} {gate_summary(everyone)} Per date: the flags table (section 4) and tables 2e and 3e.",
         f"- **What the ± is.** {se_note}",
-        "- **Index errors.** Tables 2e and 3e give, besides the money and the downside at the horizon, the errors at +1.5 and +2.5 sd and the largest error over the kept slices with where it sits. A cell marked *model vol not invertible* is a far out-of-the-money strike with a negligible price, not a mispriced smile; a cell marked *target vol … degenerate* is one where the DJX target itself is not usable.",
+        "- **Index errors.** Tables 2e and 3e give, besides the money and the downside at the horizon, the errors at +1.5 and +2.5 sd and the largest error over the kept slices with where it sits. A cell marked *model vol not invertible* is a far out-of-the-money strike with a negligible price, not a mispriced smile; a cell marked *target vol … degenerate* (below a quarter of the at-the-money target vol) is one where the DJX target itself is not usable; a cell marked *thin target* is one where the target vol is between a quarter and a half of the at-the-money one. The largest error over the usable cells (no mark) is printed beside the largest over all cells.",
         f"- **DJX target repaired.** Table 4b lists, per date, the DJX slices the repair drops and the kept slices on each side of the horizon. {check_date}: {headline or 'the list is not available (no table of the specification build); section 1b gives what the rows carry.'}{far_line}",
-        f"- **Decision 5 check (section 1).** {check_date} at {tenor}, clipped mass inside ±2.5 sd at λ = 0 / at the cap (flagged above 0.01) — {d5_line}. The before/after is decisions 1, 2 and 5 together, not decision 5 alone.",
+        f"- **Decision 5 check (section 1).** {check_date} at {tenor}, clipped mass inside ±2.5 sd at λ = 0 / at the cap (flagged above 0.01) — {d5_line}. The before/after is decisions 1, 2 and 5 together, not decision 5 alone. {' '.join(target_lines)}",
         "- **Summaries (3g).** "
         + (f"Partial: {n_priced} of {len(dev)} dates priced. " if n_priced < len(dev) else f"All {len(dev)} dates priced. ")
-        + (f"The summary the owner defined (flagged rows out) has no date: all {n_priced} priced dates are flagged for the clipped mass ({clip_range(priced_frame)}). The block *all priced dates* is made of flagged rows only." if n_priced and not n_unflagged else f"The summary the owner defined (flagged rows out) has {n_dates(n_unflagged)}; {n_flagged} of the {n_priced} priced dates are flagged for the clipped mass." if n_priced else "No date is priced yet."),
+        + (f"The summary the owner defined (flagged rows out) has no date: all {n_priced} priced dates are flagged for the clipped mass ({clip_range(priced_frame)}). The block *all priced dates* is made of flagged rows only." if n_priced and not n_unflagged else f"The summary the owner defined (flagged rows out) has {n_dates(n_unflagged)}; {n_flagged} of the {n_priced} priced dates are flagged for the clipped mass.{' It is one observation, not a summary — ' + carried + '.' if len(unflagged) == 1 else ''}" if n_priced else "No date is priced yet."),
         f"- **Calls at K_125 and K_150.** {caveat}",
         f"- **Sticky-strike deltas.** {STICKY}",
-        "- **Units.** E[D], P_D, the strikes, the calls, ED_wing and ED_eqv are fractions of the notional; the two parts of the split are squared returns; the clipped masses are fractions of the particles; the index errors are vol points.",
+        "- **Units.** E[D], P_D, the strikes, the calls, ED_wing and ED_eqv are fractions of the notional; the two parts of the split are squared returns; the clipped masses are fractions of the particles; the index errors are vol points and the target vols percent; the deltas are percent of the price per +1 % of every spot; the times of the DJX slices and the horizon are years.",
         "",
     ]  # fmt: skip
     b.md[first_at:first_at] = first
