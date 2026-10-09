@@ -81,7 +81,7 @@ QUANTITIES: tuple[tuple[str, str, str], ...] = (
     (
         "clip_lc",
         "clipped mass inside ±2.5 sd, M12",
-        "largest over the slices of the calibration; lambda at 0 or at its cap",
+        "the larger of the two one-sided masses (lambda clipped at 0; lambda clipped at its cap), each at its worst calibration slice, inside +-2.5 sd, as a fraction of the particles",
     ),
     ("clip_cdv3", "clipped mass inside ±2.5 sd, CDV(beta=3)", "the same at beta = 3"),
     ("clip_cdv6", "clipped mass inside ±2.5 sd, CDV(beta=6)", "the same at beta = 6"),
@@ -127,6 +127,9 @@ def by_date(table: pd.DataFrame) -> pd.DataFrame:
     out["kappa_s"] = table["P_D_S"] / np.sqrt(ev_s)
     out["ev_over_eqv_copula"] = table["EV_copula"] / table["EQV"]
     out["ev_over_eqv_s"] = ev_s / table["EQV"]
+    for tag, name in (("lc", "lc"), ("cdv_a", "cdv3"), ("cdv_b", "cdv6")):
+        out[f"clip_low_{name}"] = table[f"clip_low_inner_{tag}"]
+        out[f"clip_high_{name}"] = table[f"clip_high_inner_{tag}"]
     out["idx_err_m25_lc"], out["idx_err_m25_cdv3"], out["idx_err_m25_cdv6"] = (
         table["idx_m25_lc"],
         table["idx_m25_cdv_a"],

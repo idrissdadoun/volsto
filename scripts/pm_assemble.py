@@ -31,11 +31,16 @@ log = logging.getLogger("pm_assemble")
 #: (part name, heading) in the order of the owner's brief.
 SECTIONS = (
     ("A_today", "A. Today (2026-10-02), 3m, production budget"),
+    (
+        "A_check_e",
+        "A9. Check (e): why the cross-dependent volatility moves the forward less than the wing estimate",
+    ),
     ("B_reference", "B. The three reference dates, 3m, production budget"),
     ("C_history", "C. History, 3m, development budget, decisions 1-2 on"),
     ("C_arith", "C (continued). The report's arithmetic at the LC price"),
     ("D_stratified", "D. Stratified cross-dependent volatility (check f)"),
     ("F_figures", "F. Figures"),
+    ("V_validation", "V. Validation status and caveats"),
     ("Z_findings", "Findings"),
 )
 
