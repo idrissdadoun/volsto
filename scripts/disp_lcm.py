@@ -3,13 +3,17 @@ dates — one process of ``scripts/lcm_price.py`` per date, resumable, one row p
 
     python scripts/disp_lcm.py --tenor 3m|12m|24m --dates monthly|today|reference|<d1,d2,...>
         [--budget production|development] [--risk none|deltas|full] [--workers N|auto]
-        [--root <dir>] [--config <yaml>] [--limit N] [--varswap] [--no-report] [--no-retry]
+        [--root <dir>] [--config <yaml>] [--tag <name>] [--limit N] [--varswap] [--no-report]
+        [--no-retry]
 
 Dates.  ``monthly``: the converged dates of the study's model S table
 (``outputs/dispersion/model_s_3m.parquet``, 218 dates) and today, 219 in all — at 12m and 24m
 those of them with an entry of that tenor.  ``reference``: the four dates of the reference
 implementation.  The order of a pass is today and the reference dates first, then every 8th
 date, then the gaps by halving (4, 2, 1): a pass stopped early covers the whole period.
+
+``--tag <name>`` runs a variant of the configuration (``--config``) beside the main pass: its
+rows, logs and table carry the suffix ``_<name>``.
 
 Rows.  Each date's row is ``<root>/outputs/dispersion_lc/rows/<tenor>_<budget>/<date>.json``
 (what ``lcm_price.py`` writes); the pass's table is ``lcm_<tenor>.parquet`` at the production
@@ -26,8 +30,12 @@ next two side by side on half the cores each, and keeps the faster arrangement.
 
 Log.  One line per date with its status, its seconds, the elapsed time and the estimated time
 left, on stdout and in ``<root>/outputs/dispersion_lc/logs/<tenor>_<budget>.log``; each date's
-own output is in ``logs/<tenor>_<budget>/<date>.log``.  The pass ends by running the comparison
-report (``scripts/lcm_report.py``).  Nothing is written into the study's ``outputs/dispersion``.
+own output is in ``logs/<tenor>_<budget>/<date>.log``.  The line names the row's flags when
+they are set (:func:`flags_text`; owner's decisions 2 and 5 of 2026-10-09): ``flag_unscreened``
+with the names kept unscreened, ``flag_clip`` with the clipped mass inside ±2.5 sd at ``λ = 0``
+and at the cap, ``indicative`` (24m).  A flagged row stays in the table.  The pass ends by
+running the comparison report (``scripts/lcm_report.py``).  Nothing is written into the study's
+``outputs/dispersion``.
 """
 
 # ruff: noqa: E501
@@ -81,21 +89,47 @@ def interleaved(dates: Sequence[str], first: Sequence[str] = REFERENCE_DATES) ->
     return order
 
 
+def flags_text(row: dict[str, Any]) -> str:
+    """The flags of a row that are set, for the pass's one line per date (``""`` when none is):
+    ``flag_unscreened`` with the names kept unscreened, ``flag_clip`` with the clipped mass
+    inside ±2.5 sd at ``λ = 0`` and at the cap (the two it is the "or" of: each above 1 %, as
+    ``lcm_price.derived_columns`` sets them), ``indicative``.  A row without the columns (an
+    earlier pass's, or a failure) has none.
+    Test: ``tests/test_lcm_scripts.py::test_sweep_line_names_the_flags``."""
+    parts = []
+    if row.get("flag_unscreened"):
+        parts.append(f"flag_unscreened ({row.get('names_unscreened') or '?'})")
+    if row.get("flag_clip"):
+        parts.append(
+            f"flag_clip (low {row.get('clip_low_inner_max', float('nan')):.4f}, "
+            f"high {row.get('clip_high_inner_max', float('nan')):.4f})"
+        )
+    if row.get("indicative"):
+        parts.append("indicative")
+    return ", ".join(parts)
+
+
 class Sweep:
     """A pass: its folders, the rows it has, the dates left."""
 
-    def __init__(self, tenor: str, budget: str, risk: str, cfg: dict[str, Any], root: Path) -> None:
+    def __init__(
+        self, tenor: str, budget: str, risk: str, cfg: dict[str, Any], root: Path, tag: str = ""
+    ) -> None:
         self.tenor, self.budget, self.risk, self.cfg = tenor, budget, risk, cfg
         self.out = lp.out_root(cfg, root)
         self.root = root
-        self.tag = f"{tenor}_{budget}"
+        self.tag = f"{tenor}_{budget}" + (f"_{tag}" if tag else "")
         self.rows = self.out / "rows" / self.tag
         self.logs = self.out / "logs" / self.tag
         self.rows.mkdir(parents=True, exist_ok=True)
         self.logs.mkdir(parents=True, exist_ok=True)
         self.commit = code_version()
         self.digest = lp.config_digest(cfg, tenor, budget)
-        self.table = self.out / (f"lcm_{tenor}.parquet" if budget == "production" else f"lcm_{tenor}_dev.parquet")  # fmt: skip
+        stem = (f"lcm_{tenor}" if budget == "production" else f"lcm_{tenor}_dev") + (
+            f"_{tag}" if tag else ""
+        )
+        self.table = self.out / f"{stem}.parquet"
+        self.label = tag
 
     def row(self, date: str) -> dict[str, Any] | None:
         path = self.rows / f"{date}.json"
@@ -173,7 +207,8 @@ def run_dates(
             if r is None:  # the process died before its row: the row is written here
                 r = {"date": d, "tenor": sweep.tenor, "budget": sweep.budget, "risk": sweep.risk,
                      "git_commit": sweep.commit, "config_digest": sweep.digest, "status": "failed",
-                     "reason": f"process exited with code {proc.returncode} and no row"}  # fmt: skip
+                     "reason": f"process exited with code {proc.returncode} and no row",
+                     **lp.failed_columns(d, sweep.tenor)}  # fmt: skip
                 (sweep.rows / f"{d}.json").write_text(json.dumps(r, indent=1))
             finished.append((d, r["status"], seconds))
             n_rows = sweep.write_table()
@@ -184,11 +219,12 @@ def run_dates(
             if r["status"] == "failed":
                 detail = f"FAILED: {r['reason'][:160]}"
             else:
-                detail = (
+                numbers = (
                     f"E_LC[D] {r['ED_lc']:.6f} ({r['ED_lc_se']:.6f}), LC/CC {r['ratio']:.5f} ({r['ratio_se']:.5f}), "
                     f"clip inside {r['clip_inner_max']:.4f}, idx ATM {r['idx_err_atm']:+.3f} vp"
-                    + (f"; {r['reason']}" if r["reason"] else "")
                 )
+                # the reason of a status "check", then the flags that are set
+                detail = "; ".join(x for x in (numbers, r["reason"], flags_text(r)) if x)
             log.info(
                 "%s %s [%d/%d] %s %.0f s (workers %d x %d threads); elapsed %s, left about %s; table %d rows; %s",
                 time.strftime("%H:%M:%S"), d, n_done, n_total, r["status"], seconds, workers, threads,
@@ -217,13 +253,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap.add_argument(
         "--varswap", action="store_true", help="the basket variance swap on the reference dates"
     )
+    ap.add_argument(
+        "--tag",
+        default="",
+        help="a suffix for the pass's rows, logs and table (a variant of the configuration)",
+    )
     ap.add_argument("--no-report", action="store_true")
     ap.add_argument("--no-retry", action="store_true")
     args = ap.parse_args(argv)
     cfg = lp.load_config(args.config)
     risk = args.risk or cfg["risk"]
     root = Path(args.root).resolve() if args.root else lp.ROOT
-    sweep = Sweep(args.tenor, args.budget, risk, cfg, root)
+    sweep = Sweep(args.tenor, args.budget, risk, cfg, root, args.tag)
     logging.basicConfig(
         level=logging.INFO, format="%(message)s",
         handlers=[logging.StreamHandler(sys.stdout), logging.FileHandler(sweep.out / "logs" / f"{sweep.tag}.log")],
@@ -284,7 +325,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     )  # fmt: skip
     if not args.no_report:
         report = Path(__file__).resolve().parent / "lcm_report.py"
-        cmd = [sys.executable, str(report), "--tenor", args.tenor, "--budget", args.budget, "--root", str(root)]  # fmt: skip
+        cmd = [sys.executable, str(report), "--tenor", args.tenor, "--budget", args.budget, "--root", str(root),
+               "--config", args.config, "--tag", args.tag]  # fmt: skip
         code = subprocess.run(cmd, check=False).returncode
         log.info("report: exit code %d", code)
     return 0

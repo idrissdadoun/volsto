@@ -114,8 +114,11 @@ def agreement(a: pd.Series, b: pd.Series) -> dict[str, Any]:
     }  # fmt: skip
 
 
-def load(tenor: str, budget: str, out: Path) -> tuple[pd.DataFrame, Path]:
-    path = out / (f"lcm_{tenor}.parquet" if budget == "production" else f"lcm_{tenor}_dev.parquet")
+def load(tenor: str, budget: str, out: Path, label: str = "") -> tuple[pd.DataFrame, Path]:
+    stem = (f"lcm_{tenor}" if budget == "production" else f"lcm_{tenor}_dev") + (
+        f"_{label}" if label else ""
+    )
+    path = out / f"{stem}.parquet"
     rows = pd.read_parquet(path)
     entries = pd.read_parquet(dd.OUT / f"entries_{tenor}.parquet")
     entries = entries[entries["basket"] == "B1"].drop_duplicates("date").set_index("date")
@@ -130,9 +133,9 @@ def load(tenor: str, budget: str, out: Path) -> tuple[pd.DataFrame, Path]:
     return frame.sort_index(), path
 
 
-def build(tenor: str, budget: str, out: Path) -> Path:
-    frame, source = load(tenor, budget, out)
-    tag = tenor if budget == "production" else f"{tenor}_dev"
+def build(tenor: str, budget: str, out: Path, label: str = "") -> Path:
+    frame, source = load(tenor, budget, out, label)
+    tag = (tenor if budget == "production" else f"{tenor}_dev") + (f"_{label}" if label else "")
     figures = out / "figures"
     figures.mkdir(parents=True, exist_ok=True)
     ok = frame[frame["status"] != "failed"].copy()
@@ -264,6 +267,41 @@ def build(tenor: str, budget: str, out: Path) -> Path:
         f"mean LC/CC {ok.loc[binds, 'ratio'].mean():.4f}, ED_wing/CC {ok.loc[binds, 'ED_wing_ratio'].mean():.4f}, ED_eqv/CC {ok.loc[binds, 'ED_eqv_ratio'].mean():.4f} (n {int(binds.sum())}); "
         f"where it does not: {ok.loc[~binds, 'ratio'].mean():.4f}, {ok.loc[~binds, 'ED_wing_ratio'].mean():.4f}, {ok.loc[~binds, 'ED_eqv_ratio'].mean():.4f} (n {int((~binds).sum())})."
     )
+    if has_s:
+        add("")
+        add(
+            "Against model S across dates (the effect is the ratio minus 1; model S over its copula):"
+        )
+        add("")
+        add("| LC quantity | dates | mean effect | model S, same dates | Pearson | Spearman |")
+        add("|---|---:|---:|---:|---:|---:|")
+        free = ok["clip_inner_max"] < 0.05
+        for label, col, mask in (
+            ("E_LC[D] / E_CC[D], all dates", "ratio", ok["ratio"].notna()),
+            ("E_LC[D] / E_CC[D], clipped mass inside ±2.5 sd below 5 %", "ratio", free),
+            ("E_LC[D] / E_CC[D], clipped mass 5 % or more", "ratio", ~free),
+            ("ED_wing / E_CC[D], all dates", "ED_wing_ratio", ok["ratio"].notna()),
+            ("ED_eqv / E_CC[D], all dates", "ED_eqv_ratio", ok["ratio"].notna()),
+        ):
+            both = pd.concat(
+                [ok.loc[mask, col] - 1.0, ok.loc[mask, "S_ratio"] - 1.0], axis=1, keys=["a", "b"]
+            ).dropna()
+            if len(both) < 3:
+                add(f"| {label} | {len(both)} | n/a | n/a | n/a | n/a |")
+                continue
+            add(
+                f"| {label} | {len(both)} | {both['a'].mean():+.4f} | {both['b'].mean():+.4f} | "
+                f"{both['a'].corr(both['b']):+.3f} | {both['a'].corr(both['b'], method='spearman'):+.3f} |"
+            )
+        both = pd.concat(
+            [ok["clip_inner_max"], ok["S_ratio"] - 1.0], axis=1, keys=["a", "b"]
+        ).dropna()
+        if len(both) >= 3:
+            add("")
+            add(
+                f"Correlation across dates of the clipped mass inside ±2.5 sd with model S's effect: {both['a'].corr(both['b']):+.3f} "
+                f"(n {len(both)}): the dates on which model S moves the forward most are those on which the model is clipped most."
+            )
     # --- 4. kappa, deltas
     add("")
     add("## 4. κ = E[D]/√E[V]" + (", and the deltas" if "delta_fwd_lc" in ok.columns else ""))
@@ -356,6 +394,107 @@ def build(tenor: str, budget: str, out: Path) -> Path:
         add(f"*{caption}*")
         add("")
     path = out / f"report_{tag}.md"
+    tmp = path.with_suffix(".md.tmp")
+    tmp.write_text("\n".join(md) + "\n")
+    tmp.replace(path)
+    return path
+
+
+def compare(tenor: str, budget: str, out: Path, label: str) -> Path:
+    """A variant pass (``disp_lcm.py --tag <label>``) against the main pass of the same tenor and
+    budget, on the dates both priced: the differences variant minus main of the forward, of its
+    ratio, of the calls and their ratios, of the names' second moment, and the dates only one of
+    them priced.  Written to ``report_<tenor>[_dev]_<label>_vs_main.md``."""
+    base, _ = load(tenor, budget, out)
+    var, source = load(tenor, budget, out, label)
+    b, v = base[base["status"] != "failed"], var[var["status"] != "failed"]
+    common = b.index.intersection(v.index)
+    b, v = b.loc[common], v.loc[common]
+    md: list[str] = []
+    add = md.append
+    stem = (tenor if budget == "production" else f"{tenor}_dev") + f"_{label}"
+    add(f"# The variant pass `{label}` against the main pass: {tenor}, {budget} budget")
+    add("")
+    add(
+        f"Generated {time.strftime('%Y-%m-%d %H:%M')} from `{source.name}` ({len(var)} dates, statuses "
+        f"{var['status'].value_counts().to_dict()}; commit(s) {', '.join(sorted({str(c) for c in var['git_commit'].dropna()}))}) and the main "
+        f"table ({len(base)} dates, statuses {base['status'].value_counts().to_dict()}). {len(common)} dates are priced by both. "
+        "Differences are variant minus main; relative differences are of the variant over the main, minus 1. [measured]"
+    )
+    add("")
+    rows: dict[str, dict[str, Any]] = {
+        "E_LC[D], relative": summary(v["ED_lc"] / b["ED_lc"] - 1.0, b["ED_lc_se"] / b["ED_lc"]),
+        "E_CC[D], relative": summary(v["ED_cc"] / b["ED_cc"] - 1.0, b["ED_cc_se"] / b["ED_cc"]),
+        "LC/CC of the forward, difference": summary(v["ratio"] - b["ratio"], b["ratio_se"]),
+    }
+    for t in TAGS:
+        ok_b = b[f"C_{t}_lc"] > 0
+        rows[f"K_{t}: C_LC, relative"] = summary(
+            (v[f"C_{t}_lc"] / b[f"C_{t}_lc"].where(ok_b) - 1.0),
+            b[f"C_{t}_lc_se"] / b[f"C_{t}_lc"].where(ok_b),
+        )
+        rows[f"K_{t}: LC/CC, difference"] = summary(
+            v[f"C_{t}_ratio"] - b[f"C_{t}_ratio"], b[f"C_{t}_ratio_se"]
+        )
+    rows.update({
+        "names' second moment over listed strips: main": summary(b["names_mc_over_listed"]),
+        "names' second moment over listed strips: variant": summary(v["names_mc_over_listed"]),
+        "clipped mass inside ±2.5 sd, difference": summary(v["clip_inner_max"] - b["clip_inner_max"]),
+        "ED_wing / E_CC[D], difference": summary(v["ED_wing_ratio"] - b["ED_wing_ratio"], b["ED_wing_ratio_se"]),
+    })  # fmt: skip
+    if "n_dropped_calendar" in v.columns:
+        rows["slices dropped by the calendar repair, per date"] = summary(
+            v["n_dropped_calendar"].astype(float)
+        )
+    add(table(rows))
+    add("")
+    by_year = pd.DataFrame({
+        "year": common.year,
+        "E_LC[D] rel": (v["ED_lc"] / b["ED_lc"] - 1.0).to_numpy(),
+        "LC/CC diff": (v["ratio"] - b["ratio"]).to_numpy(),
+        "C_125 rel": (v["C_125_lc"] / b["C_125_lc"].where(b["C_125_lc"] > 0) - 1.0).to_numpy(),
+        "slices dropped": v["n_dropped_calendar"].to_numpy() if "n_dropped_calendar" in v.columns else np.nan,
+    })  # fmt: skip
+    by_year["period"] = pd.cut(
+        by_year["year"],
+        [2006, 2010, 2014, 2018, 2022, 2027],
+        labels=["2007-10", "2011-14", "2015-18", "2019-22", "2023-26"],
+    )
+    add("By period (means over the dates of the period):")
+    add("")
+    add(
+        "| period | dates | E_LC[D], relative | LC/CC, difference | call at K_125, relative | slices dropped per date |"
+    )
+    add("|---|---:|---:|---:|---:|---:|")
+    for period, g in by_year.groupby("period", observed=True):
+        add(
+            f"| {period} | {len(g)} | {g['E_LC[D] rel'].mean():+.4f} | {g['LC/CC diff'].mean():+.4f} | {g['C_125 rel'].mean():+.3f} | {g['slices dropped'].mean():.1f} |"
+        )
+    only_v = sorted(
+        set(var.index[var["status"] != "failed"]) - set(base.index[base["status"] != "failed"])
+    )
+    only_b = sorted(
+        set(base.index[base["status"] != "failed"]) - set(var.index[var["status"] != "failed"])
+    )
+    add("")
+    add(
+        f"Priced by the variant only ({len(only_v)}): "
+        + (", ".join(f"{d:%Y-%m-%d}" for d in only_v[:30]) or "none")
+        + ("" if len(only_v) <= 30 else " ...")
+    )
+    if only_v and "names_unscreened" in var.columns:
+        kept = var.loc[only_v, "names_unscreened"].fillna("").value_counts().to_dict()
+        add("")
+        add(
+            f"On those dates the names kept unscreened are: {kept}; LC/CC of the forward there: mean {var.loc[only_v, 'ratio'].mean():.4f}, min {var.loc[only_v, 'ratio'].min():.4f}, max {var.loc[only_v, 'ratio'].max():.4f}."
+        )
+    add("")
+    add(
+        f"Priced by the main pass only ({len(only_b)}): "
+        + (", ".join(f"{d:%Y-%m-%d}" for d in only_b[:30]) or "none")
+        + ("" if len(only_b) <= 30 else " ...")
+    )
+    path = out / f"report_{stem}_vs_main.md"
     tmp = path.with_suffix(".md.tmp")
     tmp.write_text("\n".join(md) + "\n")
     tmp.replace(path)
@@ -517,11 +656,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap.add_argument("--budget", default="production", choices=("production", "development"))
     ap.add_argument("--config", default=str(lp.CONFIG))
     ap.add_argument("--root", default=None)
+    ap.add_argument("--tag", default="", help="the suffix of a variant pass (disp_lcm.py --tag)")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
     cfg = lp.load_config(args.config)
-    path = build(args.tenor, args.budget, lp.out_root(cfg, args.root))
+    path = build(args.tenor, args.budget, lp.out_root(cfg, args.root), args.tag)
     log.info("written %s", path)
+    if args.tag:
+        try:
+            log.info(
+                "written %s",
+                compare(args.tenor, args.budget, lp.out_root(cfg, args.root), args.tag),
+            )
+        except FileNotFoundError as exc:
+            log.info("no comparison with the main pass: %s", exc)
     return 0
 
 

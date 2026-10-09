@@ -2051,7 +2051,9 @@ def test_expiry_screen() -> None:
     third-Friday rule; the quote quality of an expiry; an expiry is dropped, with the rule and
     the reason, when one of its three listed strikes nearest the forward has no positive bid on
     both sides, or when its median half spread inside ±1 sd is above 2 vol points (6 beyond one
-    year); the screen needs the quotes unless it is switched off."""
+    year); the screen needs the quotes unless it is switched off.  The default screen has the
+    calendar repair and the unscreened fallback on (owner's decisions 1 and 2 of 2026-10-09)
+    and ``ExpiryScreen.off()`` has every option off; the description lists every option."""
     from volsto.studies.disp_lc import (
         ExpiryScreen,
         QuoteQuality,
@@ -2137,6 +2139,17 @@ def test_expiry_screen() -> None:
     assert screen.reads_quotes and screen.describe() == {
         "index_third_friday": True, "nearest_two_sided": True, "nearest_strikes": 3,
         "max_half_spread_vp": 2.0, "max_half_spread_long_vp": 6.0, "long_maturity": 1.0, "quote_sd": 1.0,
+        "calendar_repair": True, "unscreened_fallback": True,
+    }  # fmt: skip
+    # the defaults of 2026-10-09 (decisions 1 and 2); off() is the fully unscreened build
+    assert screen.calendar_repair is True and screen.unscreened_fallback is True
+    assert ExpiryScreen.off() == ExpiryScreen(
+        False, False, math.inf, math.inf, 1.0, calendar_repair=False, unscreened_fallback=False
+    )
+    assert ExpiryScreen.off().describe() == {
+        "index_third_friday": False, "nearest_two_sided": False, "nearest_strikes": 3,
+        "max_half_spread_vp": math.inf, "max_half_spread_long_vp": math.inf, "long_maturity": 1.0,
+        "quote_sd": 1.0, "calendar_repair": False, "unscreened_fallback": False,
     }  # fmt: skip
     assert screen.spread_limit(1.0) == 2.0 and screen.spread_limit(1.0001) == 6.0
     kept, dropped = screen_expiries("XYZ", everything, quotes, screen)
@@ -2674,7 +2687,9 @@ def lcm_scripts() -> tuple[Any, Any]:
 def test_lcm_sweep_order_and_configuration(tmp_path: Path) -> None:
     """The sweep's order is a permutation of its dates that starts with the reference dates
     present, then every 8th date, so that a pass stopped early covers the whole period; the
-    YAML loads strictly; the resume digest moves with the budget, the tenor and the YAML; a
+    YAML loads strictly, and its screen block is the library's default screen, every option
+    written out (``lcm_norepair.yaml`` is the same file with the repair and the fallback off);
+    the resume digest moves with the budget, the tenor and the YAML; a
     row counts as done only for the same commit and digest, a status that is not a failure and
     at least the risk asked for; the outputs are refused outside ``outputs/dispersion_lc``."""
     lp, sweep = lcm_scripts()
@@ -2688,6 +2703,18 @@ def test_lcm_sweep_order_and_configuration(tmp_path: Path) -> None:
     cfg = lp.load_config()
     assert cfg["budgets"]["production"]["n_particles"] == 800_000
     assert cfg["outputs"] == "outputs/dispersion_lc" and cfg["risk"] == "deltas"
+    # the screen block names every option and is the library's default: the calendar repair and
+    # the unscreened fallback on (owner's decisions 1 and 2 of 2026-10-09); the sensitivity "no
+    # repair, no fallback" is the same file with the two off
+    from volsto.studies.disp_lc import ExpiryScreen
+
+    assert set(cfg["screen"]) == {f.name for f in dataclasses.fields(ExpiryScreen)}
+    assert ExpiryScreen(**cfg["screen"]) == ExpiryScreen()
+    assert cfg["screen"]["calendar_repair"] is True and cfg["screen"]["unscreened_fallback"] is True
+    old = lp.load_config(lp.CONFIG.with_name("lcm_norepair.yaml"))
+    assert old["screen"] == {**cfg["screen"], "calendar_repair": False, "unscreened_fallback": False}  # fmt: skip
+    assert {**old, "screen": cfg["screen"]} == cfg
+    assert lp.config_digest(old, "3m", "production") != lp.config_digest(cfg, "3m", "production")
     bad = tmp_path / "bad.yaml"
     bad.write_text(lp.CONFIG.read_text() + "\nsurprise: 1\n")
     with pytest.raises(ValueError, match="surprise"):
@@ -2727,6 +2754,149 @@ def test_lcm_delta_method_errors() -> None:
     value, se = lp.delta_method(lambda m: m[0], [d])
     mean, mean_err = mean_se(d)
     assert value == pytest.approx(mean, rel=1e-12) and se == pytest.approx(mean_err, rel=1e-6)
+
+
+def test_calendar_repair() -> None:
+    """The calendar repair of a leg's slices (``ExpiryScreen.calendar_repair``, on by default:
+    owner's decision 1 of 2026-10-09): slices whose total variance falls from one expiry to the
+    next inside the central range are dropped — of a crossing pair the one that is not a third
+    Friday, the shorter one when neither is — until none crosses; without crossings, and with
+    the option off, nothing changes; the index target goes through the same rule (decision 5)
+    and the build counts what it drops there; every dropped expiry is recorded.  A name the
+    quote screen empties is kept unscreened by default (decision 2) and refused with the
+    fallback off."""
+    from volsto.market.svi_slices import fit_svi_surface
+    from volsto.studies.disp_lc import (
+        ExpiryScreen,
+        calendar_crossings,
+        lc_spec_from_smiles,
+        repair_calendar,
+    )
+
+    forward, rate = 1.0, 0.0
+    k = np.linspace(-0.4, 0.4, 33)
+
+    def expiry(date: str, T: float, vol: float) -> Any:
+        return types.SimpleNamespace(
+            expiry=date, T=T, forward=forward, rate=rate, k=k, vol=np.full(k.size, vol)
+        )
+
+    # monthly slices at 20 % and three weeklies: 10-23 at 15 % is below the third Friday 10-16
+    # before it (total variance 0.15^2 * 21/365 < 0.20^2 * 14/365), 11-13 at 24 % is above the
+    # third Friday 11-20 after it, and 10-30 at 20 % is consistent with its neighbours
+    clean = [expiry("2026-10-16", 14 / 365, 0.20), expiry("2026-11-20", 49 / 365, 0.20),
+             expiry("2026-12-18", 77 / 365, 0.20), expiry("2027-01-15", 105 / 365, 0.20)]  # fmt: skip
+    crossed = sorted([*clean, expiry("2026-10-23", 21 / 365, 0.15), expiry("2026-10-30", 28 / 365, 0.20),
+                      expiry("2026-11-13", 42 / 365, 0.24)], key=lambda e: e.T)  # fmt: skip
+    curve = ForwardCurve.flat(1.0, 0.0, 0.0)
+    kept, dropped = repair_calendar("AAA", clean, curve, 0.25, None, "test")
+    assert [e.expiry for e in kept] == [e.expiry for e in clean] and dropped == []
+    kept, dropped = repair_calendar("AAA", crossed, curve, 0.25, None, "test")
+    gone = {d["expiry"] for d in dropped}
+    # a third Friday against a weekly: the weekly goes, whichever comes first; then nothing
+    # crosses
+    assert gone == {"2026-10-23", "2026-11-13"}, gone
+    assert all(
+        d["rule"] == "calendar" and d["leg"] == "AAA" and "falls by" in d["reason"] for d in dropped
+    )
+    surface, _ = fit_svi_surface(kept, curve, horizon=0.25, origin="test")
+    assert calendar_crossings(surface, 0.25) == []
+    before, _ = fit_svi_surface(crossed, curve, horizon=0.25, origin="test")
+    assert len(calendar_crossings(before, 0.25)) >= 2
+    again, more = repair_calendar("AAA", kept, curve, 0.25, None, "test")
+    assert [e.expiry for e in again] == [e.expiry for e in kept] and more == []
+    # in the builder: on by default (owner's decision 1 of 2026-10-09) and off in off(); on, the
+    # crossing slices of a name and of the index target go (decision 5: the same rule on DJX)
+    names, w, spots = ["AAA", "BBB"], [0.5, 0.5], [1.0, 1.0]
+    smiles = {"AAA": crossed, "BBB": clean}
+    # the weekly 10-23 at 25 % is above the third Friday 11-20 after it (0.25^2 * 21 > 0.15^2 * 49)
+    index = [expiry("2026-10-16", 14 / 365, 0.15), expiry("2026-10-23", 21 / 365, 0.25),
+             expiry("2026-11-20", 49 / 365, 0.15), expiry("2027-01-15", 105 / 365, 0.15)]  # fmt: skip
+    off = ExpiryScreen.off()
+    on = dataclasses.replace(ExpiryScreen.off(), calendar_repair=True)
+    assert ExpiryScreen().calendar_repair is True and ExpiryScreen().unscreened_fallback is True
+    assert off.calendar_repair is False and off.unscreened_fallback is False
+    assert off.describe()["calendar_repair"] is False and on.describe()["calendar_repair"] is True
+    settings: dict[str, Any] = {
+        "lc": LocalCorrelationConfig(
+            particle=ParticleConfig(n_particles=1000, horizon=0.25, seed=1)
+        ),
+        "sim": SimConfig(n_paths=1000, dt_max=DAILY, seed=1),
+    }
+    spec_off, info_off = lc_spec_from_smiles(
+        names, w, spots, smiles, index, 1.0, 0.25, screen=off, **settings
+    )
+    spec_on, info_on = lc_spec_from_smiles(
+        names, w, spots, smiles, index, 1.0, 0.25, screen=on, **settings
+    )
+    assert info_off["dropped"] == [] and len(spec_off.surfaces[0].times) == 7
+    assert info_off["n_dropped_calendar_index"] == 0
+
+    def days(times: tuple[float, ...] | list[float]) -> list[int]:
+        return [round(365 * t) for t in times]
+
+    gone_by_leg: dict[str, set[str]] = {}
+    for d in info_on["dropped"]:
+        gone_by_leg.setdefault(d["leg"], set()).add(d["expiry"])
+    assert gone_by_leg == {"AAA": {"2026-10-23", "2026-11-13"}, "index": {"2026-10-23"}}
+    assert all(d["rule"] == "calendar" and "falls by" in d["reason"] for d in info_on["dropped"])
+    assert len(spec_on.surfaces[0].times) == 5 and spec_on.surfaces[1] == spec_off.surfaces[1]
+    # the index target: its crossing weekly is kept with the repair off and dropped with it on,
+    # and the build counts it; the listed forwards kept for the alignment follow the slices
+    assert days(spec_off.index_surface.times) == [14, 21, 49, 105]
+    assert days(spec_on.index_surface.times) == [14, 49, 105]
+    assert info_on["n_dropped_calendar_index"] == 1 and info_on["index_slices"] == list(
+        spec_on.index_surface.times
+    )
+    assert days([t for t, _ in spec_on.index_forward_ratios]) == [14, 49, 105]
+    assert spec_on.index_surface != spec_off.index_surface
+    assert lc_cache.lc_spec_key(spec_on) != lc_cache.lc_spec_key(spec_off)
+    # an index target without a crossing is the same with the repair on and off
+    spec_clean_off, _ = lc_spec_from_smiles(
+        names, w, spots, smiles, clean, 1.0, 0.25, screen=off, **settings
+    )
+    spec_clean_on, info_clean_on = lc_spec_from_smiles(
+        names, w, spots, smiles, clean, 1.0, 0.25, screen=on, **settings
+    )
+    assert spec_clean_on.index_surface == spec_clean_off.index_surface
+    assert info_clean_on["n_dropped_calendar_index"] == 0
+    assert {d["leg"] for d in info_clean_on["dropped"]} == {"AAA"}
+    assert spec_clean_on.surfaces == spec_on.surfaces
+    # a name the quote screen empties: kept unscreened by default (owner's decision 2 of
+    # 2026-10-09), refused with the fallback explicitly off
+    from volsto.studies.disp_lc import QuoteQuality
+
+    def quality(e: Any, half: float) -> QuoteQuality:
+        return QuoteQuality(e.expiry, e.T, 5, 5, half, 3, 3)
+
+    quotes = {
+        "AAA": {e.expiry: quality(e, 5.0) for e in crossed},
+        "BBB": {e.expiry: quality(e, 0.5) for e in clean},
+    }
+    index_quotes = {e.expiry: quality(e, 0.5) for e in index}
+    strict = ExpiryScreen(index_third_friday=False, calendar_repair=False, unscreened_fallback=False)  # fmt: skip
+    with pytest.raises(ValueError, match="AAA: no listed expiry passes the screen"):
+        lc_spec_from_smiles(names, w, spots, smiles, index, 1.0, 0.25, screen=strict, quotes=quotes,
+                            index_quotes=index_quotes, **settings)  # fmt: skip
+    lenient = dataclasses.replace(strict, unscreened_fallback=True)
+    spec_fb, info_fb = lc_spec_from_smiles(names, w, spots, smiles, index, 1.0, 0.25, screen=lenient, quotes=quotes,
+                                           index_quotes=index_quotes, **settings)  # fmt: skip
+    assert info_fb["names_unscreened"] == ["AAA"] and info_fb["n_names_unscreened"] == 1
+    assert info_fb["dropped"] == [] and spec_fb.surfaces[0] == spec_off.surfaces[0]
+    assert info_off["names_unscreened"] == [] and lenient.describe()["unscreened_fallback"] is True
+    assert strict.describe()["unscreened_fallback"] is False
+    # the default screen (no screen given): the emptied name is kept unscreened, then repaired;
+    # the index weekly goes by the third-Friday rule, so the repair finds nothing on the index
+    spec_def, info_def = lc_spec_from_smiles(names, w, spots, smiles, index, 1.0, 0.25, quotes=quotes,
+                                             index_quotes=index_quotes, **settings)  # fmt: skip
+    assert info_def["screen"] == ExpiryScreen().describe()
+    assert info_def["names_unscreened"] == ["AAA"] and info_def["n_dropped_calendar_index"] == 0
+    assert {(d["leg"], d["expiry"], d["rule"]) for d in info_def["dropped"]} == {
+        ("index", "2026-10-23", "third_friday"),
+        ("AAA", "2026-10-23", "calendar"),
+        ("AAA", "2026-11-13", "calendar"),
+    }
+    assert spec_def.surfaces == spec_on.surfaces and spec_def.index_surface == spec_on.index_surface
 
 
 # ---------------------------------------------------------------------------------------------
@@ -2945,12 +3115,18 @@ def paired(a: np.ndarray, b: np.ndarray) -> tuple[float, float]:
     return lcm.pair_mean(a - b)
 
 
-def smile_cells(level: np.ndarray, pillars: tuple[float, ...], atm: list[float]) -> np.ndarray:
-    """Per-path out-of-the-money payoffs on the basket at the pillars and at the strikes of
-    ``SD_INNER``: ``(n_paths, n_pillars, 7)``, with the strikes' ``(k, cp)``."""
-    out = np.empty((level.shape[0], len(pillars), len(SD_INNER)))
+def smile_cells(
+    level: np.ndarray,
+    pillars: tuple[float, ...],
+    atm: list[float],
+    sds: tuple[float, ...] = SD_INNER,
+) -> np.ndarray:
+    """Per-path out-of-the-money payoffs on the basket at the pillars and at the strikes ``sds``
+    (in at-the-money standard deviations; default ``SD_INNER``): ``(n_paths, n_pillars,
+    len(sds))``, with the strikes' ``(k, cp)``."""
+    out = np.empty((level.shape[0], len(pillars), len(sds)))
     for i, T in enumerate(pillars):
-        for j, m in enumerate(SD_INNER):
+        for j, m in enumerate(sds):
             k = m * atm[i] * np.sqrt(T)
             cp = 1.0 if k >= 0 else -1.0
             out[:, i, j] = np.maximum(cp * (level[:, i] - np.exp(k)), 0.0)
@@ -2958,16 +3134,20 @@ def smile_cells(level: np.ndarray, pillars: tuple[float, ...], atm: list[float])
 
 
 def smile_difference(
-    level_a: np.ndarray, level_b: np.ndarray, pillars: tuple[float, ...], surface: ImpliedSurface
+    level_a: np.ndarray,
+    level_b: np.ndarray,
+    pillars: tuple[float, ...],
+    surface: ImpliedSurface,
+    sds: tuple[float, ...] = SD_INNER,
 ) -> pd.DataFrame:
-    """The basket's implied vols under two models on the same paths, cell by cell inside ±1.5
-    sd: the two vols, their difference in vol points and its paired standard error (the paired
-    price difference through the vega)."""
+    """The basket's implied vols under two models on the same paths, cell by cell at the
+    strikes ``sds`` (default: inside ±1.5 sd): the two vols, their difference in vol points and
+    its paired standard error (the paired price difference through the vega)."""
     atm = [float(surface.atm_vol(T)) for T in pillars]
-    pa, pb = smile_cells(level_a, pillars, atm), smile_cells(level_b, pillars, atm)
+    pa, pb = smile_cells(level_a, pillars, atm, sds), smile_cells(level_b, pillars, atm, sds)
     rows = []
     for i, T in enumerate(pillars):
-        for j, m in enumerate(SD_INNER):
+        for j, m in enumerate(sds):
             k = m * atm[i] * np.sqrt(T)
             cp = 1.0 if k >= 0 else -1.0
             va = float(implied_vol(pa[:, i, j].mean(), 1.0, np.exp(k), T, cp))
@@ -3227,14 +3407,102 @@ def test_s2_constant_correlation_fixed_point() -> None:
     assert abs(ratio - 1.0) <= 0.005
 
 
+#: S3's smile gate in vol points: the calibrated model against ``λ ≡ 1`` on common paths, with
+#: no noise allowance (owner's decision 4 of 2026-10-09, SPEC §8.7)
+S3_SMILE_GATE_VP = 0.05
+
+
+def smile_against_lambda_one(
+    model: LocalCorrelationModel,
+    sim: SimConfig,
+    pillars: tuple[float, ...],
+    surface: ImpliedSurface,
+    sds: tuple[float, ...] = lcal.SD_MULTIPLES,
+) -> pd.DataFrame:
+    """S3's smile gate (owner's decision 4 of 2026-10-09, SPEC §8.7): the basket's implied vols
+    under ``model`` (``vol_a``) and under the same model with ``λ ≡ 1`` imposed on the slices
+    and the grid of its ``λ`` (``vol_b``), on the same pricing paths — one ``BasketSampler``,
+    whose draws are fixed across ``λ``; at ``sim.seed`` they are the draws of
+    ``reprice_index_smile`` — at the pillars and at the strikes ``sds`` (default: −2.5 to +2.5
+    at-the-money standard deviations of ``surface``).  Per cell ``diff_vp = 100·(vol_a −
+    vol_b)`` and its paired standard error (:func:`smile_difference`).  Read by
+    ``test_s3_identical_names`` and by ``scripts/lcm_synthetic.py where --case s3-smile``."""
+    one = LocalCorrelationFunction.constant(1.0, model.lam.times, model.lam.k_grid)
+    sampler = lcal.BasketSampler(model, sim, pillars)
+    return smile_difference(sampler.levels(), sampler.levels(one), pillars, surface, sds)
+
+
+def paired_cells(smile: pd.DataFrame) -> str:
+    """A paired smile difference (:func:`smile_difference`) as a table, maturity by strike in
+    at-the-money sd: the difference in vol points, its paired standard error in brackets."""
+    piv = smile.pivot(index="T", columns="sd", values="diff_vp")
+    se = smile.pivot(index="T", columns="sd", values="se_vp")
+    cells = piv.copy().astype(object)
+    for i in piv.index:
+        for j in piv.columns:
+            cells.loc[i, j] = f"{piv.loc[i, j]:+.4f} ({se.loc[i, j]:.4f})"
+    return str(cells.to_string())
+
+
+def target_errors(smile: pd.DataFrame, rep: lcal.IndexRepricingReport) -> pd.DataFrame:
+    """A paired smile difference with the target's vols of an index repricing report on the
+    same cells: ``err_a_vp`` and ``err_b_vp``, the errors of the two models against the target
+    in vol points (``100·(vol − target_vol)``)."""
+    out = smile.merge(rep.table[["T", "sd", "target_vol"]], on=["T", "sd"], validate="one_to_one")
+    assert len(out) == len(smile) == len(rep.table)
+    out["err_a_vp"] = 100 * (out["vol_a"] - out["target_vol"])
+    out["err_b_vp"] = 100 * (out["vol_b"] - out["target_vol"])
+    return out
+
+
+def max_abs_inside(table: pd.DataFrame, column: str, sd_max: float) -> float:
+    """Largest ``|table[column]|`` over the cells inside ``±sd_max``."""
+    return float(table.loc[table["sd"].abs() <= sd_max + 1e-12, column].abs().max())
+
+
+def target_error_line(label: str, rep: lcal.IndexRepricingReport) -> str:
+    """One line of an index repricing report: the largest ``|error|`` against the target inside
+    ±1.5 sd and inside ±2.5 sd (with its cell) and the at-the-money error by pillar, in vol
+    points ± the Monte Carlo standard error."""
+    inside = rep.table[rep.table["sd"].abs() <= 2.5 + 1e-12]
+    w = inside.loc[inside["error_vp"].abs().idxmax()]
+    atm = rep.table[rep.table["sd"] == 0.0]
+    cells = ", ".join(
+        f"{round(12 * T)}m {e:+.3f}±{se:.3f}"
+        for T, e, se in zip(atm["T"], atm["error_vp"], atm["stderr_vp"], strict=True)
+    )
+    return (
+        f"{label}: max |error| inside ±1.5 sd {rep.max_abs_error(1.5):.3f} vp, inside ±2.5 sd "
+        f"{rep.max_abs_error(2.5):.3f} vp ({w['error_vp']:+.3f}±{w['stderr_vp']:.3f} at "
+        f"{round(12 * w['T'])}m, {w['sd']:+.1f} sd); at the money {cells}"
+    )
+
+
 @pytest.mark.slow
 def test_s3_identical_names() -> None:
     """S3: five identical names whose common smile is the index smile (the truth is ``λ ≡ 1``;
-    ``rho_max = 1`` so that the cap does not bind): on the trusted range ``λ̂ ≥ 0.99`` from the
-    end of the quarter-step segment on (``t ≥ 10/252``) and ``λ̂ ≥ 0.985`` inside it (owner's
-    decision of 2026-10-08, second round: the first quarter steps carry a small downward bias,
-    SPEC §8.7), and the index reprices within 0.05 vp (noise-aware)."""
+    ``rho_max = 1`` so that the cap does not bind).
+
+    Gates.  (i) On the trusted range ``λ̂ ≥ 0.99`` from the end of the quarter-step segment on
+    (``t ≥ 10/252``) and ``λ̂ ≥ 0.985`` inside it (owner's decision of 2026-10-08, second round:
+    the first quarter steps carry a small downward bias, SPEC §8.7).  (ii) ``|index smile(λ̂) −
+    index smile(λ ≡ 1)| ≤ 0.05 vp`` in every cell — the pillars 1m, 2m, 3m, the strikes from
+    −2.5 to +2.5 at-the-money standard deviations — with the two models priced on the same
+    paths (``production_sim()``, the pricing seed; :func:`smile_against_lambda_one`).  This is
+    the owner's decision 4 of 2026-10-09 (SPEC §8.7, [review] LC4G-a): the gate reads the
+    correlation's own contribution, with no noise allowance — the paired standard error of
+    each cell is printed, not used.  It replaces the comparison with the analytic target at
+    ``max(0.05 vp, 3 se)``, which read the single name's own discretisation of its smile (with
+    ``λ ≡ 1`` the basket is one name).
+
+    Reported, not gated: the error against the analytic target, under ``λ̂`` and under ``λ ≡
+    1``, and its Δt halving — the same world calibrated and priced on the schedule and on the
+    schedule with every step halved (``StepSchedule.refined(2)``), on common random numbers
+    (:func:`_dt_halving`): the largest error inside ±1.5 sd and inside ±2.5 sd and the
+    at-the-money error by pillar at ``dt`` and at ``dt/2``, and the paired difference of the
+    two smiles cell by cell."""
     horizon = 0.25
+    pillars = (1 / 12, 2 / 12, 0.25)
     name_surface = w5_surfaces(2)[1]
     name = LocalVol(
         LocalVolSurface.from_implied(name_surface, lc_grid(horizon)), name_surface.forward_curve
@@ -3254,9 +3522,8 @@ def test_s3_identical_names() -> None:
     low_early = float(lows[early].min()) if early.any() else 1.0
     low_late = float(lows[~early].min())
     model = LocalCorrelationModel(models, fam, res.lam, basket)
-    rep = lcal.reprice_index_smile(
-        model, name_surface, production_sim(), maturities=(1 / 12, 2 / 12, 0.25)
-    )
+    sim = production_sim()
+    rep = lcal.reprice_index_smile(model, name_surface, sim, maturities=pillars)
     print("\nS3 " + rep.summary())
     print(
         f"S3 smallest lambda on the trusted range: {low_early:.6f} inside the quarter-step "
@@ -3265,8 +3532,56 @@ def test_s3_identical_names() -> None:
         f"{res.lam.values[0, 0]:.6f}; clipped high mass max {res.clipped_high.max():.4f} with "
         f"overshoot {res.overshoot_high.max():.2e} (lambda* against the cap of 1)"
     )
+    # the gate: the calibrated lambda against lambda = 1 imposed, on the report's paths
+    smile = smile_against_lambda_one(model, sim, pillars, name_surface)
+    errors = target_errors(smile, rep)
+    assert np.allclose(errors["err_a_vp"], rep.table["error_vp"], rtol=0.0, atol=1e-4)
+    worst = smile.loc[smile["diff_vp"].abs().idxmax()]
+    passing = smile["diff_vp"].abs() <= S3_SMILE_GATE_VP
+    print(
+        "S3 gate (owner's decision 4 of 2026-10-09): basket implied vol under the calibrated "
+        "lambda minus under lambda = 1 imposed, in vol points (paired se in brackets), on the "
+        f"same {sim.n_paths} paths:\n{paired_cells(smile)}\n"
+        f"S3 gate: largest |difference| {abs(worst['diff_vp']):.4f} vp (paired se "
+        f"{worst['se_vp']:.4f}) at {round(12 * worst['T'])}m, {worst['sd']:+.1f} sd; cells over "
+        f"{S3_SMILE_GATE_VP:g} vp: {int((~passing).sum())} of {len(smile)}\n"
+        "S3 against the target on these paths (reported): max |error| inside ±1.5 sd "
+        f"{max_abs_inside(errors, 'err_a_vp', 1.5):.3f} vp under the calibrated lambda and "
+        f"{max_abs_inside(errors, 'err_b_vp', 1.5):.3f} under lambda = 1 (one name: its own "
+        f"discretisation); inside ±2.5 sd {max_abs_inside(errors, 'err_a_vp', 2.5):.3f} and "
+        f"{max_abs_inside(errors, 'err_b_vp', 2.5):.3f}"
+    )
+    # reported, not gated: the error against the target at dt and at dt/2
+    halving = _dt_halving(models, fam, basket, name_surface, W5_WEIGHTS, horizon, pillars,
+                          n_particles=PRODUCTION, n_paths=PRODUCTION, sds=lcal.SD_MULTIPLES,
+                          rho_max=1.0)  # fmt: skip
+    coarse, fine, dt_smile = halving["report_coarse"], halving["report_fine"], halving["smile"]
+    assert isinstance(coarse, lcal.IndexRepricingReport)
+    assert isinstance(fine, lcal.IndexRepricingReport) and isinstance(dt_smile, pd.DataFrame)
+    dt_errors = target_errors(dt_smile, fine)
+    dt_worst = dt_smile.loc[dt_smile["diff_vp"].abs().idxmax()]
+    same_paths = float(np.abs(coarse.table["error_vp"] - rep.table["error_vp"]).max())
+    print(
+        "S3 error against the target and its dt halving (reported, not gated; calibrated and "
+        'priced on the schedule, "dt", and with every step halved, "dt/2"; the two calibrations '
+        "on common random numbers, each report on its own pricing paths):\n"
+        + target_error_line("  dt  ", coarse)
+        + "\n"
+        + target_error_line("  dt/2", fine)
+        + "\nS3 the halving's dt calibration against the gate's (other calibration draws, the "
+        f"same pricing paths): largest difference of the two smiles {same_paths:.4f} vp\n"
+        "S3 basket implied vol, dt/2 minus dt, in vol points (paired se in brackets), priced on "
+        f"common random numbers:\n{paired_cells(dt_smile)}\n"
+        "S3 on the common random numbers: max |error| against the target inside ±1.5 sd "
+        f"{max_abs_inside(dt_errors, 'err_b_vp', 1.5):.3f} vp at dt and "
+        f"{max_abs_inside(dt_errors, 'err_a_vp', 1.5):.3f} at dt/2; inside ±2.5 sd "
+        f"{max_abs_inside(dt_errors, 'err_b_vp', 2.5):.3f} and "
+        f"{max_abs_inside(dt_errors, 'err_a_vp', 2.5):.3f}; largest |dt/2 minus dt| "
+        f"{abs(dt_worst['diff_vp']):.4f} vp (paired se {dt_worst['se_vp']:.4f}) at "
+        f"{round(12 * dt_worst['T'])}m, {dt_worst['sd']:+.1f} sd"
+    )
     assert low_late >= 0.99 and low_early >= 0.985
-    assert rep.passes(tol_inner=0.05, tol_outer=0.05), rep.summary()
+    assert passing.all(), smile.to_string()
 
 
 # ---------------------------------------------------------------------------------------------
@@ -3288,12 +3603,14 @@ def _dt_halving(
     n_particles: int,
     n_paths: int,
     schedule: StepSchedule | float | None = None,
+    sds: tuple[float, ...] = SD_INNER,
     **options: object,
 ) -> dict[str, object]:
     """Calibrate and price on ``schedule`` ("dt") and on the schedule with both of its segments
     halved ("dt/2"), on common random numbers (the coarse runs use the Brownian-consistent
     coarsening of the fine runs' draws, in the calibration and in pricing): the Palladium
-    forward and calls, and the basket smile, at both."""
+    forward and calls, and the basket smile (at the strikes ``sds``; default inside ±1.5 sd),
+    at both."""
     dt = ACCEPTANCE_SCHEDULE if schedule is None else schedule
     dt = dt if isinstance(dt, StepSchedule) else StepSchedule.uniform(dt)
     half = dt.refined(2)
@@ -3337,7 +3654,7 @@ def _dt_halving(
         diff, se = paired(pay_f[:, j], pay_c[:, j])
         rows.append({"quantity": label, "dt": coarse[0], "dt/2": fine[0], "diff": diff, "diff_se": se,
                      "rel_%": 100 * diff / coarse[0], "rel_se_%": 100 * se / coarse[0]})  # fmt: skip
-    smile = smile_difference(lev_f, lev_c, pillars, surface)
+    smile = smile_difference(lev_f, lev_c, pillars, surface, sds)
     return {
         "prices": pd.DataFrame(rows),
         "smile": smile,
@@ -3688,12 +4005,15 @@ def diagnostics() -> Any:
 def test_dow_specification_from_the_study(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The Dow of 2026-10-02 at 3m as a specification.  The smiles are the study's
     (``marginals_for``).  Under the default expiry screen (owner's decision 1): the index target
-    holds third-Friday expiries only; every expiry dropped has its leg and its reason; every
-    name's curve reproduces the forwards of its kept expiries (1e-12); the SVI slices are C8's
-    selection among the kept expiries.  Without the screen the build is the one measured before
-    the decision (278 slices).  The second build reads every slice from the records and fits
-    nothing, and its key is the first's; the alignment of the listed DJX forwards with the
-    basket's is within the 1 % flag."""
+    holds third-Friday expiries only; every expiry dropped has its leg and its reason — the
+    calendar repair's among them (on by default since the owner's decisions of 2026-10-09), and
+    the build's count of the repair's drops on the index target is theirs; every name's curve
+    reproduces the forwards of its kept expiries (1e-12); the SVI slices are C8's selection
+    among the kept expiries, and the records hold them and the slices the repair fitted and
+    dropped.  Without the screen the build is the one measured before the decision (278
+    slices).  The second build reads every slice from the records and fits nothing, and its key
+    is the first's; the alignment of the listed DJX forwards with the basket's is within the
+    1 % flag."""
     from volsto.calibration.fit_records import FitRecords
     from volsto.market import svi_slices as sv
     from volsto.studies.disp_lc import third_friday
@@ -3729,7 +4049,10 @@ def test_dow_specification_from_the_study(tmp_path: Path, monkeypatch: pytest.Mo
     )
     # the index expiries beyond one year stay (the 6 vp limit beyond 1y: second-round decision)
     assert not [key for key in dropped if key[0] == "index" and key[1] > "2027-10-02"]
-    assert {g["rule"] for g in info["dropped"]} <= {"third_friday", "strikes", "spread", "quotes"}
+    assert {g["rule"] for g in info["dropped"]} <= {"third_friday", "strikes", "spread", "quotes", "calendar"}  # fmt: skip
+    # the calendar repair (on by default: owner's decisions 1 and 5 of 2026-10-09)
+    calendar = [g for g in info["dropped"] if g["rule"] == "calendar"]
+    assert info["n_dropped_calendar_index"] == sum(g["leg"] == "index" for g in calendar)
     assert [round(t, 4) for t in spec.index_surface.times] == [
         0.0384,
         0.1342,
@@ -3751,7 +4074,8 @@ def test_dow_specification_from_the_study(tmp_path: Path, monkeypatch: pytest.Mo
         assert surface.max_maturity == max(expected[-1], 0.25) + 0.05
     assert worst < 1e-12
     n_slices = sum(len(x.times) for x in spec.surfaces) + len(spec.index_surface.times)
-    assert len(records.keys()) == n_slices
+    # the records: the slices of the specification and the ones the repair fitted, then dropped
+    assert len(records.keys()) == n_slices + len(calendar)
     assert len(spec.index_forward_ratios) == len(spec.index_surface.times)
     # without the screen: every expiry the loader returns, as before the decision
     plain, plain_info = L.build_spec(inp, screen="off")
@@ -3771,8 +4095,10 @@ def test_dow_specification_from_the_study(tmp_path: Path, monkeypatch: pytest.Mo
     by_leg: dict[str, int] = {}
     for leg, _ in dropped:
         by_leg[leg] = by_leg.get(leg, 0) + 1
-    print(f"\nDow {TODAY} 3m: {len(dropped)} expiries dropped by the screen (index {by_leg.get('index', 0)}, "
-          f"{len(by_leg) - ('index' in by_leg)} names touched); {n_slices} slices ({n_plain} without the screen); "
+    print(f"\nDow {TODAY} 3m: {len(dropped)} expiries dropped by the screen and the calendar repair (index "
+          f"{by_leg.get('index', 0)}, {len(by_leg) - ('index' in by_leg)} names touched; the repair: {len(calendar)} "
+          f"on {len({g['leg'] for g in calendar} - {'index'})} names, {info['n_dropped_calendar_index']} on the "
+          f"index); {n_slices} slices ({n_plain} without the screen); "
           f"SVI rms median {info['svi_rms_vp_median']:.2f} vp, max {info['svi_rms_vp_max']:.2f} vp; {n_forwards} "
           f"forwards reproduced to {worst:.1e}; alignment delta (%) by listed DJX expiry {deltas}; flagged for "
           f"arbitrage on |k| <= 1: {len([x for x in market.flagged if x != 'index'])} names, index "

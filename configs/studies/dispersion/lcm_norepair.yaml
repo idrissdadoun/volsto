@@ -1,4 +1,8 @@
 # Local correlation model (SPEC §8.7, M12) on the dispersion study's Dow basket.
+# SENSITIVITY "no repair, no fallback": lcm.yaml with the calendar repair and the unscreened
+# fallback off — M12's defaults until the owner's decisions 1 and 2 of 2026-10-09, kept as a
+# reported sensitivity (run with --tag norepair).  Only the two last keys of the screen block
+# differ from lcm.yaml.
 # Read by scripts/lcm_price.py (one date) and scripts/disp_lcm.py (the sweep).  Every key is
 # explicit; an unknown key is an error.
 basket: B1
@@ -34,8 +38,8 @@ screen:                  # the expiry screen (owner, 2026-10-08, second round)
   max_half_spread_vp: 2.0
   max_half_spread_long_vp: 6.0
   long_maturity: 1.0
-  calendar_repair: true        # slices of a name or of DJX that cross in calendar inside ±2 sd are dropped (owner, 2026-10-09, decisions 1 and 5)
-  unscreened_fallback: true    # a name the quote screen empties keeps its unscreened expiries, flagged (owner, 2026-10-09, decision 2)
+  calendar_repair: false       # no leg is repaired: crossing slices stay (the default until 2026-10-09)
+  unscreened_fallback: false   # a name the quote screen empties fails the date (the default until 2026-10-09)
 budgets:                 # particles, pricing paths, paths of the constant-correlation fit
   production: {n_particles: 800000, n_paths: 800000, companion_paths: 400000}
   development: {n_particles: 200000, n_paths: 200000, companion_paths: 100000}

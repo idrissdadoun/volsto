@@ -12,8 +12,9 @@ Tags: **[measured]** a number produced by this repository (the command or file i
 Numbers on market data come from the dispersion study's Dow basket (30 names, price weights,
 DJX as the index) on four dates: 2026-10-02 ("today"), 2019-09-03, 2017-04-03 (steep index
 skew, low vols) and 2008-07-07. Unless a line says otherwise they are 3-month numbers from
-`scripts/lcm_price.py` at the development budget (2·10⁵ particles and paths; today's also at
-the production budget of 8·10⁵), with Monte Carlo standard errors on antithetic pair means.
+`scripts/lcm_price.py` at the production budget (8·10⁵ particles and paths; the rows of
+`outputs/dispersion_lc/rows/3m_production/`, commit c69ffab, default configuration), with Monte
+Carlo standard errors on antithetic pair means.
 
 ---
 
@@ -152,20 +153,20 @@ at-the-money straddle at the horizon.
    both models reprice (§4).
 2. **The second term is not.** A model that reprices the index skew has a fatter left tail for
    the basket than a constant-correlation model marked at the money, so `E[R̄²]` is higher
-   [measured: +17 %, +11 %, +21 %, +2 % on the four dates, LC over CC].
-3. **So `E[V]` is lower** [measured, `E^LC[V]/E^CC[V]`: 0.955, 0.909, 0.893, 0.984].
-4. **`κ = E[D]/√E[V]` hardly moves** [measured, LC over CC: 0.993, 1.006, 1.000, 0.988].
+   [measured: +18 %, +12 %, +21 %, +2 % on the four dates, LC over CC].
+3. **So `E[V]` is lower** [measured, `E^LC[V]/E^CC[V]`: 0.953, 0.908, 0.893, 0.985].
+4. **`κ = E[D]/√E[V]` hardly moves** [measured, LC over CC: 0.994, 1.006, 1.000, 0.988].
 5. **So the forward falls by about the square root of the fall of `E[V]`** [measured,
-   `E^LC[D]/E^CC[D]`: 0.9704 ± 0.0002, 0.9587 ± 0.0002, 0.9452 ± 0.0003, 0.9807 ± 0.0001; at
-   the production budget today 0.97008 ± 0.00011].
+   `E^LC[D]/E^CC[D]`: 0.97008 ± 0.00011, 0.95816 ± 0.00010, 0.94535 ± 0.00013,
+   0.98075 ± 0.00007].
 
 | | today | 2019-09-03 | 2017-04-03 | 2008-07-07 |
 |---|---|---|---|---|
-| `E^LC[R̄²] / E^CC[R̄²]` | 1.17 | 1.11 | 1.21 | 1.02 |
-| `E^LC[V] / E^CC[V]` | 0.955 | 0.909 | 0.893 | 0.984 |
-| its square root | 0.977 | 0.953 | 0.945 | 0.992 |
-| `κ_LC / κ_CC` | 0.993 | 1.006 | 1.000 | 0.988 |
-| `E^LC[D] / E^CC[D]` | 0.970 | 0.959 | 0.945 | 0.981 |
+| `E^LC[R̄²] / E^CC[R̄²]` | 1.18 | 1.12 | 1.21 | 1.02 |
+| `E^LC[V] / E^CC[V]` | 0.953 | 0.908 | 0.893 | 0.985 |
+| its square root | 0.976 | 0.953 | 0.945 | 0.992 |
+| `κ_LC / κ_CC` | 0.994 | 1.006 | 1.000 | 0.988 |
+| `E^LC[D] / E^CC[D]` | 0.970 | 0.958 | 0.945 | 0.981 |
 | the study's model S over its copula | 0.974 (not converged) | 0.944 | 0.876 | 0.980 |
 | the reference implementation (its own world) | 0.974 | 0.945 | 0.911 | 0.976 |
 
@@ -177,7 +178,7 @@ Path by path `D ≤ √V` (Cauchy–Schwarz with the weights), and with Jensen `
 cap is model-free once `E[V]` is known [derived].
 
 **The constant-correlation companion is the study's copula.** `E^CC[D]` is within 0.7 % of the
-study's copula forward `P_D` on the four dates (0.9993, 0.9933, 1.0030, 1.0029) [measured] —
+study's copula forward `P_D` on the four dates (0.9992, 0.9937, 1.0029, 1.0022) [measured] —
 two implementations that share only the data. The LC/CC ratio is therefore also, to that
 accuracy, the correction the calibrated model applies to the study's price.
 
@@ -186,9 +187,12 @@ downside wing (§8), so its `E[R̄²]` is below the listed index strip's and the
 forward is understated. The sweep reports two bracketing numbers beside `E^LC[D]`:
 `ED_wing = κ_LC·√(Σ w E^LC[R_i²] − M_B^listed)`, which replaces the model's basket second
 moment by the listed one, and `ED_eqv = κ_LC·√EQV`, which replaces both terms by the listed
-strips [measured today at the production budget: LC 0.9701, `ED_wing` 0.9587 ± 0.0005,
-`ED_eqv` 0.9471 ± 0.0012, as ratios to `E^CC[D]`; on 2017-04-03, development budget: 0.945,
-0.902, 0.886].
+strips [measured, as ratios to `E^CC[D]`: today LC 0.9701, `ED_wing` 0.9588 ± 0.0005,
+`ED_eqv` 0.9471 ± 0.0012; 2019-09-03 0.9582, 0.9604 ± 0.0013, 0.9502; 2017-04-03 0.9454,
+0.9017 ± 0.0011, 0.8864; 2008-07-07 0.9808, 0.9842, 0.9758]. They assume κ unchanged; the
+cross-dependent prototype (`docs/cross_dependent_vol.md`, branch `cross-dependent-vol`), which
+does reach the wing, gives 0.966 today and 0.925 on 2017-04-03 with κ higher: the truth of a
+model that fits the wing lies between the LC number and these brackets on those two dates.
 
 ## 6. The calls can move either way
 
@@ -201,8 +205,8 @@ large.
   rallies: it removes dispersion from the left and adds some on the right.
 
 The profile `E[D/B | bucket]/E[D/B]` on the study's buckets of the basket return shows it
-[measured, lowest bucket (below −10 %), LC against CC: 1.00 against 1.18 today, 1.37 against
-1.59, 1.29 against 1.58, 1.19 against 1.31; highest bucket (above +10 %): 1.08 against 1.02,
+[measured, lowest bucket (below −10 %), LC against CC: 1.01 against 1.18 today, 1.37 against
+1.59, 1.29 against 1.58, 1.18 against 1.31; highest bucket (above +10 %): 1.08 against 1.02,
 0.96 against 0.80, 1.04 against 0.91, 0.99 against 0.88].
 
 Which effect wins at a far strike depends on how steep the single-name skews are relative to
@@ -210,17 +214,20 @@ the index's. Calls at multiples of the CC forward, LC over CC [measured]:
 
 | strike | today | 2019-09-03 | 2017-04-03 | 2008-07-07 |
 |---|---|---|---|---|
-| 0.75 × | 0.911 | 0.840 | 0.800 | 0.930 |
-| 1 × | 0.903 | 0.611 | 0.602 | 0.892 |
-| 1.25 × | 0.953 | 0.295 | 0.368 | 0.927 |
-| 1.5 × | 1.018 ± 0.022 | 0.112 ± 0.004 | 0.259 ± 0.010 | 0.892 ± 0.020 |
+| 0.75 × | 0.910 | 0.838 | 0.800 | 0.930 |
+| 1 × | 0.901 | 0.609 | 0.602 | 0.893 |
+| 1.25 × | 0.950 | 0.293 | 0.369 | 0.934 |
+| 1.5 × | 1.003 ± 0.010 | 0.106 ± 0.002 | 0.262 ± 0.005 | 0.921 ± 0.011 |
 
 Today the names' vols are high and their skews flat relative to the index: the far calls lose
 little or gain. On the two dates with steep skews the far calls are worth a small fraction of
-their constant-correlation price. The far calls also depend on the single-name upside wings,
-which the quotes do not pin down (the names' SVI second moment is 1.3 % above the study's
+their constant-correlation price. The far calls also depend on the single-name surfaces away
+from the quotes: on the upside wings (the names' SVI second moment is 1.3 % above the study's
 listed strips today, almost all of it above the last listed strike; SPEC §8.7, second
-follow-up, decision 5).
+follow-up, decision 5), and on the calendar crossings of the names' weekly slices — on
+2022-04-04 dropping the crossing slices moves the calls at 1.25 and 1.5 times `P_D` by −14 %
+and −33 %, and their LC/CC ratios from 0.50 to 0.46 and from 0.46 to 0.37 (SPEC §8.7, LC7
+addendum). The numbers of this section are without that repair.
 
 ## 7. Hedging (SPEC §8.7, LC6)
 
@@ -233,9 +240,10 @@ falls and dispersion rises. The common delta of the forward, as the percentage o
 * the single-name skew channel, `Δ^CC_ss − 1` < 0 (each name's volatility falls along its skew);
 * the correlation channel, `Δ^LC_ss − Δ^CC_ss` > 0.
 
-[measured, LC against CC: today +2.29 against +0.35 (production: +2.2937 ± 0.0045 against
-+0.3492 ± 0.0027, skew −0.651, correlation +1.944); 2019-09-03 +1.33 against −2.40;
-2017-04-03 +1.75 against −2.57; 2008-07-07 +1.47 against −0.51. On the reference's world for
+[measured, LC against CC, with the skew and correlation channels: today +2.294 ± 0.004 against
++0.349 ± 0.003 (−0.651, +1.944); 2019-09-03 +1.323 against −2.400 (−3.400, +3.724);
+2017-04-03 +1.740 against −2.571 (−3.571, +4.311); 2008-07-07 +1.468 against −0.513 (−1.513,
++1.981); errors at most 0.005. On the reference's world for
 today the same decomposition is +1.000, −0.804, +2.543 against the reference's +1.000, −0.804,
 +2.545, test S4.]
 
@@ -263,7 +271,14 @@ index vega, two index skew vegas and the model-risk range for today (SPEC §8.7,
   0.2 vp of their quotes), and not the cap (raising `ρ_max` from 0.98 to 0.995 moves the wing
   by 0.04 vp). In a sell-off the index needs the names' volatilities to rise *because the
   index fell*, not only because each name fell: cross-dependent volatility (Guyon, Risk 2016),
-  per-name stochastic volatility with correlated factors, or common jumps.
+  per-name stochastic volatility with correlated factors, or common jumps. Over the study's
+  208 priced dates (3m, development budget, SPEC §8.7, LC7 results) the clip binds on more
+  than 1 % of the mass inside ±2.5 sd on 196, on 10.7 % in the median; the forward's LC/CC is
+  0.970 on average against 0.942 for the study's model S over its copula, the two agree on
+  average on the 50 dates where the clipped mass is below 5 % (−2.5 % and −2.6 %), and the
+  clipped mass and model S's effect are correlated at −0.63 across dates: what this model
+  misses of model S's correction is the wing it does not reach. A prototype of the first
+  extension is on branch `cross-dependent-vol` (`docs/cross_dependent_vol.md` there).
 * **Deterministic correlation given the index.** Given `(t, k_B)` the correlation has no
   randomness of its own, so the model understates the variability of dispersion: far calls on
   dispersion are too cheap relative to stochastic-correlation models fitted to the same smiles
@@ -272,8 +287,11 @@ index vega, two index skew vegas and the model-risk range for today (SPEC §8.7,
 * **Sub-baskets.** `λ`'s state is the index, so every constituent must be simulated, and the
   correlation inside the subset is the choice of `R_low` and `R_high`, not the market's.
 * **Existence and uniqueness** of the McKean equation are open; see §4.
-* **Data.** The single-name upside wings and the long-dated index expiries are extrapolations
-  or thin quotes: 12m and 24m numbers carry the study's caveat, and on 2026-10-02 the DJX
+* **Data.** The names' weekly slices cross in calendar on most dates from 2011 on, and the
+  Dupire surface is floored there: with the crossing slices dropped (an option, off by default)
+  the forward falls by 0.5 % on average over the sweep and the call at 1.25 times `P_D` by
+  10 %, the forward's LC/CC by 0.002 (SPEC §8.7, LC7 addendum and results). The single-name
+  upside wings and the long-dated index expiries are extrapolations or thin quotes: 12m and 24m numbers carry the study's caveat, and on 2026-10-02 the DJX
   slices beyond one year are not consistent with the shorter ones in the wings (SPEC §8.7,
   [review] LC4G-g).
 * **Smaller ones.** Discrete dividends; pricing beyond the calibration horizon is refused; the
