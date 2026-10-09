@@ -18,11 +18,12 @@ across the group's priced dates with the standard error of that mean, and the me
 date stays in the per-date table with its reason.
 """
 
-# ruff: noqa: E501
+# ruff: noqa: E501, RUF001
 from __future__ import annotations
 
 import argparse
 import logging
+import math
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -102,6 +103,29 @@ SOURCE = {
 }  # fmt: skip
 
 
+#: per-date differences summarised by group: name -> (minuend, subtrahend), label
+DIFFERENCES = {
+    "cdv3_minus_lc_over_cc": ("cdv3_over_cc", "lc_over_cc"),
+    "cdv6_minus_lc_over_cc": ("cdv6_over_cc", "lc_over_cc"),
+    "lc_minus_s_over_copula": ("lc_over_copula", "s_over_copula"),
+    "cdv3_minus_s_over_copula": ("cdv3_over_copula", "s_over_copula"),
+    "cdv6_minus_s_over_copula": ("cdv6_over_copula", "s_over_copula"),
+    "lc_minus_listed_fwd": ("lc_over_copula", "listed_fwd"),
+    "cdv3_minus_listed_fwd": ("cdv3_over_copula", "listed_fwd"),
+    "cdv6_minus_listed_fwd": ("cdv6_over_copula", "listed_fwd"),
+}
+DIFFERENCE_LABELS = {
+    "cdv3_minus_lc_over_cc": "CDV(beta=3)/CC - LC/CC",
+    "cdv6_minus_lc_over_cc": "CDV(beta=6)/CC - LC/CC",
+    "lc_minus_s_over_copula": "LC/copula - model S/copula",
+    "cdv3_minus_s_over_copula": "CDV(beta=3)/copula - model S/copula",
+    "cdv6_minus_s_over_copula": "CDV(beta=6)/copula - model S/copula",
+    "lc_minus_listed_fwd": "LC/copula - listed-variance forward",
+    "cdv3_minus_listed_fwd": "CDV(beta=3)/copula - listed-variance forward",
+    "cdv6_minus_listed_fwd": "CDV(beta=6)/copula - listed-variance forward",
+}
+
+
 def by_date(table: pd.DataFrame) -> pd.DataFrame:
     """The per-date table: the owner's quantities with their Monte Carlo errors, the flags."""
     model_s = pd.read_parquet(pc.STUDY / "model_s_3m.parquet").set_index("date")
@@ -127,6 +151,11 @@ def by_date(table: pd.DataFrame) -> pd.DataFrame:
     out["kappa_s"] = table["P_D_S"] / np.sqrt(ev_s)
     out["ev_over_eqv_copula"] = table["EV_copula"] / table["EQV"]
     out["ev_over_eqv_s"] = ev_s / table["EQV"]
+    # model S's numbers count on its converged dates only
+    not_converged = ~table["model_s_converged"].fillna(False).astype(bool)
+    out.loc[not_converged.to_numpy(), ["s_over_copula", "kappa_s", "ev_over_eqv_s"]] = np.nan
+    for name, (a, b) in DIFFERENCES.items():
+        out[name] = out[a] - out[b]
     for tag, name in (("lc", "lc"), ("cdv_a", "cdv3"), ("cdv_b", "cdv6")):
         out[f"clip_low_{name}"] = table[f"clip_low_inner_{tag}"]
         out[f"clip_high_{name}"] = table[f"clip_high_inner_{tag}"]
@@ -148,7 +177,7 @@ def by_group(dates: pd.DataFrame) -> pd.DataFrame:
     priced dates; also without the dates where a name is kept unscreened."""
     rows = []
     ok = dates[dates["status"] != "failed"]
-    names = [q[0] for q in QUANTITIES] + ["ev_over_eqv_copula", "ev_over_eqv_s"]
+    names = [q[0] for q in QUANTITIES] + ["ev_over_eqv_copula", "ev_over_eqv_s", *DIFFERENCES]
     for group, _ in GROUPS:
         for sample, frame in (
             ("all priced", ok[ok["group"] == group]),
@@ -213,6 +242,112 @@ def figure(groups: pd.DataFrame) -> tuple[Any, pd.DataFrame]:
     return fig, pd.DataFrame(data)
 
 
+def reading(g_all: pd.DataFrame) -> tuple[str, dict[str, tuple[float, float]]]:
+    """The paragraph of check (f), from the by-group means (every number is a record of D.1).  The
+    sentences' claims are checked on the numbers before they are written."""
+
+    def m(group: str, name: str) -> float:
+        return float(g_all[(g_all["group"] == group) & (g_all["quantity"] == name)].iloc[0]["mean"])
+
+    def pm(group: str, name: str, digits: int = 4, sign: bool = False) -> str:
+        r = g_all[(g_all["group"] == group) & (g_all["quantity"] == name)].iloc[0]
+        return f"{r['mean']:{'+' if sign else ''}.{digits}f} ± {r['se_of_mean']:.{digits}f}"
+
+    def se(group: str, name: str) -> float:
+        return float(
+            g_all[(g_all["group"] == group) & (g_all["quantity"] == name)].iloc[0]["se_of_mean"]
+        )
+
+    def n(group: str) -> int:
+        return int(
+            g_all[(g_all["group"] == group) & (g_all["quantity"] == "lc_over_cc")].iloc[0]["n"]
+        )
+
+    h, lo = "high", "low"
+    c0, c3, c6, s_h = (
+        m(h, "lc_over_copula"),
+        m(h, "cdv3_over_copula"),
+        m(h, "cdv6_over_copula"),
+        m(h, "s_over_copula"),
+    )
+    way3, way6 = (c0 - c3) / (c0 - s_h), (c0 - c6) / (c0 - s_h)
+    claims = {
+        "high group: the forward falls with beta": c6 < c3 < c0,
+        "high group: model S is below CDV at beta = 6": s_h < c6,
+        "high group: the basket's second moment is closer to the listed one at beta = 3": abs(
+            m(h, "rbar2_cdv3") - 1
+        )
+        < abs(m(h, "rbar2_lc") - 1),
+        "high group: the clipped mass falls by less than a quarter at beta = 3": m(h, "clip_cdv3")
+        > 0.75 * m(h, "clip_lc"),
+        "high group: the second moment is not closer to the listed one at beta = 6 than at beta = 3": abs(
+            m(h, "rbar2_cdv6") - 1
+        )
+        >= abs(m(h, "rbar2_cdv3") - 1),
+        "high group: about a quarter of the particles still clipped under the prototype": 0.18
+        < m(h, "clip_cdv6")
+        < 0.30
+        and 0.18 < m(h, "clip_cdv3") < 0.30,
+        "high group: CDV at beta = 6 within two standard errors of the listed-variance forward": abs(
+            m(h, "cdv6_minus_listed_fwd")
+        )
+        < 2 * se(h, "cdv6_minus_listed_fwd"),
+        "high group: kappa lower at beta = 6 than at beta = 3": m(h, "kappa_cdv6")
+        < m(h, "kappa_cdv3"),
+        "low group: the forward falls with beta": m(lo, "cdv6_over_cc")
+        < m(lo, "cdv3_over_cc")
+        < m(lo, "lc_over_cc"),
+        "low group: kappa falls with beta": m(lo, "kappa_cdv6")
+        < m(lo, "kappa_cdv3")
+        < m(lo, "kappa_lc"),
+        "low group: the prototype's clipped mass exceeds M12's": m(lo, "clip_cdv3")
+        > m(lo, "clip_lc")
+        and m(lo, "clip_cdv6") > m(lo, "clip_lc"),
+    }
+    # what is specific to the binding dates: the difference of the two groups' per-date moves
+    did = {}
+    for b in ("3", "6"):
+        name = f"cdv{b}_minus_lc_over_cc"
+        did[b] = (m(h, name) - m(lo, name), math.hypot(se(h, name), se(lo, name)))
+    claims |= {
+        "the part of the move specific to the binding dates is within two standard errors of zero at beta = 3": abs(
+            did["3"][0]
+        )
+        < 2 * did["3"][1],
+        "the same at beta = 6": abs(did["6"][0]) < 2 * did["6"][1],
+        "low group: LC within two standard errors of model S": abs(m(lo, "lc_minus_s_over_copula"))
+        < 2 * se(lo, "lc_minus_s_over_copula"),
+        "low group: CDV at beta = 6 below model S by more than two standard errors": m(
+            lo, "cdv6_minus_s_over_copula"
+        )
+        < -2 * se(lo, "cdv6_minus_s_over_copula"),
+        "low group: the prototype lowers the forward at both betas": m(lo, "cdv3_minus_lc_over_cc")
+        < 0
+        and m(lo, "cdv6_minus_lc_over_cc") < 0,
+    }
+    failed = [k for k, ok in claims.items() if not ok]
+    if failed:
+        raise ValueError(f"the reading's sentences do not hold on the group means: {failed}")
+    text = (
+        f"**In level, yes; the test does not show that it is the wing.** On the {n(h)} dates where M12 binds most (clipped mass {pm(h, 'clip_lc', 3)}) the prototype brings the basket's second moment to the listed one "
+        f"(E[R̄²]/M_B^listed {pm(h, 'rbar2_lc', 3)} under LC, {pm(h, 'rbar2_cdv3', 3)} at β = 3, {pm(h, 'rbar2_cdv6', 3)} at β = 6) and the forward falls: over CC, {pm(h, 'lc_over_cc')} under LC, "
+        f"{pm(h, 'cdv3_over_cc')} at β = 3 and {pm(h, 'cdv6_over_cc')} at β = 6; over the copula, {pm(h, 'lc_over_copula')} → {pm(h, 'cdv3_over_copula')} → {pm(h, 'cdv6_over_copula')}, "
+        f"against {pm(h, 's_over_copula')} for model S and {pm(h, 'listed_fwd')} for the listed-variance forward. "
+        f"M12's discount to the copula on these dates goes from {100 * (1 - c0):.1f} % to {100 * (1 - c3):.1f} % at β = 3 and {100 * (1 - c6):.1f} % at β = 6, where model S is at {100 * (1 - s_h):.1f} %: "
+        f"{100 * way3:.0f} % and {100 * way6:.0f} % of the distance; at β = 6 it is at the listed-variance forward ({pm(h, 'cdv6_minus_listed_fwd', 4, True)} per date) and still {pm(h, 'cdv6_minus_s_over_copula', 4, True)} above model S. "
+        f"**But β is imposed, not calibrated, and the same β lowers the forward where M12 does not bind.** On the {n(lo)} dates with the smallest clipped mass ({pm(lo, 'clip_lc', 3)}), per date, CDV − LC over CC is "
+        f"{pm(lo, 'cdv3_minus_lc_over_cc', 4, True)} at β = 3 and {pm(lo, 'cdv6_minus_lc_over_cc', 4, True)} at β = 6, against {pm(h, 'cdv3_minus_lc_over_cc', 4, True)} and {pm(h, 'cdv6_minus_lc_over_cc', 4, True)} on the binding dates. "
+        f"The part of the move that is specific to the binding dates (high group minus low group) is {did['3'][0]:+.4f} ± {did['3'][1]:.4f} at β = 3 and {did['6'][0]:+.4f} ± {did['6'][1]:.4f} at β = 6: not distinguishable from zero. "
+        f"Where M12 does not bind, LC is already at model S (LC/copula − S/copula {pm(lo, 'lc_minus_s_over_copula', 4, True)}; on the binding dates {pm(h, 'lc_minus_s_over_copula', 4, True)}) and the prototype at β = 6 takes it below ({pm(lo, 'cdv6_minus_s_over_copula', 4, True)}). "
+        f"Mechanism. On the binding dates the second moment is matched at β = 3 while the clipped mass hardly falls ({pm(h, 'clip_lc', 3)} → {pm(h, 'clip_cdv3', 3)} → {pm(h, 'clip_cdv6', 3)}: λ is still clipped on about a quarter of the particles), "
+        f"and from β = 3 to β = 6 the forward falls through κ, not through the second moment (κ {pm(h, 'kappa_lc')} under LC, {pm(h, 'kappa_cdv3')}, {pm(h, 'kappa_cdv6')}). "
+        f"On the other dates κ falls ({pm(lo, 'kappa_lc')} → {pm(lo, 'kappa_cdv3')} → {pm(lo, 'kappa_cdv6')}) and the prototype itself clips λ ({pm(lo, 'clip_cdv3', 3)} and {pm(lo, 'clip_cdv6', 3)} of the particles) where M12 did not. "
+        "**Conclusion.** The direction is the conjectured one — on the dates where M12 binds, the prototype moves its discount towards model S's and reaches the listed-variance forward at β = 6 — but at a fixed β the stratified test does not separate the wing's effect from the cross-dependence's own effect on κ, "
+        "which is of the same size on the dates where nothing binds. Separating them needs β calibrated date by date (the smallest β that closes the wing), which was excluded from this run."
+    )
+    return text, {"3": did["3"], "6": did["6"]}
+
+
 def cell(v: Any, se: Any = None, digits: int = 4) -> str:
     return pc.pm(
         None if v is None or pd.isna(v) else float(v),
@@ -262,10 +397,15 @@ def build(table_path: Path, paragraph: Path | None) -> None:
     labels = {q[0]: q[1] for q in QUANTITIES} | {
         "ev_over_eqv_copula": "E[V]/EQV copula",
         "ev_over_eqv_s": "E[V]/EQV model S",
+        **DIFFERENCE_LABELS,
     }
     definitions = {q[0]: q[2] for q in QUANTITIES} | {
         "ev_over_eqv_copula": "EV / EQV of the entry",
         "ev_over_eqv_s": "EV_S / EQV",
+        **{
+            k: f"per date, {a} minus {b}; then the mean across the group's dates"
+            for k, (a, b) in DIFFERENCES.items()
+        },
     }
     for name in labels:
         cells = []
@@ -299,9 +439,20 @@ def build(table_path: Path, paragraph: Path | None) -> None:
         add(
             f"Model S did not converge on: {', '.join(not_conv['date'])}; its ratio is in the table as the study's file has it."
         )
+    add("")
+    add(
+        "### D.2 Reading: on the dates where M12 binds, does closing the wing move its discount towards model S's?"
+    )
+    add("")
+    text, did = reading(g_all)
+    add(text)
+    for b, (value, err) in did.items():
+        records.append(pc.record(
+            f"D.high_minus_low.cdv{b}_minus_lc_over_cc", "D", f"CDV(beta={b})/CC - LC/CC: mean over the high group minus mean over the low group", value, err, date="high group minus low group", unit="ratio difference",
+            definition="difference of the two groups' means of the per-date CDV/CC - LC/CC; se = root of the sum of the two squared standard errors of the means (the groups have no date in common)",
+            budget=budget, commit=commit, source=src, n=len(ok), notes="the part of the prototype's move that is specific to the dates where M12 binds",
+        ))  # fmt: skip
     if paragraph is not None and paragraph.exists():
-        add("")
-        add("### D.2 Reading")
         add("")
         add(paragraph.read_text().strip())
     add("")
@@ -346,8 +497,8 @@ def build(table_path: Path, paragraph: Path | None) -> None:
     pc.write_part("D_stratified", records, "\n".join(md))
     figs = (
         "| figure | file | CSV | what it shows |\n|:--|:--|:--|:--|\n"
-        "| F1 | `figures/F1_forward_over_copula.pdf` | `figures/F1_forward_over_copula.csv` | the forward over the copula's on the monthly dates 2007-2026: LC, model S, the listed-variance forward (3m, development budget, decisions 1-2 on) |\n"
-        "| F2 | `figures/F2_calls_over_copula_by_strike.pdf` | `figures/F2_calls_over_copula_by_strike.csv` | calls over the copula's by strike (0.75, 1, 1.25, 1.5 x the copula's forward), LC and model S: mean and interquartile range across dates |\n"
+        "| F1 | `figures/F1_forward_over_copula.pdf` | `figures/F1_forward_over_copula.csv` | the forward over the copula's on the dates of the history table, 2007-2026: LC, model S, the listed-variance forward (3m, development budget, decisions 1-2 on); the lines break at the 16 monthly dates of the study that have no row and at the 3 failed dates; today's point is the development-budget row |\n"
+        "| F2 | `figures/F2_calls_over_copula_by_strike.pdf` | `figures/F2_calls_over_copula_by_strike.csv` | calls over the copula's by strike (0.75, 1, 1.25, 1.5 x the copula's forward), LC and model S: mean and interquartile range across dates (the 215 dates where model S converged; at 1.25 x and 1.5 x see the caveat of section V3) |\n"
         "| F3 | `figures/F3_stratified_cdv_by_group.pdf` | `figures/F3_stratified_cdv_by_group.csv` | the stratified CDV test by group: forward over the copula's under M12, CDV at β = 3 and β = 6, model S, and the listed-variance forward (means ± standard error of the mean) |\n\n"
         "Vector PDF, 6.5 x 3 inches, plain matplotlib, no titles."
     )

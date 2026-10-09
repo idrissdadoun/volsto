@@ -118,7 +118,7 @@ def findings(b: Book) -> list[str]:
         f"{b.pm('D.high.cdv3_over_copula.mean', 4)} under CDV at β = 3 and {b.pm('D.high.cdv6_over_copula.mean', 4)} at β = 6, against {b.pm('D.high.s_over_copula.mean', 4)} for model S and {b.pm('D.high.listed_fwd.mean', 4)} for the listed-variance forward, "
         f"with the clipped mass going from {b.pm('D.high.clip_lc.mean', 3)} to {b.pm('D.high.clip_cdv3.mean', 3)} and {b.pm('D.high.clip_cdv6.mean', 3)}; "
         f"on the {b.n('D.low.lc_over_copula.mean')} dates where it is smallest the same five ratios are {b.pm('D.low.lc_over_copula.mean', 4)}, {b.pm('D.low.cdv3_over_copula.mean', 4)}, {b.pm('D.low.cdv6_over_copula.mean', 4)}, "
-        f"{b.pm('D.low.s_over_copula.mean', 4)} and {b.pm('D.low.listed_fwd.mean', 4)} (means across each group's dates ± their standard error, development budget)."
+        f"{b.pm('D.low.s_over_copula.mean', 4)} and {b.pm('D.low.listed_fwd.mean', 4)} (means across each group's dates ± their standard error, development budget); per date the prototype lowers the forward over CC by {b.pm('D.high.cdv3_minus_lc_over_cc.mean', 4, sign=True)} (β = 3) and {b.pm('D.high.cdv6_minus_lc_over_cc.mean', 4, sign=True)} (β = 6) in the first group and by {b.pm('D.low.cdv3_minus_lc_over_cc.mean', 4, sign=True)} and {b.pm('D.low.cdv6_minus_lc_over_cc.mean', 4, sign=True)} in the second, so the part specific to the binding dates is {b.pm('D.high_minus_low.cdv3_minus_lc_over_cc', 4, sign=True)} and {b.pm('D.high_minus_low.cdv6_minus_lc_over_cc', 4, sign=True)}: the direction is the conjectured one, but at a fixed β the test does not separate the wing's effect from the cross-dependence's own."
     )
     e = f"A.check_e.{d0}.beta3"
     out.append(

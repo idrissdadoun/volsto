@@ -30,6 +30,7 @@ log = logging.getLogger("pm_assemble")
 
 #: (part name, heading) in the order of the owner's brief.
 SECTIONS = (
+    ("R_reader_notes", "How to read this package, and what not to quote"),
     ("A_today", "A. Today (2026-10-02), 3m, production budget"),
     (
         "A_check_e",
