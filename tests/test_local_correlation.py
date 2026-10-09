@@ -2487,6 +2487,173 @@ def test_margrabe_and_correlation_estimators() -> None:
 
 
 # ---------------------------------------------------------------------------------------------
+# LC6: risk
+# ---------------------------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def w5_risk(w5_3m: list[LocalVol]) -> tuple[Any, Any, np.ndarray, float]:
+    """Risk engines on W5 at 3m: the model with a ``λ`` that falls with the basket and its
+    constant-correlation companion, on the same pricing settings (2·10⁴ paths)."""
+    from volsto.risk import local_correlation as lcr
+
+    horizon = 0.25
+    fam = CorrelationFamily.equi(5)
+    model = lc_model(w5_3m, fam, sloped_lambda(w5_3m, fam, horizon))
+    sim = SimConfig(n_paths=20_000, dt_max=DAILY, seed=21, chunk_size=10_000)
+    lc = lcr.LCRiskEngine(lcr.FixedLambdaBuilder(model, "LC"), sim)
+    cc = lcr.LCRiskEngine(lcr.FixedLambdaBuilder(lcr.constant_companion(model, 0.45), "CC"), sim)
+    return lc, cc, W5_WEIGHTS, horizon
+
+
+def test_sticky_moneyness_forward_delta(w5_risk: tuple[Any, Any, np.ndarray, float]) -> None:
+    """R1: under sticky moneyness a common spot move scales the dispersion path by path, so the
+    forward's elasticity is exactly 1 (+1 % of ``E[D]`` per +1 %), to 1e-9, for the log and the
+    arithmetic bump; a call's is above 1 (it gains the strike's leverage)."""
+    from volsto.risk import local_correlation as lcr
+
+    lc, _, w, T = w5_risk
+    forward = Palladium(w, 0.0, T, ZERO)
+    base = lc.price(forward, lc.builder.base)[0]
+    for bump in ("log", "arith"):
+        d = lcr.common_delta(lc, forward, lc.builder.base, regime="sticky_moneyness", bump=bump)
+        assert d.extra["elasticity"] == pytest.approx(1.0, abs=1e-9)
+        assert d.value == pytest.approx(base, rel=1e-9) and d.extra["base_price"] == base
+        assert d.states == ("LC spot[all] up", "LC spot[all] down") and d.n_paths == 20_000
+    call = Palladium(w, 0.08, T, ZERO)
+    d = lcr.common_delta(lc, call, lc.builder.base, regime="sticky_moneyness")
+    assert d.extra["elasticity"] > 1.5
+    # sticky strike is another number: the local vols and λ do not follow the spot
+    ss = lcr.common_delta(lc, forward, lc.builder.base, regime="sticky_strike")
+    assert abs(ss.extra["elasticity"] - 1.0) > 0.2 and ss.stderr > 0
+    with pytest.raises(ValueError, match="needs a recalibration"):
+        lcr.common_delta(lc, forward, lc.builder.base, regime="implied_sticky_strike")
+    with pytest.raises(ValueError):
+        lcr.common_delta(lc, forward, lc.builder.base, bump="relative")
+    with pytest.raises(ValueError):
+        lcr.LCState(None, regime="sticky")
+    with pytest.raises(ValueError):
+        lcr.LCState(None, spot_factors=(1.0, -1.0))
+
+
+def test_delta_decomposition_sums(w5_risk: tuple[Any, Any, np.ndarray, float]) -> None:
+    """R2: the decomposition of the sticky-strike common delta sums exactly — ``Δ^LC_ss =
+    homogeneity + skew channel + correlation channel`` — for the forward and for a call; for the
+    forward the homogeneity is 1 and the level term 0 (1e-9); with ``λ`` falling in the basket
+    the correlation channel is positive (the Palladium is long the index through correlation)."""
+    from volsto.risk import local_correlation as lcr
+
+    lc, cc, w, T = w5_risk
+    for strike in (0.0, 0.08):
+        dec = lcr.delta_decomposition(lc, cc, Palladium(w, strike, T, ZERO))
+        assert abs(dec.residual) < 1e-12
+        total = dec.homogeneity[0] + dec.skew_channel[0] + dec.correlation_channel[0]
+        assert dec.lc_ss[0] == pytest.approx(total, abs=1e-12)
+        assert dec.level_term[0] == pytest.approx(dec.lc_sm[0] - dec.cc_sm[0], abs=1e-12)
+        assert dec.skew_channel[0] == pytest.approx(dec.cc_ss[0] - dec.cc_sm[0], abs=1e-12)
+        assert all(
+            x[1] > 0 for x in (dec.lc_ss, dec.cc_ss, dec.skew_channel, dec.correlation_channel)
+        )
+        assert dec.correlation_channel[0] > 3 * dec.correlation_channel[1]
+        if strike == 0.0:
+            assert dec.homogeneity[0] == pytest.approx(1.0, abs=1e-9)
+            assert dec.cc_sm[0] == pytest.approx(1.0, abs=1e-9)
+            assert dec.level_term[0] == pytest.approx(0.0, abs=1e-9)
+        assert (
+            set(dec.deltas) == {"lc_ss", "lc_sm", "cc_ss", "cc_sm"}
+            and dec.to_dict()["price_lc"] > 0
+        )
+    with pytest.raises(ValueError, match="share the pricing settings"):
+        other = lcr.LCRiskEngine(cc.builder, dataclasses.replace(cc.sim, seed=99))
+        lcr.delta_decomposition(lc, other, Palladium(w, 0.0, T, ZERO))
+
+
+def test_name_deltas_sum_to_common(w5_risk: tuple[Any, Any, np.ndarray, float]) -> None:
+    """R3: ``Σ_i Δ_i S_i`` equals the common delta within the paired standard error (three
+    standard errors of the per-path difference; all spots are 1), under both regimes; and the
+    products are priced with their reference bound to the base spots (a bump moves no strike)."""
+    from volsto.risk import local_correlation as lcr
+
+    lc, _, w, T = w5_risk
+    product = Palladium(w, 0.05, T, ZERO)
+    base = lc.builder.base
+    for regime in ("sticky_strike", "sticky_moneyness"):
+        names = lcr.name_deltas(lc, product, base, regime=regime)
+        common = lcr.common_delta(lc, product, base, regime=regime)
+        assert len(names) == 5 and [d.name for d in names][:2] == ["delta[0]", "delta[1]"]
+        up, down = math.exp(0.01), math.exp(-0.01)
+        terms = [(base.with_spots([up] * 5, regime, "u"), -1.0 / (up - down)),
+                 (base.with_spots([down] * 5, regime, "d"), 1.0 / (up - down))]  # fmt: skip
+        for i in range(5):
+            f_up = [up if j == i else 1.0 for j in range(5)]
+            f_dn = [down if j == i else 1.0 for j in range(5)]
+            terms += [(base.with_spots(f_up, regime, "u"), 1.0 / (up - down)),
+                      (base.with_spots(f_dn, regime, "d"), -1.0 / (up - down))]  # fmt: skip
+        gap = lc.combination(
+            "sum of name deltas minus common", product, terms, unit="", size=0.01, scheme=""
+        )
+        assert gap.value == pytest.approx(sum(d.value for d in names) - common.value, abs=1e-12)
+        assert abs(gap.value) < 3.0 * gap.stderr and gap.stderr < 0.1 * abs(common.value)
+    assert lc.bound(product).reference == (1.0,) * 5 and lc.bound(product) is lc.bound(product)
+    swap = BasketVarianceSwap(w, [1 / 12, T], 0.04, ZERO)
+    assert lc.bound(swap) is swap and lc.n_pricings > 20 and lc.wall_clock > 0
+
+
+def test_paired_vega_standard_error(toy_spec: LocalCorrelationSpec, tmp_path: Path) -> None:
+    """R4: a vega is a recalibration through the cache, priced on the common pricing seed — its
+    paired standard error is below the unpaired one; ``λ`` recalibrated and ``λ`` held give
+    different single-name vegas (the correlation re-marking); the index vega, the two skew
+    vegas, the implied-sticky-strike delta and a model-risk variant go through the same door."""
+    from volsto.risk import local_correlation as lcr
+
+    cache = lc_cache.LocalCorrelationCache(tmp_path / "lc")
+    state = lcr.LCState(toy_spec)
+    builder = lcr.LCBuilder(cache, state)
+    assert (builder.n_built, builder.n_missed) == (1, 1) and builder.base_spots == (1.0, 1.0, 1.0)
+    sim = dataclasses.replace(toy_spec.sim, n_paths=20_000, seed=31)
+    engine = lcr.LCRiskEngine(builder, sim)
+    horizon = toy_spec.lc.particle.horizon
+    forward = Palladium(toy_spec.weights, 0.0, horizon, ZERO)
+    recal = lcr.name_vegas(engine, forward, state, names=[0], all_names=True)
+    held = lcr.name_vegas(engine, forward, state, names=[0], all_names=False, lambda_mode="held")
+    assert [v.name for v in recal] == ["vega[AAA]", "vega[all names]"] and recal[
+        0
+    ].unit == "per vol point"
+    for v in (*recal, *held):
+        assert 0 < v.stderr < v.extra["unpaired_stderr"]
+    assert recal[0].stderr < 0.5 * recal[0].extra["unpaired_stderr"]
+    assert recal[0].value != held[0].value and recal[1].value > 0
+    assert (
+        builder.n_missed == 3
+    )  # the base, name 0 bumped, every name bumped (held: no calibration)
+    index = lcr.index_vega(engine, forward, state)
+    rota = lcr.index_skew_vega(engine, forward, state, kind="rotation")
+    put90 = lcr.index_skew_vega(engine, forward, state, kind="put90")
+    assert (
+        index.value < 0 and index.stderr < index.extra["unpaired_stderr"]
+    )  # more index vol: more correlation
+    assert (
+        rota.unit == "per +1 rota"
+        and put90.unit == "per vol point at 90 %"
+        and builder.n_missed == 6
+    )
+    with pytest.raises(ValueError):
+        lcr.index_skew_vega(engine, forward, state, kind="smile")
+    implied = lcr.common_delta(engine, forward, state, regime="implied_sticky_strike")
+    assert np.isfinite(implied.value) and builder.n_missed == 8
+    other = dataclasses.replace(toy_spec, lc=dataclasses.replace(toy_spec.lc, rho_min=0.10))
+    risk = lcr.model_risk_range(engine, forward, state, [("equi 0.10", other)])
+    assert risk.low == risk.high == risk.rows[0]["price"] and risk.rows[0]["minus_base_se"] > 0
+    assert risk.to_dict()["rows"][0]["label"] == "equi 0.10"
+    # nothing is calibrated twice, and a builder that may not calibrate says so
+    again = lcr.LCBuilder(cache, state, allow_calibrate=False)
+    assert again.n_missed == 0 and again.build(state) is again.base_model
+    fresh = dataclasses.replace(toy_spec, lc=dataclasses.replace(toy_spec.lc, rho_min=0.07))
+    with pytest.raises(CacheMissError):
+        again.build(lcr.LCState(fresh))
+
+
+# ---------------------------------------------------------------------------------------------
 # LC4 acceptance (slow): helpers
 # ---------------------------------------------------------------------------------------------
 
@@ -2806,6 +2973,45 @@ def test_s4_reference_regression(tag: str) -> None:
     )
     print(table.to_string(index=False, float_format=lambda x: f"{x:.6g}"))
     assert table["z"].abs().max() < 3.0, table.to_string()
+
+
+@pytest.mark.slow
+def test_s4_reference_deltas() -> None:
+    """S4, the deltas (R5): on the reference's world of 2026-10-02 the sticky-strike common
+    deltas with the arithmetic bump (``S·1.01`` and ``S·0.99``, central), in percent of ``E[D]``
+    per +1 %, reproduce the reference's within three combined standard errors — under the
+    parametric local correlation and under the constant correlation; the decomposition of the
+    reference (homogeneity +1.000, skew −0.804, correlation +2.545) is printed beside ours."""
+    from volsto.risk import local_correlation as lcr
+
+    world = lcm.reference_world("today")
+    fx = world.fx
+    forward = Palladium(world.weights, 0.0, fx["T"], ZERO)
+    engines = {
+        "lc": lcr.LCRiskEngine(lcr.FixedLambdaBuilder(world.lc, "LC"), world.sim),
+        "cc": lcr.LCRiskEngine(lcr.FixedLambdaBuilder(world.cc, "CC"), world.sim),
+    }
+    rows = []
+    for tag, engine in engines.items():
+        d = lcr.common_delta(
+            engine, forward, engine.builder.base, regime="sticky_strike", bump="arith"
+        )
+        ref, ref_se = fx["anchors"][f"delta.{tag}"]
+        got, se = d.extra["elasticity"], d.extra["elasticity_se"]
+        rows.append({"delta": tag, "volsto": got, "se": se, "reference": ref, "ref_se": ref_se,
+                     "z": (got - ref) / float(np.hypot(se, ref_se))})  # fmt: skip
+    table = pd.DataFrame(rows)
+    dec = lcr.delta_decomposition(engines["lc"], engines["cc"], forward, bump="arith")
+    print("\nS4 deltas (2026-10-02; percent of E[D] per +1 %, sticky strike, arithmetic bump)")
+    print(table.to_string(index=False, float_format=lambda x: f"{x:.6g}"))
+    print(
+        f"decomposition: homogeneity {dec.homogeneity[0]:+.4f} ({dec.homogeneity[1]:.4f}), skew "
+        f"{dec.skew_channel[0]:+.4f} ({dec.skew_channel[1]:.4f}), correlation "
+        f"{dec.correlation_channel[0]:+.4f} ({dec.correlation_channel[1]:.4f}), level "
+        f"{dec.level_term[0]:+.1e}; residual {dec.residual:+.1e} (the reference: +1.000, -0.804, +2.545)"
+    )
+    assert table["z"].abs().max() < 3.0, table.to_string()
+    assert abs(dec.residual) < 1e-12 and dec.homogeneity[0] == pytest.approx(1.0, abs=1e-9)
 
 
 @pytest.mark.slow
