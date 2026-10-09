@@ -79,8 +79,17 @@ from volsto.market.surface import ArbitrageError, ImpliedSurface, SSVISurface, s
 from volsto.market.svi_slices import SviSlices, fit_svi_slice
 from volsto.models.bs import BlackScholes
 from volsto.models.localvol import LocalVol
-from volsto.multi import MultiAssetModel, MultiAssetMonteCarlo, MultiPathSet, Palladium
-from volsto.multi.analytics import implied_correlation, pairwise_mean_correlation
+from volsto.multi import (
+    MultiAssetModel,
+    MultiAssetMonteCarlo,
+    MultiPathSet,
+    Palladium,
+)
+from volsto.multi.analytics import (
+    implied_correlation,
+    pairwise_mean_correlation,
+    strip_second_moment,
+)
 from volsto.multi.draws import (
     ASSET_SEED_STRIDE,
     CorrelatedDraws,
@@ -559,10 +568,16 @@ LOG_EULER = SchemeConfig(weak_order2=False, local_var_time_average=False)
 PREDICTOR_CORRECTOR = SchemeConfig(weak_order2=False, predictor_corrector=True)
 
 
+#: First time of the shared Dupire grid (1/365, the library's and the specification's).  The
+#: owner's hypothesis that S3's dip came from it was tested and refuted (SPEC §8.7, second
+#: follow-up); ``scripts/lcm_synthetic.py where --case s3 --t-min`` replaces it to show that.
+GRID_T_MIN = 1.0 / 365.0
+
+
 def lc_grid(horizon: float) -> LocalVolConfig:
     """The shared Dupire grid of the specification for a horizon up to 1y."""
     return LocalVolConfig(
-        t_min=1 / 365, t_max=horizon + 0.02, n_t=120, k_min=-2.0, k_max=2.0, n_k=1601
+        t_min=GRID_T_MIN, t_max=horizon + 0.02, n_t=120, k_min=-2.0, k_max=2.0, n_k=1601
     )
 
 
@@ -2013,11 +2028,11 @@ def test_lc_step_schedule() -> None:
 
 
 def test_expiry_screen() -> None:
-    """The expiry screen of the specification builder (owner's decision 1 of 2026-10-08): the
-    third-Friday rule; the quote quality of an expiry inside ±1 at-the-money standard deviation
-    of its forward; an expiry is dropped with its reason when it has fewer than three strikes
-    with a positive bid on both sides or a median half spread above 2 vol points; the screen
-    needs the quotes unless it is switched off."""
+    """The expiry screen of the specification builder (owner's decisions of 2026-10-08): the
+    third-Friday rule; the quote quality of an expiry; an expiry is dropped, with the rule and
+    the reason, when one of its three listed strikes nearest the forward has no positive bid on
+    both sides, or when its median half spread inside ±1 sd is above 2 vol points (6 beyond one
+    year); the screen needs the quotes unless it is switched off."""
     from volsto.studies.disp_lc import (
         ExpiryScreen,
         QuoteQuality,
@@ -2042,69 +2057,141 @@ def test_expiry_screen() -> None:
     assert third_friday("2027-06-17") and not third_friday("2027-06-17", {"2027-06-18"})
     assert not third_friday("2026-10-15", {"2026-10-16"}) and not third_friday("2026-10-24")
 
-    forward, T, rate, atm = 100.0, 0.25, 0.04, 0.20  # 1 sd = 10 %: the strikes 95 to 110
+    forward, rate, atm = 100.0, 0.04, 0.20
     strikes = np.arange(70.0, 131.0, 5.0)
     k = np.log(strikes / forward)
-    df = math.exp(-rate * T)
-    call = black_price(forward, strikes, T, atm, 1.0, df)
-    put = black_price(forward, strikes, T, atm, -1.0, df)
-    vega = black_vega(forward, strikes, T, atm, df)
 
-    def expiry(date: str) -> Any:
+    def expiry(date: str, T: float = 0.25, vol: float = atm) -> Any:
         return types.SimpleNamespace(
-            expiry=date, T=T, forward=forward, rate=rate, k=k, vol=np.full(k.size, atm)
+            expiry=date, T=T, forward=forward, rate=rate, k=k, vol=np.full(k.size, vol)
         )
 
-    def chain(date: str, half_vp: float, dead_puts: tuple[float, ...] = ()) -> pd.DataFrame:
-        half = 0.01 * half_vp * vega
-        p_bid = np.where(np.isin(strikes, dead_puts), 0.0, np.maximum(put - half, 0.0))
-        return pd.DataFrame({"expirDate": date, "strike": strikes, "cBidPx": np.maximum(call - half, 0.0),
+    def chain(
+        date: str,
+        half_vp: float,
+        dead_puts: tuple[float, ...] = (),
+        T: float = 0.25,
+        vol: float = atm,
+        listed: np.ndarray = strikes,
+    ) -> pd.DataFrame:
+        df = math.exp(-rate * T)
+        call = black_price(forward, listed, T, vol, 1.0, df)
+        put = black_price(forward, listed, T, vol, -1.0, df)
+        half = 0.01 * half_vp * black_vega(forward, listed, T, vol, df)
+        p_bid = np.where(np.isin(listed, dead_puts), 0.0, np.maximum(put - half, 0.0))
+        return pd.DataFrame({"expirDate": date, "strike": listed, "cBidPx": np.maximum(call - half, 0.0),
                              "cAskPx": call + half, "pBidPx": p_bid, "pAskPx": put + half})  # fmt: skip
 
     good, thin, wide, weekly, gone = (
         expiry("2026-12-18"), expiry("2027-01-15"), expiry("2027-03-19"), expiry("2026-12-24"),
         expiry("2027-06-17"),
     )  # fmt: skip
-    rows = pd.concat([chain("2026-12-18", 1.0), chain("2027-01-15", 1.0, (95.0, 100.0)),
-                      chain("2027-03-19", 2.5), chain("2026-12-24", 0.5)])  # fmt: skip
-    quotes = quote_quality(rows, [good, thin, wide, weekly, gone])
+    long_ok, long_wide = expiry("2028-06-16", 1.5), expiry("2028-12-15", 2.0)
+    few = expiry("2027-02-19")
+    # 1 sd = 1.5 %: only the strike at the forward is inside, and the puts and calls of its two
+    # neighbours are worth less than their half spread — no bid: dropped by the strike rule
+    narrow = expiry("2027-04-16", 0.25, 0.03)
+    far = expiry("2027-05-21", 0.25, 0.20)
+    rows = pd.concat([
+        chain("2026-12-18", 1.0), chain("2027-01-15", 1.0, (95.0,)), chain("2027-03-19", 2.5),
+        chain("2026-12-24", 0.5), chain("2028-06-16", 2.5, T=1.5), chain("2028-12-15", 6.5, T=2.0),
+        chain("2027-02-19", 1.0, listed=np.array([95.0, 105.0])),
+        chain("2027-04-16", 1.0, vol=0.03),
+        # two-sided at the three nearest strikes, no bid on a put further out: kept
+        chain("2027-05-21", 1.0, (85.0,)),
+    ])  # fmt: skip
+    everything = [good, thin, wide, weekly, gone, long_ok, long_wide, few, narrow, far]
+    quotes = quote_quality(rows, everything)
+    # 1 sd = 10 %: the strikes 95 to 110 are inside; the three nearest are 100, 105 and 95
     assert quotes["2026-12-18"] == QuoteQuality(
-        "2026-12-18", T, 4, 4, pytest.approx(1.0, abs=1e-12)
+        "2026-12-18", 0.25, 4, 4, pytest.approx(1.0, abs=1e-12), 3, 3, False
     )
-    assert quotes["2027-01-15"].n_strikes == 4 and quotes["2027-01-15"].n_two_sided == 2
+    assert (quotes["2027-01-15"].n_nearest, quotes["2027-01-15"].n_nearest_two_sided) == (3, 2)
     assert quotes["2027-03-19"].median_half_spread_vp == pytest.approx(2.5, abs=1e-12)
-    assert quotes["2027-06-17"].n_strikes == 0 and math.isnan(
+    assert quotes["2027-06-17"].n_nearest == 0 and math.isnan(
         quotes["2027-06-17"].median_half_spread_vp
     )
+    assert (quotes["2027-02-19"].n_nearest, quotes["2027-02-19"].n_nearest_two_sided) == (2, 2)
+    assert quotes["2027-04-16"].n_strikes == 1 and not quotes["2027-04-16"].spread_on_nearest
+    assert quotes["2027-05-21"].n_nearest_two_sided == 3 and quotes["2027-05-21"].n_two_sided == 4
     screen = ExpiryScreen()
     assert screen.reads_quotes and screen.describe() == {
-        "index_third_friday": True, "min_two_sided": 3, "max_half_spread_vp": 2.0, "quote_sd": 1.0,
+        "index_third_friday": True, "nearest_two_sided": True, "nearest_strikes": 3,
+        "max_half_spread_vp": 2.0, "max_half_spread_long_vp": 6.0, "long_maturity": 1.0, "quote_sd": 1.0,
     }  # fmt: skip
-    everything = [good, thin, wide, weekly, gone]
+    assert screen.spread_limit(1.0) == 2.0 and screen.spread_limit(1.0001) == 6.0
     kept, dropped = screen_expiries("XYZ", everything, quotes, screen)
-    assert [e.expiry for e in kept] == ["2026-12-18", "2026-12-24"]
-    reasons = {g["expiry"]: g["reason"] for g in dropped}
-    assert all(g["leg"] == "XYZ" and g["T"] == T for g in dropped)
-    assert reasons["2027-01-15"].startswith("2 strikes inside ±1 sd with a positive bid")
-    assert reasons["2027-03-19"].startswith("median half spread inside ±1 sd 2.50 vol points")
-    assert reasons["2027-06-17"].startswith("0 strikes inside ±1 sd")
+    assert [e.expiry for e in kept] == ["2026-12-18", "2026-12-24", "2028-06-16", "2027-05-21"]
+    why = {g["expiry"]: (g["rule"], g["reason"]) for g in dropped}
+    assert all(
+        g["leg"] == "XYZ" and set(g) == {"leg", "expiry", "T", "rule", "reason"} for g in dropped
+    )
+    assert why["2027-01-15"][0] == "strikes" and why["2027-01-15"][1].startswith(
+        "2 of the 3 listed strikes nearest the forward have a positive bid"
+    )
+    assert why["2027-03-19"] == (
+        "spread",
+        "median half spread inside ±1 sd 2.50 vol points, above 2",
+    )
+    assert why["2028-12-15"] == (
+        "spread",
+        "median half spread inside ±1 sd 6.50 vol points, above 6",
+    )
+    assert why["2027-06-17"][0] == "strikes" and why["2027-02-19"][0] == "strikes"
+    assert why["2027-04-16"][0] == "strikes" and quotes["2027-04-16"].n_nearest_two_sided == 1
+    assert "(2 listed)" in why["2027-02-19"][1] and "(0 listed)" in why["2027-06-17"][1]
+    # an expiry whose ±1 sd holds no listed strike: the spread is read on the nearest three
+    off_grid = types.SimpleNamespace(
+        expiry="2027-07-16", T=0.25, forward=102.5, rate=rate, k=np.log(strikes / 102.5),
+        vol=np.full(k.size, 0.02),
+    )  # fmt: skip
+    q = quote_quality(chain("2027-07-16", 1.0), [off_grid])["2027-07-16"]
+    assert q.n_strikes == 0 and q.spread_on_nearest and q.n_nearest == 3
+    assert math.isfinite(q.median_half_spread_vp)
     # the index reads third Fridays only: the weekly goes first, whatever its quotes
     kept, dropped = screen_expiries("index", everything, quotes, screen, index=True)
-    assert [e.expiry for e in kept] == ["2026-12-18"]
-    assert {g["expiry"]: g["reason"] for g in dropped}["2026-12-24"] == "not a third-Friday expiry"
+    assert [e.expiry for e in kept] == ["2026-12-18", "2028-06-16", "2027-05-21"]
+    assert {g["expiry"]: g["rule"] for g in dropped}["2026-12-24"] == "third_friday"
     assert screen_expiries("index", everything, None, ExpiryScreen.off(), index=True) == (
         everything,
         [],
     )
-    kept, _ = screen_expiries(
-        "index", everything, None, ExpiryScreen(True, 0, math.inf), index=True
-    )
-    assert [e.expiry for e in kept] == ["2026-12-18", "2027-01-15", "2027-03-19", "2027-06-17"]
+    only_fridays = ExpiryScreen(True, False, math.inf, math.inf)
+    assert not only_fridays.reads_quotes and not ExpiryScreen.off().reads_quotes
+    kept, _ = screen_expiries("index", everything, None, only_fridays, index=True)
+    assert "2026-12-24" not in [e.expiry for e in kept] and len(kept) == len(everything) - 1
     with pytest.raises(ValueError, match="quote screen needs"):
         screen_expiries("XYZ", everything, None, screen)
-    for bad in ({"min_two_sided": -1}, {"max_half_spread_vp": 0.0}):
+    for bad in (
+        {"max_half_spread_vp": 0.0},
+        {"max_half_spread_long_vp": -1.0},
+        {"long_maturity": 0.0},
+    ):
         with pytest.raises(ValueError):
             ExpiryScreen(**bad)  # type: ignore[arg-type]
+
+
+def test_strip_second_moment() -> None:
+    """``strip_second_moment``: a flat vol gives the lognormal value ``f²·e^{σ²T} − 2f + 1`` (with
+    and without carry); the regions of a split sum to the strip; a skewed surface has a larger
+    second moment below the forward than its mirror image above it."""
+    for r, q, vol, T in ((0.0, 0.0, 0.2, 0.25), (0.04, 0.01, 0.35, 1.0), (0.03, 0.0, 0.15, 2.0)):
+        fc = ForwardCurve.flat(1.0, r, q)
+        flat = surface_from_config(
+            SSVIConfig((0.25, 1.0, 2.0), (vol,) * 3, 0.0, 1e-9, 0.5, 5.0), fc, fc.rate_curve
+        )
+        f = float(fc.forward(T))
+        exact = f * f * math.exp(vol * vol * T) - 2 * f + 1
+        assert strip_second_moment(flat, T) == pytest.approx(exact, rel=1e-9)
+        total, parts = strip_second_moment(flat, T, splits=[-0.2, 0.0, 0.2])  # type: ignore[misc]
+        assert total == pytest.approx(exact, rel=1e-9) and parts.shape == (4,) and np.all(parts > 0)
+        assert parts.sum() + (f - 1.0) ** 2 == pytest.approx(total, rel=2e-5)
+    skewed = w5_surfaces(1)[0]
+    _, parts = strip_second_moment(skewed, 0.25, splits=[0.0])  # type: ignore[misc]
+    assert parts[0] > parts[1] > 0
+    for bad in ({"n_half": 3}, {"splits": [0.1, 0.0]}):
+        with pytest.raises(ValueError):
+            strip_second_moment(skewed, 0.25, **bad)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -2222,6 +2309,28 @@ def clip_table(res: lcal.LCCalibrationResult) -> str:
         for j in picks
     ]
     return "\n".join(lines)
+
+
+#: the two-week pillar every synthetic target carries (owner's decision of 2026-10-08, second
+#: round: a market surface has one)
+TWO_WEEKS = 1 / 24
+
+
+def clip_by_first_pillar(res: lcal.LCCalibrationResult, first: float) -> str:
+    """The clipped mass inside ±2.5 sd, reported separately before the target's first pillar
+    and from it on (the gate reads every slice)."""
+    t = res.grid.times
+    inner = np.maximum(res.clipped_low_inner, res.clipped_high_inner)
+    before = t < first - 1e-12
+    j0, j1 = int(np.argmax(np.where(before, inner, -1.0))), int(
+        np.argmax(np.where(before, -1.0, inner))
+    )
+    return (
+        f"clipped mass inside ±{lcal.CLIP_GATE_SD:g} sd: before the first pillar (t < {first:.4f}, "
+        f"{int(before.sum())} slices) max {inner[j0]:.5f} at t={t[j0]:.4f}, {int((inner[before] > 0.01).sum())} "
+        f"slices over 1 %; from the first pillar on ({int((~before).sum())} slices) max {inner[j1]:.5f} at "
+        f"t={t[j1]:.4f}, {int((inner[~before] > 0.01).sum())} slices over 1 %"
+    )
 
 
 #: the particle seeds of the noise-aware gates (four independent calibrations)
@@ -2451,14 +2560,17 @@ def test_s4_recalibrated_variant() -> None:
 
 @pytest.mark.slow
 def test_s1_round_trip() -> None:
-    """S1 (as redesigned by the owner's decision 3, SPEC §8.7): W5 at 1y under the known
-    ``λ_true(t, k) = 0.5 − 0.4·tanh(k/0.25)``; its index smiles at every month to 1y and at 13
-    months (a target must not end at the horizon) from 2·10⁶ paths, fitted with SVI slices; the
-    particle calibration at 8·10⁵ particles on four seeds.  Pass: the index reprices within
-    0.15 vp inside ±1.5 sd and 0.30 vp inside ±2.5 sd (noise-aware, 8·10⁵ pricing paths); the
-    clipped mass inside ±2.5 sd is at most 1 % at every step; ``|λ̂ − λ_true| ≤ gate + 2·s_λ``
-    inside ±1.5 sd for ``t ≥ 1m``, with the gate 0.05 at the pillars and 0.07 between them and
-    ``s_λ`` the standard deviation of ``λ̂`` over the four seeds."""
+    """S1 (as redesigned by the owner's decisions of 2026-10-08, SPEC §8.7): W5 at 1y under the
+    known ``λ_true(t, k) = 0.5 − 0.4·tanh(k/0.25)``; its index smiles at two weeks, at every
+    month to 1y and at 13 months (a target starts with a short pillar, as a market surface
+    does, and does not end at the horizon) from 2·10⁶ paths, fitted with SVI slices; the
+    particle calibration at 8·10⁵ particles on four seeds.  Pass: the index reprices at every
+    pillar of the target up to the horizon within 0.15 vp inside ±1.5 sd and 0.30 vp inside
+    ±2.5 sd (noise-aware, 8·10⁵ pricing paths); the clipped mass inside ±2.5 sd is at most 1 %
+    at every step, from the start (printed separately before and from the first pillar);
+    ``|λ̂ − λ_true| ≤ gate + 2·s_λ`` inside ±1.5 sd for ``t ≥ 1m``, with the gate 0.05 at the
+    pillars and 0.07 between them and ``s_λ`` the standard deviation of ``λ̂`` over the four
+    seeds."""
     horizon, beyond = 1.0, 13 / 12
     pillars = tuple(m / 12 for m in range(1, 13))
     models = w5_models(beyond)
@@ -2472,19 +2584,22 @@ def test_s1_round_trip() -> None:
     lam_true = LocalCorrelationFunction([0.0, beyond], k_grid, np.tile(truth(k_grid), (2, 1)))
     true_model = LocalCorrelationModel(models, fam, lam_true, basket)
     index_surface, fits = index_smile_by_simulation(
-        true_model, production_sim(n_paths=2_000_000), (*pillars, beyond)
+        true_model, production_sim(n_paths=2_000_000), (TWO_WEEKS, *pillars, beyond)
     )
     print("\nS1 target (2e6 paths):\n" + fits.to_string(index=False))
     results = [calibrate(models, fam, basket, index_surface, horizon, seed=s) for s in NOISE_SEEDS]
     res = results[0]
     model = true_model.with_lambda(res.lam)
-    rep = lcal.reprice_index_smile(model, index_surface, production_sim(), maturities=pillars)
+    rep = lcal.reprice_index_smile(
+        model, index_surface, production_sim(), maturities=(TWO_WEEKS, *pillars)
+    )
     gate = lambda_gate(results, truth, index_surface, pillars)
     print(
         f"S1 calibration: {res.wall_time:.0f} s ({res.grid.n_steps} steps), timings {res.timings}"
     )
     print("S1 " + rep.summary())
     print("S1 " + clip_table(res))
+    print("S1 " + clip_by_first_pillar(res, TWO_WEEKS))
     print_lambda_gate("S1", gate)
     assert res.max_clipped_mass_inner <= 0.01, clip_table(res)
     assert rep.passes(), rep.summary()
@@ -2493,12 +2608,14 @@ def test_s1_round_trip() -> None:
 
 @pytest.mark.slow
 def test_s2_constant_correlation_fixed_point() -> None:
-    """S2 (design of the owner's decision 3): W5 at 3m under the constant correlation 0.5
-    (``λ = 0.48/0.98``); its index smile at 1m, 2m, 3m and 4m from 2·10⁶ paths; the calibration
+    """S2 (design of the owner's decisions): W5 at 3m under the constant correlation 0.5
+    (``λ = 0.48/0.98``); its index smile at two weeks, 1m, 2m, 3m and 4m from 2·10⁶ paths; the
+    calibration
     on four seeds must find the constant back — ``|λ̂ − 0.4898| ≤ gate + 2·s_λ`` inside ±1.5 sd
     for ``t ≥ 1m``, the gate 0.05 at the pillars and 0.07 between them — and price the Palladium
-    forward within 0.5 % of the true model's (paired).  Printed: the errors against the
-    specification's first gate of 0.03, and the index repricing."""
+    forward within 0.5 % of the true model's (paired).  The owner confirmed on 2026-10-08 that
+    the gate of S1 replaces the specification's 0.03.  Printed: the errors against that first
+    gate, the index repricing and the clipped mass."""
     horizon, beyond = 0.25, 4 / 12
     pillars = (1 / 12, 2 / 12, 0.25)
     models = w5_models(beyond)
@@ -2508,7 +2625,7 @@ def test_s2_constant_correlation_fixed_point() -> None:
     const = LocalCorrelationFunction.constant(lam_c, [0.0, beyond], k_grid_of(models))
     true_model = LocalCorrelationModel(models, fam, const, basket)
     index_surface, fits = index_smile_by_simulation(
-        true_model, production_sim(n_paths=2_000_000), (*pillars, beyond)
+        true_model, production_sim(n_paths=2_000_000), (TWO_WEEKS, *pillars, beyond)
     )
     print("\nS2 target (2e6 paths):\n" + fits.to_string(index=False))
     results = [calibrate(models, fam, basket, index_surface, horizon, seed=s) for s in NOISE_SEEDS]
@@ -2522,9 +2639,10 @@ def test_s2_constant_correlation_fixed_point() -> None:
     d_lc = dispersion_payoffs(model, sim, W5_WEIGHTS, horizon)[:, 0]
     d_cc = dispersion_payoffs(cc, sim, W5_WEIGHTS, horizon)[:, 0]
     ratio, ratio_se = lcm.pair_ratio(d_lc, d_cc)
-    rep = lcal.reprice_index_smile(model, index_surface, sim, maturities=pillars)
+    rep = lcal.reprice_index_smile(model, index_surface, sim, maturities=(TWO_WEEKS, *pillars))
     print("S2 " + rep.summary())
     print("S2 " + clip_table(res))
+    print("S2 " + clip_by_first_pillar(res, TWO_WEEKS))
     print_lambda_gate("S2", gate)
     print(
         f"S2 against the first gate of 0.03 (no noise allowance): {int((gate['max_abs_err'] > 0.03).sum())} "
@@ -2538,8 +2656,10 @@ def test_s2_constant_correlation_fixed_point() -> None:
 @pytest.mark.slow
 def test_s3_identical_names() -> None:
     """S3: five identical names whose common smile is the index smile (the truth is ``λ ≡ 1``;
-    ``rho_max = 1`` so that the cap does not bind): ``λ̂ ≥ 0.99`` on the trusted range and the
-    index reprices within 0.05 vp (noise-aware)."""
+    ``rho_max = 1`` so that the cap does not bind): on the trusted range ``λ̂ ≥ 0.99`` from the
+    end of the quarter-step segment on (``t ≥ 10/252``) and ``λ̂ ≥ 0.985`` inside it (owner's
+    decision of 2026-10-08, second round: the first quarter steps carry a small downward bias,
+    SPEC §8.7), and the index reprices within 0.05 vp (noise-aware)."""
     horizon = 0.25
     name_surface = w5_surfaces(2)[1]
     name = LocalVol(
@@ -2550,21 +2670,28 @@ def test_s3_identical_names() -> None:
     basket = w5_basket(models)
     res = calibrate(models, fam, basket, name_surface, horizon, rho_max=1.0)
     k = res.lam.k_grid
-    low = min(
-        float(res.lam.values[j][(k >= res.q_lo[j]) & (k <= res.q_hi[j])].min())
-        for j in range(1, res.lam.n_slices)
+    lows = np.array(
+        [
+            float(res.lam.values[j][(k >= res.q_lo[j]) & (k <= res.q_hi[j])].min())
+            for j in range(1, res.lam.n_slices)
+        ]
     )
+    early = res.grid.times[1:] < 10 / 252 - 1e-12
+    low_early = float(lows[early].min()) if early.any() else 1.0
+    low_late = float(lows[~early].min())
     model = LocalCorrelationModel(models, fam, res.lam, basket)
     rep = lcal.reprice_index_smile(
         model, name_surface, production_sim(), maturities=(1 / 12, 2 / 12, 0.25)
     )
     print("\nS3 " + rep.summary())
     print(
-        f"S3 smallest lambda on the trusted range over the slices: {low:.6f}; lambda at t0 "
+        f"S3 smallest lambda on the trusted range: {low_early:.6f} inside the quarter-step "
+        f"segment ({int(early.sum())} slices, {int((lows[early] < 0.99).sum())} below 0.99; floor "
+        f"0.985), {low_late:.6f} from t = 10/252 on (floor 0.99); lambda at t0 "
         f"{res.lam.values[0, 0]:.6f}; clipped high mass max {res.clipped_high.max():.4f} with "
         f"overshoot {res.overshoot_high.max():.2e} (lambda* against the cap of 1)"
     )
-    assert low >= 0.99
+    assert low_late >= 0.99 and low_early >= 0.985
     assert rep.passes(tol_inner=0.05, tol_outer=0.05), rep.summary()
 
 
@@ -2813,9 +2940,9 @@ def test_s7_bandwidth() -> None:
 def test_s10_carry_mode() -> None:
     """S10: W5 with a rate of 4 % and dividend yields of 0–4 % in carry mode (the basket is the
     price basket, whose drift the calibration ignores).  The index smile of a known sloped ``λ``
-    (2·10⁶ paths, at 1m, 2m, 3m and 4m: the target does not end at the horizon) is the target.
-    Pass: ``E[B_T]/F_B(T) − 1`` within 3 standard errors and the
-    index at-the-money error at most 0.15 vp at every pillar.  Printed: the per-step mean of
+    (2·10⁶ paths, at two weeks, 1m, 2m, 3m and 4m: the target starts with a short pillar and
+    does not end at the horizon) is the target.  Pass: ``E[B_T]/F_B(T) − 1`` within 3 standard
+    errors and the index at-the-money error at most 0.15 vp at every pillar up to the horizon.  Printed: the per-step mean of
     ``|δ_t|`` and the carry-mode ``λ`` against the performance-mode ``λ`` on the same particles."""
     horizon, beyond = 0.25, 4 / 12
     yields = (0.00, 0.01, 0.02, 0.03, 0.04)
@@ -2833,13 +2960,15 @@ def test_s10_carry_mode() -> None:
     )
     true_model = LocalCorrelationModel(models, fam, lam_true, basket)
     index_surface, fits = index_smile_by_simulation(
-        true_model, production_sim(n_paths=2_000_000), (*W5_3M_PILLARS, beyond)
+        true_model, production_sim(n_paths=2_000_000), (TWO_WEEKS, *W5_3M_PILLARS, beyond)
     )
     print("\nS10 target (carry mode, 2e6 paths):\n" + fits.to_string(index=False))
     res = calibrate(models, fam, basket, index_surface, horizon)
     assert res.drift_abs_mean is not None
     model = true_model.with_lambda(res.lam)
-    rep = lcal.reprice_index_smile(model, index_surface, production_sim(), maturities=W5_3M_PILLARS)
+    rep = lcal.reprice_index_smile(
+        model, index_surface, production_sim(), maturities=(TWO_WEEKS, *W5_3M_PILLARS)
+    )
     perf = calibrate(models, fam, basket.with_mode("performance"), index_surface, horizon)
     kg = res.lam.k_grid
     inside = np.array(
@@ -2848,6 +2977,7 @@ def test_s10_carry_mode() -> None:
     gap = np.abs(res.lam.values[1:] - perf.lam.values[1:])[inside]
     print("S10 " + rep.summary())
     print("S10 " + clip_table(res))
+    print("S10 " + clip_by_first_pillar(res, TWO_WEEKS))
     print(
         f"S10 mean |delta_t| over the cloud, per year: max over steps {res.drift_abs_mean.max():.3e}, "
         f"at 1m {res.drift_abs_mean[int(np.argmin(np.abs(res.grid.times - 1 / 12)))]:.3e}, at 3m "
@@ -2946,6 +3076,9 @@ def test_dow_specification_from_the_study(tmp_path: Path, monkeypatch: pytest.Mo
         == dropped[("index", "2026-11-30")]
         == "not a third-Friday expiry"
     )
+    # the index expiries beyond one year stay (the 6 vp limit beyond 1y: second-round decision)
+    assert not [key for key in dropped if key[0] == "index" and key[1] > "2027-10-02"]
+    assert {g["rule"] for g in info["dropped"]} <= {"third_friday", "strikes", "spread", "quotes"}
     assert [round(t, 4) for t in spec.index_surface.times] == [
         0.0384,
         0.1342,
@@ -3079,8 +3212,8 @@ BASELINE_FLOOR = 0.0002
 @needs_study_data
 def test_s11_dow_baseline() -> None:
     """S11: the Dow of 2026-10-02 at 3m on the screened target — the full calibration at 8·10⁵
-    particles; the index smile acceptance, gated when the largest clipped mass is at most 1 %
-    and reported otherwise; the basket forward within 3 standard errors; and the M12 baseline
+    particles; the index smile acceptance, gated when the largest clipped mass inside ±2.5 sd
+    is at most 1 % and reported otherwise (the owner's reading of the rule, 2026-10-08); the basket forward within 3 standard errors; and the M12 baseline
     ``tests/golden/lcm_baseline_2026-10-02.json`` (``E[D]`` and the calls under the model and
     under its constant-correlation companion, their ratio, ``E[V]`` and ``κ``), each cell within
     ``max(2 standard errors, 0.02 % of notional)`` of the recorded value.  The baseline is
@@ -3093,13 +3226,13 @@ def test_s11_dow_baseline() -> None:
     print("S11 " + rep.summary())
     z = rep.forwards["forward_error"] / rep.forwards["forward_error_se"]
     assert z.abs().max() < 3.0, rep.forwards.to_string()
-    if res.max_clipped_mass <= 0.01:
+    if res.max_clipped_mass_inner <= 0.01:
         assert rep.passes(), rep.summary()
     else:
         print(
-            f"S11 index smile acceptance reported, not gated: the largest clipped mass is "
-            f"{res.max_clipped_mass:.4f} (inside ±{lcal.CLIP_GATE_SD:g} sd: {res.max_clipped_mass_inner:.4f}); "
-            f"{len(rep.violations())} cells over the smile gate"
+            f"S11 index smile acceptance reported, not gated: the largest clipped mass inside "
+            f"±{lcal.CLIP_GATE_SD:g} sd is {res.max_clipped_mass_inner:.4f} (the whole cloud: "
+            f"{res.max_clipped_mass:.4f}); {len(rep.violations())} cells over the smile gate"
         )
     assert L.BASELINE_FILE.exists(), "record it: python scripts/lcm_diagnostics.py baseline --write"
     recorded = json.loads(L.BASELINE_FILE.read_text())

@@ -3,7 +3,7 @@ schedule, and the tail rule on the synthetic world — for information.
 
     python scripts/lcm_synthetic.py runs --schedule week [--tests s1 s2 s5 s10]
     python scripts/lcm_synthetic.py tail [--schedule lc]
-    python scripts/lcm_synthetic.py where --case s1|s3 [--schedule lc]
+    python scripts/lcm_synthetic.py where --case s1|s3|s3-smile [--schedule lc] [--t-min 2016]
 
 The acceptance tests S1, S2, S5 and S10 of ``tests/test_local_correlation.py`` run on the model's
 step schedule (quarter steps over the first two weeks, then daily: the owner's decision 2 of
@@ -20,7 +20,9 @@ paths.
 ``where`` locates the two gates that fail on the model's schedule (SPEC §8.7, LC4 follow-up):
 for S1 the clipped mass inside ±2.5 sd slice by slice, before and after the target's first
 pillar, as designed and with a two-week pillar added to the target; for S3 the smallest ``λ̂``
-slice by slice.
+slice by slice (``--t-min 2016``: with the Dupire grids starting at 1/2016 instead of 1/365, the
+owner's hypothesis of the second round — the dip does not go away, it deepens), and for S3's
+smile (``s3-smile``) the calibrated ``λ`` against ``λ = 1`` imposed on four pricing seeds.
 
 The numbers of SPEC §8.7 labelled "one-week variant", "tail rule, W5" and "where" come from
 here; the Dow ones from ``scripts/lcm_diagnostics.py``.
@@ -190,6 +192,36 @@ def where_s3() -> None:
             )  # fmt: skip
 
 
+def where_s3_smile() -> None:
+    """S3's smile: the five identical names priced with the calibrated ``λ`` and with ``λ = 1``
+    imposed (the basket is then one name, so the error is the name's own discretisation of its
+    smile), on four pricing seeds of 8·10⁵ paths."""
+    horizon = 0.25
+    surface = t.w5_surfaces(2)[1]
+    name = LocalVol(
+        LocalVolSurface.from_implied(surface, t.lc_grid(horizon)), surface.forward_curve
+    )
+    models = [name] * 5
+    fam = CorrelationFamily.equi(5, 0.02, 1.0)
+    basket = t.w5_basket(models)
+    res = t.calibrate(models, fam, basket, surface, horizon, rho_max=1.0)
+    one = LocalCorrelationFunction.constant(1.0, res.lam.times, res.lam.k_grid)
+    seeds = tuple(t.PRICING_SEED + i for i in range(4))
+    for tag, lam in (("the calibrated lambda", res.lam), ("lambda = 1 imposed", one)):
+        model = LocalCorrelationModel(models, fam, lam, basket)
+        rep = lcal.reprice_index_smile(
+            model, surface, t.production_sim(), maturities=t.W5_3M_PILLARS, pricing_seeds=seeds
+        )
+        over = len(rep.violations(0.05, 1.5, 0.05, 2.5))
+        log.info(
+            "S3 smile under %s, %d pricing seeds: %d cells over the 0.05 vp gate\n%s",
+            tag,
+            len(seeds),
+            over,
+            rep.summary(),
+        )
+
+
 def where_s1() -> None:
     """S1 (the round trip at 1y): the clipped mass inside ±2.5 sd slice by slice — as designed
     (monthly pillars and 13m) and with a two-week pillar added to the target."""
@@ -240,13 +272,16 @@ def where_s1() -> None:
 
 def run_where(args: argparse.Namespace) -> None:
     t.ACCEPTANCE_SCHEDULE = lcd.SCHEDULES[args.schedule]
+    if args.t_min is not None:
+        t.GRID_T_MIN = 1.0 / args.t_min
+        log.info("the Dupire grids start at t_min = 1/%g", args.t_min)
     log.info(
         "=== where the gate of %s fails, on the schedule %r (%s)",
         args.case.upper(),
         args.schedule,
         t.ACCEPTANCE_SCHEDULE,
     )
-    {"s1": where_s1, "s3": where_s3}[args.case]()
+    {"s1": where_s1, "s3": where_s3, "s3-smile": where_s3_smile}[args.case]()
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -260,8 +295,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--schedule", default="lc", choices=sorted(lcd.SCHEDULES))
     p.set_defaults(run=run_tail)
     p = sub.add_parser("where", help="where the gates of S1 and S3 fail")
-    p.add_argument("--case", required=True, choices=("s1", "s3"))
+    p.add_argument("--case", required=True, choices=("s1", "s3", "s3-smile"))
     p.add_argument("--schedule", default="lc", choices=sorted(lcd.SCHEDULES))
+    p.add_argument(
+        "--t-min",
+        type=float,
+        default=None,
+        help="first time of the Dupire grids as 1/x (default 365)",
+    )
     p.set_defaults(run=run_where)
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)

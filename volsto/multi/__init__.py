@@ -26,6 +26,7 @@ from volsto.multi.analytics import (
     gaussian_straddle_dispersion,
     implied_correlation,
     pairwise_mean_correlation,
+    strip_second_moment,
 )
 from volsto.multi.draws import CorrelatedDraws
 from volsto.multi.family import CorrelationFamily
@@ -73,4 +74,5 @@ __all__ = [
     "gaussian_straddle_dispersion",
     "implied_correlation",
     "pairwise_mean_correlation",
+    "strip_second_moment",
 ]

@@ -6,6 +6,8 @@
     python scripts/lcm_diagnostics.py tail      --date D
     python scripts/lcm_diagnostics.py wing      --date D
     python scripts/lcm_diagnostics.py baseline  [--write]
+    python scripts/lcm_diagnostics.py strips    --date D
+    python scripts/lcm_diagnostics.py calendar  --date D
 
 Every Dow number of SPEC §8.7 comes from one of these commands (the synthetic ones come from the
 slow tests of ``tests/test_local_correlation.py`` and from ``scripts/lcm_synthetic.py``):
@@ -27,10 +29,16 @@ slow tests of ``tests/test_local_correlation.py`` and from ``scripts/lcm_synthet
   (b) the comonotonic upper bound on the index puts implied by the names' marginals,
   ``E[(K − Σ w_i q_i(U))⁺]``, against the DJX quotes; (c) the sensitivity to ``rho_max = 0.995``.
 * ``baseline`` — the run behind the M12 baseline of test S11 (``tests/golden/``).
+* ``strips`` — the single-name part of ``E[V] − E^Q[V]``: each name's second moment from its SVI
+  surface against the study's strip (vols linear between listed strikes, flat beyond them), by
+  region of the strike axis, and the model's Monte Carlo against the SVI strip.
+* ``calendar`` — the effect of the calendar crossings inside ±2 sd of the cloud: the offending
+  slices dropped, the model recalibrated, ``E[D]``, the calls and the index smile compared on
+  the same particles and the same pricing paths.
 
 The smiles are the study's own (``scripts/disp_entries.py::smiles_of``, the loader behind
 ``marginals_for``; its defaults are untouched).  Results are logged and written as JSON under
-``outputs/lc/`` (git-ignored) with the reproducibility record.  Standard errors are on
+``outputs/dispersion_lc/diagnostics/`` (git-ignored) with the reproducibility record.  Standard errors are on
 antithetic pair means throughout.
 """
 
@@ -88,11 +96,14 @@ from volsto.config import (  # noqa: E402
 )
 from volsto.engine.grid import TimeGrid  # noqa: E402
 from volsto.market.bs import black_price, black_vega, implied_vol  # noqa: E402
-from volsto.market.svi_slices import svi_total_variance  # noqa: E402
+from volsto.market.curves import DiscountCurve, ForwardCurve  # noqa: E402
+from volsto.market.svi_slices import SviSlices, svi_total_variance  # noqa: E402
+from volsto.multi.analytics import strip_second_moment  # noqa: E402
 from volsto.multi.lc_draws import LocalCorrelationDraws  # noqa: E402
 from volsto.multi.lc_function import LocalCorrelationFunction  # noqa: E402
 from volsto.multi.lc_model import LocalCorrelationModel  # noqa: E402
 from volsto.studies import disp_data as dd  # noqa: E402
+from volsto.studies import disp_smile as ds  # noqa: E402
 from volsto.studies.disp_lc import (  # noqa: E402
     ExpiryScreen,
     QuoteQuality,
@@ -104,7 +115,11 @@ from volsto.studies.disp_lc import (  # noqa: E402
 log = logging.getLogger("lcm_diagnostics")
 
 ROOT = Path(__file__).resolve().parents[1]
-OUT = ROOT / "outputs" / "lc"
+#: Every output of the local correlation model on the study's data goes under this folder of the
+#: worktree (owner's decision of 2026-10-08, second round) — never into ``outputs/dispersion``,
+#: the study's own folder.
+LC_OUT = ROOT / "outputs" / "dispersion_lc"
+OUT = LC_OUT / "diagnostics"
 #: The four dates of the reference implementation (today, typical, steep skew, tied alternate).
 REFERENCE_DATES = ("2026-10-02", "2019-09-03", "2017-04-03", "2008-07-07")
 PARTICLE_SEED = 12345
@@ -113,7 +128,7 @@ PRODUCTION = 800_000
 DAILY = 1.0 / 252.0
 SCREENS: dict[str, ExpiryScreen] = {
     "default": ExpiryScreen(),
-    "third-friday": ExpiryScreen(True, 0, math.inf),
+    "third-friday": ExpiryScreen(True, False, math.inf, math.inf),
     "off": ExpiryScreen.off(),
 }
 #: ``lc``: the model's schedule (quarter steps over the first two weeks); ``week``: the
@@ -124,6 +139,7 @@ SCHEDULES: dict[str, StepSchedule | float] = {
     "week": StepSchedule(breaks=(5.0 / 252.0,), dts=(1.0 / 1008.0, DAILY)),
     "daily": DAILY,
 }
+ZERO_CURVE = DiscountCurve.flat(0.0)
 PARTICLE_FIELDS = frozenset({"bandwidth_factor", "estimator", "second_pass", "tail_extrapolation"})
 SD_INNER = (-1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5)
 
@@ -409,16 +425,18 @@ def variance_split(s: Sample, inp: DowInputs) -> dict[str, Any]:
         "single_name_part": esq[0] - sum_wm, "single_name_part_se": esq[1],
         "basket_part": erb2[0] - m_b, "basket_part_se": erb2[1],
         "kappa": ed[0] / math.sqrt(ev[0]),
+        "forward_at_listed_EQV": ed[0] / math.sqrt(ev[0]) * math.sqrt(eqv), "ED": ed,
     }  # fmt: skip
 
 
 def log_split(tag: str, v: dict[str, Any]) -> None:
     log.info(
         "%s: E[V] %.6f (%.6f) against the listed E^Q[V] %.6f: ratio %.4f (%.4f); split (Σ w E[R_i²] - Σ w M_i) - "
-        "(E[R̄²] - M_B^listed) = %+.6f (%.6f) - (%+.6f (%.6f)) = %+.6f; kappa = E[D]/sqrt(E[V]) = %.4f",
+        "(E[R̄²] - M_B^listed) = %+.6f (%.6f) - (%+.6f (%.6f)) = %+.6f; kappa = E[D]/sqrt(E[V]) = %.4f; the forward "
+        "the listed E^Q[V] implies at that kappa: %.6f (E[D] %.6f)",
         tag, v["EV"][0], v["EV"][1], v["EQV"], v["EV_over_EQV"], v["EV_over_EQV_se"],
         v["single_name_part"], v["single_name_part_se"], v["basket_part"], v["basket_part_se"],
-        v["EV"][0] - v["EQV"], v["kappa"],
+        v["EV"][0] - v["EQV"], v["kappa"], v["forward_at_listed_EQV"], v["ED"][0],
     )  # fmt: skip
 
 
@@ -466,9 +484,13 @@ def log_market(
     by_leg: dict[str, int] = {}
     for g in info["dropped"]:
         by_leg[g["leg"]] = by_leg.get(g["leg"], 0) + 1
+    by_rule: dict[str, int] = {}
+    for g in info["dropped"]:
+        by_rule[g["rule"]] = by_rule.get(g["rule"], 0) + 1
     log.info(
-        "screen %s: %d expiries dropped (index %d; %d names touched)",
-        info["screen"], len(info["dropped"]), by_leg.get("index", 0), len([k for k in by_leg if k != "index"]),
+        "screen %s: %d expiries dropped %s (index %d; %d names touched)",
+        info["screen"], len(info["dropped"]), by_rule, by_leg.get("index", 0),
+        len([k for k in by_leg if k != "index"]),
     )  # fmt: skip
     horizon = spec.lc.particle.horizon
     for g in info["dropped"]:
@@ -534,24 +556,28 @@ def run_screen(args: argparse.Namespace) -> dict[str, Any]:
                 {"expiry": e.expiry, "days": round(e.T * 365), "third_friday": third_friday(e.expiry, listed),
                  "used": round(e.T, 6) in used, "atm_vol": atm, "forward_ratio": e.forward / inp.index_spot,
                  "n_two_sided": q.n_two_sided, "n_strikes_1sd": q.n_strikes,
+                 "n_nearest_two_sided": q.n_nearest_two_sided,
                  "median_half_spread_vp": q.median_half_spread_vp, "total_variance_falls": falls}
             )  # fmt: skip
             log.info(
-                "    %s (%3dd) third Friday %-5s used %-5s ATM %6.2f%%  F/I0 %.5f  two-sided strikes in ±1 sd %2d of %2d  "
-                "median half spread %5.2f vp%s",
+                "    %s (%3dd) third Friday %-5s used %-5s ATM %6.2f%%  F/I0 %.5f  two-sided: %d of the 3 nearest strikes, "
+                "%2d of %2d in ±1 sd  median half spread %5.2f vp%s",
                 e.expiry, round(e.T * 365), third_friday(e.expiry, listed), round(e.T, 6) in used, 100 * atm,
-                e.forward / inp.index_spot, q.n_two_sided, q.n_strikes, q.median_half_spread_vp,
+                e.forward / inp.index_spot, q.n_nearest_two_sided, q.n_two_sided, q.n_strikes, q.median_half_spread_vp,
                 "  <-- total variance below the previous expiry's" if falls else "",
             )  # fmt: skip
             prev = w0
         s = log_market(spec, market, info)
         n_listed = sum(len(v) for v in inp.smiles.values()) + len(inp.index_smiles)
+        by_rule: dict[str, int] = {}
+        for g in info["dropped"]:
+            by_rule[g["rule"]] = by_rule.get(g["rule"], 0) + 1
         log.info(
-            "    %d expiries listed on the 31 legs, %d dropped by the screen",
-            n_listed,
-            len(info["dropped"]),
-        )
-        out[date] = {"index_expiries": rows, "dropped": info["dropped"], "n_listed": n_listed,
+            "    %d expiries listed on the 31 legs, %d dropped by the screen: %s; index expiries kept: %s",
+            n_listed, len(info["dropped"]), by_rule,
+            [e.expiry for e in inp.index_smiles if not any(g["leg"] == "index" and g["expiry"] == e.expiry for g in info["dropped"])],
+        )  # fmt: skip
+        out[date] = {"index_expiries": rows, "dropped": info["dropped"], "n_listed": n_listed, "by_rule": by_rule,
                      "alignment": s["alignment"], "flagged": s["flagged"], "record": record(spec)}  # fmt: skip
     write_json(f"screen_{args.tenor}", out, args.out)
     return out
@@ -1061,6 +1087,234 @@ def run_wing(args: argparse.Namespace) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------------------------
+# the single-name strips (S8's diagnostic)
+# ---------------------------------------------------------------------------------------------
+
+
+class StudySmile:
+    """The study's smile of a name at the horizon as a surface the strip can read: vols linear
+    between the listed strikes and flat beyond them, total variance linear in time between the
+    two bracketing expiries (``disp_smile.smile_at``); the forward is the study's."""
+
+    def __init__(self, smile: Any) -> None:
+        self.smile = smile
+        self.forward_curve = ForwardCurve.from_forwards(
+            1.0, [smile.T], [smile.forward / smile.spot], ZERO_CURVE
+        )
+
+    def atm_vol(self, T: float) -> float:
+        return float(self.smile.vol(0.0))
+
+    def total_variance(self, k: Any, T: float) -> np.ndarray:
+        return np.asarray(self.smile.vol(np.asarray(k, dtype=float)) ** 2 * T)
+
+
+REGIONS = (
+    "below the listed strikes",
+    "listed, below the forward",
+    "listed, above the forward",
+    "above the listed strikes",
+)
+
+
+def strip_regions(inp: DowInputs, market: LCMarket) -> pd.DataFrame:
+    """Per name at the horizon: ``E[R_i²]`` from the model's SVI surface and from the study's
+    smile (all the study's listed expiries), each split into ``(f − 1)²`` and the strip by
+    region of the strike axis — below the listed strikes, listed below the forward, listed
+    above it, above the listed strikes (the listed range is the one the two bracketing expiries
+    share) — and the entry's own ``M_i``."""
+    T = inp.T
+    entry_m = np.asarray(inp.entry["legs"]["M"], dtype=float)
+    rows = []
+    for i, name in enumerate(inp.names):
+        smile = ds.smile_at(inp.smiles[name], inp.spots[i], T)
+        k_lo = max(float(smile.lo.k.min()), float(smile.hi.k.min()))
+        k_hi = min(float(smile.lo.k.max()), float(smile.hi.k.max()))
+        cuts = [k_lo, 0.0, k_hi]
+        study_total, study_parts = strip_second_moment(StudySmile(smile), T, splits=cuts)  # type: ignore[arg-type,misc]
+        svi_total, svi_parts = strip_second_moment(market.surfaces[i], T, splits=cuts)  # type: ignore[misc]
+        row: dict[str, Any] = {"name": name, "weight": float(inp.weights[i] / inp.weights.sum()),
+                               "k_lo": k_lo, "k_hi": k_hi, "M_entry": float(entry_m[i]),
+                               "M_study": float(study_total), "M_svi": float(svi_total),
+                               "sd": float(smile.vol(0.0)) * math.sqrt(T)}  # fmt: skip
+        for j, label in enumerate(REGIONS):
+            row[f"study: {label}"] = float(study_parts[j])
+            row[f"svi: {label}"] = float(svi_parts[j])
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def run_strips(args: argparse.Namespace) -> dict[str, Any]:
+    t0 = time.perf_counter()
+    inp = load_inputs(args.date, args.tenor)
+    spec, _ = build_spec(inp, n_particles=args.particles, n_paths=args.paths, screen=args.screen, schedule=SCHEDULES[args.schedule])  # fmt: skip
+    market = build_lc_market(spec)
+    table = strip_regions(inp, market)
+    w = table["weight"].to_numpy()
+    log.info("=== single-name strips on %s %s (T = %.6f)", args.date, args.tenor, inp.T)
+    check = float(np.max(np.abs(table["M_study"] / table["M_entry"] - 1.0)))
+    log.info(
+        "Σ w M_i: the entry %.6f; the study's strip rebuilt here %.6f (largest relative difference by name %.1e); "
+        "the SVI surfaces %.6f; SVI - study = %+.6f (%+.2f %%)",
+        float(w @ table["M_entry"]), float(w @ table["M_study"]), check, float(w @ table["M_svi"]),
+        float(w @ (table["M_svi"] - table["M_study"])), 100 * float(w @ (table["M_svi"] - table["M_study"])) / float(w @ table["M_study"]),
+    )  # fmt: skip
+    by_region = {}
+    for label in REGIONS:
+        d = table[f"svi: {label}"] - table[f"study: {label}"]
+        by_region[label] = float(w @ d)
+        log.info("    %-28s Σ w (SVI - study) = %+.6f   (study %.6f, SVI %.6f)", label, by_region[label],
+                 float(w @ table[f"study: {label}"]), float(w @ table[f"svi: {label}"]))  # fmt: skip
+    rest = float(w @ (table["M_svi"] - table["M_study"])) - sum(by_region.values())
+    log.info("    %-28s %+.6f   (the (f - 1)² terms and the quadrature)", "the rest", rest)
+    table["diff"] = table["M_svi"] - table["M_study"]
+    table["weighted_diff"] = table["weight"] * table["diff"]
+    top = table.reindex(table["weighted_diff"].abs().sort_values(ascending=False).index).head(8)
+    show = top[["name", "weight", "sd", "k_lo", "k_hi", "M_study", "M_svi", "weighted_diff"]].copy()
+    show["k_lo_sd"], show["k_hi_sd"] = show["k_lo"] / show["sd"], show["k_hi"] / show["sd"]
+    log.info(
+        "the eight names with the largest weighted difference:\n%s",
+        show.to_string(index=False, float_format=lambda x: f"{x:.6f}"),
+    )
+    # the model's own second moments: the names' law does not depend on the correlation
+    res_times = TimeGrid.build([inp.T], spec.sim.dt_max).times
+    zero = LocalCorrelationFunction.constant(0.0, res_times, market.index_lv.k_grid)
+    smp = sample(model_of(spec, market, zero), spec.sim, np.array(spec.weights), [inp.T])
+    mc = pair_mean(smp.sq)
+    log.info(
+        "the model's Monte Carlo Σ w E[R_i²] = %.6f (%.6f): against the SVI strips %+.6f, against the study's %+.6f "
+        "(the single-name part of E[V] - E^Q[V])",
+        mc[0], mc[1], mc[0] - float(w @ table["M_svi"]), mc[0] - float(w @ table["M_entry"]),
+    )  # fmt: skip
+    payload = {"date": args.date, "tenor": args.tenor, "table": table.to_dict("records"), "by_region": by_region, "rest": rest,
+               "sum_w_M_entry": float(w @ table["M_entry"]), "sum_w_M_study": float(w @ table["M_study"]),
+               "sum_w_M_svi": float(w @ table["M_svi"]), "mc_sum_w_R2": mc,
+               "record": record(spec, total_seconds=time.perf_counter() - t0)}  # fmt: skip
+    write_json(f"strips_{args.date}_{args.tenor}", payload, args.out)
+    return payload
+
+
+# ---------------------------------------------------------------------------------------------
+# calendar crossings
+# ---------------------------------------------------------------------------------------------
+
+
+def central_crossings(
+    spec: LocalCorrelationSpec, res: LCCalibrationResult, central_sd: float = 2.0
+) -> dict[str, list[tuple[float, float, float, float]]]:
+    """Per name, the calendar crossings inside the cloud mean ``± central_sd`` standard
+    deviations: ``(T_s, T_{s+1}, min dw, k)`` for each pair of consecutive slices whose total
+    variance falls somewhere in that range."""
+    ranges = visited_arbitrage(spec, res, central_sd=central_sd)["ranges"]
+    out: dict[str, list[tuple[float, float, float, float]]] = {}
+    for name, cfg, market in zip(spec.names, spec.surfaces, spec.markets, strict=True):
+        r = ranges[name]
+        surface = SviSlices(
+            np.array(cfg.times),
+            np.array(cfg.params),
+            ForwardCurve.from_config(market),
+            cfg.max_maturity,
+        )
+        rep = surface.arbitrage_report(k_lo=r["k_lo_central"], k_hi=r["k_hi_central"])
+        found = [
+            (float(cfg.times[s]), float(cfg.times[s + 1]), float(c), float(k))
+            for s, (c, k) in enumerate(zip(rep.min_calendar, rep.argmin_calendar, strict=True))
+            if c < -rep.tol
+        ]
+        if found:
+            out[name] = found
+    return out
+
+
+def slice_to_drop(expiry_of: dict[float, str], pair: tuple[float, float]) -> str:
+    """Of two crossing slices, the one to drop: the one that is not a third-Friday expiry — the
+    shorter one when both are, or neither is (the rule is fixed in advance, SPEC §8.7)."""
+    a, b = expiry_of[round(pair[0], 9)], expiry_of[round(pair[1], 9)]
+    if third_friday(a) and not third_friday(b):
+        return b
+    return a
+
+
+def run_calendar(args: argparse.Namespace) -> dict[str, Any]:
+    t0 = time.perf_counter()
+    inp = load_inputs(args.date, args.tenor)
+    options = {
+        "n_particles": args.particles,
+        "n_paths": args.paths,
+        "screen": args.screen,
+        "schedule": SCHEDULES[args.schedule],
+    }
+    spec, _ = build_spec(inp, **options)
+    market = build_lc_market(spec)
+    res = calibrate(spec, market)
+    base_cross = central_crossings(spec, res)
+    log.info(
+        "=== calendar crossings inside ±2 sd of the cloud on %s %s: %d names",
+        args.date,
+        args.tenor,
+        len(base_cross),
+    )
+    removed: dict[str, list[str]] = {}
+    work, cross = inp, base_cross
+    for round_ in range(1, 6):
+        if not cross:
+            break
+        smiles = dict(work.smiles)
+        for name, pairs in cross.items():
+            expiry_of = {round(float(e.T), 9): e.expiry for e in work.smiles[name]}
+            gone = {slice_to_drop(expiry_of, (a, b)) for a, b, _, _ in pairs}
+            for a, b, c, k in pairs:
+                log.info("    round %d %-5s slices T = %.4f -> %.4f: w falls by %.2e at k = %+.4f; dropped: %s",
+                         round_, name, a, b, -c, k, slice_to_drop(expiry_of, (a, b)))  # fmt: skip
+            removed.setdefault(name, []).extend(sorted(gone))
+            smiles[name] = [e for e in work.smiles[name] if e.expiry not in gone]
+        work = dataclasses.replace(work, smiles=smiles)
+        spec2, _ = build_spec(work, **options)
+        market2 = build_lc_market(spec2)
+        res2 = calibrate(spec2, market2)
+        cross = central_crossings(spec2, res2)
+    log.info(
+        "slices dropped: %s; crossings left inside ±2 sd: %d names %s",
+        removed,
+        len(cross),
+        sorted(cross),
+    )
+    w = np.array(spec.weights)
+    pillars = repricing_pillars(spec)
+    a = sample(model_of(spec, market, res.lam), spec.sim, w, pillars)
+    b = sample(model_of(spec2, market2, res2.lam), spec2.sim, w, pillars)
+    strikes = [float(x) for x in inp.entry["B1"]["strikes"]]
+    rows = []
+    for label, K in [("E[D]", 0.0)] + [
+        (f"call {m:g}", K) for m, K in zip((0.5, 0.75, 1.0, 1.25, 1.5, 2.0), strikes, strict=True)
+    ]:
+        x, y = np.maximum(a.D - K, 0.0), np.maximum(b.D - K, 0.0)
+        d, se = pair_mean(y - x)
+        rows.append({"quantity": label, "base": pair_mean(x)[0], "base_se": pair_mean(x)[1], "repaired": pair_mean(y)[0],
+                     "repaired_minus_base": d, "paired_se": se, "rel_%": 100 * d / pair_mean(x)[0], "rel_se_%": 100 * se / pair_mean(x)[0]})  # fmt: skip
+    prices = pd.DataFrame(rows)
+    log.info("prices, the offending slices dropped against the base (the same particles and pricing paths):\n%s",
+             prices.to_string(index=False, float_format=lambda x: f"{x:.6g}"))  # fmt: skip
+    smile = smile_difference(b.levels, a.levels, pillars, market.index_surface)
+    cells = smile.assign(
+        cell=[f"{d:+.4f} ({e:.4f})" for d, e in zip(smile["diff_vp"], smile["se_vp"], strict=True)]
+    )
+    log.info(
+        "index smile, repaired minus base, vol points (paired se):\n%s",
+        cells.pivot(index="T", columns="sd", values="cell").to_string(),
+    )
+    sq = pair_mean(b.sq - a.sq)
+    log.info("Σ w E[R_i²]: %+.3e (%.1e); clipped mass inside ±%.1f sd: %.4f -> %.4f; verdict on E[D] against 0.05 %%: %s",
+             sq[0], sq[1], CLIP_GATE_SD, res.max_clipped_mass_inner, res2.max_clipped_mass_inner,
+             "above: a calendar repair is proposed" if abs(prices.iloc[0]["rel_%"]) > 0.05 else "below: recorded")  # fmt: skip
+    payload = {"date": args.date, "tenor": args.tenor, "crossings": {k: v for k, v in base_cross.items()}, "removed": removed,
+               "left": {k: v for k, v in cross.items()}, "prices": rows, "smile": smile.to_dict("records"),
+               "record": record(spec, total_seconds=time.perf_counter() - t0)}  # fmt: skip
+    write_json(f"calendar_{args.date}_{args.tenor}_{args.particles}", payload, args.out)
+    return payload
+
+
+# ---------------------------------------------------------------------------------------------
 # the M12 baseline (S11)
 # ---------------------------------------------------------------------------------------------
 
@@ -1189,7 +1443,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         p.add_argument("--particles", type=int, default=PRODUCTION)
         p.add_argument("--paths", type=int, default=PRODUCTION)
         p.add_argument(
-            "--out", default=None, help="JSON path (default: outputs/lc/<command>_….json)"
+            "--out",
+            default=None,
+            help="JSON path (default: outputs/dispersion_lc/diagnostics/<command>_….json)",
         )
 
     p = sub.add_parser("screen", help="the expiry screen, the quote quality and the alignment")
@@ -1218,6 +1474,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     p = sub.add_parser("wing", help="the three diagnostics of the downside wing")
     common(p)
     p.set_defaults(run=run_wing)
+    p = sub.add_parser(
+        "strips", help="the single-name second moments: SVI against the study's strips"
+    )
+    common(p)
+    p.set_defaults(run=run_strips)
+    p = sub.add_parser("calendar", help="the effect of the calendar crossings inside ±2 sd")
+    common(p)
+    p.set_defaults(run=run_calendar)
     p = sub.add_parser(
         "baseline",
         help="the M12 baseline (S11): --write records tests/golden/lcm_baseline_<date>.json",

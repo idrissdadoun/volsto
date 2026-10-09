@@ -17,14 +17,15 @@ loaded (the study's :class:`~volsto.studies.disp_smile.ExpirySmile` lists, throu
   of SPEC §8.7); the listed forwards ``F_I(T_e)/I_0`` are kept for the alignment report;
 * **the shared grid** of SPEC §8.7 for the horizon (:func:`default_lc_grid`).
 
-**Which expiries enter** (:class:`ExpiryScreen`; owner's decision of 2026-10-08, on by default):
+**Which expiries enter** (:class:`ExpiryScreen`; owner's decisions of 2026-10-08, on by default):
 the index target reads the standard monthly (third-Friday) expiries only, and an expiry of any
-leg — index or name — is dropped when, inside ±1 at-the-money standard deviation of its
-forward, it has fewer than three strikes with a positive bid on both the call and the put, or
-a median half bid-ask spread above 2 vol points (:func:`quote_quality` measures both on the
-vendor's chain).  Every expiry dropped is logged with its reason and returned in the build's
-information.  The screen lives here and not in the study's loader: the study's published
-numbers were made with every expiry its own guards kept, and its loader is unchanged.
+leg — index or name — is dropped when one of its three listed strikes nearest the forward has
+no two-sided market (a positive bid on both the call and the put), or when its median half
+bid-ask spread inside ±1 at-the-money standard deviation of the forward is above 2 vol points
+(up to one year; above 6 beyond) (:func:`quote_quality` measures both on the vendor's chain).
+Every expiry dropped is logged with its reason and returned in the build's information.  The
+screen lives here and not in the study's loader: the study's published numbers were made with
+every expiry its own guards kept, and its loader is unchanged.
 """
 
 from __future__ import annotations
@@ -110,20 +111,32 @@ def third_friday(expiry: str, listed: Collection[str] = ()) -> bool:
     return False
 
 
+#: The strike rule reads this many listed strikes nearest the forward.
+NEAREST_STRIKES: Final[int] = 3
+
+
 @dataclass(frozen=True)
 class QuoteQuality:
-    """The quotes of one listed expiry inside ``±QUOTE_SD`` at-the-money standard deviations of
-    its forward (:func:`quote_quality`): the listed strikes there, those with a positive bid on
-    both the call and the put, and the median over the strikes of the half bid-ask spread of the
-    option the smile reads (the call at or above the forward, the put below) in vol points
-    (the half spread divided by that option's Black vega; NaN when no strike has a valid
-    two-way quote)."""
+    """The quotes of one listed expiry (:func:`quote_quality`).
+
+    ``n_nearest``: how many of the ``NEAREST_STRIKES`` listed strikes nearest the forward exist
+    (an expiry may list fewer); ``n_nearest_two_sided``: how many of them have a positive bid on
+    both the call and the put.  ``n_strikes``: the listed strikes inside ``±QUOTE_SD``
+    at-the-money standard deviations of the forward; ``n_two_sided``: those of them with a
+    positive bid on both sides.  ``median_half_spread_vp``: the median over the strikes inside
+    ``±QUOTE_SD`` sd — over the nearest strikes when none is inside (``spread_on_nearest``) — of
+    the half bid-ask spread of the option the smile reads (the call at or above the forward, the
+    put below) in vol points (the half spread divided by that option's Black vega; NaN when no
+    strike has a valid two-way quote)."""
 
     expiry: str
     T: float
     n_strikes: int
     n_two_sided: int
     median_half_spread_vp: float
+    n_nearest: int = 0
+    n_nearest_two_sided: int = 0
+    spread_on_nearest: bool = False
 
 
 def quote_quality(chain: pd.DataFrame, expiries: Sequence[ListedExpiry]) -> dict[str, QuoteQuality]:
@@ -144,53 +157,104 @@ def quote_quality(chain: pd.DataFrame, expiries: Sequence[ListedExpiry]) -> dict
         near = np.abs(k) <= QUOTE_SD * atm * math.sqrt(e.T)
         c_bid, c_ask = g["cBidPx"].to_numpy(float), g["cAskPx"].to_numpy(float)
         p_bid, p_ask = g["pBidPx"].to_numpy(float), g["pAskPx"].to_numpy(float)
-        two_sided = near & (c_bid > 0) & (p_bid > 0)
+        both = (c_bid > 0) & (p_bid > 0)
+        nearest = np.zeros(strike.size, dtype=bool)
+        nearest[np.argsort(np.abs(k), kind="stable")[:NEAREST_STRIKES]] = True
         call = strike >= e.forward
         bid, ask = np.where(call, c_bid, p_bid), np.where(call, c_ask, p_ask)
         vol = np.interp(k, e.k, e.vol)
         vega = black_vega(e.forward, strike, e.T, vol, math.exp(-e.rate * e.T))
-        valid = near & np.isfinite(bid) & np.isfinite(ask) & (ask > 0) & (ask >= bid) & (vega > 0)
+        quoted = np.isfinite(bid) & np.isfinite(ask) & (ask > 0) & (ask >= bid) & (vega > 0)
+        on_nearest = not bool(near.any())
+        valid = (nearest if on_nearest else near) & quoted
         half = 100.0 * 0.5 * (ask[valid] - bid[valid]) / vega[valid]
         median = float(np.median(half)) if valid.any() else float("nan")
         out[e.expiry] = QuoteQuality(
-            e.expiry, float(e.T), int(near.sum()), int(two_sided.sum()), median
+            e.expiry,
+            float(e.T),
+            int(near.sum()),
+            int((near & both).sum()),
+            median,
+            int(nearest.sum()),
+            int((nearest & both).sum()),
+            on_nearest,
         )
     return out
 
 
 @dataclass(frozen=True)
 class ExpiryScreen:
-    """Which listed expiries enter the model (module docstring).
+    """Which listed expiries enter the model (module docstring; owner's decisions of 2026-10-08,
+    second round).
 
     ``index_third_friday``: the index target reads standard monthly expiries only.
-    ``min_two_sided``: an expiry needs this many strikes inside ±1 sd with a positive bid on
-    both the call and the put (0: not read).  ``max_half_spread_vp``: and a median half spread
-    there of at most this many vol points (``inf``: not read)."""
+    ``nearest_two_sided``: the ``NEAREST_STRIKES`` listed strikes nearest the forward must each
+    have a positive bid on both the call and the put (an expiry that lists fewer is dropped).
+    ``max_half_spread_vp``: the median half spread inside ±1 sd is at most this many vol points
+    for an expiry of up to ``long_maturity`` years, and at most ``max_half_spread_long_vp``
+    beyond (``inf``: not read)."""
 
     index_third_friday: bool = True
-    min_two_sided: int = 3
+    nearest_two_sided: bool = True
     max_half_spread_vp: float = 2.0
+    max_half_spread_long_vp: float = 6.0
+    long_maturity: float = 1.0
 
     def __post_init__(self) -> None:
-        if self.min_two_sided < 0 or not self.max_half_spread_vp > 0:
-            raise ValueError("need min_two_sided >= 0 and max_half_spread_vp > 0")
+        if not (self.max_half_spread_vp > 0 and self.max_half_spread_long_vp > 0):
+            raise ValueError("the half-spread limits must be positive")
+        if not self.long_maturity > 0:
+            raise ValueError("long_maturity must be positive")
 
     @classmethod
     def off(cls) -> ExpiryScreen:
         """No screen: every expiry the loader returns (the study's own selection)."""
-        return cls(False, 0, math.inf)
+        return cls(False, False, math.inf, math.inf)
 
     @property
     def reads_quotes(self) -> bool:
-        return self.min_two_sided > 0 or math.isfinite(self.max_half_spread_vp)
+        return (
+            self.nearest_two_sided
+            or math.isfinite(self.max_half_spread_vp)
+            or math.isfinite(self.max_half_spread_long_vp)
+        )
+
+    def spread_limit(self, maturity: float) -> float:
+        """The half-spread limit of an expiry of ``maturity`` years, in vol points."""
+        if maturity <= self.long_maturity + 1e-12:
+            return self.max_half_spread_vp
+        return self.max_half_spread_long_vp
 
     def describe(self) -> dict[str, Any]:
         return {
             "index_third_friday": self.index_third_friday,
-            "min_two_sided": self.min_two_sided,
+            "nearest_two_sided": self.nearest_two_sided,
+            "nearest_strikes": NEAREST_STRIKES,
             "max_half_spread_vp": self.max_half_spread_vp,
+            "max_half_spread_long_vp": self.max_half_spread_long_vp,
+            "long_maturity": self.long_maturity,
             "quote_sd": QUOTE_SD,
         }
+
+
+def screen_reason(e: ListedExpiry, q: QuoteQuality | None, screen: ExpiryScreen) -> tuple[str, str]:
+    """``(rule, reason)`` of the quote rule that drops ``e`` — ``("", "")`` when it passes.
+    ``rule`` is ``"strikes"`` or ``"spread"`` (or ``"quotes"`` when the day has none)."""
+    if q is None:
+        return "quotes", "no quotes"
+    if screen.nearest_two_sided and q.n_nearest_two_sided < NEAREST_STRIKES:
+        return "strikes", (
+            f"{q.n_nearest_two_sided} of the {NEAREST_STRIKES} listed strikes nearest the forward "
+            f"have a positive bid on both the call and the put ({q.n_nearest} listed)"
+        )
+    limit = screen.spread_limit(float(e.T))
+    if math.isfinite(limit) and not (q.median_half_spread_vp <= limit):
+        where = "on the nearest strikes" if q.spread_on_nearest else f"inside ±{QUOTE_SD:g} sd"
+        return "spread", (
+            f"median half spread {where} {q.median_half_spread_vp:.2f} vol points, above "
+            f"{limit:g}"
+        )
+    return "", ""
 
 
 def screen_expiries(
@@ -202,7 +266,8 @@ def screen_expiries(
     index: bool = False,
 ) -> tuple[list[ListedExpiry], list[dict[str, Any]]]:
     """``(kept, dropped)`` of one leg's expiries under ``screen``; each dropped expiry is a
-    record ``{"leg", "expiry", "T", "reason"}`` and is logged."""
+    record ``{"leg", "expiry", "T", "rule", "reason"}`` (``rule``: ``"third_friday"``,
+    ``"strikes"``, ``"spread"`` or ``"quotes"``) and is logged."""
     if screen.reads_quotes and quotes is None:
         raise ValueError(
             f"{leg}: the quote screen needs the day's quote quality (quote_quality on the "
@@ -212,27 +277,15 @@ def screen_expiries(
     dropped: list[dict[str, Any]] = []
     listed = {e.expiry for e in expiries}
     for e in expiries:
-        reason = ""
+        rule, reason = "", ""
         if index and screen.index_third_friday and not third_friday(e.expiry, listed):
-            reason = "not a third-Friday expiry"
+            rule, reason = "third_friday", "not a third-Friday expiry"
         elif screen.reads_quotes and quotes is not None:
-            q = quotes.get(e.expiry)
-            if q is None:
-                reason = "no quotes"
-            elif q.n_two_sided < screen.min_two_sided:
-                reason = (
-                    f"{q.n_two_sided} strikes inside ±{QUOTE_SD:g} sd with a positive bid on the "
-                    f"call and the put (of {q.n_strikes} listed), fewer than {screen.min_two_sided}"
-                )
-            elif math.isfinite(screen.max_half_spread_vp) and not (
-                q.median_half_spread_vp <= screen.max_half_spread_vp
-            ):
-                reason = (
-                    f"median half spread inside ±{QUOTE_SD:g} sd {q.median_half_spread_vp:.2f} "
-                    f"vol points, above {screen.max_half_spread_vp:g}"
-                )
+            rule, reason = screen_reason(e, quotes.get(e.expiry), screen)
         if reason:
-            dropped.append({"leg": leg, "expiry": e.expiry, "T": float(e.T), "reason": reason})
+            dropped.append(
+                {"leg": leg, "expiry": e.expiry, "T": float(e.T), "rule": rule, "reason": reason}
+            )
             log.info("expiry screen: %s %s (T = %.4f) dropped: %s", leg, e.expiry, e.T, reason)
         else:
             kept.append(e)
@@ -411,6 +464,7 @@ def lc_spec_from_smiles(
 
 __all__ = [
     "CARRY_RULES",
+    "NEAREST_STRIKES",
     "QUOTE_SD",
     "ExpiryScreen",
     "ListedExpiry",
@@ -420,5 +474,6 @@ __all__ = [
     "name_market",
     "quote_quality",
     "screen_expiries",
+    "screen_reason",
     "third_friday",
 ]

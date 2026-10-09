@@ -21,10 +21,17 @@ sensitivity ``−σ/(2√(1−ρ))`` is the smaller one in absolute terms at hig
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from typing import TYPE_CHECKING
+
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
+from scipy.special import ndtr
 
 from volsto.multi.draws import check_correlation
+
+if TYPE_CHECKING:
+    from volsto.market.surface import ImpliedSurface
 
 FloatArray = NDArray[np.float64]
 
@@ -140,6 +147,74 @@ def gaussian_palladium_call(
     return float((m - strike) * norm.cdf(d) + sd * norm.pdf(d))
 
 
+def _simpson(y: FloatArray, h: float) -> float:
+    """Simpson's rule on an odd number of equally spaced points."""
+    return float(h / 3.0 * (y[0] + y[-1] + 4.0 * y[1:-1:2].sum() + 2.0 * y[2:-1:2].sum()))
+
+
+def strip_second_moment(
+    surface: ImpliedSurface,
+    T: float,
+    *,
+    splits: Sequence[float] | None = None,
+    n_half: int = 2000,
+) -> float | tuple[float, FloatArray]:
+    """``E[R²]`` of ``R = S_T/S_0 − 1`` from the vanilla strip of an implied surface (SPEC §8.7):
+
+        E[R²] = (f − 1)² + 2·∫_0^f P(K) dK + 2·∫_f^∞ C(K) dK,        f = F(T)/S_0,
+
+    in units of the spot and undiscounted.  Simpson's rule in ``k = ln(K/F)`` (``dK = K dk``) on
+    ``n_half`` intervals each side of the forward over ``±8a`` with ``a = max(σ_ATM√T, 0.1)``,
+    wide enough for ``K/S_0`` in ``[0.2, 3]`` — the grid of ``disp_smile.build_marginal`` — and
+    beyond it the lognormal tails at the edge vols.
+
+    ``splits``: increasing log-moneyness levels; the function then also returns the strip part
+    of ``E[R²]`` (everything but ``(f − 1)²``) by region, ``len(splits) + 1`` numbers: below the
+    first split, between consecutive ones, above the last (trapezoids on the same grid, summing
+    to the Simpson value within its quadrature error; the lognormal tails go to the outer
+    regions).
+
+    Lognormal check: a flat vol ``σ`` gives ``f²·e^{σ²T} − 2f + 1`` (derived; tested)."""
+    if n_half < 2 or n_half % 2:
+        raise ValueError("n_half must be even and at least 2")
+    f = float(surface.forward_curve.forward(T)) / float(surface.forward_curve.spot)
+    a = max(float(surface.atm_vol(T)) * np.sqrt(T), 0.1)
+    k_lo = min(-8.0 * a, float(np.log(0.2 / f)))
+    k_hi = max(8.0 * a, float(np.log(3.0 / f)))
+    k = np.concatenate([np.linspace(k_lo, 0.0, n_half + 1), np.linspace(0.0, k_hi, n_half + 1)[1:]])
+    s = np.sqrt(np.maximum(np.asarray(surface.total_variance(k, T), dtype=np.float64), 1e-12))
+    strike = f * np.exp(k)
+    d1 = -k / s + 0.5 * s
+    call = f * ndtr(d1) - strike * ndtr(d1 - s)
+    put = call - (f - strike)
+    put_side = _simpson(put[: n_half + 1] * strike[: n_half + 1], -k_lo / n_half)
+    call_side = _simpson(call[n_half:] * strike[n_half:], k_hi / n_half)
+
+    def tail(edge: int, upper: bool) -> float:
+        """``E[((X − K)⁺)²]`` above the grid or ``E[((K − X)⁺)²]`` below it, lognormal."""
+        K, v = float(strike[edge]), float(s[edge])
+        e1 = (np.log(f / K) + 0.5 * v * v) / v
+        e2, e0 = e1 - v, e1 + v
+        if upper:
+            return float(f * f * np.exp(v * v) * ndtr(e0) - 2 * K * f * ndtr(e1) + K * K * ndtr(e2))
+        return float(K * K * ndtr(-e2) - 2 * K * f * ndtr(-e1) + f * f * np.exp(v * v) * ndtr(-e0))
+
+    up_tail, dn_tail = tail(-1, True), tail(0, False)
+    total = 2.0 * (put_side + call_side) + up_tail + dn_tail + (f - 1.0) ** 2
+    if splits is None:
+        return float(total)
+    cuts = np.asarray(splits, dtype=np.float64)
+    if cuts.ndim != 1 or np.any(np.diff(cuts) <= 0):
+        raise ValueError("splits must be increasing")
+    otm = np.where(k < 0.0, put, call) * strike
+    cells = (otm[1:] + otm[:-1]) * np.diff(k)  # twice the trapezoid: the factor 2 of the strip
+    region = np.searchsorted(cuts, 0.5 * (k[1:] + k[:-1]))
+    parts = np.bincount(region, weights=cells, minlength=cuts.size + 1)
+    parts[0] += dn_tail
+    parts[-1] += up_tail
+    return float(total), np.asarray(parts, dtype=np.float64)
+
+
 __all__ = [
     "basket_vol",
     "gaussian_dispersion_moments",
@@ -148,4 +223,5 @@ __all__ = [
     "gaussian_straddle_dispersion",
     "implied_correlation",
     "pairwise_mean_correlation",
+    "strip_second_moment",
 ]
