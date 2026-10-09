@@ -45,6 +45,7 @@ volsto/
       curves.py          # discount factors, forward curve (r, q) — piecewise-flat and interpolated
       surface.py         # ImpliedSurface ABC; SSVISurface; GridSurface (market slices)
       dupire.py          # local vol from total-variance surface (Gatheral formula)
+      svi_slices.py      # raw SVI per expiry, the surface through the slices, its arbitrage report (§8.7)
       varswap.py         # variance-swap strip by log-contract replication; xi0(T) curve
       bs.py              # Black–Scholes price, greeks, implied vol inversion (vectorised, robust)
     models/
@@ -62,6 +63,9 @@ volsto/
       fit_2f.py          # staged fit of the 2F parameters (§15)
       stability.py       # rolling refits and identifiability diagnostics (§15)
       cache.py           # content-addressed cache of calibrated leverage functions
+      fit_records.py     # content-addressed records of fitted slices, with a code tag (§8.7)
+      local_correlation.py  # particle calibration of the local correlation λ(t, k); the constant and two-parameter fits (§8.7)
+      lc_cache.py        # cache of calibrated λ, the LC market builder, the LC code-tag guard (§8.7)
       ssr.py             # skew-stickiness ratio estimator and 2F fitting helpers
     engine/
       grid.py            # TimeGrid: union of product fixings + discretisation steps
@@ -86,6 +90,7 @@ volsto/
       volsto_sens.py     # sensitivities to (omega, theta, k1, k2, rho...) with recalibration
       attribution.py     # P&L explain
       engine.py          # BumpSpec / RiskEngine / RiskReport (§7.1, §7.13)
+      local_correlation.py  # LC states and spot regimes, deltas and their decomposition, vegas by recalibration, model-risk range (§8.7)
       product_risk.py    # fixing, barrier and realised-variance risks (§7.10)
       estimators.py      # likelihood-ratio, conditional and control-variate Greeks (§7.11)
     hedging/
@@ -101,6 +106,18 @@ volsto/
       mixing.py          # mixing solution for pure-SV vanilla smiles (ch. 8 App. A)
     pde/
       lsv1f.py           # 2D finite-difference pricer for the 1F degenerate case (validation only)
+    multi/               # the multi-asset layer (§8.5) and the local correlation model (§8.7)
+      draws.py           # correlated Gaussian draws: closed-form equicorrelation factor, numba mixing
+      model.py           # MultiAssetModel (constant correlation); the MultiModel protocol
+      paths.py           # MultiPathSet: one PathSet per asset, aux arrays
+      mc.py              # MultiAssetMonteCarlo
+      products.py        # basket, dispersion (the Palladium family), extremum, relative, correlation and variance products
+      analytics.py       # Gaussian dispersion formulas, Margrabe, strip second moment, standard errors on pair means
+      family.py          # CorrelationFamily ρ(λ) = (1 − λ)·R_low + λ·R_high; historical-scaled R_low
+      lc_draws.py        # the family's draws: the asset streams and the common factor η
+      lc_function.py     # LocalCorrelationFunction λ(t, k); ParametricLambda
+      lc_kernel.py       # the joint step kernel (pure numba); a and b of the basket variance
+      lc_model.py        # BasketSpec, LocalCorrelationModel
     data/                # vendor data layer (§18): roots, raw manifest, fetch, volsto-data CLI
       roots.py           # VOLSTO_DATA_RAW / VOLSTO_DATA_STORE, free-space check
       orats.py           # ORATS strikes file: naming, declared schema versions
@@ -114,6 +131,7 @@ volsto/
       m4.py              # headline study runner behind the M4/M4b tables (implemented)
       runner.py          # run a study from YAML, write parquet + LaTeX tables + figures
       latex.py
+      disp_lc.py         # LC specification from the dispersion study's smiles; the expiry screen (§8.7)
     viewers/
       precompute.py      # builds parameter grids into the cache
       app.py             # Streamlit entry point
@@ -332,6 +350,8 @@ Single-run spread ±0.04 vp on the variance swap. The coarse schedule is the def
 
 ### 4.3 Cache
 Content-addressed: key = SHA-256 of (surface params, curves, model params, particle config, seed, calibration code tag). The code tag is manual (so the precompute is not invalidated by every commit); `code_tag_guard.json` stores hashes of the particle, binned-estimator, normal-draws (`engine/rng.py`), leverage, LSV, Bergomi and local-vol modules (`cache.GUARDED_MODULES`) and a test fails when they change without a tag bump. Store leverage `.npz` + diagnostics `.json` + a `manifest.parquet` row. `get_or_calibrate(cfg)` is the only entry point studies and viewers use. Calibration must never run silently inside a viewer; the viewer reads the cache and reports what is missing. **Hash re-recorded without a tag bump (2026-09-16, M10):** `calibrate_leverage` gained the study runner's calibration guard as its first statement (`volsto/calibration/guard.py`: it refuses or returns and touches no numerics), which changed the hashed source; the `m6` hash was re-recorded with `write_guard()` instead of bumping the tag, because a bump would invalidate every cached leverage for a change that cannot move a number. The rule stands: a change that can move a calibrated number bumps the tag. **Hash re-recorded without a tag bump (2026-10-04, binned estimator and lean draws; owner decision):** `calibration/binned.py` and `engine/rng.py` joined the guarded modules (the draws were not guarded before: a change of their layout or addressing moves every leverage, and only `tests/test_engine.py` stood in its way), `conditional_variance_estimate` was split by code motion and `GaussianDraws` fills its blocks without the intermediate copies; the `m6` hash was re-recorded in the commit that carries the proof that no default-path number moved — `test_lean_draws_equal_the_reference_layout` (the draws, bit for bit against the earlier layout), `test_default_estimator_is_the_m6_sorted_path` (the estimator, bit for bit against the frozen m6 function, every post-processing option and a whole calibration), `test_keys_of_committed_specs_unchanged` (the keys), and at the cache settings `test_default_path_matches_the_k2_baseline_digest` (slow) — §4.1.
+
+**A second code tag (M12, §8.7).** The local correlation cache (`calibration/lc_cache.py::LocalCorrelationCache`) is keyed by the SHA-256 of `LocalCorrelationSpec.key_payload()` and of its own manual tag `LC_CODE_TAG` (`"lc1"`, in `calibration/local_correlation.py`), and guarded by its own file, `lc_code_tag_guard.json`, over `LC_GUARDED_MODULES`: the LC kernel, model, draws and function, the correlation family, `multi/draws.py`, `engine/rng.py`, `models/localvol.py`, `market/dupire.py`, `market/svi_slices.py`, `calibration/local_correlation.py`, `calibration/particle.py` and `calibration/binned.py` (`tests/test_local_correlation.py::test_lc_code_tag_guard`). The two tags are independent — a bump of the leverage tag leaves every cached `λ` valid and conversely — but four modules are hashed by both guards (`calibration/particle.py`, `calibration/binned.py`, `engine/rng.py`, `models/localvol.py`), so a change to one of them is judged twice. The same rule holds: a change that can move a calibrated `λ` bumps the tag; a re-record without a bump needs the bit-for-bit proof on `λ`, stated in the commit (done twice in M12: LC1's addition to `curves.py` for the importer guard, and the first LC4 follow-up's diagnostics). An entry holds `λ` (`.npz`), the stored `R_low` when it is a matrix, the plot data, the diagnostics with the reproducibility record, and a row of `manifest.parquet`; a `"historical-scaled"` or `"matrix"` `R_low` and a `"matrix"` `R_high` are keyed by the digest of their data (`r_low_source`, `r_high_source`), never by the matrix.
 
 ### 4.4 SSR and 2F fitting helpers
 Skew-stickiness ratio (book eq. 9.3 / 12.50):
@@ -1533,6 +1553,42 @@ The study of §8.4 on every weekly entry of the ORATS history (§18.10). Specifi
 - **[review] LC7-e: the reference dates at production** are the first step after the 3m development pass in the driver rather than before the scripts' commit; 2026-10-02 was run at production before it (above).
 - **[review] LC7-f: the development budget fits `λ_c` on 10⁵ paths** (the specification's 4·10⁵ at production), to keep the preview pass inside the night.
 
+**LC8 — documentation, and the acceptance summary for the owner's review (2026-10-09).**
+- **Built.** §1 (the layout lines of `market/svi_slices.py`, `calibration/fit_records.py`, `calibration/local_correlation.py`, `calibration/lc_cache.py`, the `multi/` package, `risk/local_correlation.py`, `studies/disp_lc.py`); §4.3 (the second code tag and its guard); §12 (the M12 entry); `docs/methodology.md` §11 (nine entry-point rows); `docs/local_correlation.md` — the theory note in the specification's eight sections, with this repository's own measured numbers on the four reference dates in place of the reference implementation's.
+- **Acceptance summary** (a FAIL stays a FAIL; REPORTED: not gated by the owner's rule because the clipped mass inside ±2.5 sd exceeds 1 %).
+
+| test | what | result |
+|---|---|---|
+| V1 | the library's SVI fit equals the C8 fit bit for bit (9 synthetic smiles, 533 recorded expiries) | PASS |
+| I1–I9 | identities of the draws, the kernel, the function rows, calibration against pricing | PASS (fast, bit for bit where stated) |
+| I10 | path-by-path identities of the correlation products | PASS |
+| C1 | covariance of the family's draws | PASS |
+| C2 | single names under the model against their local vol: W5, and the thirty Dow names (450 cells) | PASS (worst z 3.60, 2 cells over 3) |
+| C3 | outperformance against Margrabe; the correlation estimators | PASS |
+| S1 | round trip of a known `λ`, 1y | PASS |
+| S2 | constant correlation is a fixed point | PASS |
+| S3 | identical names give `λ = 1` | floors PASS; **smile gate FAIL** (one cell, −0.208 ± 0.069 vp against 0.207; LC4G-a) |
+| S4 | the reference implementation: four dates, the recalibrated variant, the deltas | PASS (worst z 2.05; deltas z −0.47 and +1.09) |
+| S5 | step halving: W5; the Dow | PASS (+0.026 % ± 0.002; −0.008 % ± 0.004) |
+| S6 | particle doubling against calibration noise | PASS |
+| S7 | bandwidth | PASS |
+| S8 | `E^LC[V]` against the strips: W5; the Dow | W5 PASS (0.88 % ± 0.15 % against 1 %); the Dow REPORTED (1.0491 ± 0.0026 on 2026-10-02) |
+| S9 | basket variance swap against the strip: W5; the Dow | W5 PASS (+0.022 vp against 0.30); the Dow REPORTED (model against its own smile −0.022 ± 0.029 vp; its smile against the listed strip −1.114 vp) |
+| S10 | carry mode | PASS |
+| S11 | the Dow baseline of 2026-10-02 | PASS (the smile REPORTED: 11 cells over the gate, downside wing) |
+| R1–R4 | sticky-moneyness delta, the decomposition's sum, name deltas against the common delta, paired vega errors | PASS |
+| LC7 | the scripts: order, configuration, resume, delta-method errors | PASS |
+| suite | fast: 1001 passed, 359 skipped, 4 failed — the four failures of the branch's baseline (`test_shadow_rotation` ×3, `test_snapshot_portability`), none in M12's code | unchanged |
+
+- **Owner decisions needed** (each has a [review] item above with the alternatives; what is in place is the most conservative reversible option and is labelled [provisional] where it changes a number).
+  1. *S3's smile gate* (LC4G-a): gate the calibrated model against `λ ≡ 1` on common paths, or pool pricing seeds; as written it fails on the single name's own discretisation.
+  2. *The long-dated DJX expiries* (LC4G-g): a calendar rule on the index target or a tighter spread rule beyond one year; until then the 12m and 24m rows are [provisional] away from the money.
+  3. *The names' sanity check* (LC7-a): keep 2 % against the listed strips (dates then carry the status `check` where the smiles' own wings differ from the strips'), or compare with the names' SVI strips on a central range.
+  4. *The calendar repair* (LC4G-e): not built (`E[D]` moves by 0.040 %, below the 0.05 % of the decision); the calls move by 0.08 to 0.10 %.
+  5. *The companion's fit* (LC7-b, LC7-f): its Monte Carlo error is not in `ratio_se`; fitting `λ_c` on the pricing paths, or on more paths at the development budget, would remove most of it.
+  6. *S3's dip* (LC4G-b) and *the first-weeks bias of the names* (LC5-d): both are discretisation effects of the first steps that the quarter-step schedule reduced and did not remove.
+- **Not done in M12:** no pull request, no merge; the specification file is unchanged (LC4G-f); the uncertain-`λ` overlay, sub-basket products and a pairwise local correlation are in the note's limits only.
+
 ## 9. Viewers
 
 `viewers/precompute.py` builds grids into the cache: default grid `ω ∈ {0, 0.5, 1, 1.5, 2, 2.5, 3}`, `ρ1 ∈ {−0.9, −0.7, −0.5, −0.3, 0}`, `k1 ∈ {0.5, 1.5, 4}`, 2F presets (a few `(θ, k1, k2, ρ12)` combinations including the SSR ≈ 1.2 fit), always including the 1F degenerate points so the old studies are recoverable. Precompute is a CLI with resume support. Owner additions (recorded at the M4c review, for M9): the precompute CLI takes an explicit list of grid points and a worker count, so a grid can be sharded across cores or machines and resumed — `volsto-precompute --shard i/n` runs the i-th of n interleaved shards of the point list; the cache is relocatable (relative paths only, manifest-driven), so grids can be computed on a rented multi-core VM and synced to a laptop; production entries use 8·10⁵ particles (§11).
@@ -1905,6 +1961,8 @@ M9. Precompute CLI + Streamlit viewers + Excel export. **Done and accepted 2026-
 M10. Study runner with LaTeX output; regenerate the original paper's tables; backtest study on the market history (§15 Part 4). **Built and committed 2026-09-16/17 (0aa8dcb and its 2026-09-17 follow-up; pending owner review; open items in §10.3):** Part 0 eSSVI calendar repair (§13.1–13.2), the study runner (§10.1), the catalogue S1–S7 (§10.2), the rolling backtest with seasoning and sticky-leverage attribution (§10.3, §6.10, §7.12.1), `docs/methodology.md`, `docs/studies.md`.
 
 M11. Vendor data store and ORATS importer (§18). **In progress (2026-10-03):** Part 0 (the one-day sample inspected, `docs/m11_part0.md`) and Part 1 (data roots, raw manifest and calendar check, `fetch`, the `volsto-data` CLI, `docs/data_runbook.md`) built; Part 2a (the layout measured) and Part 2b (`convert`, `verify`, `extract`, `sql`; §18.3–18.4) built; Part 3 (the read API `volsto/market/store.py`, §18.5) built and merged; Part 4 (the ORATS importer for SPX, §18.6, with the Part 5 plan §18.7 and the single-stock report §18.8) built, pending review.
+
+M12. Local correlation model for correlation products, starting with the Palladium (§8.7; the owner's specification v1.0 of 2026-10-08). **Built 2026-10-08/09 on branch `local-correlation` (LC1–LC8; pending owner review; not merged):** LC1 SVI slices in the library (4a469a6, de4b702); LC2 the correlation family and its draws (0a62d07); LC3 the model and its joint kernel (e7b268c); LC4 the particle calibration, its cache and the acceptance runs (2613e9a, with the owner's two rounds of decisions in 9579c41 and 7672bfb); LC5 the correlation products (b4552c3); LC6 risk (d1e14af); LC7 the study's scripts (b7b8bd3) and the sweeps over the dispersion study's dates; LC8 this documentation. Acceptance: every gate passes except S3's smile gate on the quarter-step schedule (one cell; FAIL, [review] LC4G-a); on the Dow the index downside wing is out of the model class's reach (owner's decision 7 of the second round) and the smile, S8 and S9 are reported, not gated, on the dates where the clipped mass inside ±2.5 sd exceeds 1 %. The summary and the [review] items are at the end of §8.7; the theory note is `docs/local_correlation.md`.
 
 Open items for the owner: the original study archive (SSVI parameters, seeds, tables) — the M4 cliquet baseline is ≈ 10–16% above the study at every ω with ratios across ω agreeing to 1%, consistent with a surface difference; the paid EOD archive for a multi-year backtest.
 

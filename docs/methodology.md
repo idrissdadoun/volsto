@@ -858,3 +858,12 @@ short the book, as in the hedging studies and the shadow rotation
 | Hedging | `volsto.hedging.Hedger`, `volsto.studies.m8b` |
 | Grid precompute, viewer | `volsto-precompute`, `volsto-viewer` (`volsto.viewers`) |
 | Studies, backtest | `volsto-study`, `volsto-backtest` (see [studies.md](studies.md)) |
+| Multi-asset layer, dispersion products | `volsto.multi.MultiAssetModel`, `MultiAssetMonteCarlo`, `volsto.multi.products` (`Palladium`, `PalladiumPut`, `DispersionGap`, `WorstOf`, `CorrelationSwap`, `BasketVarianceSwap`, …) |
+| SVI slices per expiry | `volsto.market.svi_slices.fit_svi_slice`, `fit_svi_surface`, `SviSlices` |
+| Correlation family | `volsto.multi.family.CorrelationFamily`, `historical_scaled_correlation` |
+| Local correlation model | `volsto.multi.lc_model.LocalCorrelationModel`, `BasketSpec`, `volsto.multi.lc_function.LocalCorrelationFunction` |
+| Local correlation calibration | `volsto.calibration.local_correlation.calibrate_local_correlation`, `calibrate_constant_lambda`, `calibrate_parametric_lambda` (via the cache only) |
+| Local correlation cache | `volsto.calibration.lc_cache.LocalCorrelationCache.get_or_calibrate`, `build_lc_market`, `lc_spec_key` |
+| Index repricing under LC | `volsto.calibration.local_correlation.reprice_index_smile` |
+| LC risk | `volsto.risk.local_correlation.LCRiskEngine`, `LCBuilder`, `delta_decomposition`, `name_vegas`, `index_skew_vega`, `model_risk_range` |
+| LC on the dispersion study | `volsto.studies.disp_lc.lc_spec_from_smiles`, `ExpiryScreen`; `scripts/lcm_price.py`, `scripts/disp_lcm.py`, `scripts/lcm_report.py` (see [local_correlation.md](local_correlation.md)) |
