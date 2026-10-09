@@ -232,6 +232,31 @@ def test_arbitrage_report_detects_violations() -> None:
     assert rep.min_g[0] == pytest.approx(g[5:-5].min(), abs=2e-4)
     with pytest.raises(ValueError):
         clean.arbitrage_report(n_k=2)
+    # on per-slice ranges (the range a particle cloud visits): the put-wing crossing is seen
+    # when the range reaches it and not when it does not; a pair is checked on the union
+    ks = np.linspace(-1.0, 0.0, 100_001)
+    above = sv.svi_total_variance(crossed.params[1], ks) >= sv.svi_total_variance(
+        crossed.params[0], ks
+    )
+    crossing = float(ks[np.argmax(above)])  # the first strike where the later slice is above
+    assert -1.0 < crossing < 0.0
+    near = crossed.arbitrage_report(k_lo=[crossing + 0.01] * 2, k_hi=[0.3, 0.3])
+    assert near.ok and near.k_lo == (crossing + 0.01,) * 2 and near.k_hi == (0.3, 0.3)
+    assert near.min_calendar[0] > 0 and near.to_dict()["k_lo"] == [crossing + 0.01] * 2
+    union = crossed.arbitrage_report(k_lo=[crossing + 0.01, crossing - 0.05], k_hi=[0.3, 0.3])
+    assert union.butterfly_ok and not union.calendar_ok
+    assert union.argmin_calendar[0] == pytest.approx(crossing - 0.05)
+    wide = vogt.arbitrage_report(k_lo=[-0.2], k_hi=[1.5], n_k=601)
+    tight = vogt.arbitrage_report(k_lo=[-0.2], k_hi=[0.2], n_k=601)
+    assert not wide.butterfly_ok and tight.butterfly_ok
+    assert "k_lo" not in rep.to_dict()
+    for bad in (
+        {"k_lo": [0.0]},
+        {"k_lo": [0.0], "k_hi": [0.1]},
+        {"k_lo": [0.2, 0.2], "k_hi": [0.1, 0.3]},
+    ):
+        with pytest.raises(ValueError):
+            crossed.arbitrage_report(**bad)  # type: ignore[arg-type]
 
 
 class _Expiry:

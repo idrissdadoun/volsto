@@ -16,16 +16,28 @@ loaded (the study's :class:`~volsto.studies.disp_smile.ExpirySmile` lists, throu
   moneyness ``k = ln(K/F_I(T_e))``, to be used at the basket's forward moneyness (the alignment
   of SPEC §8.7); the listed forwards ``F_I(T_e)/I_0`` are kept for the alignment report;
 * **the shared grid** of SPEC §8.7 for the horizon (:func:`default_lc_grid`).
+
+**Which expiries enter** (:class:`ExpiryScreen`; owner's decision of 2026-10-08, on by default):
+the index target reads the standard monthly (third-Friday) expiries only, and an expiry of any
+leg — index or name — is dropped when, inside ±1 at-the-money standard deviation of its
+forward, it has fewer than three strikes with a positive bid on both the call and the put, or
+a median half bid-ask spread above 2 vol points (:func:`quote_quality` measures both on the
+vendor's chain).  Every expiry dropped is logged with its reason and returned in the build's
+information.  The screen lives here and not in the study's loader: the study's published
+numbers were made with every expiry its own guards kept, and its loader is unchanged.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import logging
 import math
-from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING, Any, Protocol
+from collections.abc import Collection, Mapping, Sequence
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Final, Protocol
 
 import numpy as np
+import pandas as pd
 from numpy.typing import NDArray
 
 from volsto.config import (
@@ -37,6 +49,7 @@ from volsto.config import (
     SimConfig,
     SviSurfaceConfig,
 )
+from volsto.market.bs import black_vega
 from volsto.market.curves import DiscountCurve, ForwardCurve
 from volsto.market.svi_slices import (
     FIT_MIN_POINTS,
@@ -52,12 +65,19 @@ if TYPE_CHECKING:
     from volsto.calibration.fit_records import FitRecords
 
 FloatArray = NDArray[np.float64]
+log = logging.getLogger(__name__)
 
 CARRY_RULES: tuple[str, ...] = ("study", "zero")
+#: The quote screen reads the strikes inside this many at-the-money standard deviations of the
+#: expiry's forward.
+QUOTE_SD: Final[float] = 1.0
 
 
 class ListedExpiry(Protocol):
     """What the builder reads of a listed expiry (the study's ``ExpirySmile``)."""
+
+    @property
+    def expiry(self) -> str: ...
 
     @property
     def T(self) -> float: ...
@@ -73,6 +93,150 @@ class ListedExpiry(Protocol):
 
     @property
     def vol(self) -> FloatArray: ...
+
+
+def third_friday(expiry: str, listed: Collection[str] = ()) -> bool:
+    """A standard monthly expiry: the third Friday of its month — or the Saturday after it (the
+    convention until 2015), or the Thursday before it when that Friday is a market holiday.
+    ``listed``: the leg's listed expiries; a Saturday or a Thursday counts only when the Friday
+    beside it is not listed too (an index with daily expiries lists the Thursday every month)."""
+    d = pd.Timestamp(expiry)
+    if d.dayofweek == 4:
+        return 15 <= d.day <= 21
+    if d.dayofweek == 5 and 16 <= d.day <= 22:
+        return (d - pd.Timedelta(days=1)).strftime("%Y-%m-%d") not in listed
+    if d.dayofweek == 3 and 14 <= d.day <= 20:
+        return (d + pd.Timedelta(days=1)).strftime("%Y-%m-%d") not in listed
+    return False
+
+
+@dataclass(frozen=True)
+class QuoteQuality:
+    """The quotes of one listed expiry inside ``±QUOTE_SD`` at-the-money standard deviations of
+    its forward (:func:`quote_quality`): the listed strikes there, those with a positive bid on
+    both the call and the put, and the median over the strikes of the half bid-ask spread of the
+    option the smile reads (the call at or above the forward, the put below) in vol points
+    (the half spread divided by that option's Black vega; NaN when no strike has a valid
+    two-way quote)."""
+
+    expiry: str
+    T: float
+    n_strikes: int
+    n_two_sided: int
+    median_half_spread_vp: float
+
+
+def quote_quality(chain: pd.DataFrame, expiries: Sequence[ListedExpiry]) -> dict[str, QuoteQuality]:
+    """:class:`QuoteQuality` of each of ``expiries`` from the vendor's rows of the ticker on the
+    day the smiles are from (columns ``expirDate, strike, cBidPx, cAskPx, pBidPx, pAskPx``).
+    The forward, the rate and the at-the-money vol are the expiry smile's own."""
+    out: dict[str, QuoteQuality] = {}
+    by_expiry = {str(e)[:10]: g for e, g in chain.groupby("expirDate", sort=True)}
+    for e in expiries:
+        g = by_expiry.get(e.expiry)
+        if g is None:
+            out[e.expiry] = QuoteQuality(e.expiry, float(e.T), 0, 0, float("nan"))
+            continue
+        g = g.sort_values("strike").drop_duplicates("strike")
+        strike = g["strike"].to_numpy(float)
+        k = np.log(strike / e.forward)
+        atm = float(np.interp(0.0, e.k, e.vol))
+        near = np.abs(k) <= QUOTE_SD * atm * math.sqrt(e.T)
+        c_bid, c_ask = g["cBidPx"].to_numpy(float), g["cAskPx"].to_numpy(float)
+        p_bid, p_ask = g["pBidPx"].to_numpy(float), g["pAskPx"].to_numpy(float)
+        two_sided = near & (c_bid > 0) & (p_bid > 0)
+        call = strike >= e.forward
+        bid, ask = np.where(call, c_bid, p_bid), np.where(call, c_ask, p_ask)
+        vol = np.interp(k, e.k, e.vol)
+        vega = black_vega(e.forward, strike, e.T, vol, math.exp(-e.rate * e.T))
+        valid = near & np.isfinite(bid) & np.isfinite(ask) & (ask > 0) & (ask >= bid) & (vega > 0)
+        half = 100.0 * 0.5 * (ask[valid] - bid[valid]) / vega[valid]
+        median = float(np.median(half)) if valid.any() else float("nan")
+        out[e.expiry] = QuoteQuality(
+            e.expiry, float(e.T), int(near.sum()), int(two_sided.sum()), median
+        )
+    return out
+
+
+@dataclass(frozen=True)
+class ExpiryScreen:
+    """Which listed expiries enter the model (module docstring).
+
+    ``index_third_friday``: the index target reads standard monthly expiries only.
+    ``min_two_sided``: an expiry needs this many strikes inside ±1 sd with a positive bid on
+    both the call and the put (0: not read).  ``max_half_spread_vp``: and a median half spread
+    there of at most this many vol points (``inf``: not read)."""
+
+    index_third_friday: bool = True
+    min_two_sided: int = 3
+    max_half_spread_vp: float = 2.0
+
+    def __post_init__(self) -> None:
+        if self.min_two_sided < 0 or not self.max_half_spread_vp > 0:
+            raise ValueError("need min_two_sided >= 0 and max_half_spread_vp > 0")
+
+    @classmethod
+    def off(cls) -> ExpiryScreen:
+        """No screen: every expiry the loader returns (the study's own selection)."""
+        return cls(False, 0, math.inf)
+
+    @property
+    def reads_quotes(self) -> bool:
+        return self.min_two_sided > 0 or math.isfinite(self.max_half_spread_vp)
+
+    def describe(self) -> dict[str, Any]:
+        return {
+            "index_third_friday": self.index_third_friday,
+            "min_two_sided": self.min_two_sided,
+            "max_half_spread_vp": self.max_half_spread_vp,
+            "quote_sd": QUOTE_SD,
+        }
+
+
+def screen_expiries(
+    leg: str,
+    expiries: Sequence[ListedExpiry],
+    quotes: Mapping[str, QuoteQuality] | None,
+    screen: ExpiryScreen,
+    *,
+    index: bool = False,
+) -> tuple[list[ListedExpiry], list[dict[str, Any]]]:
+    """``(kept, dropped)`` of one leg's expiries under ``screen``; each dropped expiry is a
+    record ``{"leg", "expiry", "T", "reason"}`` and is logged."""
+    if screen.reads_quotes and quotes is None:
+        raise ValueError(
+            f"{leg}: the quote screen needs the day's quote quality (quote_quality on the "
+            "vendor's chain); pass screen=ExpiryScreen.off() to build without it"
+        )
+    kept: list[ListedExpiry] = []
+    dropped: list[dict[str, Any]] = []
+    listed = {e.expiry for e in expiries}
+    for e in expiries:
+        reason = ""
+        if index and screen.index_third_friday and not third_friday(e.expiry, listed):
+            reason = "not a third-Friday expiry"
+        elif screen.reads_quotes and quotes is not None:
+            q = quotes.get(e.expiry)
+            if q is None:
+                reason = "no quotes"
+            elif q.n_two_sided < screen.min_two_sided:
+                reason = (
+                    f"{q.n_two_sided} strikes inside ±{QUOTE_SD:g} sd with a positive bid on the "
+                    f"call and the put (of {q.n_strikes} listed), fewer than {screen.min_two_sided}"
+                )
+            elif math.isfinite(screen.max_half_spread_vp) and not (
+                q.median_half_spread_vp <= screen.max_half_spread_vp
+            ):
+                reason = (
+                    f"median half spread inside ±{QUOTE_SD:g} sd {q.median_half_spread_vp:.2f} "
+                    f"vol points, above {screen.max_half_spread_vp:g}"
+                )
+        if reason:
+            dropped.append({"leg": leg, "expiry": e.expiry, "T": float(e.T), "reason": reason})
+            log.info("expiry screen: %s %s (T = %.4f) dropped: %s", leg, e.expiry, e.T, reason)
+        else:
+            kept.append(e)
+    return kept, dropped
 
 
 def default_lc_grid(horizon: float) -> LocalVolConfig:
@@ -153,16 +317,26 @@ def lc_spec_from_smiles(
     records: FitRecords | None = None,
     label: str = "",
     origin: str = "disp_lc",
+    screen: ExpiryScreen | None = None,
+    quotes: Mapping[str, Mapping[str, QuoteQuality]] | None = None,
+    index_quotes: Mapping[str, QuoteQuality] | None = None,
 ) -> tuple[LocalCorrelationSpec, dict[str, Any]]:
     """The specification of the local correlation model on a basket of the study (module
     docstring) and what the build measured: per name the SVI fits' root-mean-square errors in
     vol points, the names whose last listed expiry is before the horizon (their surface is
-    extrapolated flat in implied vol), and the same for the index.
+    extrapolated flat in implied vol), the same for the index, and the expiries the screen
+    dropped (``"dropped"``: one record per expiry with its leg and reason; ``"screen"``: the
+    settings).
 
+    ``screen``: the expiry screen (default :class:`ExpiryScreen` — third-Friday index expiries
+    and the quote screen on every leg); it needs ``quotes`` (per name) and ``index_quotes``,
+    the :func:`quote_quality` of the day.  ``ExpiryScreen.off()`` takes every expiry given.
     ``weights`` are normalised to sum to 1; ``lc.particle.horizon`` is replaced by ``horizon``.
     """
     if not (len(names) == len(weights) == len(spots)):
         raise ValueError("names, weights and spots must have the same length")
+    screen = ExpiryScreen() if screen is None else screen
+    dropped: list[dict[str, Any]] = []
     w = [float(x) for x in weights]
     total = math.fsum(w)
     w = [x / total for x in w]
@@ -173,7 +347,12 @@ def lc_spec_from_smiles(
     rms: dict[str, list[float]] = {}
     extrapolated: list[str] = []
     for name, spot in zip(names, spots, strict=True):
-        expiries = list(smiles[name])
+        expiries, gone = screen_expiries(
+            name, list(smiles[name]), None if quotes is None else quotes.get(name, {}), screen
+        )
+        dropped += gone
+        if not expiries:
+            raise ValueError(f"{name}: no listed expiry passes the screen")
         market = name_market(expiries, float(spot), carry)
         cfg, fits = _surface_config(
             expiries, ForwardCurve.from_config(market), horizon, records, f"{origin}:{name}"
@@ -184,13 +363,19 @@ def lc_spec_from_smiles(
         if max(float(e.T) for e in expiries) < horizon:
             extrapolated.append(name)
     flat = ForwardCurve(1.0, DiscountCurve.flat(0.0), DiscountCurve.flat(0.0))
+    index_expiries, gone = screen_expiries(
+        "index", list(index_smiles), index_quotes, screen, index=True
+    )
+    dropped += gone
+    if not index_expiries:
+        raise ValueError("the index: no listed expiry passes the screen")
     index_cfg, index_fits = _surface_config(
-        list(index_smiles), flat, horizon, records, f"{origin}:index"
+        index_expiries, flat, horizon, records, f"{origin}:index"
     )
     kept = set(index_cfg.times)
     ratios = tuple(
         (float(e.T), float(e.forward) / float(index_spot))
-        for e in index_smiles
+        for e in index_expiries
         if float(e.T) in kept
     )
     spec = LocalCorrelationSpec(
@@ -216,10 +401,24 @@ def lc_spec_from_smiles(
         "n_slices_by_name": {k: len(v) for k, v in rms.items()},
         "names_extrapolated": extrapolated,
         "n_names_extrapolated": len(extrapolated),
-        "index_extrapolated": bool(max(float(e.T) for e in index_smiles) < horizon),
+        "index_extrapolated": bool(max(float(e.T) for e in index_expiries) < horizon),
         "index_slices": list(index_cfg.times),
+        "screen": screen.describe(),
+        "dropped": dropped,
     }
     return spec, info
 
 
-__all__ = ["CARRY_RULES", "ListedExpiry", "default_lc_grid", "lc_spec_from_smiles", "name_market"]
+__all__ = [
+    "CARRY_RULES",
+    "QUOTE_SD",
+    "ExpiryScreen",
+    "ListedExpiry",
+    "QuoteQuality",
+    "default_lc_grid",
+    "lc_spec_from_smiles",
+    "name_market",
+    "quote_quality",
+    "screen_expiries",
+    "third_friday",
+]

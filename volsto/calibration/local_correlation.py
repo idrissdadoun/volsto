@@ -86,6 +86,10 @@ LC_CODE_TAG: Final[str] = "lc1"
 UNIDENTIFIED_RATIO: Final[float] = 1e-12
 #: The at-the-money vol of the bandwidth rule is read at ``max(t, 1/365)`` (the leverage's rule).
 MIN_ATM_TIME: Final[float] = 1.0 / 365.0
+#: The clipped mass of the acceptance gates is read inside this many at-the-money standard
+#: deviations of the basket (owner's decision of 2026-10-08, SPEC §8.7): beyond, the target is
+#: an extrapolation and a clip there says nothing about the smile that is quoted.
+CLIP_GATE_SD: Final[float] = 2.5
 #: Tolerance of the constant-``λ`` secant, in implied vol (0.00002 vol points; the reference's).
 CONSTANT_LAMBDA_TOL: Final[float] = 2e-7
 #: Default strikes of the index repricing report, in at-the-money standard deviations.
@@ -194,11 +198,18 @@ class LCCalibrationResult:
     Per slice ``j`` (the row ``λ(t_j, ·)``, built from the cloud at ``t_j``): the trusted range
     ``q_lo[j]``, ``q_hi[j]``; the clipped masses ``clipped_low[j] = #{p: λ*(t_j, k_p) < 0}/N`` and
     ``clipped_high[j] = #{p: λ*(t_j, k_p) > λ_max}/N`` with their mass-weighted overshoots
-    ``E[(λ* − clip λ*)·1_clipped]``; the mean of ``λ`` over the particles; the cloud means of
-    ``a`` and ``b``; the unidentified flag; in carry mode the mean of ``|δ_t|`` (the basket
-    drift the calibration ignores), ``None`` otherwise.  ``bandwidths[j − 1]`` is the bandwidth
-    of slice ``j ≥ 1``.  ``lambda_star`` is the unclipped table.  With a second pass ``lam`` and
-    ``lambda_star`` are the averages and the diagnostics are the last pass's.
+    ``E[(λ* − clip λ*)·1_clipped]``; the same masses restricted to the particles inside
+    ``±CLIP_GATE_SD`` at-the-money standard deviations of the basket, ``|k_p| ≤ 2.5·σ_ATM,B(t_j)
+    ·√t_j`` (``clipped_low_inner``, ``clipped_high_inner``: what the acceptance gates read); the
+    mean of ``λ`` over the particles; the cloud means of ``a`` and ``b``; the unidentified flag;
+    the range the cloud visits — ``name_k_min[j, i]``, ``name_k_max[j, i]`` (the smallest and
+    largest forward log-moneyness ``ln(S_i/F_i(t_j))`` of name ``i``), its cloud mean and
+    standard deviation ``name_k_mean``, ``name_k_std``, and the same four for the basket
+    (``basket_k_min``, ``basket_k_max``, ``basket_k_mean``, ``basket_k_std``); in carry mode the
+    mean of ``|δ_t|`` (the basket drift the calibration ignores), ``None`` otherwise.
+    ``bandwidths[j − 1]`` is the bandwidth of slice ``j ≥ 1``.  ``lambda_star`` is the unclipped
+    table.  With a second pass ``lam`` and ``lambda_star`` are the averages and the diagnostics
+    are the last pass's.
 
     How to read the clipped masses: ``clipped_high > 0`` — the index is more volatile there than
     the family can deliver (the single-name vols are too low for that index level; typically
@@ -227,11 +238,27 @@ class LCCalibrationResult:
     mean_b: FloatArray = field(default_factory=lambda: np.empty(0))
     lambda_max: float = 1.0
     timings: dict[str, float] = field(default_factory=dict)
+    clipped_low_inner: FloatArray = field(default_factory=lambda: np.empty(0))
+    clipped_high_inner: FloatArray = field(default_factory=lambda: np.empty(0))
+    name_k_min: FloatArray = field(default_factory=lambda: np.empty((0, 0)))
+    name_k_max: FloatArray = field(default_factory=lambda: np.empty((0, 0)))
+    basket_k_min: FloatArray = field(default_factory=lambda: np.empty(0))
+    basket_k_max: FloatArray = field(default_factory=lambda: np.empty(0))
+    name_k_mean: FloatArray = field(default_factory=lambda: np.empty((0, 0)))
+    name_k_std: FloatArray = field(default_factory=lambda: np.empty((0, 0)))
+    basket_k_mean: FloatArray = field(default_factory=lambda: np.empty(0))
+    basket_k_std: FloatArray = field(default_factory=lambda: np.empty(0))
 
     @property
     def max_clipped_mass(self) -> float:
         """The largest clipped mass (low or high) over the slices."""
         return float(max(self.clipped_low.max(), self.clipped_high.max()))
+
+    @property
+    def max_clipped_mass_inner(self) -> float:
+        """The largest clipped mass inside ``±CLIP_GATE_SD`` sd (low or high) over the slices:
+        the number the acceptance gates read."""
+        return float(max(self.clipped_low_inner.max(), self.clipped_high_inner.max()))
 
     def clip_intervals(self, j: int) -> list[tuple[str, float, float]]:
         """The ``k``-intervals of the trusted range of slice ``j`` where the clip binds:
@@ -264,6 +291,10 @@ class LCCalibrationResult:
             "timings": dict(self.timings),
             "lambda_max": self.lambda_max,
             "max_clipped_mass": self.max_clipped_mass,
+            "clip_gate_sd": CLIP_GATE_SD,
+            "max_clipped_mass_inner": self.max_clipped_mass_inner,
+            "max_clipped_low_inner": float(self.clipped_low_inner.max()),
+            "max_clipped_high_inner": float(self.clipped_high_inner.max()),
             "max_clipped_low": float(self.clipped_low.max()),
             "max_clipped_low_time": float(t[worst_lo]),
             "max_clipped_high": float(self.clipped_high.max()),
@@ -278,6 +309,10 @@ class LCCalibrationResult:
             ),
             "clipped_low": [float(x) for x in self.clipped_low],
             "clipped_high": [float(x) for x in self.clipped_high],
+            "clipped_low_inner": [float(x) for x in self.clipped_low_inner],
+            "clipped_high_inner": [float(x) for x in self.clipped_high_inner],
+            "basket_k_min": [float(x) for x in self.basket_k_min],
+            "basket_k_max": [float(x) for x in self.basket_k_max],
             "lambda_mean": [float(x) for x in self.lambda_mean],
             "q_lo": [float(x) for x in self.q_lo],
             "q_hi": [float(x) for x in self.q_hi],
@@ -457,6 +492,11 @@ def calibrate_local_correlation(
     q_lo, q_hi = np.empty(n_slices), np.empty(n_slices)
     clipped_low, clipped_high = np.empty(n_slices), np.empty(n_slices)
     over_low, over_high = np.empty(n_slices), np.empty(n_slices)
+    inner_low, inner_high = np.empty(n_slices), np.empty(n_slices)
+    name_lo, name_hi = np.empty((n_slices, n)), np.empty((n_slices, n))
+    name_mu, name_sd = np.empty((n_slices, n)), np.empty((n_slices, n))
+    basket_lo, basket_hi = np.empty(n_slices), np.empty(n_slices)
+    basket_mu, basket_sd = np.empty(n_slices), np.empty(n_slices)
     lambda_mean = np.empty(n_slices)
     mean_a, mean_b = np.empty(n_slices), np.empty(n_slices)
     unidentified = np.zeros(n_slices, dtype=np.bool_)
@@ -482,6 +522,8 @@ def calibrate_local_correlation(
         per = np.interp(k_cloud, k_grid, star)
         below, above = per < 0.0, per > lam_max
         clipped_low[j], clipped_high[j] = float(below.mean()), float(above.mean())
+        inner = np.abs(k_cloud) <= CLIP_GATE_SD * float(sig_atm[j]) * np.sqrt(float(times[j]))
+        inner_low[j], inner_high[j] = float((below & inner).mean()), float((above & inner).mean())
         over_low[j] = float(np.where(below, per, 0.0).mean())
         over_high[j] = float(np.where(above, per - lam_max, 0.0).mean())
         lambda_mean[j] = float(np.clip(per, 0.0, lam_max).mean())
@@ -504,6 +546,7 @@ def calibrate_local_correlation(
         unidentified[0] = flat0
         q_lo[0] = q_hi[0] = k_0
         clipped_low[0], clipped_high[0] = float(star0 < 0.0), float(star0 > lam_max)
+        inner_low[0], inner_high[0] = clipped_low[0], clipped_high[0]
         over_low[0], over_high[0] = min(star0, 0.0), max(star0 - lam_max, 0.0)
         lambda_mean[0] = value
         if lc.clip_policy == "raise" and (star0 < 0.0 or star0 > lam_max):
@@ -534,6 +577,10 @@ def calibrate_local_correlation(
             kb,
         )
         mean_a[j], mean_b[j] = float(a.mean()), float(b.mean())
+        name_lo[j], name_hi[j] = ls.min(axis=0) - ln_f[:, j], ls.max(axis=0) - ln_f[:, j]
+        name_mu[j], name_sd[j] = ls.mean(axis=0) - ln_f[:, j], ls.std(axis=0)
+        basket_lo[j], basket_hi[j] = float(kb.min()), float(kb.max())
+        basket_mu[j], basket_sd[j] = float(kb.mean()), float(kb.std())
         if drift_abs is not None:
             drift_abs[j] = _mean_abs_drift(ls, j)
 
@@ -722,6 +769,16 @@ def calibrate_local_correlation(
         mean_b=mean_b,
         lambda_max=lam_max,
         timings=timings,
+        clipped_low_inner=inner_low,
+        clipped_high_inner=inner_high,
+        name_k_min=name_lo,
+        name_k_max=name_hi,
+        basket_k_min=basket_lo,
+        basket_k_max=basket_hi,
+        name_k_mean=name_mu,
+        name_k_std=name_sd,
+        basket_k_mean=basket_mu,
+        basket_k_std=basket_sd,
     )
 
 

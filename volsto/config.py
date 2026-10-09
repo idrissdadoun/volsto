@@ -241,6 +241,13 @@ class StepSchedule:
     def finest(self) -> float:
         return min(self.dts)
 
+    def refined(self, factor: int) -> StepSchedule:
+        """The same breaks with every step divided by ``factor`` (the Δt checks halve every
+        segment: a grid built on it is the grid of ``self`` with each step cut in ``factor``)."""
+        if factor < 1:
+            raise ValueError("factor must be a positive integer")
+        return StepSchedule(self.breaks, tuple(d / factor for d in self.dts))
+
     def __repr__(self) -> str:
         if not self.breaks:
             return f"StepSchedule(uniform dt={self.dts[0]:.6g})"
@@ -875,6 +882,25 @@ class CalibrationSpec:
 
 #: Values of :attr:`LocalCorrelationConfig.family`.
 LC_FAMILIES: tuple[str, ...] = ("particle", "parametric", "constant")
+#: The step schedule of the local correlation model, for calibration and pricing alike (owner's
+#: decision of 2026-10-08, SPEC §8.7): quarter steps (1/1008) over the first two weeks, daily
+#: steps (1/252) after.  At 1/252 throughout the index smile of the synthetic world came out
+#: about 0.2 vol points too high at one month — an error of first order in the step, made in
+#: the first days, where the names' local vols move fastest.
+LC_STEP_SCHEDULE: StepSchedule = StepSchedule(
+    breaks=(10.0 / 252.0,), dts=(1.0 / 1008.0, 1.0 / 252.0)
+)
+
+
+def lc_sim_config(n_paths: int = 800_000, seed: int = 0, **options: Any) -> SimConfig:
+    """The simulation settings of the local correlation model: :data:`LC_STEP_SCHEDULE` and
+    chunks of 2·10⁴ paths (thirty names fit the chunk memory budget); ``options`` are the other
+    fields of :class:`SimConfig`.  ``dt_max`` may be given to depart from the schedule."""
+    options.setdefault("dt_max", LC_STEP_SCHEDULE)
+    options.setdefault("chunk_size", 20_000)
+    return SimConfig(n_paths=n_paths, seed=seed, **options)
+
+
 #: ``ParticleConfig`` fields the local correlation calibration does not read (the leverage
 #: grid and its clip bounds): left out of :meth:`LocalCorrelationSpec.key_payload`.
 LC_UNUSED_PARTICLE_FIELDS: tuple[str, ...] = ("leverage_std_span", "leverage_dk", "l_min", "l_max")
@@ -1042,8 +1068,10 @@ class LocalCorrelationSpec:
     surface bumps of the vegas; ``r_low_source`` the digest of the data behind a
     ``"historical-scaled"`` ``R_low`` (file SHA-256, window, end date) or the SHA-256 of a
     ``"matrix"`` file — the matrix itself is machine-dependent in its last bits and is never
-    hashed (SPEC §13.3).  ``index_forward_ratios`` (``(T_e, F_I(T_e)/I_0)`` per listed index
-    expiry) and ``label`` are for reports only and are not keyed.
+    hashed (SPEC §13.3); ``r_high_source`` the SHA-256 of a ``"matrix"`` ``R_high`` file (the
+    path alone would let the file change under the key).  ``index_forward_ratios`` (``(T_e,
+    F_I(T_e)/I_0)`` per listed index expiry) and ``label`` are for reports only and are not
+    keyed.
 
     The calibration seed is ``lc.particle.seed`` (keyed); the pricing seed is ``sim.seed`` (not
     keyed)."""
@@ -1061,9 +1089,10 @@ class LocalCorrelationSpec:
     r_low_source: str | None = None
     index_forward_ratios: tuple[tuple[float, float], ...] = ()
     label: str = ""
+    r_high_source: str | None = None
 
     OMIT_WHEN_NONE: ClassVar[frozenset[str]] = frozenset(
-        {"perturbations", "index_perturbation", "r_low_source"}
+        {"perturbations", "index_perturbation", "r_low_source", "r_high_source"}
     )
 
     def __post_init__(self) -> None:
@@ -1098,6 +1127,10 @@ class LocalCorrelationSpec:
         if self.r_low_source is None and not self.lc.r_low == "equi":
             raise ValueError(
                 f"r_low = {self.lc.r_low!r} needs r_low_source (the digest of its data or file)"
+            )
+        if self.r_high_source is None and self.lc.r_high != "ones":
+            raise ValueError(
+                f"r_high = {self.lc.r_high!r} needs r_high_source (the SHA-256 of its file)"
             )
 
     @property
@@ -1143,4 +1176,6 @@ class LocalCorrelationSpec:
             payload["index_perturbation"] = to_mapping(self.index_perturbation)
         if self.r_low_source is not None:
             payload["r_low_source"] = self.r_low_source
+        if self.r_high_source is not None:
+            payload["r_high_source"] = self.r_high_source
         return payload

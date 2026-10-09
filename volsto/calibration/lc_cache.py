@@ -52,6 +52,7 @@ from volsto.calibration.cache import CacheMissError, atomic_write, code_version
 from volsto.calibration.fit_records import FitRecords, canonical
 from volsto.calibration.local_correlation import (
     LC_CODE_TAG,
+    LCCalibrationResult,
     calibrate_constant_lambda,
     calibrate_local_correlation,
     calibrate_parametric_lambda,
@@ -68,6 +69,7 @@ from volsto.models.localvol import LocalVol
 from volsto.multi.family import (
     CorrelationFamily,
     family_from_spec,
+    file_sha256,
     load_correlation_matrix,
     parse_r_high_spec,
     parse_r_low_spec,
@@ -168,6 +170,94 @@ def _svi_surface(cfg: SviSurfaceConfig, curve: ForwardCurve) -> SviSlices:
     return SviSlices(np.array(cfg.times), np.array(cfg.params), curve, cfg.max_maturity)
 
 
+def _check_file_digest(label: str, path: str, expected: str | None) -> None:
+    """A matrix file read for ``label`` must have the digest the specification (and so the
+    cache key) holds."""
+    digest = file_sha256(path)
+    if digest != expected:
+        raise ValueError(
+            f"{label}: the file {path} has SHA-256 {digest}, not the specification's "
+            f"{label}_source ({expected}): the matrix changed under its path"
+        )
+
+
+#: The central range of the visited-range arbitrage report, in standard deviations of the cloud.
+VISITED_CENTRAL_SD: Final[float] = 3.0
+
+
+def visited_arbitrage(
+    spec: LocalCorrelationSpec,
+    result: LCCalibrationResult,
+    *,
+    n_k: int = 401,
+    central_sd: float = VISITED_CENTRAL_SD,
+) -> dict[str, Any]:
+    """The arbitrage report of every SVI surface of ``spec`` on the range its particles visited
+    (owner's decision of 2026-10-08, SPEC §8.7; the report on ``|k| ≤ 1`` of
+    :func:`build_lc_market` flags far wings no particle reaches).
+
+    Slice ``s`` of name ``i`` is checked on ``[min, max]`` of the name's forward log-moneyness
+    over the calibration cloud at the grid time nearest ``min(T_s, horizon)`` (never the
+    degenerate ``t_0``); a pair of slices on the union of their two ranges; the index target
+    likewise on the basket's range.  The extremes of 8·10⁵ particles are four to five standard
+    deviations out, so the same report is also run on the central range, the cloud mean
+    ``± central_sd`` standard deviations (inside the visited range): a violation there is where
+    the particles are.
+
+    Returns ``{"flagged": [labels], "violations": {label: [lines]}, "flagged_central": [labels],
+    "violations_central": {label: [lines]}, "ranges": {label: {"T", "k_lo", "k_hi",
+    "k_lo_central", "k_hi_central"}}}``."""
+    times = result.grid.times
+    horizon = float(times[-1])
+
+    def rows(slice_times: Sequence[float]) -> list[int]:
+        return [max(1, int(np.argmin(np.abs(times - min(float(t), horizon))))) for t in slice_times]
+
+    curves = [ForwardCurve.from_config(m) for m in spec.markets]
+    flat = ForwardCurve(1.0, DiscountCurve.flat(0.0), DiscountCurve.flat(0.0))
+    out: dict[str, Any] = {
+        "central_sd": float(central_sd),
+        "flagged": [],
+        "violations": {},
+        "flagged_central": [],
+        "violations_central": {},
+        "ranges": {},
+    }
+    r = result
+    cases = [
+        (name, cfg, curve, i)
+        for i, (name, cfg, curve) in enumerate(zip(spec.names, spec.surfaces, curves, strict=True))
+    ]
+    cases.append(("index", spec.index_surface, flat, -1))
+    for label, cfg, curve, i in cases:
+        if i >= 0:
+            lo, hi = r.name_k_min[:, i], r.name_k_max[:, i]
+            mu, sd = r.name_k_mean[:, i], r.name_k_std[:, i]
+        else:
+            lo, hi, mu, sd = r.basket_k_min, r.basket_k_max, r.basket_k_mean, r.basket_k_std
+        j = rows(cfg.times)
+        k_lo, k_hi = [float(lo[x]) for x in j], [float(hi[x]) for x in j]
+        c_lo = [max(float(mu[x] - central_sd * sd[x]), a) for x, a in zip(j, k_lo, strict=True)]
+        c_hi = [min(float(mu[x] + central_sd * sd[x]), b) for x, b in zip(j, k_hi, strict=True)]
+        surface = _svi_surface(cfg, curve)
+        full = surface.arbitrage_report(n_k=n_k, k_lo=k_lo, k_hi=k_hi)
+        central = surface.arbitrage_report(n_k=n_k, k_lo=c_lo, k_hi=c_hi)
+        out["ranges"][label] = {
+            "T": [float(t) for t in cfg.times],
+            "k_lo": k_lo,
+            "k_hi": k_hi,
+            "k_lo_central": c_lo,
+            "k_hi_central": c_hi,
+        }
+        if not full.ok:
+            out["flagged"].append(label)
+            out["violations"][label] = full.violations()
+        if not central.ok:
+            out["flagged_central"].append(label)
+            out["violations_central"][label] = central.violations()
+    return out
+
+
 def _dupire_summary(lv: LocalVolSurface) -> dict[str, float]:
     d = lv.check_positive()
     return {
@@ -210,8 +300,10 @@ def build_lc_market(
     surface on ``spec.lc.lambda_grid`` (default: the shared grid) is the ``λ`` grid.
 
     ``r_low_matrix`` / ``r_high_matrix``: the matrices of a non-default family — for a
-    ``"matrix:<path>"`` specification the file is read when no matrix is given; a
-    ``"historical-scaled"`` ``R_low`` must be given (the cache passes the stored one).
+    ``"matrix:<path>"`` specification the file is read when no matrix is given, and its SHA-256
+    must be the specification's ``r_low_source`` / ``r_high_source`` (the key hashes the digest:
+    a file that changed under its path is refused); a ``"historical-scaled"`` ``R_low`` must be
+    given (the cache passes the stored one).
 
     Arbitrage policy ``spec.lc.arbitrage``: ``"raise"`` raises
     :class:`~volsto.market.surface.ArbitrageError` on the first surface with a butterfly or
@@ -252,6 +344,7 @@ def build_lc_market(
     low_kind, low_args = parse_r_low_spec(lc.r_low)
     high_kind, high_args = parse_r_high_spec(lc.r_high)
     if low_kind == "matrix" and r_low_matrix is None:
+        _check_file_digest("r_low", low_args["path"], spec.r_low_source)
         r_low_matrix = load_correlation_matrix(low_args["path"], spec.names)
     if low_kind == "historical-scaled" and r_low_matrix is None:
         raise ValueError(
@@ -259,6 +352,7 @@ def build_lc_market(
             "window's returns; the cache stores it with the entry and reads it back)"
         )
     if high_kind == "matrix" and r_high_matrix is None:
+        _check_file_digest("r_high", high_args["path"], spec.r_high_source)
         r_high_matrix = load_correlation_matrix(high_args["path"], spec.names)
     family = family_from_spec(
         spec.n_names,
@@ -577,7 +671,11 @@ def _calibrate(
             spec.sim,
             lc,
         )
-        summary = {"family": "particle", **result.summary()}
+        summary = {
+            "family": "particle",
+            **result.summary(),
+            "arbitrage_visited": visited_arbitrage(spec, result),
+        }
         return result.lam, summary, lambda_surface_frame(result)
     # the two fitted families: a skeleton on the calibration grid's slices
     times = TimeGrid.build([horizon], spec.sim.dt_max).times
@@ -671,5 +769,6 @@ __all__ = [
     "lc_spec_key",
     "read_lc_guard",
     "reproducibility_record",
+    "visited_arbitrage",
     "write_lc_guard",
 ]

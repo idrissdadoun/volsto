@@ -34,7 +34,10 @@ from __future__ import annotations
 import dataclasses
 import inspect
 import json
+import math
+import types
 from pathlib import Path
+from typing import Any
 
 import _lcm_reference as lcm
 import numpy as np
@@ -47,6 +50,7 @@ from volsto.calibration.cache import CacheMissError
 from volsto.calibration.guard import CalibrationForbiddenError, calibration_forbidden
 from volsto.calibration.particle import _finish_estimate, conditional_variance_estimate
 from volsto.config import (
+    LC_STEP_SCHEDULE,
     ConfigError,
     CurveConfig,
     LocalCorrelationConfig,
@@ -62,12 +66,13 @@ from volsto.config import (
     SurfacePerturbation,
     SviSurfaceConfig,
     from_mapping,
+    lc_sim_config,
     to_mapping,
 )
 from volsto.engine.grid import TimeGrid
 from volsto.engine.mc import summarize
 from volsto.engine.rng import GaussianDraws
-from volsto.market.bs import black_vega, implied_vol
+from volsto.market.bs import black_price, black_vega, implied_vol
 from volsto.market.curves import DiscountCurve, ForwardCurve
 from volsto.market.dupire import LocalVolSurface
 from volsto.market.surface import ArbitrageError, ImpliedSurface, SSVISurface, surface_from_config
@@ -1721,6 +1726,7 @@ def test_lc_configuration(toy_spec: LocalCorrelationSpec) -> None:
         {"local_vol": dataclasses.replace(spec.local_vol, t_max=0.1)},  # no room for the last step
         {"local_vol": dataclasses.replace(spec.local_vol, t_max=0.9)},  # beyond the surfaces
         {"lc": dataclasses.replace(spec.lc, r_low="matrix:/tmp/low.npy")},  # no r_low_source
+        {"lc": dataclasses.replace(spec.lc, r_high="matrix:/tmp/high.npy")},  # no r_high_source
     ):
         with pytest.raises(ValueError):
             dataclasses.replace(spec, **bad)  # type: ignore[arg-type]
@@ -1792,6 +1798,21 @@ def test_lc_cache_round_trip(toy_spec: LocalCorrelationSpec, tmp_path: Path) -> 
         rec["threads"] >= 1 and rec["machine"] and rec["git_commit"] and rec["label"] == spec.label
     )
     assert diag.calibration["family"] == "particle" and 0.0 <= diag.max_clipped_mass <= 1.0
+    cal = diag.calibration
+    assert cal["clip_gate_sd"] == lcal.CLIP_GATE_SD == 2.5
+    assert 0.0 <= cal["max_clipped_mass_inner"] <= cal["max_clipped_mass"]
+    assert all(a <= b for a, b in zip(cal["clipped_high_inner"], cal["clipped_high"], strict=True))
+    assert all(a <= b for a, b in zip(cal["clipped_low_inner"], cal["clipped_low"], strict=True))
+    visited = cal["arbitrage_visited"]
+    assert set(visited["ranges"]) == {"AAA", "BBB", "CCC", "index"} and visited["central_sd"] == 3.0
+    for label, r in visited["ranges"].items():
+        n_slices = len(spec.index_surface.times if label == "index" else spec.surfaces[0].times)
+        assert len(r["T"]) == len(r["k_lo"]) == len(r["k_hi"]) == n_slices
+        for lo, c_lo, c_hi, hi in zip(
+            r["k_lo"], r["k_lo_central"], r["k_hi_central"], r["k_hi"], strict=True
+        ):
+            assert lo <= c_lo < 0.0 < c_hi <= hi
+    assert set(visited["flagged_central"]) <= set(visited["flagged"]) <= set(visited["ranges"])
     assert diag.market["arbitrage_ok"] and diag.market["flagged"] == []
     assert set(diag.market["dupire"]) == {"AAA", "BBB", "CCC", "index"}
     # the alignment of the listed index forwards: zero carry, so δ = −ln(F_I/I_0)
@@ -1926,6 +1947,25 @@ def test_build_lc_market_policies(toy_spec: LocalCorrelationSpec, tmp_path: Path
         np.log(f_basket), rel=1e-12
     )
     assert float(lc_cache.build_lc_market(spec).index_surface.forward_curve.forward(1.0)) == 1.0
+    # a matrix R_high: keyed by the digest of its file, and a file that changed is refused
+    high = 0.5 * np.ones((3, 3)) + 0.5 * np.eye(3)
+    np.save(tmp_path / "high.npy", high)
+    high_lc = dataclasses.replace(spec.lc, r_high=f"matrix:{tmp_path / 'high.npy'}")
+    high_spec = dataclasses.replace(
+        spec, lc=high_lc, r_high_source=file_sha256(tmp_path / "high.npy")
+    )
+    np.testing.assert_array_equal(lc_cache.build_lc_market(high_spec).family.r_high, high)
+    assert "r_high_source" in high_spec.key_payload() and "r_high_source" not in spec.key_payload()
+    assert from_mapping(LocalCorrelationSpec, to_mapping(high_spec)) == high_spec
+    assert lc_cache.lc_spec_key(dataclasses.replace(high_spec, r_high_source="0" * 64)) != (
+        lc_cache.lc_spec_key(high_spec)
+    )
+    np.save(tmp_path / "high.npy", 0.6 * np.ones((3, 3)) + 0.4 * np.eye(3))
+    with pytest.raises(ValueError, match="r_high_source"):
+        lc_cache.build_lc_market(high_spec)
+    np.save(tmp_path / "low.npy", np.eye(3))
+    with pytest.raises(ValueError, match="r_low_source"):
+        lc_cache.build_lc_market(matrix_spec)
 
 
 def test_lc_code_tag_guard() -> None:
@@ -1944,6 +1984,129 @@ def test_lc_code_tag_guard() -> None:
     lc_cache.check_lc_guard()
 
 
+def test_lc_step_schedule() -> None:
+    """The model's step schedule (owner's decision 2 of 2026-10-08): quarter steps over the
+    first two weeks, daily steps after; the monthly pillars are nodes; halving every segment
+    gives the grid with each step cut in two (what the Δt checks coarsen back)."""
+    assert LC_STEP_SCHEDULE.breaks == (10 / 252,) and LC_STEP_SCHEDULE.dts == (1 / 1008, 1 / 252)
+    grid = TimeGrid.build([0.25], LC_STEP_SCHEDULE)
+    assert grid.n_steps == 40 + 53
+    np.testing.assert_allclose(grid.times[:41], np.arange(41) / 1008, rtol=0, atol=1e-15)
+    np.testing.assert_allclose(grid.times[40:], np.arange(10, 64) / 252, rtol=0, atol=1e-15)
+    for month in (1, 2, 3):
+        assert np.min(np.abs(grid.times - month / 12)) < 1e-15
+    half = LC_STEP_SCHEDULE.refined(2)
+    assert half.breaks == LC_STEP_SCHEDULE.breaks and half.dts == (1 / 2016, 1 / 504)
+    fine = TimeGrid.build([0.25], half)
+    assert fine.n_steps == 2 * grid.n_steps
+    np.testing.assert_allclose(fine.times[::2], grid.times, rtol=0, atol=1e-15)
+    assert TimeGrid.build([2.0], LC_STEP_SCHEDULE).n_steps == 40 + 494
+    assert StepSchedule.uniform(DAILY).refined(4).dts == (DAILY / 4,)
+    assert LC_STEP_SCHEDULE.refined(1) == LC_STEP_SCHEDULE
+    # the model's default simulation settings carry the schedule
+    sim = lc_sim_config(1000, 7)
+    assert sim.step_schedule == LC_STEP_SCHEDULE and (sim.n_paths, sim.seed) == (1000, 7)
+    assert sim.chunk_size == 20_000 and lc_sim_config().n_paths == 800_000
+    assert lc_sim_config(1000, 7, dt_max=DAILY).step_schedule == StepSchedule.uniform(DAILY)
+    with pytest.raises(ValueError):
+        LC_STEP_SCHEDULE.refined(0)
+
+
+def test_expiry_screen() -> None:
+    """The expiry screen of the specification builder (owner's decision 1 of 2026-10-08): the
+    third-Friday rule; the quote quality of an expiry inside ±1 at-the-money standard deviation
+    of its forward; an expiry is dropped with its reason when it has fewer than three strikes
+    with a positive bid on both sides or a median half spread above 2 vol points; the screen
+    needs the quotes unless it is switched off."""
+    from volsto.studies.disp_lc import (
+        ExpiryScreen,
+        QuoteQuality,
+        quote_quality,
+        screen_expiries,
+        third_friday,
+    )
+
+    assert third_friday("2026-10-16") and third_friday("2026-12-18") and third_friday("2019-09-20")
+    for other in (
+        "2026-10-30",
+        "2026-11-30",
+        "2026-10-09",
+        "2026-10-23",
+        "2026-10-21",
+        "2026-10-14",
+    ):
+        assert not third_friday(other)
+    # the Saturday of the old convention, and the Thursday before a holiday Friday — unless the
+    # Friday beside them is listed too (an index with daily expiries)
+    assert third_friday("2008-07-19") and not third_friday("2008-07-19", {"2008-07-18"})
+    assert third_friday("2027-06-17") and not third_friday("2027-06-17", {"2027-06-18"})
+    assert not third_friday("2026-10-15", {"2026-10-16"}) and not third_friday("2026-10-24")
+
+    forward, T, rate, atm = 100.0, 0.25, 0.04, 0.20  # 1 sd = 10 %: the strikes 95 to 110
+    strikes = np.arange(70.0, 131.0, 5.0)
+    k = np.log(strikes / forward)
+    df = math.exp(-rate * T)
+    call = black_price(forward, strikes, T, atm, 1.0, df)
+    put = black_price(forward, strikes, T, atm, -1.0, df)
+    vega = black_vega(forward, strikes, T, atm, df)
+
+    def expiry(date: str) -> Any:
+        return types.SimpleNamespace(
+            expiry=date, T=T, forward=forward, rate=rate, k=k, vol=np.full(k.size, atm)
+        )
+
+    def chain(date: str, half_vp: float, dead_puts: tuple[float, ...] = ()) -> pd.DataFrame:
+        half = 0.01 * half_vp * vega
+        p_bid = np.where(np.isin(strikes, dead_puts), 0.0, np.maximum(put - half, 0.0))
+        return pd.DataFrame({"expirDate": date, "strike": strikes, "cBidPx": np.maximum(call - half, 0.0),
+                             "cAskPx": call + half, "pBidPx": p_bid, "pAskPx": put + half})  # fmt: skip
+
+    good, thin, wide, weekly, gone = (
+        expiry("2026-12-18"), expiry("2027-01-15"), expiry("2027-03-19"), expiry("2026-12-24"),
+        expiry("2027-06-17"),
+    )  # fmt: skip
+    rows = pd.concat([chain("2026-12-18", 1.0), chain("2027-01-15", 1.0, (95.0, 100.0)),
+                      chain("2027-03-19", 2.5), chain("2026-12-24", 0.5)])  # fmt: skip
+    quotes = quote_quality(rows, [good, thin, wide, weekly, gone])
+    assert quotes["2026-12-18"] == QuoteQuality(
+        "2026-12-18", T, 4, 4, pytest.approx(1.0, abs=1e-12)
+    )
+    assert quotes["2027-01-15"].n_strikes == 4 and quotes["2027-01-15"].n_two_sided == 2
+    assert quotes["2027-03-19"].median_half_spread_vp == pytest.approx(2.5, abs=1e-12)
+    assert quotes["2027-06-17"].n_strikes == 0 and math.isnan(
+        quotes["2027-06-17"].median_half_spread_vp
+    )
+    screen = ExpiryScreen()
+    assert screen.reads_quotes and screen.describe() == {
+        "index_third_friday": True, "min_two_sided": 3, "max_half_spread_vp": 2.0, "quote_sd": 1.0,
+    }  # fmt: skip
+    everything = [good, thin, wide, weekly, gone]
+    kept, dropped = screen_expiries("XYZ", everything, quotes, screen)
+    assert [e.expiry for e in kept] == ["2026-12-18", "2026-12-24"]
+    reasons = {g["expiry"]: g["reason"] for g in dropped}
+    assert all(g["leg"] == "XYZ" and g["T"] == T for g in dropped)
+    assert reasons["2027-01-15"].startswith("2 strikes inside ±1 sd with a positive bid")
+    assert reasons["2027-03-19"].startswith("median half spread inside ±1 sd 2.50 vol points")
+    assert reasons["2027-06-17"].startswith("0 strikes inside ±1 sd")
+    # the index reads third Fridays only: the weekly goes first, whatever its quotes
+    kept, dropped = screen_expiries("index", everything, quotes, screen, index=True)
+    assert [e.expiry for e in kept] == ["2026-12-18"]
+    assert {g["expiry"]: g["reason"] for g in dropped}["2026-12-24"] == "not a third-Friday expiry"
+    assert screen_expiries("index", everything, None, ExpiryScreen.off(), index=True) == (
+        everything,
+        [],
+    )
+    kept, _ = screen_expiries(
+        "index", everything, None, ExpiryScreen(True, 0, math.inf), index=True
+    )
+    assert [e.expiry for e in kept] == ["2026-12-18", "2027-01-15", "2027-03-19", "2027-06-17"]
+    with pytest.raises(ValueError, match="quote screen needs"):
+        screen_expiries("XYZ", everything, None, screen)
+    for bad in ({"min_two_sided": -1}, {"max_half_spread_vp": 0.0}):
+        with pytest.raises(ValueError):
+            ExpiryScreen(**bad)  # type: ignore[arg-type]
+
+
 # ---------------------------------------------------------------------------------------------
 # LC4 acceptance (slow): helpers
 # ---------------------------------------------------------------------------------------------
@@ -1956,10 +2119,22 @@ SD_INNER = (-1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5)
 ZERO = DiscountCurve.flat(0.0)
 
 
+#: The step schedule of the acceptance runs: the model's (quarter steps over the first two
+#: weeks, daily after; the owner's decision 2 of 2026-10-08, SPEC §8.7).  ``scripts/
+#: lcm_synthetic.py`` replaces it to report the same runs on another schedule, for information.
+ACCEPTANCE_SCHEDULE: StepSchedule | float = LC_STEP_SCHEDULE
+
+
 def production_sim(
-    dt: float = DAILY, n_paths: int = PRODUCTION, seed: int = PRICING_SEED
+    dt: StepSchedule | float | None = None, n_paths: int = PRODUCTION, seed: int = PRICING_SEED
 ) -> SimConfig:
-    return SimConfig(n_paths=n_paths, dt_max=dt, seed=seed, chunk_size=20_000)
+    """The acceptance tests' simulation settings (``dt``: default :data:`ACCEPTANCE_SCHEDULE`)."""
+    return SimConfig(
+        n_paths=n_paths,
+        dt_max=ACCEPTANCE_SCHEDULE if dt is None else dt,
+        seed=seed,
+        chunk_size=20_000,
+    )
 
 
 def index_smile_by_simulation(
@@ -1998,11 +2173,13 @@ def calibrate(
     **options: object,
 ) -> lcal.LCCalibrationResult:
     """A particle calibration at the acceptance settings (``options`` change the particle or the
-    local correlation configuration: ``bandwidth_factor``, ``lambda_tail``, ``target_average``)."""
+    local correlation configuration: ``seed``, ``bandwidth_factor``, ``lambda_tail``,
+    ``target_average``)."""
     particle_fields = {f.name for f in dataclasses.fields(ParticleConfig)}
     p_opts = {k: v for k, v in options.items() if k in particle_fields}
     l_opts = {k: v for k, v in options.items() if k not in particle_fields}
-    cfg = ParticleConfig(n_particles=n_particles, horizon=horizon, seed=PARTICLE_SEED, **p_opts)  # type: ignore[arg-type]
+    p_opts.setdefault("seed", PARTICLE_SEED)
+    cfg = ParticleConfig(n_particles=n_particles, horizon=horizon, **p_opts)  # type: ignore[arg-type]
     lc = LocalCorrelationConfig(particle=cfg, mode=basket.mode, **l_opts)  # type: ignore[arg-type]
     index_lv = LocalVolSurface.from_implied(index_surface, lc_grid(horizon))
     return lcal.calibrate_local_correlation(
@@ -2019,41 +2196,87 @@ def calibrate(
 
 
 def clip_table(res: lcal.LCCalibrationResult) -> str:
-    """The clipped mass per step, summarised: the maxima, where they are, and the profile at a
-    few slices."""
+    """The clipped mass per step, summarised: the maxima, where they are, the masses inside
+    ±2.5 sd (what the gate reads), and the profile at a few slices."""
     t = res.grid.times
     lo, hi = int(np.argmax(res.clipped_low)), int(np.argmax(res.clipped_high))
-    picks = sorted({0, 1, 2, 5, 10, 21, 42, len(t) // 2, len(t) - 1} & set(range(len(t))))
+    inner = np.maximum(res.clipped_low_inner, res.clipped_high_inner)
+    picks = sorted(
+        {0, 1, 2, 5, 10, 21, 42, len(t) // 2, len(t) - 1, int(np.argmax(inner))}
+        & set(range(len(t)))
+    )
     lines = [
         f"clipped mass per slice: max low {res.clipped_low.max():.5f} at t={t[lo]:.4f}, max high "
         f"{res.clipped_high.max():.5f} at t={t[hi]:.4f}; mean low {res.clipped_low.mean():.5f}, "
         f"mean high {res.clipped_high.mean():.5f}; slices above 1 %: "
-        f"{int(np.sum(np.maximum(res.clipped_low, res.clipped_high) > 0.01))} of {len(t)}"
+        f"{int(np.sum(np.maximum(res.clipped_low, res.clipped_high) > 0.01))} of {len(t)}",
+        f"clipped mass inside ±{lcal.CLIP_GATE_SD:g} sd (the gate): max low "
+        f"{res.clipped_low_inner.max():.5f}, max high {res.clipped_high_inner.max():.5f} at "
+        f"t={t[int(np.argmax(res.clipped_high_inner))]:.4f}; slices above 1 %: "
+        f"{int(np.sum(inner > 0.01))} of {len(t)}",
     ]
     lines += [
-        f"  t={t[j]:.4f}: low {res.clipped_low[j]:.5f} high {res.clipped_high[j]:.5f} "
-        f"mean lambda {res.lambda_mean[j]:.4f} trusted [{res.q_lo[j]:+.3f}, {res.q_hi[j]:+.3f}]"
+        f"  t={t[j]:.4f}: low {res.clipped_low[j]:.5f} high {res.clipped_high[j]:.5f} (inside: "
+        f"{res.clipped_low_inner[j]:.5f} / {res.clipped_high_inner[j]:.5f}) mean lambda "
+        f"{res.lambda_mean[j]:.4f} trusted [{res.q_lo[j]:+.3f}, {res.q_hi[j]:+.3f}]"
         for j in picks
     ]
     return "\n".join(lines)
 
 
-def lambda_error_table(
-    res: lcal.LCCalibrationResult, truth: object, index_surface: ImpliedSurface, t_min: float
+#: the particle seeds of the noise-aware gates (four independent calibrations)
+NOISE_SEEDS = (PARTICLE_SEED, PARTICLE_SEED + 1, PARTICLE_SEED + 2, PARTICLE_SEED + 3)
+
+
+def lambda_gate(
+    results: list[lcal.LCCalibrationResult],
+    truth: object,
+    index_surface: ImpliedSurface,
+    pillars: tuple[float, ...],
+    t_min: float = 1 / 12,
+    gate_pillar: float = 0.05,
+    gate_between: float = 0.07,
 ) -> pd.DataFrame:
-    """``max |λ̂ − λ_true|`` over ``k`` within ±1.5 at-the-money standard deviations, per slice
-    from ``t_min`` on (``truth`` maps ``k`` to the true ``λ``)."""
+    """The noise-aware ``λ`` gate (owner's decision 3 of 2026-10-08, SPEC §8.7).  Per slice from
+    ``t_min`` on, at 61 points inside ±1.5 at-the-money standard deviations: the error ``λ̂ −
+    λ_true`` of the first calibration and ``s_λ``, the standard deviation of ``λ̂`` across the
+    calibrations (independent seeds).  A cell passes when ``|error| ≤ gate + 2·s_λ``, the gate
+    being ``gate_pillar`` at a pillar maturity of the target and ``gate_between`` elsewhere.
+    One row per slice: the largest ``|error|`` and where, ``s_λ`` there, the largest ``s_λ``,
+    and ``excess``, the largest ``|error| − gate − 2·s_λ`` (the slice passes when ``≤ 0``)."""
     rows = []
-    for t in res.grid.times:
+    for t in results[0].grid.times:
         if t < t_min - 1e-12:
             continue
         sd = float(index_surface.atm_vol(t)) * np.sqrt(t)
         k = np.linspace(-1.5 * sd, 1.5 * sd, 61)
-        err = res.lam(t, k) - truth(k)  # type: ignore[operator]
+        lam = np.array([r.lam(t, k) for r in results])
+        err = lam[0] - truth(k)  # type: ignore[operator]
+        s = lam.std(axis=0, ddof=1)
+        at_pillar = bool(np.any(np.isclose(t, pillars, rtol=0.0, atol=1e-9)))
+        gate = gate_pillar if at_pillar else gate_between
         i = int(np.argmax(np.abs(err)))
-        rows.append({"t": t, "sd": sd, "max_abs_err": float(np.abs(err).max()), "at_k": float(k[i]),
+        rows.append({"t": t, "pillar": at_pillar, "gate": gate, "max_abs_err": float(np.abs(err[i])),
+                     "at_k": float(k[i]), "s_at_max": float(s[i]), "max_s": float(s.max()),
+                     "excess": float((np.abs(err) - gate - 2.0 * s).max()),
                      "err_atm": float(err[30]), "err_m1p5": float(err[0]), "err_p1p5": float(err[-1])})  # fmt: skip
     return pd.DataFrame(rows)
+
+
+def print_lambda_gate(label: str, gate: pd.DataFrame) -> None:
+    at, between = gate[gate["pillar"]], gate[~gate["pillar"]]
+    print(f"{label} lambda against the truth at the pillars (inside ±1.5 sd; s = sd over 4 seeds):")
+    print(at.drop(columns="pillar").to_string(index=False, float_format=lambda x: f"{x:+.4f}"))
+    for name, part in (("at the pillars", at), ("between the pillars", between)):
+        if len(part):
+            w = part.loc[part["max_abs_err"].idxmax()]
+            print(
+                f"{label} {name} ({len(part)} slices, gate {w['gate']:.2f} + 2 s): worst |error| "
+                f"{w['max_abs_err']:.4f} at t={w['t']:.4f}, k={w['at_k']:+.4f} (s there "
+                f"{w['s_at_max']:.4f}); median over slices {part['max_abs_err'].median():.4f}; "
+                f"largest excess over the gate {part['excess'].max():+.4f}; slices over it: "
+                f"{int((part['excess'] > 0).sum())}"
+            )
 
 
 def dispersion_payoffs(
@@ -2228,14 +2451,17 @@ def test_s4_recalibrated_variant() -> None:
 
 @pytest.mark.slow
 def test_s1_round_trip() -> None:
-    """S1: W5 at 1y under the known ``λ_true(t, k) = 0.5 − 0.4·tanh(k/0.25)``; its index smiles
-    at 1m, 2m, 3m, 6m, 9m and 1y from 2·10⁶ paths, fitted with SVI slices; the particle
-    calibration at 8·10⁵ particles.  Pass: the index reprices within 0.15 vp inside ±1.5 sd and
-    0.30 vp inside ±2.5 sd (noise-aware, 8·10⁵ pricing paths); the clipped mass is at most 1 %
-    at every step; ``|λ̂ − λ_true| ≤ 0.05`` on ±1.5 sd for ``t ≥ 1m``."""
-    horizon = 1.0
-    pillars = (1 / 12, 2 / 12, 3 / 12, 6 / 12, 9 / 12, 1.0)
-    models = w5_models(horizon)
+    """S1 (as redesigned by the owner's decision 3, SPEC §8.7): W5 at 1y under the known
+    ``λ_true(t, k) = 0.5 − 0.4·tanh(k/0.25)``; its index smiles at every month to 1y and at 13
+    months (a target must not end at the horizon) from 2·10⁶ paths, fitted with SVI slices; the
+    particle calibration at 8·10⁵ particles on four seeds.  Pass: the index reprices within
+    0.15 vp inside ±1.5 sd and 0.30 vp inside ±2.5 sd (noise-aware, 8·10⁵ pricing paths); the
+    clipped mass inside ±2.5 sd is at most 1 % at every step; ``|λ̂ − λ_true| ≤ gate + 2·s_λ``
+    inside ±1.5 sd for ``t ≥ 1m``, with the gate 0.05 at the pillars and 0.07 between them and
+    ``s_λ`` the standard deviation of ``λ̂`` over the four seeds."""
+    horizon, beyond = 1.0, 13 / 12
+    pillars = tuple(m / 12 for m in range(1, 13))
+    models = w5_models(beyond)
     fam = CorrelationFamily.equi(5)
     basket = w5_basket(models)
 
@@ -2243,52 +2469,51 @@ def test_s1_round_trip() -> None:
         return np.asarray(0.5 - 0.4 * np.tanh(np.asarray(k) / 0.25))
 
     k_grid = k_grid_of(models)
-    lam_true = LocalCorrelationFunction([0.0, horizon], k_grid, np.tile(truth(k_grid), (2, 1)))
+    lam_true = LocalCorrelationFunction([0.0, beyond], k_grid, np.tile(truth(k_grid), (2, 1)))
     true_model = LocalCorrelationModel(models, fam, lam_true, basket)
     index_surface, fits = index_smile_by_simulation(
-        true_model, production_sim(n_paths=2_000_000), pillars
+        true_model, production_sim(n_paths=2_000_000), (*pillars, beyond)
     )
     print("\nS1 target (2e6 paths):\n" + fits.to_string(index=False))
-    res = calibrate(models, fam, basket, index_surface, horizon)
+    results = [calibrate(models, fam, basket, index_surface, horizon, seed=s) for s in NOISE_SEEDS]
+    res = results[0]
     model = true_model.with_lambda(res.lam)
     rep = lcal.reprice_index_smile(model, index_surface, production_sim(), maturities=pillars)
-    err = lambda_error_table(res, truth, index_surface, 1 / 12)
-    at_pillars = err[np.isin(np.round(err["t"], 9), np.round(pillars, 9))]
-    print(f"S1 calibration: {res.wall_time:.0f} s, timings {res.timings}")
+    gate = lambda_gate(results, truth, index_surface, pillars)
+    print(
+        f"S1 calibration: {res.wall_time:.0f} s ({res.grid.n_steps} steps), timings {res.timings}"
+    )
     print("S1 " + rep.summary())
     print("S1 " + clip_table(res))
-    print("S1 lambda error against the truth at the pillars (max over ±1.5 sd):")
-    print(at_pillars.to_string(index=False, float_format=lambda x: f"{x:+.4f}"))
-    worst = err.loc[err["max_abs_err"].idxmax()]
-    print(
-        f"S1 worst |lambda error| over all {len(err)} slices from 1m: {worst['max_abs_err']:.4f} at "
-        f"t={worst['t']:.4f}, k={worst['at_k']:+.4f}; median over slices {err['max_abs_err'].median():.4f}"
-    )
-    assert res.max_clipped_mass <= 0.01, clip_table(res)
+    print_lambda_gate("S1", gate)
+    assert res.max_clipped_mass_inner <= 0.01, clip_table(res)
     assert rep.passes(), rep.summary()
-    assert err["max_abs_err"].max() <= 0.05, err.to_string()
+    assert (gate["excess"] <= 0.0).all(), gate.to_string()
 
 
 @pytest.mark.slow
 def test_s2_constant_correlation_fixed_point() -> None:
-    """S2: W5 at 3m under the constant correlation 0.5 (``λ = 0.48/0.98``); its index smile from
-    2·10⁶ paths; the calibration must find the constant back — ``|λ̂ − 0.4898| ≤ 0.03`` inside
-    ±1.5 sd for ``t ≥ 1m`` — and price the Palladium forward within 0.5 % of the true model's
-    (paired)."""
-    horizon = 0.25
+    """S2 (design of the owner's decision 3): W5 at 3m under the constant correlation 0.5
+    (``λ = 0.48/0.98``); its index smile at 1m, 2m, 3m and 4m from 2·10⁶ paths; the calibration
+    on four seeds must find the constant back — ``|λ̂ − 0.4898| ≤ gate + 2·s_λ`` inside ±1.5 sd
+    for ``t ≥ 1m``, the gate 0.05 at the pillars and 0.07 between them — and price the Palladium
+    forward within 0.5 % of the true model's (paired).  Printed: the errors against the
+    specification's first gate of 0.03, and the index repricing."""
+    horizon, beyond = 0.25, 4 / 12
     pillars = (1 / 12, 2 / 12, 0.25)
-    models = w5_models(horizon)
+    models = w5_models(beyond)
     fam = CorrelationFamily.equi(5)
     basket = w5_basket(models)
     lam_c = (0.5 - 0.02) / 0.98
-    const = LocalCorrelationFunction.constant(lam_c, [0.0, horizon], k_grid_of(models))
+    const = LocalCorrelationFunction.constant(lam_c, [0.0, beyond], k_grid_of(models))
     true_model = LocalCorrelationModel(models, fam, const, basket)
     index_surface, fits = index_smile_by_simulation(
-        true_model, production_sim(n_paths=2_000_000), pillars
+        true_model, production_sim(n_paths=2_000_000), (*pillars, beyond)
     )
     print("\nS2 target (2e6 paths):\n" + fits.to_string(index=False))
-    res = calibrate(models, fam, basket, index_surface, horizon)
-    err = lambda_error_table(res, lambda k: np.full(np.shape(k), lam_c), index_surface, 1 / 12)
+    results = [calibrate(models, fam, basket, index_surface, horizon, seed=s) for s in NOISE_SEEDS]
+    res = results[0]
+    gate = lambda_gate(results, lambda k: np.full(np.shape(k), lam_c), index_surface, pillars)
     model = true_model.with_lambda(res.lam)
     cc = true_model.with_lambda(
         LocalCorrelationFunction.constant(lam_c, res.lam.times, k_grid_of(models))
@@ -2298,16 +2523,15 @@ def test_s2_constant_correlation_fixed_point() -> None:
     d_cc = dispersion_payoffs(cc, sim, W5_WEIGHTS, horizon)[:, 0]
     ratio, ratio_se = lcm.pair_ratio(d_lc, d_cc)
     rep = lcal.reprice_index_smile(model, index_surface, sim, maturities=pillars)
-    worst = err.loc[err["max_abs_err"].idxmax()]
     print("S2 " + rep.summary())
     print("S2 " + clip_table(res))
+    print_lambda_gate("S2", gate)
     print(
-        f"S2 lambda against {lam_c:.4f}: worst |error| {worst['max_abs_err']:.4f} at t={worst['t']:.4f}, "
-        f"k={worst['at_k']:+.4f}; at 3m ATM {err.iloc[-1]['err_atm']:+.4f}, -1.5 sd "
-        f"{err.iloc[-1]['err_m1p5']:+.4f}, +1.5 sd {err.iloc[-1]['err_p1p5']:+.4f}\n"
+        f"S2 against the first gate of 0.03 (no noise allowance): {int((gate['max_abs_err'] > 0.03).sum())} "
+        f"of {len(gate)} slices over it, worst {gate['max_abs_err'].max():.4f}\n"
         f"S2 E_LC[D]/E_CC[D] = {ratio:.5f} ({ratio_se:.5f}); E_CC[D] = {lcm.pair_mean(d_cc)[0]:.6f}"
     )
-    assert err["max_abs_err"].max() <= 0.03, err.to_string()
+    assert (gate["excess"] <= 0.0).all(), gate.to_string()
     assert abs(ratio - 1.0) <= 0.005
 
 
@@ -2362,15 +2586,19 @@ def _dt_halving(
     *,
     n_particles: int,
     n_paths: int,
-    dt: float = DAILY,
+    schedule: StepSchedule | float | None = None,
     **options: object,
 ) -> dict[str, object]:
-    """Calibrate and price at ``dt`` and ``dt/2`` on common random numbers (the coarse runs use
-    the Brownian-consistent coarsening of the fine runs' draws, in the calibration and in
-    pricing): the Palladium forward and calls, and the basket smile, at both steps."""
-    fine_sim = production_sim(dt / 2, n_paths)
+    """Calibrate and price on ``schedule`` ("dt") and on the schedule with both of its segments
+    halved ("dt/2"), on common random numbers (the coarse runs use the Brownian-consistent
+    coarsening of the fine runs' draws, in the calibration and in pricing): the Palladium
+    forward and calls, and the basket smile, at both."""
+    dt = ACCEPTANCE_SCHEDULE if schedule is None else schedule
+    dt = dt if isinstance(dt, StepSchedule) else StepSchedule.uniform(dt)
+    half = dt.refined(2)
+    fine_sim = production_sim(half, n_paths)
     coarse_sim = production_sim(dt, n_paths)
-    n_fine = TimeGrid.build([horizon], dt / 2).n_steps
+    n_fine = TimeGrid.build([horizon], half).n_steps
     cal_fine = LocalCorrelationDraws(PARTICLE_SEED, n_particles, n_fine, fam)
     res_f = calibrate(models, fam, basket, surface, horizon, n_particles=n_particles, sim=fine_sim,
                       draws=cal_fine, **options)  # fmt: skip
@@ -2378,7 +2606,7 @@ def _dt_halving(
                       draws=cal_fine.coarsened(2), **options)  # fmt: skip
     m_f = LocalCorrelationModel(models, fam, res_f.lam, basket)
     m_c = LocalCorrelationModel(models, fam, res_c.lam, basket)
-    grid_f = TimeGrid.build(list(pillars), dt / 2, calibration_grid=m_f.required_times())
+    grid_f = TimeGrid.build(list(pillars), half, calibration_grid=m_f.required_times())
     grid_c = TimeGrid.build(list(pillars), dt, calibration_grid=m_c.required_times())
     assert grid_f.n_steps == 2 * grid_c.n_steps
     price_fine = m_f.draws_for(grid_f, PRICING_SEED, n_paths)
@@ -2441,10 +2669,10 @@ def _print_dt(label: str, out: dict[str, object]) -> None:
 
 @pytest.mark.slow
 def test_s5_dt_halving_w5() -> None:
-    """S5 on W5 at 3m: calibrated and priced at ``dt = 1/252`` and at ``dt/2`` on common random
-    numbers — ``|E[D](dt/2) − E[D](dt)| < 0.2 %`` of ``E[D]`` and the index smile within 0.10 vp
-    inside ±1.5 sd.  Also printed: the same with the point-value target (SPEC §8.7, review
-    point 3)."""
+    """S5 on W5 at 3m: calibrated and priced on the model's step schedule and on the schedule
+    with both segments halved, on common random numbers — ``|E[D](dt/2) − E[D](dt)| < 0.2 %`` of
+    ``E[D]`` and the index smile within 0.10 vp inside ±1.5 sd.  Also printed: the same with the
+    point-value target (SPEC §8.7, review point 3)."""
     models = w5_models(0.25)
     fam = CorrelationFamily.equi(5)
     basket = w5_basket(models)
@@ -2460,49 +2688,91 @@ def test_s5_dt_halving_w5() -> None:
     assert (smile["diff_vp"].abs() <= np.maximum(0.10, 3 * smile["se_vp"])).all(), smile.to_string()
 
 
+def smile_vols(
+    level: np.ndarray, pillars: tuple[float, ...], surface: ImpliedSurface
+) -> np.ndarray:
+    """The basket's implied vols at the pillars and at the strikes of ``SD_INNER``, flattened
+    ``(n_pillars·7,)``, from the out-of-the-money option means."""
+    atm = [float(surface.atm_vol(T)) for T in pillars]
+    pay = smile_cells(level, pillars, atm).mean(axis=0)
+    out = []
+    for i, T in enumerate(pillars):
+        for j, m in enumerate(SD_INNER):
+            k = m * atm[i] * np.sqrt(T)
+            out.append(float(implied_vol(pay[i, j], 1.0, np.exp(k), T, 1.0 if k >= 0 else -1.0)))
+    return np.array(out)
+
+
 @pytest.mark.slow
 def test_s6_particle_doubling() -> None:
-    """S6 on W5 at 3m: calibrations at 4·10⁵ and 8·10⁵ particles of the same seed, priced on
-    the same paths — ``E[D]``, the calls and the index smile agree within the Monte Carlo error
-    of the paired difference (``|z| < 3``)."""
+    """S6 on W5 at 3m, with the gate of the owner's decision 4 (SPEC §8.7): the difference
+    between the calibrations at 4·10⁵ and at 8·10⁵ particles is read against the calibration
+    noise, ``|P(8·10⁵) − P(4·10⁵)| ≤ 3·√(s₄² + s₈²)``, where ``s_N`` is the standard deviation of
+    the price over four independent calibration seeds at ``N`` particles, everything priced on
+    the same paths — for ``E[D]``, the calls and each cell of the index smile.  Printed as
+    materiality checks: the differences against 0.02 % of ``E[D]`` and 0.01 vp."""
     horizon = 0.25
     models = w5_models(horizon)
     fam = CorrelationFamily.equi(5)
     basket = w5_basket(models)
     surface, _ = w5_target(horizon)
     sim = production_sim()
-    out = {}
-    for n in (400_000, PRODUCTION):
-        res = calibrate(models, fam, basket, surface, horizon, n_particles=n)
-        model = LocalCorrelationModel(models, fam, res.lam, basket)
-        out[n] = (res, model)
-    base = float(dispersion_payoffs(out[PRODUCTION][1], sim, W5_WEIGHTS, horizon)[:, 0].mean())
+    counts = (400_000, PRODUCTION)
+    fitted = {
+        (n, seed): LocalCorrelationModel(
+            models,
+            fam,
+            calibrate(models, fam, basket, surface, horizon, n_particles=n, seed=seed).lam,
+            basket,
+        )
+        for n in counts
+        for seed in NOISE_SEEDS
+    }
+    first = (PRODUCTION, NOISE_SEEDS[0])
+    base = float(dispersion_payoffs(fitted[first], sim, W5_WEIGHTS, horizon)[:, 0].mean())
     strikes = tuple(m * base for m in (0.75, 1.0, 1.25, 1.5))
-    pay = {n: dispersion_payoffs(m, sim, W5_WEIGHTS, horizon, strikes) for n, (_, m) in out.items()}
-    rows = []
-    for j, label in enumerate(("E[D]", "call 0.75", "call 1.00", "call 1.25", "call 1.50")):
-        diff, se = paired(pay[PRODUCTION][:, j], pay[400_000][:, j])
-        value, value_se = lcm.pair_mean(pay[PRODUCTION][:, j])
-        rows.append({"quantity": label, "8e5": value, "se": value_se, "8e5 - 4e5": diff,
-                     "paired_se": se, "z": diff / se, "rel_%": 100 * diff / value})  # fmt: skip
-    prices = pd.DataFrame(rows)
-    lev = {n: basket_levels(m, sim, W5_3M_PILLARS) for n, (_, m) in out.items()}
-    smile = smile_difference(lev[PRODUCTION], lev[400_000], W5_3M_PILLARS, surface)
-    smile["z"] = smile["diff_vp"] / smile["se_vp"]
-    lam_diff = np.abs(out[PRODUCTION][0].lam.values - out[400_000][0].lam.values)
-    res8 = out[PRODUCTION][0]
-    kg = res8.lam.k_grid
-    inside = np.array(
-        [(kg >= res8.q_lo[j]) & (kg <= res8.q_hi[j]) for j in range(res8.lam.n_slices)]
+    price = {
+        key: dispersion_payoffs(m, sim, W5_WEIGHTS, horizon, strikes).mean(axis=0)
+        for key, m in fitted.items()
+    }
+    vol = {
+        key: smile_vols(basket_levels(m, sim, W5_3M_PILLARS), W5_3M_PILLARS, surface)
+        for key, m in fitted.items()
+    }
+
+    def gate(
+        values: dict[tuple[int, int], np.ndarray], labels: list[str], scale: float
+    ) -> pd.DataFrame:
+        rows = []
+        for j, label in enumerate(labels):
+            lo = np.array([values[(counts[0], seed)][j] for seed in NOISE_SEEDS])
+            hi = np.array([values[(counts[1], seed)][j] for seed in NOISE_SEEDS])
+            s_lo, s_hi = float(lo.std(ddof=1)), float(hi.std(ddof=1))
+            diff = float(hi[0] - lo[0])
+            limit = 3.0 * float(np.hypot(s_lo, s_hi))
+            rows.append({"quantity": label, "8e5": hi[0] * scale, "8e5 - 4e5": diff * scale,
+                         "s_4e5": s_lo * scale, "s_8e5": s_hi * scale, "gate": limit * scale,
+                         "ratio": abs(diff) / limit, "mean diff": float(hi.mean() - lo.mean()) * scale})  # fmt: skip
+        return pd.DataFrame(rows)
+
+    prices = gate(price, ["E[D]", "call 0.75", "call 1.00", "call 1.25", "call 1.50"], 1.0)
+    cells = [f"T={T:.4f} {m:+.1f}sd" for T in W5_3M_PILLARS for m in SD_INNER]
+    smile = gate(vol, cells, 100.0)
+    rel = 100.0 * abs(prices.iloc[0]["8e5 - 4e5"]) / prices.iloc[0]["8e5"]
+    print(
+        "\nS6 W5 3m: 8e5 against 4e5 particles (seed 12345), four calibration seeds at each count, the same pricing paths"
     )
-    print("\nS6 W5 3m: 8e5 against 4e5 particles, the same pricing paths")
     print(prices.to_string(index=False, float_format=lambda x: f"{x:.6g}"))
-    print("S6 basket implied vol, 8e5 minus 4e5 particles (vol points):")
-    print(smile.to_string(index=False, float_format=lambda x: f"{x:+.4f}"))
-    print(f"S6 max |lambda(8e5) - lambda(4e5)| on the trusted range {lam_diff[inside].max():.4f}, "
-          f"mean {lam_diff[inside].mean():.4f}")  # fmt: skip
-    assert prices["z"].abs().max() < 3.0, prices.to_string()
-    assert smile["z"].abs().max() < 3.0, smile.to_string()
+    print("S6 basket implied vol (vol points):")
+    print(smile.to_string(index=False, float_format=lambda x: f"{x:+.5f}"))
+    print(
+        f"S6 materiality: |E[D](8e5) - E[D](4e5)| = {rel:.4f} % of E[D] (0.02 %: "
+        f"{'within' if rel <= 0.02 else 'over'}); largest smile difference "
+        f"{smile['8e5 - 4e5'].abs().max():.4f} vp (0.01 vp: "
+        f"{'within' if smile['8e5 - 4e5'].abs().max() <= 0.01 else 'over'})"
+    )
+    assert (prices["ratio"] <= 1.0).all(), prices.to_string()
+    assert (smile["ratio"] <= 1.0).all(), smile.to_string()
 
 
 @pytest.mark.slow
@@ -2543,13 +2813,14 @@ def test_s7_bandwidth() -> None:
 def test_s10_carry_mode() -> None:
     """S10: W5 with a rate of 4 % and dividend yields of 0–4 % in carry mode (the basket is the
     price basket, whose drift the calibration ignores).  The index smile of a known sloped ``λ``
-    (2·10⁶ paths) is the target.  Pass: ``E[B_T]/F_B(T) − 1`` within 3 standard errors and the
+    (2·10⁶ paths, at 1m, 2m, 3m and 4m: the target does not end at the horizon) is the target.
+    Pass: ``E[B_T]/F_B(T) − 1`` within 3 standard errors and the
     index at-the-money error at most 0.15 vp at every pillar.  Printed: the per-step mean of
     ``|δ_t|`` and the carry-mode ``λ`` against the performance-mode ``λ`` on the same particles."""
-    horizon = 0.25
+    horizon, beyond = 0.25, 4 / 12
     yields = (0.00, 0.01, 0.02, 0.03, 0.04)
     curves = [ForwardCurve.flat(1.0, 0.04, q) for q in yields]
-    cfg = lc_grid(horizon)
+    cfg = lc_grid(beyond)
     models = [
         LocalVol(LocalVolSurface.from_implied(w5_surfaces(i + 1, curves[i])[i], cfg), curves[i])
         for i in range(5)
@@ -2558,11 +2829,11 @@ def test_s10_carry_mode() -> None:
     basket = BasketSpec(W5_WEIGHTS, "carry", curves)
     k_grid = k_grid_of(models)
     lam_true = LocalCorrelationFunction.parametric(
-        ParametricLambda(0.45, 2.0, 0.0, fam.lambda_max), [0.0, horizon], k_grid
+        ParametricLambda(0.45, 2.0, 0.0, fam.lambda_max), [0.0, beyond], k_grid
     )
     true_model = LocalCorrelationModel(models, fam, lam_true, basket)
     index_surface, fits = index_smile_by_simulation(
-        true_model, production_sim(n_paths=2_000_000), W5_3M_PILLARS
+        true_model, production_sim(n_paths=2_000_000), (*W5_3M_PILLARS, beyond)
     )
     print("\nS10 target (carry mode, 2e6 paths):\n" + fits.to_string(index=False))
     res = calibrate(models, fam, basket, index_surface, horizon)
@@ -2579,7 +2850,8 @@ def test_s10_carry_mode() -> None:
     print("S10 " + clip_table(res))
     print(
         f"S10 mean |delta_t| over the cloud, per year: max over steps {res.drift_abs_mean.max():.3e}, "
-        f"at 1m {res.drift_abs_mean[21]:.3e}, at 3m {res.drift_abs_mean[-1]:.3e}\n"
+        f"at 1m {res.drift_abs_mean[int(np.argmin(np.abs(res.grid.times - 1 / 12)))]:.3e}, at 3m "
+        f"{res.drift_abs_mean[-1]:.3e}\n"
         f"S10 carry-mode against performance-mode lambda on the trusted range: max |diff| "
         f"{gap.max():.4f}, mean {gap.mean():.5f}\n"
         f"S10 forward: "
@@ -2617,108 +2889,110 @@ needs_study_data = pytest.mark.skipif(
 )
 
 
-def dow_inputs(date: str, tenor: str) -> dict[str, object]:
-    """The study's inputs of a date: the entry's names, maturity and price weights, and the
-    expiry smiles of the names and of DJX through the study's own loader
-    (``scripts/disp_entries.py::marginals_for``, as check C8 does; the forward rule and the
-    expiry guards are the study's)."""
-    import pickle
+def diagnostics() -> Any:
+    """``scripts/lcm_diagnostics.py`` as a module: the loader of the study's inputs, the
+    specification builder with the expiry screen, and the measurements the Dow tests gate."""
     import sys
 
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-    import disp_entries as de
+    scripts = str(Path(__file__).resolve().parents[1] / "scripts")
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    import lcm_diagnostics
 
-    from volsto.studies import disp_data as dd
-
-    with (dd.OUT / "entries" / tenor / f"{date}.pkl").open("rb") as fh:
-        entry = pickle.load(fh)
-    names = list(entry["names"])
-    T = float(entry["T"])
-    got = de.marginals_for(date, [*names, "DJX"], T)
-    assert got is not None
-    panel = dd.prices().ffill()
-    return {
-        "names": names,
-        "T": T,
-        "weights": np.asarray(entry["w_B1"], dtype=float),
-        "spots": [float(panel.at[date, t]) for t in names],
-        "smiles": {t: got[t][2] for t in names},
-        "index_smiles": got["DJX"][2],
-        "index_spot": float(panel.at[date, "DJX"]),
-    }
-
-
-def dow_spec(
-    date: str, tenor: str, *, n_particles: int, records: object = None, **lc_options: object
-) -> tuple[LocalCorrelationSpec, dict[str, object], dict[str, object]]:
-    from volsto.studies.disp_lc import lc_spec_from_smiles
-
-    data = dow_inputs(date, tenor)
-    particle = ParticleConfig(n_particles=n_particles, horizon=float(data["T"]), seed=PARTICLE_SEED)  # type: ignore[arg-type]
-    lc = LocalCorrelationConfig(particle=particle, **lc_options)  # type: ignore[arg-type]
-    spec, info = lc_spec_from_smiles(
-        data["names"],  # type: ignore[arg-type]
-        data["weights"],  # type: ignore[arg-type]
-        data["spots"],  # type: ignore[arg-type]
-        data["smiles"],  # type: ignore[arg-type]
-        data["index_smiles"],  # type: ignore[arg-type]
-        data["index_spot"],  # type: ignore[arg-type]
-        float(data["T"]),  # type: ignore[arg-type]
-        lc=lc,
-        sim=production_sim(),
-        records=records,  # type: ignore[arg-type]
-        label=f"{date} B1 {tenor}",
-    )
-    return spec, info, data
+    return lcm_diagnostics
 
 
 @pytest.mark.slow
 @needs_study_data
 def test_dow_specification_from_the_study(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The Dow of 2026-10-02 at 3m as a specification: every name's curve reproduces its listed
-    forwards (1e-12); the SVI slices are C8's selection; the second build reads every slice from
-    the records and fits nothing, and its key is the first's; the alignment of the listed DJX
-    forwards with the basket's is reported for each expiry (all within the 1 % flag)."""
+    """The Dow of 2026-10-02 at 3m as a specification.  The smiles are the study's
+    (``marginals_for``).  Under the default expiry screen (owner's decision 1): the index target
+    holds third-Friday expiries only; every expiry dropped has its leg and its reason; every
+    name's curve reproduces the forwards of its kept expiries (1e-12); the SVI slices are C8's
+    selection among the kept expiries.  Without the screen the build is the one measured before
+    the decision (278 slices).  The second build reads every slice from the records and fits
+    nothing, and its key is the first's; the alignment of the listed DJX forwards with the
+    basket's is within the 1 % flag."""
     from volsto.calibration.fit_records import FitRecords
     from volsto.market import svi_slices as sv
+    from volsto.studies.disp_lc import third_friday
 
+    L = diagnostics()
+    inp = L.load_inputs(TODAY, "3m")
+    study = L.de.marginals_for(TODAY, [*inp.names, "DJX"], inp.T)
+    assert study is not None
+    for ticker, mine in [*inp.smiles.items(), ("DJX", inp.index_smiles)]:
+        theirs = study[ticker][2]
+        assert [e.expiry for e in mine] == [e.expiry for e in theirs]
+        for a, b in zip(mine, theirs, strict=True):
+            assert a.forward == b.forward
+            np.testing.assert_array_equal(a.k, b.k)
+            np.testing.assert_array_equal(a.vol, b.vol)
     records = FitRecords(tmp_path / "lc" / "svi_fits")
-    spec, info, data = dow_spec(TODAY, "3m", n_particles=PRODUCTION, records=records)
+    spec, info = L.build_spec(inp, records=records)
     assert (
         spec.n_names == 30 and spec.lc.particle.horizon == 0.25 and spec.label == f"{TODAY} B1 3m"
     )
     assert abs(sum(spec.weights) - 1.0) < 1e-12 and spec.local_vol.n_k == 1601
-    smiles = data["smiles"]
-    assert isinstance(smiles, dict)
-    worst = 0.0
-    for name, market, surface, spot in zip(spec.names, spec.markets, spec.surfaces, data["spots"]):  # type: ignore[arg-type]
+    assert spec.sim.step_schedule == LC_STEP_SCHEDULE
+    # the screen: what was dropped, and why
+    dropped = {(g["leg"], g["expiry"]): g["reason"] for g in info["dropped"]}
+    assert len(dropped) == len(info["dropped"]) and all(dropped.values())
+    listed = {e.expiry for e in inp.index_smiles}
+    index_kept = [e for e in inp.index_smiles if ("index", e.expiry) not in dropped]
+    assert all(third_friday(e.expiry, listed) for e in index_kept)
+    assert (
+        dropped[("index", "2026-10-30")]
+        == dropped[("index", "2026-11-30")]
+        == "not a third-Friday expiry"
+    )
+    assert [round(t, 4) for t in spec.index_surface.times] == [
+        0.0384,
+        0.1342,
+        0.211,
+        0.4603,
+        0.7068,
+    ]
+    worst, n_forwards = 0.0, 0
+    for name, market, surface, spot in zip(spec.names, spec.markets, spec.surfaces, inp.spots):
         curve = ForwardCurve.from_config(market)
-        listed = smiles[name]
-        ratio = np.array([e.forward / spot for e in listed])
-        got = np.asarray(curve.forward(np.array([e.T for e in listed])))
+        kept = [e for e in inp.smiles[name] if (name, e.expiry) not in dropped]
+        ratio = np.array([e.forward / spot for e in kept])
+        got = np.asarray(curve.forward(np.array([e.T for e in kept])))
         worst = max(worst, float(np.max(np.abs(got / ratio - 1.0))))
-        kept = [e.T for e in listed if e.T >= 10 / 365]
-        expected = [t for t in kept if t <= 0.25] + [t for t in kept if t > 0.25][:2]
+        n_forwards += len(kept)
+        times = [e.T for e in kept if e.T >= 10 / 365]
+        expected = [t for t in times if t <= 0.25] + [t for t in times if t > 0.25][:2]
         assert list(surface.times) == expected and surface.record_keys is not None
         assert surface.max_maturity == max(expected[-1], 0.25) + 0.05
     assert worst < 1e-12
-    n_slices = sum(len(s.times) for s in spec.surfaces) + len(spec.index_surface.times)
+    n_slices = sum(len(x.times) for x in spec.surfaces) + len(spec.index_surface.times)
     assert len(records.keys()) == n_slices
     assert len(spec.index_forward_ratios) == len(spec.index_surface.times)
+    # without the screen: every expiry the loader returns, as before the decision
+    plain, plain_info = L.build_spec(inp, screen="off")
+    n_plain = sum(len(x.times) for x in plain.surfaces) + len(plain.index_surface.times)
+    assert plain_info["dropped"] == [] and n_plain == 278 and len(plain.index_surface.times) == 7
+    assert lc_cache.lc_spec_key(plain) != lc_cache.lc_spec_key(spec)
 
     def no_fit(*args: object, **kwargs: object) -> object:
         raise AssertionError("a recorded slice was fitted again")
 
     monkeypatch.setattr(sv, "fit_svi_slice", no_fit)
-    again, _, _ = dow_spec(TODAY, "3m", n_particles=PRODUCTION, records=records)
+    again, _ = L.build_spec(inp, records=records)
     assert again == spec and lc_cache.lc_spec_key(again) == lc_cache.lc_spec_key(spec)
     monkeypatch.undo()
     market = lc_cache.build_lc_market(spec)
     deltas = [(round(a["T"], 4), round(100 * a["delta"], 3)) for a in market.alignment]
-    print(f"\nDow {TODAY} 3m: SVI rms median {info['svi_rms_vp_median']:.2f} vp, max "
-          f"{info['svi_rms_vp_max']:.2f} vp; {n_slices} slices; forwards reproduced to {worst:.1e}; "
-          f"alignment delta (%) by listed DJX expiry {deltas}; flagged for arbitrage on |k| <= 1: "
-          f"{len([x for x in market.flagged if x != 'index'])} names, index {'index' in market.flagged}")  # fmt: skip
+    by_leg: dict[str, int] = {}
+    for leg, _ in dropped:
+        by_leg[leg] = by_leg.get(leg, 0) + 1
+    print(f"\nDow {TODAY} 3m: {len(dropped)} expiries dropped by the screen (index {by_leg.get('index', 0)}, "
+          f"{len(by_leg) - ('index' in by_leg)} names touched); {n_slices} slices ({n_plain} without the screen); "
+          f"SVI rms median {info['svi_rms_vp_median']:.2f} vp, max {info['svi_rms_vp_max']:.2f} vp; {n_forwards} "
+          f"forwards reproduced to {worst:.1e}; alignment delta (%) by listed DJX expiry {deltas}; flagged for "
+          f"arbitrage on |k| <= 1: {len([x for x in market.flagged if x != 'index'])} names, index "
+          f"{'index' in market.flagged}")  # fmt: skip
     assert all(abs(a["delta"]) < 0.01 and not a["flagged"] for a in market.alignment)
     assert info["n_names_extrapolated"] == 0 and not info["index_extrapolated"]
 
@@ -2729,14 +3003,14 @@ def test_single_names_match_local_vol_on_the_dow() -> None:
     """C2 on the thirty Dow names of 2026-10-02 (3m): under a calibrated ``λ`` every single-name
     out-of-the-money vanilla — forward log-moneyness ``k ∈ {−0.15, −0.05, 0, 0.05, 0.15}``,
     maturities ``T/3``, ``2T/3``, ``T`` — is the single-asset ``LocalVol`` Monte Carlo price on
-    an independent seed: ``|z| < 3`` in each of the 450 cells, with the combined standard
-    errors.  (The index target only shapes ``λ``; the names' law does not depend on it.)"""
-    spec, _, _ = dow_spec(TODAY, "3m", n_particles=200_000)
+    an independent seed.  The gate on the 450 cells (owner's decision of 2026-10-08): every
+    ``|z| < 4`` and at most four cells with ``|z| > 3`` (1.2 expected by chance), with the
+    combined standard errors.  (The index target only shapes ``λ``; the names' law does not
+    depend on it.)"""
+    L = diagnostics()
+    spec, _ = L.build_spec(L.load_inputs(TODAY, "3m"), n_particles=200_000)
     market = lc_cache.build_lc_market(spec)
-    res = lcal.calibrate_local_correlation(
-        market.models, market.family, market.basket, market.index_surface, market.index_lv,
-        spec.lc.particle, spec.sim, spec.lc,
-    )  # fmt: skip
+    res = L.calibrate(spec, market)
     model = LocalCorrelationModel(market.models, market.family, res.lam, market.basket, spec.names)
     horizon = 0.25
     maturities = [horizon / 3, 2 * horizon / 3, horizon]
@@ -2766,14 +3040,89 @@ def test_single_names_match_local_vol_on_the_dow() -> None:
                 z = (got.mean - ref.mean) / float(np.hypot(got.stderr, ref.stderr))
                 rows.append((spec.names[i], T, k, got.mean, got.stderr, ref.mean, ref.stderr, z))
     table = pd.DataFrame(rows, columns=["name", "T", "k", "lc", "lc_se", "lv", "lv_se", "z"])
-    over = table[table["z"].abs() >= 3.0]
+    over = table[table["z"].abs() > 3.0]
     print(
         f"\nC2 (Dow {TODAY}, 30 names): {len(table)} cells, worst |z| {table['z'].abs().max():.2f}, "
         f"rms z {np.sqrt((table['z'] ** 2).mean()):.2f}, mean z {table['z'].mean():+.2f}, cells with "
         f"|z| >= 2: {int((table['z'].abs() >= 2).sum())} (expected {0.0455 * len(table):.0f}), "
-        f">= 3: {len(over)} (expected {0.0027 * len(table):.1f})"
+        f"> 3: {len(over)} (expected {0.0027 * len(table):.1f})"
     )
     if len(over):
         print(over.to_string(index=False))
     assert len(table) == 450
-    assert table["z"].abs().max() < 3.0, over.to_string()
+    assert table["z"].abs().max() < 4.0 and len(over) <= 4, over.to_string()
+
+
+@pytest.mark.slow
+@needs_study_data
+def test_s5_dt_halving_dow() -> None:
+    """S5 on the Dow of 2026-10-02 at 3m (the screened target of the owner's decision 1, 8·10⁵
+    particles and paths): calibrated and priced on the model's step schedule and on the schedule
+    with both segments halved, on common random numbers — ``|E[D](dt/2) − E[D](dt)| < 0.2 %`` of
+    ``E[D]`` and the index smile within 0.10 vp inside ±1.5 sd at 1m, 2m and 3m."""
+    L = diagnostics()
+    spec, _ = L.build_spec(L.load_inputs(TODAY, "3m"))
+    market = lc_cache.build_lc_market(spec)
+    T = spec.lc.particle.horizon
+    out = L.dt_check(spec, market, [T / 3, 2 * T / 3, T])
+    print("\n" + L.format_dt(f"S5 Dow {TODAY} 3m", out))
+    prices, smile = out["prices"], out["smile"]
+    assert abs(prices.iloc[0]["rel_%"]) < 0.2, prices.to_string()
+    assert (smile["diff_vp"].abs() <= np.maximum(0.10, 3 * smile["se_vp"])).all(), smile.to_string()
+
+
+#: the absolute floor of the baseline's tolerance: 0.02 % of notional (``test_m6_regression``)
+BASELINE_FLOOR = 0.0002
+
+
+@pytest.mark.slow
+@needs_study_data
+def test_s11_dow_baseline() -> None:
+    """S11: the Dow of 2026-10-02 at 3m on the screened target — the full calibration at 8·10⁵
+    particles; the index smile acceptance, gated when the largest clipped mass is at most 1 %
+    and reported otherwise; the basket forward within 3 standard errors; and the M12 baseline
+    ``tests/golden/lcm_baseline_2026-10-02.json`` (``E[D]`` and the calls under the model and
+    under its constant-correlation companion, their ratio, ``E[V]`` and ``κ``), each cell within
+    ``max(2 standard errors, 0.02 % of notional)`` of the recorded value.  The baseline is
+    written by ``scripts/lcm_diagnostics.py baseline --write``."""
+    L = diagnostics()
+    run = L.baseline_run()
+    res, rep = run["result"], run["report"]
+    print(f"\nS11 Dow {TODAY} 3m ({run['seconds']:.0f} s): rho_CC {run['rho_cc']:.6f}")
+    print("S11 " + L.format_clip(res))
+    print("S11 " + rep.summary())
+    z = rep.forwards["forward_error"] / rep.forwards["forward_error_se"]
+    assert z.abs().max() < 3.0, rep.forwards.to_string()
+    if res.max_clipped_mass <= 0.01:
+        assert rep.passes(), rep.summary()
+    else:
+        print(
+            f"S11 index smile acceptance reported, not gated: the largest clipped mass is "
+            f"{res.max_clipped_mass:.4f} (inside ±{lcal.CLIP_GATE_SD:g} sd: {res.max_clipped_mass_inner:.4f}); "
+            f"{len(rep.violations())} cells over the smile gate"
+        )
+    assert L.BASELINE_FILE.exists(), "record it: python scripts/lcm_diagnostics.py baseline --write"
+    recorded = json.loads(L.BASELINE_FILE.read_text())
+    rows = []
+    for name, (value, se) in recorded["cells"].items():
+        got = run["cells"][name][0]
+        tol = max(2.0 * se, BASELINE_FLOOR)
+        rows.append({"cell": name, "baseline": value, "se": se, "now": got, "diff": got - value,
+                     "tolerance": tol, "ok": abs(got - value) <= tol})  # fmt: skip
+    table = pd.DataFrame(rows)
+    print("S11 against the recorded baseline:")
+    print(table.to_string(index=False, float_format=lambda x: f"{x:.6g}"))
+    # the settings behind the recorded numbers (the key itself moves with the last bits of the
+    # SVI fits from one machine to another, so it is recorded but not compared)
+    now = L.baseline_document(run)
+    assert recorded["screen"] == now["screen"] and recorded["n_dropped"] == now["n_dropped"]
+    for field in (
+        "particle_seed",
+        "pricing_seed",
+        "n_particles",
+        "n_paths",
+        "schedule",
+        "lc_code_tag",
+    ):
+        assert recorded["record"][field] == now["record"][field], field
+    assert table["ok"].all(), table.to_string()

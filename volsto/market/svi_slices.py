@@ -210,7 +210,9 @@ def fit_svi_slice(
 @dataclass(frozen=True)
 class ArbitrageReport:
     """Output of :meth:`SviSlices.arbitrage_report` on the grid of ``n_k`` points over
-    ``|k| ≤ k_range``.
+    ``|k| ≤ k_range`` — or, when the report was asked on per-slice ranges, over ``[k_lo[s],
+    k_hi[s]]`` for the butterfly of slice ``s`` and over the union of the two slices' ranges for
+    the calendar of a pair (``k_lo``, ``k_hi``; ``None`` for the symmetric range).
 
     * ``min_g[s]``: the smallest value on the grid of slice ``s``'s butterfly function
       ``g(k) = (1 − k w′/(2w))² − (w′²/4)(1/w + 1/4) + w″/2`` (the density of the slice has the
@@ -235,6 +237,8 @@ class ArbitrageReport:
     k_range: float
     n_k: int
     tol: float
+    k_lo: tuple[float, ...] | None = None
+    k_hi: tuple[float, ...] | None = None
 
     @property
     def butterfly_ok(self) -> bool:
@@ -281,6 +285,8 @@ class ArbitrageReport:
             "n_k": self.n_k,
             "tol": self.tol,
             "violations": self.violations(),
+            **({} if self.k_lo is None else {"k_lo": list(self.k_lo)}),
+            **({} if self.k_hi is None else {"k_hi": list(self.k_hi)}),
         }
 
 
@@ -345,17 +351,33 @@ class SviSlices(ImpliedSurface):
         )
 
     def arbitrage_report(
-        self, k_range: float = 1.0, n_k: int = 401, tol: float = ARBITRAGE_TOL
+        self,
+        k_range: float = 1.0,
+        n_k: int = 401,
+        tol: float = ARBITRAGE_TOL,
+        *,
+        k_lo: Sequence[float] | None = None,
+        k_hi: Sequence[float] | None = None,
     ) -> ArbitrageReport:
         """Butterfly per slice and calendar per consecutive pair on ``n_k`` points over
-        ``|k| ≤ k_range`` (:class:`ArbitrageReport`).  Checked by
+        ``|k| ≤ k_range`` (:class:`ArbitrageReport`) — or, with ``k_lo`` and ``k_hi`` (one bound
+        per slice, e.g. the range a particle cloud visits at that maturity), over ``[k_lo[s],
+        k_hi[s]]`` for slice ``s`` and over the union of the two ranges for a pair.  Checked by
         ``tests/test_svi_slices.py::test_arbitrage_report_detects_violations``."""
         if k_range <= 0 or n_k < 3:
             raise ValueError("need k_range > 0 and n_k >= 3")
-        ks = np.linspace(-k_range, k_range, n_k)
-        min_g, arg_g, n_floored = [], [], []
-        floored = np.empty((self.n_slices, n_k))
-        for s, p in enumerate(self.params):
+        if (k_lo is None) != (k_hi is None):
+            raise ValueError("give both k_lo and k_hi, or neither")
+        if k_lo is None or k_hi is None:
+            lo = np.full(self.n_slices, -float(k_range))
+            hi = np.full(self.n_slices, float(k_range))
+        else:
+            lo, hi = np.asarray(k_lo, dtype=float), np.asarray(k_hi, dtype=float)
+            if lo.shape != (self.n_slices,) or hi.shape != (self.n_slices,) or np.any(hi < lo):
+                raise ValueError("k_lo and k_hi: one bound per slice, with k_lo <= k_hi")
+
+        def floored_slice(p: ArrayLike, ks: FloatArray) -> tuple[FloatArray, FloatArray, int]:
+            """The floored slice on ``ks``, its butterfly function and its floored points."""
             w, w1, w2 = svi_derivatives(p, ks)
             low = w <= W_FLOOR
             # on the floor the surface is flat in k: w = W_FLOOR, w' = w'' = 0, hence g = 1
@@ -363,14 +385,20 @@ class SviSlices(ImpliedSurface):
             w1 = np.where(low, 0.0, w1)
             w2 = np.where(low, 0.0, w2)
             g = (1.0 - ks * w1 / (2.0 * ws)) ** 2 - 0.25 * w1 * w1 * (1.0 / ws + 0.25) + 0.5 * w2
+            return ws, g, int(low.sum())
+
+        min_g, arg_g, n_floored = [], [], []
+        for s, p in enumerate(self.params):
+            ks = np.linspace(lo[s], hi[s], n_k)
+            _, g, n_low = floored_slice(p, ks)
             i = int(np.argmin(g))
             min_g.append(float(g[i]))
             arg_g.append(float(ks[i]))
-            n_floored.append(int(low.sum()))
-            floored[s] = ws
+            n_floored.append(n_low)
         min_c, arg_c = [], []
         for s in range(self.n_slices - 1):
-            d = floored[s + 1] - floored[s]
+            ks = np.linspace(min(lo[s], lo[s + 1]), max(hi[s], hi[s + 1]), n_k)
+            d = floored_slice(self.params[s + 1], ks)[0] - floored_slice(self.params[s], ks)[0]
             i = int(np.argmin(d))
             min_c.append(float(d[i]))
             arg_c.append(float(ks[i]))
@@ -384,6 +412,8 @@ class SviSlices(ImpliedSurface):
             float(k_range),
             int(n_k),
             float(tol),
+            None if k_lo is None else tuple(float(x) for x in lo),
+            None if k_hi is None else tuple(float(x) for x in hi),
         )
 
     def check_no_arbitrage(
