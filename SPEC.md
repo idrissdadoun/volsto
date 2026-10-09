@@ -1660,6 +1660,7 @@ The study of §8.4 on every weekly entry of the ORATS history (§18.10). Specifi
   8. *A name the quote screen empties* (LC7-i): ten dates of the sweep fail for one name, eight of them in the crisis of 2008–09; the fallback is built, off by default.
   9. *The index target against the study's index level* (LC7-k): about ten dates on which the two at-the-money correlations differ by more than 0.05.
 - **Not done in M12:** no pull request, no merge; the specification file is unchanged (LC4G-f); the uncertain-`λ` overlay, sub-basket products and a pairwise local correlation are in the note's limits only.
+- **After M12 (the third round's last phase).** A prototype of cross-dependent volatility — `σ_i = σ_Dup,i(t, k_i)·g(k_B)·s_i(t, k_i)` with `g = clip(e^{−β k_B})` and `s_i = 1/√E[g² | k_i]` estimated on the particles, `λ` from the same formula — is on its own branch and worktree (`cross-dependent-vol`, `~/Code/volsto-cdv`: `volsto/multi/cdv.py`, `tests/test_cross_dependent_vol.py`, `scripts/cdv_scan.py`, `docs/cross_dependent_vol.md`), off by default and without a change to M12. `β = 0` reproduces M12 bit for bit. On the Dow at 3m (2·10⁵): 2026-10-02, `β` 0 → 3: clipped mass inside ±2.5 sd 1.8 % → 0.0 %, index error at −2.5 sd −1.44 → −0.24 vp, `E[D]/E^CC[D]` 0.9703 → 0.9662; 2017-04-03, `β` 0 → 6: 15.3 % → 4.4 %, −2.20 → −0.63 vp, 0.9449 → 0.9252; 2019-09-03, `β` 0 → 3 → 6: 13.3 → 6.9 → 3.9 %, 0.9594 → 0.9632 → 0.9439. The names' second moment against the listed strips is unchanged within its error up to those `β`.
 
 ## 9. Viewers
 
