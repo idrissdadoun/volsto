@@ -147,6 +147,55 @@ def gaussian_palladium_call(
     return float((m - strike) * norm.cdf(d) + sd * norm.pdf(d))
 
 
+def margrabe_exchange(sigma_a: float, sigma_e: float, rho: float, T: float) -> float:
+    """Margrabe's exchange option on two lognormal assets of unit forwards (recalled; derived by
+    change of numeraire): ``E[(X_a − X_e)⁺] = N(½σ√T) − N(−½σ√T)`` with ``σ² = σ_a² + σ_e² −
+    2ρσ_aσ_e``.  Checked against :class:`volsto.multi.products.OutperformanceOption`."""
+    var = sigma_a * sigma_a + sigma_e * sigma_e - 2.0 * rho * sigma_a * sigma_e
+    if var < 0 or T <= 0:
+        raise ValueError("need a non-negative spread variance and a positive maturity")
+    half = 0.5 * float(np.sqrt(var * T))
+    return float(ndtr(half) - ndtr(-half))
+
+
+def pair_means(x: ArrayLike, antithetic: bool = True) -> FloatArray:
+    """The independent samples behind a standard error: the means of antithetic pairs (paths
+    ``2i`` and ``2i + 1``), or the paths themselves."""
+    v = np.asarray(x, dtype=np.float64)
+    if not antithetic:
+        return v
+    if v.shape[0] % 2:
+        raise ValueError("antithetic paths come in pairs")
+    return np.asarray(0.5 * (v[0::2] + v[1::2]), dtype=np.float64)
+
+
+def mean_se(x: ArrayLike, antithetic: bool = True) -> tuple[float, float]:
+    """``(mean, standard error)`` on pair means."""
+    y = pair_means(x, antithetic)
+    return float(y.mean()), float(y.std(ddof=1) / np.sqrt(y.shape[0]))
+
+
+def ratio_se(a: ArrayLike, b: ArrayLike, antithetic: bool = True) -> tuple[float, float]:
+    """``(E[a]/E[b], its standard error)`` by the delta method on pair means — ``a`` and ``b``
+    on the same paths: with ``r = ā/b̄``, the standard error of the mean of ``(a − r·b)/b̄``
+    (derived; the reference implementation's ``ratio_pm``)."""
+    ya, yb = pair_means(a, antithetic), pair_means(b, antithetic)
+    r = float(ya.mean() / yb.mean())
+    u = (ya - r * yb) / yb.mean()
+    return r, float(u.std(ddof=1) / np.sqrt(u.shape[0]))
+
+
+def kappa_se(d: ArrayLike, v: ArrayLike, antithetic: bool = True) -> tuple[float, float]:
+    """``κ = E[d]/√E[v]`` and its delta-method standard error on pair means (``d`` the
+    dispersion, ``v`` the dispersion variance, the same paths): the standard error of the mean of
+    ``(d − d̄)/√v̄ − ½κ(v − v̄)/v̄`` (derived)."""
+    yd, yv = pair_means(d, antithetic), pair_means(v, antithetic)
+    md, mv = float(yd.mean()), float(yv.mean())
+    kappa = md / float(np.sqrt(mv))
+    u = (yd - md) / np.sqrt(mv) - 0.5 * kappa * (yv - mv) / mv
+    return kappa, float(u.std(ddof=1) / np.sqrt(u.shape[0]))
+
+
 def _simpson(y: FloatArray, h: float) -> float:
     """Simpson's rule on an odd number of equally spaced points."""
     return float(h / 3.0 * (y[0] + y[-1] + 4.0 * y[1:-1:2].sum() + 2.0 * y[2:-1:2].sum()))
@@ -222,6 +271,11 @@ __all__ = [
     "gaussian_palladium_forward",
     "gaussian_straddle_dispersion",
     "implied_correlation",
+    "kappa_se",
+    "margrabe_exchange",
+    "mean_se",
+    "pair_means",
     "pairwise_mean_correlation",
+    "ratio_se",
     "strip_second_moment",
 ]

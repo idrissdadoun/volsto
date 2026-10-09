@@ -32,6 +32,7 @@ Seeds are fixed; a statistical cell that fails is reported with its table, never
 from __future__ import annotations
 
 import dataclasses
+import functools
 import inspect
 import json
 import math
@@ -77,17 +78,35 @@ from volsto.market.curves import DiscountCurve, ForwardCurve
 from volsto.market.dupire import LocalVolSurface
 from volsto.market.surface import ArbitrageError, ImpliedSurface, SSVISurface, surface_from_config
 from volsto.market.svi_slices import SviSlices, fit_svi_slice
+from volsto.market.varswap import varswap_strike
 from volsto.models.bs import BlackScholes
 from volsto.models.localvol import LocalVol
 from volsto.multi import (
+    BasketStraddle,
+    BasketVarianceSwap,
+    BestOf,
+    CorrelationSwap,
+    DispersionGap,
     MultiAssetModel,
     MultiAssetMonteCarlo,
     MultiPathSet,
+    MultiPortfolio,
+    OutperformanceOption,
     Palladium,
+    PalladiumCallSpread,
+    PalladiumPut,
+    RelativePerformanceStraddle,
+    SingleNameStraddles,
+    WorstOf,
+    dispersion_straddles,
 )
 from volsto.multi.analytics import (
     implied_correlation,
+    kappa_se,
+    margrabe_exchange,
+    mean_se,
     pairwise_mean_correlation,
+    ratio_se,
     strip_second_moment,
 )
 from volsto.multi.draws import (
@@ -117,7 +136,7 @@ from volsto.multi.lc_draws import COMMON_FACTOR_SEED_OFFSET, LocalCorrelationDra
 from volsto.multi.lc_function import LocalCorrelationFunction, ParametricLambda
 from volsto.multi.lc_kernel import lc_ab
 from volsto.multi.lc_model import BasketSpec, LocalCorrelationModel
-from volsto.studies.disp_payoff import gap_formula
+from volsto.studies.disp_payoff import daily_stats, gap_formula
 
 #: a positive definite, non-equicorrelation ``R_low`` and a rank-2 ``R_high`` above it entrywise
 #: (two perfectly correlated groups, 0.6 across)
@@ -2195,6 +2214,279 @@ def test_strip_second_moment() -> None:
 
 
 # ---------------------------------------------------------------------------------------------
+# LC5: the correlation products (I10, C3)
+# ---------------------------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def lc_paths(w5_3m: list[LocalVol]) -> tuple[MultiPathSet, Any, float]:
+    """Local correlation paths of W5 at 3m with the three monthly dates recorded (2·10⁴ paths,
+    a ``λ`` that falls with the basket): ``(paths, fixing index, horizon)``."""
+    horizon = 0.25
+    fam = CorrelationFamily.equi(5)
+    model = lc_model(w5_3m, fam, sloped_lambda(w5_3m, fam, horizon))
+    sim = SimConfig(n_paths=20_000, dt_max=DAILY, seed=11, chunk_size=10_000)
+    mc = MultiAssetMonteCarlo(sim)
+    probe = WorstOf("put", 1.0, horizon, ZERO, knock_in=0.9, monitoring=[1 / 12, 2 / 12, horizon])
+    grid = mc.build_grid([probe], model)
+    return mc.simulate(model, grid), grid.fixing_index, horizon
+
+
+def test_dispersion_product_identities(lc_paths: tuple[MultiPathSet, Any, float]) -> None:
+    """I10, the dispersion products, path by path on local correlation paths: put–call parity
+    ``(D − K)⁺ − (K − D)⁺ = D − K``; the call spread is ``Palladium(K₁) − Palladium(K₂)``; the
+    gap is ``Palladium(0) − dispersion_straddles`` and the study's ``gap_formula`` (1e-14), with
+    ``0 ≤ G ≤ 2|R̄|``; ``with_reference`` binds the levels (a product bound to the spots is the
+    product itself, bound to other levels it reads the performances against them)."""
+    paths, idx, T = lc_paths
+    w = W5_WEIGHTS
+    d = Palladium(w, 0.0, T, ZERO).payoff(paths, idx)
+    r = paths.performances(idx[T])
+    rb = r @ w
+    for K in (0.03, 0.07, 0.12):
+        call = Palladium(w, K, T, ZERO).payoff(paths, idx)
+        put = PalladiumPut(w, K, T, ZERO).payoff(paths, idx)
+        np.testing.assert_allclose(call - put, d - K, rtol=0, atol=1e-15)
+        assert np.all(put >= 0) and put.max() <= K
+    spread = PalladiumCallSpread(w, 0.05, 0.09, T, ZERO, notional=3.0).payoff(paths, idx)
+    legs = Palladium(w, 0.05, T, ZERO).payoff(paths, idx) - Palladium(w, 0.09, T, ZERO).payoff(
+        paths, idx
+    )
+    np.testing.assert_allclose(spread, 3.0 * legs, rtol=0, atol=1e-15)
+    assert spread.max() <= 3.0 * 0.04 + 1e-15 and spread.min() >= 0.0
+    gap = DispersionGap(w, T, ZERO).payoff(paths, idx)
+    np.testing.assert_allclose(
+        gap, d - dispersion_straddles(w, T, ZERO).payoff(paths, idx), rtol=0, atol=1e-15
+    )
+    np.testing.assert_allclose(gap, gap_formula(1.0 + r, w), rtol=0, atol=1e-14)
+    assert np.all(gap >= -1e-15) and np.all(gap <= 2.0 * np.abs(rb) + 1e-15)
+    scaled = DispersionGap(w, T, ZERO, basket_scale=0.5, strike=0.01).payoff(paths, idx)
+    package = np.abs(r - 0.01) @ w - 0.5 * np.abs(rb - 0.01)
+    np.testing.assert_allclose(scaled, d - package, rtol=0, atol=1e-15)
+    # reference levels
+    spots = [float(x) for x in paths.spots(0)[0]]
+    for product in (
+        Palladium(w, 0.05, T, ZERO),
+        PalladiumPut(w, 0.05, T, ZERO),
+        DispersionGap(w, T, ZERO),
+    ):
+        np.testing.assert_array_equal(
+            product.with_reference(spots).payoff(paths, idx), product.payoff(paths, idx)
+        )
+        assert product.reference is None and product.with_reference(spots).reference == tuple(spots)
+    ref = [1.1, 0.9, 1.0, 1.05, 0.95]
+    r2 = paths.spots(idx[T]) / np.array(ref) - 1.0
+    d2 = np.abs(r2 - (r2 @ w)[:, None]) @ w
+    np.testing.assert_allclose(
+        Palladium(w, 0.0, T, ZERO).with_reference(ref).payoff(paths, idx), d2, rtol=0, atol=1e-15
+    )
+    book = MultiPortfolio([Palladium(w, 0.05, T, ZERO), BasketStraddle(w, T, ZERO)], [1.0, -0.5])
+    bound = book.with_reference(ref)
+    np.testing.assert_allclose(
+        bound.payoff(paths, idx),
+        np.maximum(d2 - 0.05, 0.0) - 0.5 * np.abs(r2 @ w),
+        rtol=0,
+        atol=1e-15,
+    )
+    with pytest.raises(TypeError, match="no performance reference"):
+        BasketVarianceSwap(w, [1 / 12, T], 0.04, ZERO).with_reference(ref)
+    for bad in (lambda: PalladiumPut(w, -0.1, T, ZERO), lambda: PalladiumCallSpread(w, 0.09, 0.05, T, ZERO),
+                lambda: DispersionGap(w, T, ZERO, basket_scale=-1.0), lambda: Palladium(w, 0.0, T, ZERO).with_reference([1.0]),
+                lambda: Palladium(w, 0.0, T, ZERO, reference=[1.0, 1.0, 1.0, 1.0, -1.0])):  # fmt: skip
+        with pytest.raises(ValueError):
+            bad()
+    assert "put on dispersion" in repr(PalladiumPut(w, 0.05, T, ZERO))
+    assert "strikes 0.05 / 0.09" in repr(PalladiumCallSpread(w, 0.05, 0.09, T, ZERO))
+    assert "straddle package" in repr(DispersionGap(w, T, ZERO))
+
+
+def test_extremum_and_relative_products(lc_paths: tuple[MultiPathSet, Any, float]) -> None:
+    """I10, worst-of, best-of and relative performance, path by path: one asset gives the
+    vanilla; for two assets ``(M − K)⁺ + (m − K)⁺ = (X₁ − K)⁺ + (X₂ − K)⁺``; the worst-of call is
+    at most each single-name call; the knock-in at 0 pays nothing, at ``∞`` it is the European,
+    and it grows with the barrier and with the monitoring dates; relative straddles with ``β =
+    0`` are the single-name straddles, and one name against itself gives ``|K|``."""
+    paths, idx, T = lc_paths
+    w = W5_WEIGHTS
+    x = paths.spots(idx[T]) / paths.spots(0)
+    K = 0.97
+    for i in range(5):
+        for cp in (1.0, -1.0):
+            vanilla = np.maximum(cp * (x[:, i] - K), 0.0)
+            np.testing.assert_array_equal(
+                WorstOf(cp, K, T, ZERO, assets=[i]).payoff(paths, idx), vanilla
+            )
+            np.testing.assert_array_equal(
+                BestOf(cp, K, T, ZERO, assets=[i]).payoff(paths, idx), vanilla
+            )
+    best = BestOf("call", K, T, ZERO, assets=[0, 3]).payoff(paths, idx)
+    worst = WorstOf("call", K, T, ZERO, assets=[0, 3]).payoff(paths, idx)
+    singles = np.maximum(x[:, 0] - K, 0.0) + np.maximum(x[:, 3] - K, 0.0)
+    np.testing.assert_allclose(best + worst, singles, rtol=0, atol=1e-15)
+    worst_all = WorstOf("call", K, T, ZERO).payoff(paths, idx)
+    best_all = BestOf("put", K, T, ZERO).payoff(paths, idx)
+    for i in range(5):
+        assert np.all(worst_all <= np.maximum(x[:, i] - K, 0.0)) and np.all(
+            best_all <= np.maximum(K - x[:, i], 0.0)
+        )
+    np.testing.assert_array_equal(worst_all, np.maximum(x.min(axis=1) - K, 0.0))
+    # knock-in on the worst-of put
+    dates = [1 / 12, 2 / 12, T]
+    european = WorstOf("put", 1.0, T, ZERO).payoff(paths, idx)
+    assert np.all(
+        WorstOf("put", 1.0, T, ZERO, knock_in=0.0, monitoring=dates).payoff(paths, idx) == 0.0
+    )
+    np.testing.assert_array_equal(
+        WorstOf("put", 1.0, T, ZERO, knock_in=np.inf, monitoring=dates).payoff(paths, idx), european
+    )
+    low = WorstOf("put", 1.0, T, ZERO, knock_in=0.85, monitoring=dates).payoff(paths, idx)
+    high = WorstOf("put", 1.0, T, ZERO, knock_in=0.92, monitoring=dates).payoff(paths, idx)
+    last = WorstOf("put", 1.0, T, ZERO, knock_in=0.85).payoff(paths, idx)
+    assert np.all(last <= low) and np.all(low <= high) and np.all(high <= european)
+    assert 0.0 < last.mean() < low.mean() < high.mean() < european.mean()
+    running = np.minimum.reduce([(paths.spots(idx[t]) / paths.spots(0)).min(axis=1) for t in dates])
+    np.testing.assert_array_equal(low, np.where(running <= 0.85, european, 0.0))
+    # the reference levels of a level product
+    ref = [1.1, 0.9, 1.0, 1.05, 0.95]
+    np.testing.assert_allclose(
+        WorstOf("put", 1.0, T, ZERO).with_reference(ref).payoff(paths, idx),
+        np.maximum(1.0 - (paths.spots(idx[T]) / np.array(ref)).min(axis=1), 0.0), rtol=0, atol=1e-15,
+    )  # fmt: skip
+    # relative performance
+    r = x - 1.0
+    straddles = RelativePerformanceStraddle(
+        range(5), T, ZERO, betas=np.zeros(5), name_weights=w, weights=w, strike=0.01
+    )
+    np.testing.assert_allclose(
+        straddles.payoff(paths, idx),
+        SingleNameStraddles(w, T, ZERO, strike=0.01).payoff(paths, idx),
+        rtol=0,
+        atol=1e-15,
+    )
+    own = RelativePerformanceStraddle([2], T, ZERO, against=2, strike=-0.03).payoff(paths, idx)
+    np.testing.assert_allclose(own, 0.03, rtol=0, atol=1e-15)
+    rel = RelativePerformanceStraddle([0, 4], T, ZERO, betas=[1.0, 0.5], weights=w).payoff(
+        paths, idx
+    )
+    rb = r @ w
+    np.testing.assert_allclose(
+        rel, 0.5 * (np.abs(r[:, 0] - rb) + np.abs(r[:, 4] - 0.5 * rb)), rtol=0, atol=1e-15
+    )
+    out = OutperformanceOption(1, "call", 0.02, T, ZERO, weights=w).payoff(paths, idx)
+    np.testing.assert_allclose(out, np.maximum(r[:, 1] - rb - 0.02, 0.0), rtol=0, atol=1e-15)
+    pair = OutperformanceOption(1, "put", 0.0, T, ZERO, against=4).payoff(paths, idx)
+    np.testing.assert_allclose(pair, np.maximum(r[:, 4] - r[:, 1], 0.0), rtol=0, atol=1e-15)
+    for bad in (lambda: WorstOf("put", 1.0, T, ZERO, monitoring=dates), lambda: WorstOf("put", 1.0, T, ZERO, knock_in=-0.1),
+                lambda: WorstOf("put", 1.0, T, ZERO, knock_in=0.9, monitoring=[T + 0.1]), lambda: BestOf("call", 1.0, T, ZERO, assets=[1, 1]),
+                lambda: OutperformanceOption(0, "call", 0.0, T, ZERO), lambda: OutperformanceOption(0, "call", 0.0, T, ZERO, against=1, weights=w),
+                lambda: OutperformanceOption(0, "call", 0.0, T, ZERO, against="index"),
+                lambda: RelativePerformanceStraddle([0, 1], T, ZERO, betas=[1.0], weights=w)):  # fmt: skip
+        with pytest.raises(ValueError):
+            bad()
+    with pytest.raises(ValueError, match="beyond the paths"):
+        BestOf("call", 1.0, T, ZERO, assets=[7]).payoff(paths, idx)
+    assert "knock-in at 0.85 on 3 dates" in repr(
+        WorstOf("put", 1.0, T, ZERO, knock_in=0.85, monitoring=dates)
+    )
+    assert "against asset 4" in repr(OutperformanceOption(1, "put", 0.0, T, ZERO, against=4))
+    assert "against the basket" in repr(straddles) and "Best-of call" in repr(
+        BestOf("call", 1.0, T, ZERO)
+    )
+
+
+def test_margrabe_and_correlation_estimators() -> None:
+    """C3 and the realised-correlation products.  Two Black–Scholes names: the outperformance
+    option at ``K = 0`` is Margrabe's exchange option within 3 standard errors.  Five
+    Black–Scholes names at a constant correlation, 63 daily fixings: the Cboe-formula
+    correlation equals the study's ``daily_stats(...)["rho_real"]`` path by path, the pairwise
+    one equals the explicit double sum over pairs (zero-mean, and Pearson with ``demean``), both
+    are within 0.02 of ``ρ`` on average; the basket variance swap is the realised variance of
+    the performance basket; ``ratio_se`` and ``kappa_se`` are the delta method on pair means."""
+    cfg = LocalVolConfig(t_min=1 / 365, t_max=0.6, n_t=2, k_min=-2.0, k_max=2.0, n_k=801)
+    fc = ForwardCurve.flat(1.0, 0.0, 0.0)
+    T, rho = 0.5, 0.4
+    pair = [flat_local_vol(0.20, cfg, fc), flat_local_vol(0.30, cfg, fc)]
+    mc = MultiAssetMonteCarlo(SimConfig(n_paths=200_000, dt_max=1 / 52, seed=5, chunk_size=50_000))
+    got = mc.price(
+        OutperformanceOption(0, "call", 0.0, T, ZERO, against=1),
+        MultiAssetModel(pair, constant_correlation(2, rho)),
+    )
+    exact = margrabe_exchange(0.20, 0.30, rho, T)
+    # by hand: σ² = 0.04 + 0.09 − 2·0.4·0.06 = 0.082, ½σ√T = 0.101242, 2N(0.101242) − 1 = 0.08064
+    assert exact == pytest.approx(0.08064, abs=1e-5)
+    assert abs(got.mean - exact) < 3.0 * got.stderr, (got.mean, got.stderr, exact)
+    assert margrabe_exchange(0.2, 0.2, 1.0, T) == 0.0
+    with pytest.raises(ValueError):
+        margrabe_exchange(0.2, 0.3, 0.4, 0.0)
+    # realised correlation on a daily schedule
+    horizon, rho5 = 0.25, 0.5
+    vols = (0.20, 0.25, 0.30, 0.35, 0.40)
+    names = [flat_local_vol(v, cfg, fc) for v in vols]
+    w = W5_WEIGHTS
+    fixings = np.arange(1, 64) / 252.0
+    swaps = [
+        CorrelationSwap(w, fixings, 0.0, ZERO),
+        CorrelationSwap(w, fixings, 0.0, ZERO, estimator="pairwise"),
+        CorrelationSwap(w, fixings, 0.0, ZERO, estimator="pairwise", demean=True),
+        BasketVarianceSwap(w, fixings, 0.0, ZERO),
+    ]
+    mc5 = MultiAssetMonteCarlo(SimConfig(n_paths=20_000, dt_max=DAILY, seed=9, chunk_size=10_000))
+    model5 = MultiAssetModel(names, constant_correlation(5, rho5))
+    grid = mc5.build_grid(swaps, model5)
+    assert grid.n_steps == 63 and horizon == pytest.approx(float(fixings[-1]))
+    paths = mc5.simulate(model5, grid)
+    idx = grid.fixing_index
+    cboe, pairwise, pearson, rv = (s.payoff(paths, idx) for s in swaps)
+    cols = idx.indices(np.concatenate(([0.0], fixings)))
+    level = np.stack([paths.spot_at(cols, i) for i in range(5)], axis=2)  # (paths, dates, names)
+    for p in range(40):
+        stats = daily_stats(level[p] / level[p, 0], w)
+        assert cboe[p] == pytest.approx(stats["rho_real"], abs=1e-12)
+        lr = np.diff(np.log(level[p]), axis=0)
+        for values, demean in ((pairwise, False), (pearson, True)):
+            x = lr - lr.mean(axis=0) if demean else lr
+            num = den = 0.0
+            for i in range(5):
+                for j in range(i + 1, 5):
+                    c = float(
+                        x[:, i] @ x[:, j] / np.sqrt((x[:, i] @ x[:, i]) * (x[:, j] @ x[:, j]))
+                    )
+                    num, den = num + w[i] * w[j] * c, den + w[i] * w[j]
+            assert values[p] == pytest.approx(num / den, abs=1e-12)
+        basket = (level[p] / level[p, 0]) @ w
+        assert rv[p] == pytest.approx(
+            252.0 / 63 * float(np.sum(np.diff(np.log(basket)) ** 2)), abs=1e-14
+        )
+    for values in (cboe, pairwise, pearson):
+        assert abs(float(values.mean()) - rho5) < 0.02, float(values.mean())
+    strike = CorrelationSwap(w, fixings, 0.45, ZERO, notional=2.0).payoff(paths, idx)
+    np.testing.assert_allclose(strike, 2.0 * (cboe - 0.45), rtol=0, atol=1e-15)
+    for bad in (lambda: CorrelationSwap(w, fixings, 0.0, ZERO, estimator="spearman"), lambda: CorrelationSwap(w, fixings, 0.0, ZERO, demean=True),
+                lambda: CorrelationSwap([1.0], fixings, 0.0, ZERO), lambda: BasketVarianceSwap(w, [0.1], 0.0, ZERO)):  # fmt: skip
+        with pytest.raises(ValueError):
+            bad()
+    assert "Cboe formula" in repr(swaps[0]) and "pairwise, demeaned" in repr(swaps[2])
+    assert "variance strike 0" in repr(swaps[3])
+    # the delta-method standard errors on antithetic pair means
+    rng = np.random.default_rng(1)
+    a, b = rng.lognormal(0.0, 0.3, 4000), rng.lognormal(0.1, 0.2, 4000)
+    ya, yb = 0.5 * (a[0::2] + a[1::2]), 0.5 * (b[0::2] + b[1::2])
+    r, se = ratio_se(a, b)
+    assert r == pytest.approx(ya.mean() / yb.mean(), rel=1e-15)
+    assert se == pytest.approx(
+        float(np.std((ya - r * yb) / yb.mean(), ddof=1) / np.sqrt(2000)), rel=1e-12
+    )
+    assert (r, se) == lcm.pair_ratio(a, b) and mean_se(a) == lcm.pair_mean(a)
+    kappa, kse = kappa_se(a, b)
+    assert kappa == pytest.approx(ya.mean() / np.sqrt(yb.mean()), rel=1e-15) and 0 < kse < 0.05
+    assert mean_se(a, antithetic=False)[1] == pytest.approx(
+        float(a.std(ddof=1) / np.sqrt(4000)), rel=1e-12
+    )
+    with pytest.raises(ValueError):
+        mean_se(a[:-1])
+
+
+# ---------------------------------------------------------------------------------------------
 # LC4 acceptance (slow): helpers
 # ---------------------------------------------------------------------------------------------
 
@@ -2994,6 +3286,83 @@ def test_s10_carry_mode() -> None:
     assert z.abs().max() < 3.0, rep.forwards.to_string()
     atm = rep.table[rep.table["sd"] == 0.0]
     assert (atm["error_vp"].abs() <= np.maximum(0.15, 3 * atm["stderr_vp"])).all(), atm.to_string()
+
+
+# ---------------------------------------------------------------------------------------------
+# S8, S9: the variance anchors on W5 (LC5)
+# ---------------------------------------------------------------------------------------------
+
+
+@functools.lru_cache(maxsize=1)
+def w5_production() -> tuple[list[LocalVol], CorrelationFamily, BasketSpec, ImpliedSurface, Any]:
+    """W5 at 3m calibrated to its analytic index target at the production budget (shared by S8
+    and S9): ``(names, family, basket, index surface, calibration result)``."""
+    horizon = 0.25
+    models = w5_models(horizon)
+    fam = CorrelationFamily.equi(5)
+    basket = w5_basket(models)
+    surface, _ = w5_target(horizon)
+    return models, fam, basket, surface, calibrate(models, fam, basket, surface, horizon)
+
+
+@pytest.mark.slow
+def test_s8_variance_anchor_w5() -> None:
+    """S8 on W5 at 3m: the model's ``E[V]``, ``V = Σ w R_i² − R̄²``, against the strips of its
+    targets, ``E^Q[V] = Σ w M_i − M_B`` (``strip_second_moment`` on the five names' surfaces and
+    on the index target): ``|E^LC[V]/E^Q[V] − 1| ≤ 1 %``.  Printed: the split of the difference
+    into its single-name part and its basket part."""
+    models, fam, basket, surface, res = w5_production()
+    horizon, w = 0.25, W5_WEIGHTS
+    model = LocalCorrelationModel(models, fam, res.lam, basket)
+    sim = production_sim()
+    grid = TimeGrid.build([horizon], sim.dt_max, calibration_grid=model.required_times())
+    draws = model.draws_for(grid, sim.seed, sim.n_paths, sim.antithetic)
+    sq, rb = np.empty(sim.n_paths), np.empty(sim.n_paths)
+    for p0, p1 in sim.chunk_ranges(grid.n_records * model.n_assets, 0):
+        r = model.simulate_chunk(grid, draws, p0, p1, sim.scheme).performances(
+            grid.fixing_index[horizon]
+        )
+        sq[p0:p1], rb[p0:p1] = (r * r) @ w, r @ w
+    ev, ev_se = mean_se(sq - rb * rb)
+    strips = np.array([strip_second_moment(x, horizon) for x in w5_surfaces()])
+    m_b = float(strip_second_moment(surface, horizon))  # type: ignore[arg-type]
+    eqv = float(w @ strips) - m_b
+    names, names_se = mean_se(sq)
+    index, index_se = mean_se(rb * rb)
+    print(
+        f"\nS8 W5 3m: E_LC[V] = {ev:.6f} ({ev_se:.6f}); E_Q[V] = Σ w M_i - M_B = {float(w @ strips):.6f} - "
+        f"{m_b:.6f} = {eqv:.6f}; ratio {ev / eqv:.5f} ({ev_se / eqv:.5f}); split: single names "
+        f"{names - float(w @ strips):+.6f} ({names_se:.6f}), basket {index - m_b:+.6f} ({index_se:.6f}); "
+        f"clipped mass inside ±{lcal.CLIP_GATE_SD:g} sd {res.max_clipped_mass_inner:.4f}"
+    )
+    assert abs(ev / eqv - 1.0) <= 0.01
+
+
+@pytest.mark.slow
+def test_s9_basket_variance_swap_w5() -> None:
+    """S9 on W5 at 3m: the vol strike of the basket variance swap under the model — the realised
+    variance of the performance basket on 63 daily fixings — against the variance-swap strike
+    of the index target's strip (``varswap_strike``, log-contract replication): within 0.30 vp.
+    Printed with the clipped mass."""
+    models, fam, basket, surface, res = w5_production()
+    horizon = 0.25
+    model = LocalCorrelationModel(models, fam, res.lam, basket)
+    # the 63 daily fixings, read off the model's own grid (the quarter-step nodes hold them; a
+    # fixing one ulp away from a node is not a grid time)
+    nodes = np.asarray(model.required_times())
+    fixings = [float(nodes[int(np.argmin(np.abs(nodes - j / 252.0)))]) for j in range(1, 64)]
+    assert np.allclose(fixings, np.arange(1, 64) / 252.0, rtol=0, atol=1e-12)
+    swap = BasketVarianceSwap(W5_WEIGHTS, fixings, 0.0, ZERO)
+    price = MultiAssetMonteCarlo(production_sim()).price(swap, model)
+    vol_lc = float(np.sqrt(price.mean))
+    vol_strip = float(np.sqrt(varswap_strike(surface, horizon)))
+    print(
+        f"\nS9 W5 3m: basket variance swap under LC {100 * vol_lc:.4f} vp "
+        f"({100 * price.stderr / (2 * vol_lc):.4f}); the index target's strip {100 * vol_strip:.4f} vp; "
+        f"difference {100 * (vol_lc - vol_strip):+.4f} vp; clipped mass inside ±{lcal.CLIP_GATE_SD:g} sd "
+        f"{res.max_clipped_mass_inner:.4f} (whole cloud {res.max_clipped_mass:.4f})"
+    )
+    assert abs(vol_lc - vol_strip) <= 0.0030
 
 
 # ---------------------------------------------------------------------------------------------
