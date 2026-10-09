@@ -132,9 +132,19 @@ study's model S 0.876). At `β = 10` the clipped mass rises again (9.2 %, now wh
 its clip and on the upside, where `g < 1` lowers the names' volatilities and more correlation is
 asked for): one exponential with a clip is not the right shape for both wings.
 
-Two dates, one budget, one shape of `g`: an indication, not a result. What the two scans agree
-on: the names keep their second moment, the basket's reaches the listed strip's as the clipped
-mass falls, and the forward falls further than M12's but by less than the bracketing formulas.
+**2019-09-03** (`--betas 0,3,6 --g-max 3`; the clipped mass of M12 is 13 % there, at short
+maturities, and the 3m wing is already near: −0.41 vp at −2.5 sd): `β` = 0 / 3 / 6 → clipped mass
+inside ±2.5 sd 13.3 / 6.9 / 3.9 %; index at −2.5 sd −0.41 / −0.14 / −0.13 vp; `E[D]/E^CC[D]`
+0.9594 / 0.9632 / 0.9439 (errors 0.0007); κ 0.766 / 0.773 / 0.756; the names' second moment
+over the listed strips +1.0 / +0.8 / +1.0 %. The forward is not monotone in `β` on this date:
+where the index wing costs little to reach, what `β` changes is mostly how dispersion is
+distributed over index levels, and the family spans about ±1 % of the forward.
+
+Three dates, one budget, one shape of `g`: an indication, not a result. What the scans agree on:
+the names keep their second moment and the basket's reaches the listed strip's as the clipped
+mass falls. Where the wing is far out of M12's reach (2026-10-02, 2017-04-03) the forward falls
+further than M12's, by less than the bracketing formulas; where it is near (2019-09-03) the
+forward moves by about ±1 % either way.
 
 ## 5. What this is and is not
 
