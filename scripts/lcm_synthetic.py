@@ -22,7 +22,9 @@ for S1 the clipped mass inside ±2.5 sd slice by slice, before and after the tar
 pillar, as designed and with a two-week pillar added to the target; for S3 the smallest ``λ̂``
 slice by slice (``--t-min 2016``: with the Dupire grids starting at 1/2016 instead of 1/365, the
 owner's hypothesis of the second round — the dip does not go away, it deepens), and for S3's
-smile (``s3-smile``) the calibrated ``λ`` against ``λ = 1`` imposed on four pricing seeds.
+smile (``s3-smile``) the calibrated ``λ`` and ``λ = 1`` imposed, each against the target on
+four pricing seeds, and their paired difference on common paths seed by seed (the gate of the
+owner's decision 4 of 2026-10-09).
 
 The numbers of SPEC §8.7 labelled "one-week variant", "tail rule, W5" and "where" come from
 here; the Dow ones from ``scripts/lcm_diagnostics.py``.
@@ -194,8 +196,12 @@ def where_s3() -> None:
 
 def where_s3_smile() -> None:
     """S3's smile: the five identical names priced with the calibrated ``λ`` and with ``λ = 1``
-    imposed (the basket is then one name, so the error is the name's own discretisation of its
-    smile), on four pricing seeds of 8·10⁵ paths."""
+    imposed (the basket is then one name, so the error is the name's own repricing of its
+    smile), each against the analytic target on four pricing seeds of 8·10⁵ paths pooled; then
+    the gate of the owner's decision 4 of 2026-10-09 (SPEC §8.7) as ``test_s3_identical_names``
+    reads it — the paired difference of the two smiles on the same paths, from −2.5 to +2.5 sd,
+    against 0.05 vp with no noise allowance (``smile_against_lambda_one`` of the test file) —
+    on each of the four pricing seeds (the test reads the first)."""
     horizon = 0.25
     surface = t.w5_surfaces(2)[1]
     name = LocalVol(
@@ -214,12 +220,27 @@ def where_s3_smile() -> None:
         )
         over = len(rep.violations(0.05, 1.5, 0.05, 2.5))
         log.info(
-            "S3 smile under %s, %d pricing seeds: %d cells over the 0.05 vp gate\n%s",
+            "S3 smile under %s against the target, %d pricing seeds pooled: %d cells over max(0.05 vp, 3 se), "
+            "the gate before the decision of 2026-10-09\n%s",
             tag,
             len(seeds),
             over,
             rep.summary(),
         )
+    model = LocalCorrelationModel(models, fam, res.lam, basket)
+    for seed in seeds:
+        smile = t.smile_against_lambda_one(
+            model, t.production_sim(seed=seed), t.W5_3M_PILLARS, surface
+        )
+        worst = smile.loc[smile["diff_vp"].abs().idxmax()]
+        over = int((~(smile["diff_vp"].abs() <= t.S3_SMILE_GATE_VP)).sum())
+        log.info(
+            "S3 gate (decision 4 of 2026-10-09), pricing seed %d: the calibrated lambda minus lambda = 1 on the same "
+            "paths, vol points (paired se); largest |difference| %.4f (%.4f) at T = %.4f, %+.1f sd; %d of %d cells "
+            "over %g vp\n%s",
+            seed, abs(worst["diff_vp"]), worst["se_vp"], worst["T"], worst["sd"], over, len(smile),
+            t.S3_SMILE_GATE_VP, t.paired_cells(smile),
+        )  # fmt: skip
 
 
 def where_s1() -> None:

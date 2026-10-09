@@ -6,8 +6,12 @@
     python scripts/lcm_diagnostics.py tail      --date D
     python scripts/lcm_diagnostics.py wing      --date D
     python scripts/lcm_diagnostics.py baseline  [--write]
-    python scripts/lcm_diagnostics.py strips    --date D
+    python scripts/lcm_diagnostics.py strips    --date D [--screen repair|norepair|...] [--paths N] [--model zero|lc]
     python scripts/lcm_diagnostics.py calendar  --date D
+
+``--screen`` names one of ``SCREENS``: ``default`` (the M12 default of ``ExpiryScreen``),
+``norepair`` and ``repair`` (the default quote rules without and with the names' calendar repair
+and the unscreened fallback, both stated), ``third-friday``, ``off``.
 
 Every Dow number of SPEC §8.7 comes from one of these commands (the synthetic ones come from the
 slow tests of ``tests/test_local_correlation.py`` and from ``scripts/lcm_synthetic.py``):
@@ -31,10 +35,17 @@ slow tests of ``tests/test_local_correlation.py`` and from ``scripts/lcm_synthet
 * ``baseline`` — the run behind the M12 baseline of test S11 (``tests/golden/``).
 * ``strips`` — the single-name part of ``E[V] − E^Q[V]``: each name's second moment from its SVI
   surface against the study's strip (vols linear between listed strikes, flat beyond them), by
-  region of the strike axis, and the model's Monte Carlo against the SVI strip.
+  region of the strike axis, and the model's Monte Carlo against the SVI strip — in total and,
+  exactly per path, by the same regions (``model_regions``: puts and calls beyond the last
+  listed strike, and inside the listed range), with the names that carry the difference (the
+  owner's decision 3 of 2026-10-09: which tail puts ``Σ w E[R_i²]`` above the strips), and how
+  few paths carry the region above the listed strikes (``call_wing_paths``).  No calibration by
+  default, the names' law does not depend on the correlation; ``--model lc`` calibrates and
+  splits the calibrated model's pricing paths, the ones the sweep's check is computed on.
 * ``calendar`` — the effect of the calendar crossings inside ±2 sd of the cloud: the offending
   slices dropped, the model recalibrated, ``E[D]``, the calls and the index smile compared on
-  the same particles and the same pricing paths.
+  the same particles and the same pricing paths.  Its base is the chosen screen with the
+  calendar repair off, whatever the default: the command drops the slices itself.
 
 The smiles are the study's own (``scripts/disp_entries.py::smiles_of``, the loader behind
 ``marginals_for``; its defaults are untouched).  Results are logged and written as JSON under
@@ -126,9 +137,27 @@ PARTICLE_SEED = 12345
 PRICING_SEED = 2024
 PRODUCTION = 800_000
 DAILY = 1.0 / 252.0
+#: The expiry screens of ``--screen``, each stated in full so that none but ``default`` moves
+#: with the defaults of ``ExpiryScreen``.  ``default``: the M12 default, whatever it is;
+#: ``norepair``: the default quote rules, no calendar repair of the names and no unscreened
+#: fallback (the screen of the development pass ``lcm_3m_dev_norepair``); ``repair``: the same
+#: quote rules with both on (the variant pass ``lcm_3m_dev_repair``; the owner's decisions 1 and
+#: 2 of 2026-10-09); ``third-friday``: the index's third-Friday rule alone, no quote rule,
+#: neither option; ``off``: ``ExpiryScreen.off()``, every expiry the loader returns.
 SCREENS: dict[str, ExpiryScreen] = {
     "default": ExpiryScreen(),
-    "third-friday": ExpiryScreen(True, False, math.inf, math.inf),
+    "norepair": dataclasses.replace(
+        ExpiryScreen(), calendar_repair=False, unscreened_fallback=False
+    ),
+    "repair": dataclasses.replace(ExpiryScreen(), calendar_repair=True, unscreened_fallback=True),
+    "third-friday": ExpiryScreen(
+        index_third_friday=True,
+        nearest_two_sided=False,
+        max_half_spread_vp=math.inf,
+        max_half_spread_long_vp=math.inf,
+        calendar_repair=False,
+        unscreened_fallback=False,
+    ),
     "off": ExpiryScreen.off(),
 }
 #: ``lc``: the model's schedule (quarter steps over the first two weeks); ``week``: the
@@ -271,7 +300,8 @@ def pair_ratio(a: np.ndarray, b: np.ndarray) -> tuple[float, float]:
 class Sample:
     """Per path at the horizon: the dispersion ``D = Σ w|R_i − R̄|``, ``Σ w R_i²`` and ``R̄``
     (``R_i = S_i(T)/S_i(0) − 1``); and the basket's forward-moneyness level ``e^{k_B}`` at the
-    pillars."""
+    pillars.  ``R``: the names' performances themselves, ``(n_paths, n_names)``, when the pass
+    was asked to keep them (the ``strips`` command; ``None`` otherwise)."""
 
     D: np.ndarray
     sq: np.ndarray
@@ -279,6 +309,7 @@ class Sample:
     levels: np.ndarray
     pillars: list[float]
     seconds: float
+    R: np.ndarray | None = None
 
     @property
     def V(self) -> np.ndarray:
@@ -291,8 +322,12 @@ def sample(
     weights: np.ndarray,
     pillars: Sequence[float],
     draws: LocalCorrelationDraws | None = None,
+    *,
+    keep_performances: bool = False,
 ) -> Sample:
-    """One pass over the pricing paths (or over given draws: the Δt check)."""
+    """One pass over the pricing paths (or over given draws: the Δt check).
+    ``keep_performances``: also keep every name's ``R_i`` at the horizon, per path (8 bytes per
+    path and name); the other fields are what the pass returns without it."""
     t0 = time.perf_counter()
     mats = [float(t) for t in pillars]
     grid = TimeGrid.build(mats, sim.dt_max, calibration_grid=model.required_times())
@@ -300,6 +335,7 @@ def sample(
     cols = [grid.fixing_index[t] for t in mats]
     n = sim.n_paths
     D, sq, rb, lev = np.empty(n), np.empty(n), np.empty(n), np.empty((n, len(mats)))
+    R = np.empty((n, model.n_assets)) if keep_performances else None
     for p0, p1 in sim.chunk_ranges(grid.n_records * model.n_assets, 0):
         paths = model.simulate_chunk(grid, d, p0, p1, sim.scheme)
         r = paths.performances(cols[-1])
@@ -307,9 +343,11 @@ def sample(
         D[p0:p1] = np.abs(r - mean[:, None]) @ weights
         sq[p0:p1] = (r * r) @ weights
         rb[p0:p1] = mean
+        if R is not None:
+            R[p0:p1] = r
         assert paths.aux is not None
         lev[p0:p1] = np.exp(paths.aux["k_basket"][:, cols])
-    return Sample(D, sq, rb, lev, mats, time.perf_counter() - t0)
+    return Sample(D, sq, rb, lev, mats, time.perf_counter() - t0, R)
 
 
 def smile_cells(
@@ -1115,6 +1153,9 @@ REGIONS = (
     "listed, above the forward",
     "above the listed strikes",
 )
+#: The same four, as the options that carry them (the columns of the tables by name): puts and
+#: calls beyond the last listed strike, and inside the listed range.
+REGION_SHORT = ("puts beyond", "puts listed", "calls listed", "calls beyond")
 
 
 def strip_regions(inp: DowInputs, market: LCMarket) -> pd.DataFrame:
@@ -1122,7 +1163,8 @@ def strip_regions(inp: DowInputs, market: LCMarket) -> pd.DataFrame:
     smile (all the study's listed expiries), each split into ``(f − 1)²`` and the strip by
     region of the strike axis — below the listed strikes, listed below the forward, listed
     above it, above the listed strikes (the listed range is the one the two bracketing expiries
-    share) — and the entry's own ``M_i``."""
+    share) — and the entry's own ``M_i``.  The cuts are log-moneyness levels ``k_lo < 0 < k_hi``
+    on each smile's own forward (``f_study``, ``f_svi``: the two forwards over the spot)."""
     T = inp.T
     entry_m = np.asarray(inp.entry["legs"]["M"], dtype=float)
     rows = []
@@ -1133,10 +1175,13 @@ def strip_regions(inp: DowInputs, market: LCMarket) -> pd.DataFrame:
         cuts = [k_lo, 0.0, k_hi]
         study_total, study_parts = strip_second_moment(StudySmile(smile), T, splits=cuts)  # type: ignore[arg-type,misc]
         svi_total, svi_parts = strip_second_moment(market.surfaces[i], T, splits=cuts)  # type: ignore[misc]
+        curve = market.surfaces[i].forward_curve
         row: dict[str, Any] = {"name": name, "weight": float(inp.weights[i] / inp.weights.sum()),
                                "k_lo": k_lo, "k_hi": k_hi, "M_entry": float(entry_m[i]),
                                "M_study": float(study_total), "M_svi": float(svi_total),
-                               "sd": float(smile.vol(0.0)) * math.sqrt(T)}  # fmt: skip
+                               "sd": float(smile.vol(0.0)) * math.sqrt(T),
+                               "f_study": float(smile.forward / smile.spot),
+                               "f_svi": float(curve.forward(T)) / float(curve.spot)}  # fmt: skip
         for j, label in enumerate(REGIONS):
             row[f"study: {label}"] = float(study_parts[j])
             row[f"svi: {label}"] = float(svi_parts[j])
@@ -1144,14 +1189,137 @@ def strip_regions(inp: DowInputs, market: LCMarket) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+FORWARD_TERM = "forward term"
+
+
+def model_regions(
+    R: np.ndarray, weights: np.ndarray, forwards: np.ndarray, k_lo: np.ndarray, k_hi: np.ndarray
+) -> tuple[pd.DataFrame, dict[str, tuple[float, float]], float]:
+    """The model's Monte Carlo ``E[R_i²]`` split by the regions of :func:`strip_regions`, exactly
+    per path.  With ``X = S_T/S_0 = 1 + R`` and any level ``f``,
+
+        (X − 1)² = (f − 1)² + 2(f − 1)(X − f) + ((f − X)⁺)² + ((X − f)⁺)²,
+
+    and, since ``d/dK ((K − X)⁺)² = 2(K − X)⁺`` and ``d/dK ((X − K)⁺)² = −2(X − K)⁺``,
+
+        2·∫_{K1}^{K2} (K − X)⁺ dK = ((K2 − X)⁺)² − ((K1 − X)⁺)²        (the put side, K2 ≤ f),
+        2·∫_{K1}^{K2} (X − K)⁺ dK = ((X − K1)⁺)² − ((X − K2)⁺)²        (the call side, K1 ≥ f).
+
+    Taking expectations with ``f`` the forward over the spot gives the strip of
+    ``volsto.multi.analytics.strip_second_moment`` (Carr–Madan: ``E[R²] = (f − 1)² +
+    2∫_0^f P(K) dK + 2∫_f^∞ C(K) dK``), so the part of ``E[R²]`` carried by the strikes
+    ``[K1, K2]`` is the mean of the right-hand sides above.  With ``K_lo = f·e^{k_lo}`` and
+    ``K_hi = f·e^{k_hi}`` (the cuts of the SVI strip, on the model's forward) the four regions
+    are, per path,
+
+        below the listed strikes     ((K_lo − X)⁺)²
+        listed, below the forward    ((f − X)⁺)² − ((K_lo − X)⁺)²
+        listed, above the forward    ((X − f)⁺)² − ((X − K_hi)⁺)²
+        above the listed strikes     ((X − K_hi)⁺)²
+
+    and what is left of ``R²`` is ``(f − 1)²`` and the forward term ``2(f − 1)(X − f)``, whose
+    expectation is zero under the model and whose sample mean ``2(f − 1)(X̄ − f)`` is reported
+    with the rest: the four regions, ``(f − 1)²`` and the forward term sum to the sample's
+    ``E[R²]`` path by path.
+
+    Returns ``(per name, weighted over the names, gap)``: per name the mean and the standard
+    error (antithetic pair means) of ``R²``, of each region and of the forward term; the same
+    for ``Σ_i w_i ·`` (the weighted sum is formed per path, then averaged over pairs); and the
+    largest ``|regions + (f − 1)² + forward term − E[R²]|`` over the names, which is rounding
+    (``run_strips`` logs it and refuses a run where it is above 1e-12)."""
+    n, m = R.shape
+    labels = [*REGIONS, FORWARD_TERM]
+    acc = np.zeros((n, len(labels)))
+    rows, gap = [], 0.0
+    for i in range(m):
+        f, x = float(forwards[i]), 1.0 + R[:, i]
+        lo, hi = f * math.exp(float(k_lo[i])), f * math.exp(float(k_hi[i]))
+        below, above = np.maximum(lo - x, 0.0) ** 2, np.maximum(x - hi, 0.0) ** 2
+        parts = [
+            below,
+            np.maximum(f - x, 0.0) ** 2 - below,
+            np.maximum(x - f, 0.0) ** 2 - above,
+            above,
+            2.0 * (f - 1.0) * (x - f),
+        ]
+        total = pair_mean(R[:, i] ** 2)
+        row: dict[str, Any] = {"M_mc": total[0], "M_mc_se": total[1], "f_mc": float(x.mean()), "x_max": float(x.max())}  # fmt: skip
+        s = (f - 1.0) ** 2
+        for j, label in enumerate(labels):
+            row[f"mc: {label}"], row[f"mc_se: {label}"] = pair_mean(parts[j])
+            s += row[f"mc: {label}"]
+            acc[:, j] += weights[i] * parts[j]
+        gap = max(gap, abs(s - total[0]))
+        rows.append(row)
+    return (
+        pd.DataFrame(rows),
+        {label: pair_mean(acc[:, j]) for j, label in enumerate(labels)},
+        gap,
+    )
+
+
+WING_SHARES = (1, 10, 100, 1000)
+
+
+def call_wing_paths(
+    R: np.ndarray,
+    weights: np.ndarray,
+    forwards: np.ndarray,
+    k_hi: np.ndarray,
+    names: Sequence[str],
+    n_top: int = 8,
+) -> tuple[dict[str, Any], pd.DataFrame]:
+    """How few paths carry the region above the listed strikes.  Per path and name the cell
+    ``c_i = w_i·((X_i − K_hi,i)⁺)²`` of :func:`model_regions` (the mean over the paths of
+    ``Σ_i c_i`` is the region's part of ``Σ w E[R_i²]``).  Returns the number of paths with a
+    name above its last listed strike and the share of the region's sum carried by its 1, 10,
+    100 and 1000 largest paths (``WING_SHARES``); and the ``n_top`` largest cells: the name, the
+    path, ``X = S_T/S_0``, its log-moneyness on the forward ``ln(X/f)`` and the cell's part of
+    the region's mean, ``c_i/n``.  A second moment whose sample mean a handful of paths carry
+    has a standard error that is itself not estimated (it is the same handful)."""
+    n = R.shape[0]
+    f = np.asarray(forwards, dtype=float)
+    cells = np.asarray(weights) * np.maximum(1.0 + R - f * np.exp(np.asarray(k_hi)), 0.0) ** 2
+    per_path = cells.sum(axis=1)
+    ranked = np.sort(per_path)[::-1]
+    total = float(ranked.sum())
+    summary: dict[str, Any] = {"n_paths_above": int(np.count_nonzero(per_path)), "region_mean": total / n}  # fmt: skip
+    for k in WING_SHARES:
+        summary[f"share_top_{k}"] = float(ranked[:k].sum() / total) if total > 0 else float("nan")
+    flat = np.argsort(cells, axis=None)[::-1][:n_top]
+    rows = []
+    for path, i in zip(*np.unravel_index(flat, cells.shape), strict=True):
+        x = 1.0 + float(R[path, i])
+        rows.append({"name": names[i], "path": int(path), "X": x, "ln(X/f)": math.log(x / float(f[i])),
+                     "part of the region": float(cells[path, i]) / n,
+                     "share": float(cells[path, i]) / total if total > 0 else float("nan")})  # fmt: skip
+    return summary, pd.DataFrame(rows)
+
+
+def _cell(value: float, se: float | None = None) -> str:
+    return f"{value:+.6f}" if se is None else f"{value:+.6f} ({se:.6f})"
+
+
 def run_strips(args: argparse.Namespace) -> dict[str, Any]:
+    """The ``strips`` command.  First the SVI surfaces against the study's strips (the second
+    round's table, unchanged); then the model's Monte Carlo ``Σ w E[R_i²]`` in total and — the
+    owner's decision 3 of 2026-10-09 — by region of the strike axis (:func:`model_regions`),
+    against both strips, with the names that carry the difference."""
     t0 = time.perf_counter()
     inp = load_inputs(args.date, args.tenor)
-    spec, _ = build_spec(inp, n_particles=args.particles, n_paths=args.paths, screen=args.screen, schedule=SCHEDULES[args.schedule])  # fmt: skip
+    spec, info = build_spec(inp, n_particles=args.particles, n_paths=args.paths, screen=args.screen, schedule=SCHEDULES[args.schedule])  # fmt: skip
     market = build_lc_market(spec)
     table = strip_regions(inp, market)
     w = table["weight"].to_numpy()
     log.info("=== single-name strips on %s %s (T = %.6f)", args.date, args.tenor, inp.T)
+    by_rule: dict[str, int] = {}
+    for g in info["dropped"]:
+        by_rule[g["rule"]] = by_rule.get(g["rule"], 0) + 1
+    log.info(
+        "screen %s %s: expiries dropped %s; by the calendar repair: %s; names kept unscreened: %s",
+        args.screen, info["screen"], by_rule,
+        [(g["leg"], g["expiry"]) for g in info["dropped"] if g["rule"] == "calendar"], info["names_unscreened"],
+    )  # fmt: skip
     check = float(np.max(np.abs(table["M_study"] / table["M_entry"] - 1.0)))
     log.info(
         "Σ w M_i: the entry %.6f; the study's strip rebuilt here %.6f (largest relative difference by name %.1e); "
@@ -1176,21 +1344,137 @@ def run_strips(args: argparse.Namespace) -> dict[str, Any]:
         "the eight names with the largest weighted difference:\n%s",
         show.to_string(index=False, float_format=lambda x: f"{x:.6f}"),
     )
-    # the model's own second moments: the names' law does not depend on the correlation
-    res_times = TimeGrid.build([inp.T], spec.sim.dt_max).times
-    zero = LocalCorrelationFunction.constant(0.0, res_times, market.index_lv.k_grid)
-    smp = sample(model_of(spec, market, zero), spec.sim, np.array(spec.weights), [inp.T])
+    # the model's own second moments: the names' law does not depend on the correlation, so the
+    # paths are those of lambda = 0 and nothing is calibrated; ``--model lc`` calibrates and takes
+    # the calibrated model's pricing paths at the repricing pillars, the paths of the sweep's check
+    w_model = np.array(spec.weights)
+    if args.model == "lc":
+        res = calibrate(spec, market)
+        lam, pillars = res.lam, repricing_pillars(spec)
+        log.info(
+            "the paths below are the calibrated model's (%d particles, %.0f s; clipped mass inside ±%.1f sd %.4f)",
+            spec.lc.particle.n_particles, res.wall_time, CLIP_GATE_SD, res.max_clipped_mass_inner,
+        )  # fmt: skip
+    else:
+        res_times = TimeGrid.build([inp.T], spec.sim.dt_max).times
+        lam, pillars = LocalCorrelationFunction.constant(0.0, res_times, market.index_lv.k_grid), [inp.T]  # fmt: skip
+    smp = sample(model_of(spec, market, lam), spec.sim, w_model, pillars, keep_performances=True)
     mc = pair_mean(smp.sq)
     log.info(
         "the model's Monte Carlo Σ w E[R_i²] = %.6f (%.6f): against the SVI strips %+.6f, against the study's %+.6f "
         "(the single-name part of E[V] - E^Q[V])",
         mc[0], mc[1], mc[0] - float(w @ table["M_svi"]), mc[0] - float(w @ table["M_entry"]),
     )  # fmt: skip
+    # the same Monte Carlo by region of the strike axis, exactly per path (model_regions)
+    assert smp.R is not None
+    per_name, mc_region, gap = model_regions(
+        smp.R,
+        w_model,
+        table["f_svi"].to_numpy(),
+        table["k_lo"].to_numpy(),
+        table["k_hi"].to_numpy(),
+    )
+    table = pd.concat([table, per_name], axis=1)
+    const = float(w_model @ (table["f_svi"] - 1.0) ** 2)
+    gap_total = abs(sum(v[0] for v in mc_region.values()) + const - mc[0])
+    fwd = mc_region[FORWARD_TERM]
+    log.info(
+        "the model's Monte Carlo by region (%d paths): the four regions + (f - 1)² + the forward term 2(f - 1)(X̄ - f) "
+        "against E[R_i²], largest gap by name %.1e, weighted %.1e; without the forward term the gap is the term itself: "
+        "largest by name %.1e, Σ w %+.2e (%.1e); the names' forwards: max |X̄/f - 1| = %.1e",
+        smp.R.shape[0], gap, gap_total, float(table[f"mc: {FORWARD_TERM}"].abs().max()), fwd[0], fwd[1],
+        float((table["f_mc"] / table["f_svi"] - 1.0).abs().max()),
+    )  # fmt: skip
+    if max(gap, gap_total) > 1e-12:
+        raise RuntimeError(f"the regions do not sum to the Monte Carlo E[R²]: gap {gap:.2e}, weighted {gap_total:.2e}")  # fmt: skip
+    sums = {"study": float(w @ table["M_study"]), "svi": float(w @ table["M_svi"])}
+    region_rows = []
+    for label in REGIONS:
+        st, sv = float(w @ table[f"study: {label}"]), float(w @ table[f"svi: {label}"])
+        region_rows.append({"region": label, "study": st, "svi": sv, "mc": mc_region[label][0], "mc_se": mc_region[label][1]})  # fmt: skip
+    inner = {k: sum(r[k] for r in region_rows) for k in ("study", "svi", "mc")}
+    # what is not strip: (f − 1)², the quadrature of the two strips, the forward term of the sample
+    region_rows.append({"region": "the rest", "study": sums["study"] - inner["study"], "svi": sums["svi"] - inner["svi"],
+                        "mc": mc[0] - inner["mc"], "mc_se": fwd[1]})  # fmt: skip
+    region_rows.append({"region": "total", "study": sums["study"], "svi": sums["svi"], "mc": mc[0], "mc_se": mc[1]})  # fmt: skip
+    for r in region_rows:
+        r["svi_minus_study"], r["mc_minus_svi"], r["mc_minus_study"] = r["svi"] - r["study"], r["mc"] - r["svi"], r["mc"] - r["study"]  # fmt: skip
+    regions = pd.DataFrame(region_rows)
+    shown = pd.DataFrame({
+        "region": regions["region"],
+        "study": [f"{x:.6f}" for x in regions["study"]],
+        "SVI": [f"{x:.6f}" for x in regions["svi"]],
+        "model MC (se)": [f"{x:.6f} ({e:.6f})" for x, e in zip(regions["mc"], regions["mc_se"], strict=True)],
+        "SVI - study": [_cell(x) for x in regions["svi_minus_study"]],
+        "model - SVI (se)": [_cell(x, e) for x, e in zip(regions["mc_minus_svi"], regions["mc_se"], strict=True)],
+        "model - study (se)": [_cell(x, e) for x, e in zip(regions["mc_minus_study"], regions["mc_se"], strict=True)],
+    })  # fmt: skip
+    log.info(
+        "Σ w E[R_i²] by region of the strike axis: the study's strip, the SVI strip, the model's Monte Carlo (standard "
+        "errors on antithetic pair means of the weighted sum; the rest: (f - 1)², the strips' quadrature, the forward term):\n%s",
+        shown.to_string(index=False),
+    )  # fmt: skip
+    four = regions.iloc[: len(REGIONS)]
+    lead = four.loc[four["mc_minus_study"].abs().idxmax()]
+    total_ms = float(regions.iloc[-1]["mc_minus_study"])
+    log.info(
+        "model - study = %+.6f (%.6f), %+.2f %% (%.2f %%) of the study's strips; the region that carries most of it: "
+        "%s, %+.6f (%.6f), of which SVI - study %+.6f and model - SVI %+.6f (%.6f)",
+        total_ms, mc[1], 100 * total_ms / sums["study"], 100 * mc[1] / sums["study"], lead["region"], lead["mc_minus_study"],
+        lead["mc_se"], lead["svi_minus_study"], lead["mc_minus_svi"], lead["mc_se"],
+    )  # fmt: skip
+    # the names: weighted differences, in total and by region
+    by_name: dict[str, pd.DataFrame] = {}
+    for tag, ref in (("study", "study"), ("svi", "svi")):
+        t = pd.DataFrame({"name": table["name"], "weight": table["weight"]})
+        t["total"] = table["weight"] * (table["M_mc"] - table[f"M_{ref}"])
+        t["total_se"] = table["weight"] * table["M_mc_se"]
+        for label, short in zip(REGIONS, REGION_SHORT, strict=True):
+            t[short] = table["weight"] * (table[f"mc: {label}"] - table[f"{ref}: {label}"])
+            t[f"{short}_se"] = table["weight"] * table[f"mc_se: {label}"]
+        by_name[tag] = t
+        top8 = t.reindex(t["total"].abs().sort_values(ascending=False).index).head(8)
+        cells = pd.DataFrame({"name": top8["name"], "weight": [f"{x:.4f}" for x in top8["weight"]],
+                              "total (se)": [_cell(x, e) for x, e in zip(top8["total"], top8["total_se"], strict=True)]})  # fmt: skip
+        for short in REGION_SHORT:
+            cells[f"{short} (se)"] = [_cell(x, e) for x, e in zip(top8[short], top8[f"{short}_se"], strict=True)]  # fmt: skip
+        log.info(
+            "w_i (model MC - %s strip) by name, the eight largest, in total and by region:\n%s",
+            "the study's" if tag == "study" else "the SVI", cells.to_string(index=False),
+        )  # fmt: skip
+    svi_name = pd.DataFrame({"name": table["name"], "total": table["weight"] * (table["M_svi"] - table["M_study"])})  # fmt: skip
+    for label, short in zip(REGIONS, REGION_SHORT, strict=True):
+        svi_name[short] = table["weight"] * (table[f"svi: {label}"] - table[f"study: {label}"])
+    top3 = by_name["study"].reindex(by_name["study"]["total"].abs().sort_values(ascending=False).index).head(3)  # fmt: skip
+    for _, r in top3.iterrows():
+        where = max(REGION_SHORT, key=lambda s: abs(float(r[s])))
+        v = svi_name.loc[svi_name["name"] == r["name"]].iloc[0]
+        log.info(
+            "    %-5s w (model - study) %+.6f (%.6f), most of it %s: %+.6f (%.6f); there SVI - study %+.6f",
+            r["name"], r["total"], r["total_se"], where, r[where], r[f"{where}_se"], v[where],
+        )  # fmt: skip
+    wing, wing_cells = call_wing_paths(
+        smp.R, w_model, table["f_svi"].to_numpy(), table["k_hi"].to_numpy(), list(table["name"])
+    )
+    log.info(
+        "the region above the listed strikes in the sample: %d of %d paths have a name above its last listed strike; "
+        "share of the region's %.6f carried by the largest path %.1f %%, the 10 largest %.1f %%, the 100 largest %.1f %%, "
+        "the 1000 largest %.1f %%; the largest cells (X = S_T/S_0):\n%s",
+        wing["n_paths_above"], smp.R.shape[0], wing["region_mean"], *(100 * wing[f"share_top_{k}"] for k in WING_SHARES),
+        wing_cells.to_string(index=False, float_format=lambda x: f"{x:.6f}"),
+    )  # fmt: skip
     payload = {"date": args.date, "tenor": args.tenor, "table": table.to_dict("records"), "by_region": by_region, "rest": rest,
                "sum_w_M_entry": float(w @ table["M_entry"]), "sum_w_M_study": float(w @ table["M_study"]),
-               "sum_w_M_svi": float(w @ table["M_svi"]), "mc_sum_w_R2": mc,
+               "sum_w_M_svi": float(w @ table["M_svi"]), "mc_sum_w_R2": mc, "model": args.model,
+               "call_wing": wing, "call_wing_cells": wing_cells.to_dict("records"),
+               "regions": region_rows, "mc_by_region": mc_region, "mc_identity_gap": max(gap, gap_total),
+               "model_minus_study_by_name": by_name["study"].to_dict("records"),
+               "model_minus_svi_by_name": by_name["svi"].to_dict("records"),
+               "svi_minus_study_by_name": svi_name.to_dict("records"),
+               "screen": args.screen, "screen_settings": info["screen"], "dropped": info["dropped"],
+               "names_unscreened": info["names_unscreened"],
                "record": record(spec, total_seconds=time.perf_counter() - t0)}  # fmt: skip
-    write_json(f"strips_{args.date}_{args.tenor}", payload, args.out)
+    write_json(f"strips_{args.date}_{args.tenor}_{args.screen}_{args.model}_{args.paths}", payload, args.out)  # fmt: skip
     return payload
 
 
@@ -1238,10 +1522,13 @@ def slice_to_drop(expiry_of: dict[float, str], pair: tuple[float, float]) -> str
 def run_calendar(args: argparse.Namespace) -> dict[str, Any]:
     t0 = time.perf_counter()
     inp = load_inputs(args.date, args.tenor)
+    # the base is unrepaired whatever the screen's default: this command drops the crossing
+    # slices itself, round by round, and measures the effect against the surfaces as fitted
+    unrepaired = dataclasses.replace(SCREENS[args.screen], calendar_repair=False)
     options = {
         "n_particles": args.particles,
         "n_paths": args.paths,
-        "screen": args.screen,
+        "screen": unrepaired,
         "schedule": SCHEDULES[args.schedule],
     }
     spec, _ = build_spec(inp, **options)
@@ -1254,6 +1541,7 @@ def run_calendar(args: argparse.Namespace) -> dict[str, Any]:
         args.tenor,
         len(base_cross),
     )
+    log.info("the base: screen %s with the calendar repair off %s", args.screen, unrepaired.describe())  # fmt: skip
     removed: dict[str, list[str]] = {}
     work, cross = inp, base_cross
     for round_ in range(1, 6):
@@ -1475,9 +1763,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     common(p)
     p.set_defaults(run=run_wing)
     p = sub.add_parser(
-        "strips", help="the single-name second moments: SVI against the study's strips"
+        "strips",
+        help="the single-name second moments by region: SVI, the study's strips, the model",
     )
     common(p)
+    p.add_argument(
+        "--model",
+        default="zero",
+        choices=("zero", "lc"),
+        help="the paths of the Monte Carlo split: lambda = 0, nothing calibrated (the default; "
+        "the names' law does not depend on the correlation), or the calibrated model's",
+    )
     p.set_defaults(run=run_strips)
     p = sub.add_parser("calendar", help="the effect of the calendar crossings inside ±2 sd")
     common(p)

@@ -3492,15 +3492,16 @@ def test_s3_identical_names() -> None:
     the owner's decision 4 of 2026-10-09 (SPEC §8.7, [review] LC4G-a): the gate reads the
     correlation's own contribution, with no noise allowance — the paired standard error of
     each cell is printed, not used.  It replaces the comparison with the analytic target at
-    ``max(0.05 vp, 3 se)``, which read the single name's own discretisation of its smile (with
-    ``λ ≡ 1`` the basket is one name).
+    ``max(0.05 vp, 3 se)``, which read the single name's own repricing error and not the
+    correlation (with ``λ ≡ 1`` the basket is one name).
 
-    Reported, not gated: the error against the analytic target, under ``λ̂`` and under ``λ ≡
-    1``, and its Δt halving — the same world calibrated and priced on the schedule and on the
-    schedule with every step halved (``StepSchedule.refined(2)``), on common random numbers
-    (:func:`_dt_halving`): the largest error inside ±1.5 sd and inside ±2.5 sd and the
-    at-the-money error by pillar at ``dt`` and at ``dt/2``, and the paired difference of the
-    two smiles cell by cell."""
+    Reported, not gated: where the strikes sit against the trusted range of ``λ̂`` at their
+    pillar (the floors read that range only); the error against the analytic target, under
+    ``λ̂`` and under ``λ ≡ 1``, and its Δt halving — the same world calibrated and priced on the
+    schedule and on the schedule with every step halved (``StepSchedule.refined(2)``), on
+    common random numbers (:func:`_dt_halving`): the largest error inside ±1.5 sd and inside
+    ±2.5 sd and the at-the-money error by pillar at ``dt`` and at ``dt/2``, and the paired
+    difference of the two smiles cell by cell."""
     horizon = 0.25
     pillars = (1 / 12, 2 / 12, 0.25)
     name_surface = w5_surfaces(2)[1]
@@ -3538,6 +3539,17 @@ def test_s3_identical_names() -> None:
     assert np.allclose(errors["err_a_vp"], rep.table["error_vp"], rtol=0.0, atol=1e-4)
     worst = smile.loc[smile["diff_vp"].abs().idxmax()]
     passing = smile["diff_vp"].abs() <= S3_SMILE_GATE_VP
+    # reported: where the strikes sit against the trusted range of lambda at their pillar
+    # (the floors read lambda on that range only), in at-the-money sd
+    ends = {}
+    for T in pillars:
+        j = int(np.argmin(np.abs(res.lam.times - T)))
+        sd = float(name_surface.atm_vol(T)) * np.sqrt(T)
+        ends[T] = (float(res.q_lo[j]) / sd, float(res.q_hi[j]) / sd)
+    trusted = np.array(
+        [ends[T][0] <= m <= ends[T][1] for T, m in zip(smile["T"], smile["sd"], strict=True)]
+    )
+    worst_in = smile[trusted].loc[smile[trusted]["diff_vp"].abs().idxmax()]
     print(
         "S3 gate (owner's decision 4 of 2026-10-09): basket implied vol under the calibrated "
         "lambda minus under lambda = 1 imposed, in vol points (paired se in brackets), on the "
@@ -3545,10 +3557,17 @@ def test_s3_identical_names() -> None:
         f"S3 gate: largest |difference| {abs(worst['diff_vp']):.4f} vp (paired se "
         f"{worst['se_vp']:.4f}) at {round(12 * worst['T'])}m, {worst['sd']:+.1f} sd; cells over "
         f"{S3_SMILE_GATE_VP:g} vp: {int((~passing).sum())} of {len(smile)}\n"
+        "S3 gate, reported: the trusted range of lambda at the pillars, in at-the-money sd: "
+        + ", ".join(f"{round(12 * T)}m [{lo:+.2f}, {hi:+.2f}]" for T, (lo, hi) in ends.items())
+        + f"; at the {int(trusted.sum())} strikes inside it the largest |difference| is "
+        f"{abs(worst_in['diff_vp']):.4f} vp (paired se {worst_in['se_vp']:.4f}) at "
+        f"{round(12 * worst_in['T'])}m, {worst_in['sd']:+.1f} sd, and "
+        f"{int((~passing[trusted]).sum())} cells are over the gate; outside it "
+        f"{int((~passing[~trusted]).sum())} of {int((~trusted).sum())}\n"
         "S3 against the target on these paths (reported): max |error| inside ±1.5 sd "
         f"{max_abs_inside(errors, 'err_a_vp', 1.5):.3f} vp under the calibrated lambda and "
-        f"{max_abs_inside(errors, 'err_b_vp', 1.5):.3f} under lambda = 1 (one name: its own "
-        f"discretisation); inside ±2.5 sd {max_abs_inside(errors, 'err_a_vp', 2.5):.3f} and "
+        f"{max_abs_inside(errors, 'err_b_vp', 1.5):.3f} under lambda = 1 (one name against its "
+        f"own analytic smile); inside ±2.5 sd {max_abs_inside(errors, 'err_a_vp', 2.5):.3f} and "
         f"{max_abs_inside(errors, 'err_b_vp', 2.5):.3f}"
     )
     # reported, not gated: the error against the target at dt and at dt/2
