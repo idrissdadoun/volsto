@@ -113,10 +113,28 @@ pricing, on 4 threads.]
   while the basket's tail is fattened. On this date the forward of a model that reaches the
   wing is much nearer to M12's than to the bracketing numbers.
 
-One date, one budget, one shape of `g`: an indication, not a result. The scan on the reference
-dates where the wing binds on 13 to 15 % of the mass (2019-09-03, 2017-04-03) is the next
-thing to run (`scripts/cdv_scan.py --date …`).
+**2017-04-03, where the wing binds on 15 % of the mass** (`--date 2017-04-03 --betas 0,3,6,10
+--g-max 3`; the same budget; `E^CC[D]` = 0.056315 from the M12 sweep row):
 
+| β | clipped mass inside ±2.5 sd (high / low) | index error at 3m (vp): at the money / 90 % / −1.5 sd / −2.5 sd | `E[D]` | `E[D]/E^CC[D]` | `Σ w E[R_i²]` over the listed strips | basket part of `E[V] − E^Q[V]` | κ |
+|---|---|---|---|---|---|---|---|
+| 0 (M12) | 15.3 % / 1.1 % | −0.03 / −1.58 / −1.00 / −2.20 | 0.053211 | 0.9449 | +1.7 % | −0.00044 | 0.7604 |
+| 3 | 8.7 % / 0.4 % | −0.00 / −0.88 / −0.54 / −1.24 | 0.052675 | 0.9354 | +1.6 % | −0.00022 | 0.7710 |
+| 6 | 4.4 % / 0.0 % | +0.01 / −0.43 / −0.27 / −0.63 | 0.052100 | 0.9252 | +1.7 % | −0.00009 | 0.7725 |
+| 10 | 9.2 % / 0.0 % | +0.02 / −0.33 / −0.19 / −0.53 | 0.051463 | 0.9139 | +1.9 % | −0.00010 | 0.7609 |
+
+[measured; standard errors 0.02 vp at the money, 0.04 to 0.06 in the wing, 0.00003 on `E[D]`.]
+Here the steeper index skew needs a stronger cross-dependence: `β = 6` takes the clipped mass
+from 15.3 % to 4.4 % and the error at −2.5 sd from −2.2 to −0.6 vp, and the forward from
+0.945 to 0.925 of the constant-correlation forward (M12's bracketing numbers on this date:
+`ED_wing` 0.902, `ED_eqv` 0.886; the reference implementation in its own world 0.911; the
+study's model S 0.876). At `β = 10` the clipped mass rises again (9.2 %, now where `g` is at
+its clip and on the upside, where `g < 1` lowers the names' volatilities and more correlation is
+asked for): one exponential with a clip is not the right shape for both wings.
+
+Two dates, one budget, one shape of `g`: an indication, not a result. What the two scans agree
+on: the names keep their second moment, the basket's reaches the listed strip's as the clipped
+mass falls, and the forward falls further than M12's but by less than the bracketing formulas.
 
 ## 5. What this is and is not
 
