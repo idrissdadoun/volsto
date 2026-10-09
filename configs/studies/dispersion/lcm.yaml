@@ -34,6 +34,8 @@ screen:                  # the expiry screen (owner, 2026-10-08, second round)
   max_half_spread_vp: 2.0
   max_half_spread_long_vp: 6.0
   long_maturity: 1.0
+  calendar_repair: true        # slices of a name or of DJX that cross in calendar inside ±2 sd are dropped (owner, 2026-10-09, decisions 1 and 5)
+  unscreened_fallback: true    # a name the quote screen empties keeps its unscreened expiries, flagged (owner, 2026-10-09, decision 2)
 budgets:                 # particles, pricing paths, paths of the constant-correlation fit
   production: {n_particles: 800000, n_paths: 800000, companion_paths: 400000}
   development: {n_particles: 200000, n_paths: 200000, companion_paths: 100000}

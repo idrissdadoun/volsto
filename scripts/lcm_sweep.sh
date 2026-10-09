@@ -1,22 +1,28 @@
 #!/bin/sh
 # Local correlation model (SPEC §8.7, M12 part LC7): the long passes, in the owner's order
-# (third round, 2026-10-08).  Run from a frozen worktree of the commit to be measured, writing
-# into the worktree that holds outputs/dispersion_lc:
+# (fourth round, 2026-10-09: the calendar repair of every leg and the unscreened fallback are
+# the defaults of configs/studies/dispersion/lcm.yaml).  Run from a frozen worktree of the
+# commit to be measured, writing into the worktree that holds outputs/dispersion_lc:
 #
 #   nohup caffeinate -ims sh scripts/lcm_sweep.sh ~/Code/volsto-lc \
 #       >> ~/Code/volsto-lc/outputs/dispersion_lc/logs/driver.log 2>&1 &
 #
 # Every pass is resumable by date (scripts/disp_lcm.py): running this script again skips what
-# the same commit and configuration already wrote.  STEPS selects the steps (default: all).
-#   0  today and the three other reference dates, 3m, production budget, deltas, variance swap
-#   1  3m development pass (2e5 particles and paths, no risk) over the 219 dates
-#   2  3m production pass (8e5, deltas)
-#   3  today's full risk at production budget
-#   4  12m development pass          5  24m development pass
-#   R  3m development pass with the calendar repair of the names' slices on (lcm_repair.yaml;
-#      rows, logs and table carry the suffix _repair)
+# the same commit and configuration already wrote.  STEPS selects the steps (default: P F T Y Z).
+#   P  3m production pass on the default configuration (8e5 particles and paths, deltas, the
+#      variance swap on the reference dates) over the 219 dates, today and the reference dates
+#      first; the report at the end
+#   F  today's full risk at production budget (the row is risk_full_2026-10-02_3m.json)
+#   T  today alone at 12m, then at 24m: development budget (2e5), no risk — the clipped mass at
+#      lambda = 0 and at the cap on the repaired DJX surface (decision 5)
+#   Y  12m development pass over the monthly dates
+#   Z  24m, development budget, on the four reference dates only: indicative (the row of today
+#      is T's)
+#   N  optional sensitivity, not in the default steps: 3m development pass with no repair and no
+#      fallback (lcm_norepair.yaml; rows, logs and table carry the suffix _norepair).  A row of
+#      that name written by an earlier commit is run again and replaced.
 ROOT=${1:?usage: lcm_sweep.sh <worktree that holds outputs/dispersion_lc> [steps]}
-STEPS=${2:-"0 1 2 3 4 5"}
+STEPS=${2:-"P F T Y Z"}
 PY=${PY:-$ROOT/.venv/bin/python}
 WORKERS=${WORKERS:-auto}
 cd "$(dirname "$0")/.." || exit 1
@@ -35,20 +41,20 @@ run() {
 
 for step in $STEPS; do
     case $step in
-    0) run scripts/disp_lcm.py --tenor 3m --dates reference --budget production --risk deltas \
-        --varswap --workers 1 --root "$ROOT" --no-report ;;
-    1) run scripts/disp_lcm.py --tenor 3m --dates monthly --budget development --risk none \
-        --workers "$WORKERS" --root "$ROOT" ;;
-    2) run scripts/disp_lcm.py --tenor 3m --dates monthly --budget production --risk deltas \
+    P) run scripts/disp_lcm.py --tenor 3m --dates monthly --budget production --risk deltas \
         --varswap --workers "$WORKERS" --root "$ROOT" ;;
-    3) run scripts/lcm_price.py --date 2026-10-02 --tenor 3m --budget production --risk full \
+    F) run scripts/lcm_price.py --date 2026-10-02 --tenor 3m --budget production --risk full \
         --root "$ROOT" --row-out "$ROOT/outputs/dispersion_lc/risk_full_2026-10-02_3m.json" ;;
-    4) run scripts/disp_lcm.py --tenor 12m --dates monthly --budget development --risk none \
+    T) run scripts/disp_lcm.py --tenor 12m --dates today --budget development --risk none \
+        --workers 1 --root "$ROOT" --no-report
+       run scripts/disp_lcm.py --tenor 24m --dates today --budget development --risk none \
+        --workers 1 --root "$ROOT" --no-report ;;
+    Y) run scripts/disp_lcm.py --tenor 12m --dates monthly --budget development --risk none \
         --workers "$WORKERS" --root "$ROOT" ;;
-    5) run scripts/disp_lcm.py --tenor 24m --dates monthly --budget development --risk none \
+    Z) run scripts/disp_lcm.py --tenor 24m --dates reference --budget development --risk none \
         --workers "$WORKERS" --root "$ROOT" ;;
-    R) run scripts/disp_lcm.py --tenor 3m --dates monthly --budget development --risk none \
-        --workers "$WORKERS" --config configs/studies/dispersion/lcm_repair.yaml --tag repair \
+    N) run scripts/disp_lcm.py --tenor 3m --dates monthly --budget development --risk none \
+        --workers "$WORKERS" --config configs/studies/dispersion/lcm_norepair.yaml --tag norepair \
         --root "$ROOT" ;;
     *) echo "unknown step $step" ;;
     esac

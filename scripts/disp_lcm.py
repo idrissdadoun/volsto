@@ -30,8 +30,12 @@ next two side by side on half the cores each, and keeps the faster arrangement.
 
 Log.  One line per date with its status, its seconds, the elapsed time and the estimated time
 left, on stdout and in ``<root>/outputs/dispersion_lc/logs/<tenor>_<budget>.log``; each date's
-own output is in ``logs/<tenor>_<budget>/<date>.log``.  The pass ends by running the comparison
-report (``scripts/lcm_report.py``).  Nothing is written into the study's ``outputs/dispersion``.
+own output is in ``logs/<tenor>_<budget>/<date>.log``.  The line names the row's flags when
+they are set (:func:`flags_text`; owner's decisions 2 and 5 of 2026-10-09): ``flag_unscreened``
+with the names kept unscreened, ``flag_clip`` with the clipped mass inside ±2.5 sd at ``λ = 0``
+and at the cap, ``indicative`` (24m).  A flagged row stays in the table.  The pass ends by
+running the comparison report (``scripts/lcm_report.py``).  Nothing is written into the study's
+``outputs/dispersion``.
 """
 
 # ruff: noqa: E501
@@ -83,6 +87,26 @@ def interleaved(dates: Sequence[str], first: Sequence[str] = REFERENCE_DATES) ->
                 order.append(d)
                 seen.add(d)
     return order
+
+
+def flags_text(row: dict[str, Any]) -> str:
+    """The flags of a row that are set, for the pass's one line per date (``""`` when none is):
+    ``flag_unscreened`` with the names kept unscreened, ``flag_clip`` with the clipped mass
+    inside ±2.5 sd at ``λ = 0`` and at the cap (the two it is the "or" of: each above 1 %, as
+    ``lcm_price.derived_columns`` sets them), ``indicative``.  A row without the columns (an
+    earlier pass's, or a failure) has none.
+    Test: ``tests/test_lcm_scripts.py::test_sweep_line_names_the_flags``."""
+    parts = []
+    if row.get("flag_unscreened"):
+        parts.append(f"flag_unscreened ({row.get('names_unscreened') or '?'})")
+    if row.get("flag_clip"):
+        parts.append(
+            f"flag_clip (low {row.get('clip_low_inner_max', float('nan')):.4f}, "
+            f"high {row.get('clip_high_inner_max', float('nan')):.4f})"
+        )
+    if row.get("indicative"):
+        parts.append("indicative")
+    return ", ".join(parts)
 
 
 class Sweep:
@@ -183,7 +207,8 @@ def run_dates(
             if r is None:  # the process died before its row: the row is written here
                 r = {"date": d, "tenor": sweep.tenor, "budget": sweep.budget, "risk": sweep.risk,
                      "git_commit": sweep.commit, "config_digest": sweep.digest, "status": "failed",
-                     "reason": f"process exited with code {proc.returncode} and no row"}  # fmt: skip
+                     "reason": f"process exited with code {proc.returncode} and no row",
+                     **lp.failed_columns(d, sweep.tenor)}  # fmt: skip
                 (sweep.rows / f"{d}.json").write_text(json.dumps(r, indent=1))
             finished.append((d, r["status"], seconds))
             n_rows = sweep.write_table()
@@ -194,11 +219,12 @@ def run_dates(
             if r["status"] == "failed":
                 detail = f"FAILED: {r['reason'][:160]}"
             else:
-                detail = (
+                numbers = (
                     f"E_LC[D] {r['ED_lc']:.6f} ({r['ED_lc_se']:.6f}), LC/CC {r['ratio']:.5f} ({r['ratio_se']:.5f}), "
                     f"clip inside {r['clip_inner_max']:.4f}, idx ATM {r['idx_err_atm']:+.3f} vp"
-                    + (f"; {r['reason']}" if r["reason"] else "")
                 )
+                # the reason of a status "check", then the flags that are set
+                detail = "; ".join(x for x in (numbers, r["reason"], flags_text(r)) if x)
             log.info(
                 "%s %s [%d/%d] %s %.0f s (workers %d x %d threads); elapsed %s, left about %s; table %d rows; %s",
                 time.strftime("%H:%M:%S"), d, n_done, n_total, r["status"], seconds, workers, threads,

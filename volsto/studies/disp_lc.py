@@ -27,18 +27,29 @@ Every expiry dropped is logged with its reason and returned in the build's infor
 screen lives here and not in the study's loader: the study's published numbers were made with
 every expiry its own guards kept, and its loader is unchanged.
 
-**Calendar repair** (``ExpiryScreen.calendar_repair``, off by default; :func:`repair_calendar`):
-a name's fitted slices may cross in calendar between neighbouring short expiries — the total
-variance falls from one slice to the next somewhere inside the range the name's distribution
-visits — and the Dupire surface is floored there.  With the option on, such slices are dropped
-before the surface is built: of a crossing pair the slice that is not a third-Friday expiry
-goes, the shorter one when both are or neither is, round after round until no pair crosses
-inside the central range (or ``CALENDAR_MAX_ROUNDS`` rounds).  The index target is not touched.
+**Calendar repair** (``ExpiryScreen.calendar_repair``, on by default: owner's decision 1 of
+2026-10-09, SPEC §8.7; :func:`repair_calendar`): a leg's fitted slices may cross in calendar
+between neighbouring expiries — the total variance falls from one slice to the next somewhere
+inside the range the leg's distribution visits — and the Dupire surface is floored there.  Such
+slices are dropped before the surface is built: of a crossing pair the slice that is not a
+third-Friday expiry goes, the shorter one when both are or neither is, round after round until
+no pair crosses inside the central range (or ``CALENDAR_MAX_ROUNDS`` rounds).  The index target
+goes through the same rule after its screen (owner's decision 5 of 2026-10-09), on the flat
+curve it is fitted on; what the rule drops of it is recorded like a name's (leg ``"index"``)
+and counted in the build's information (``n_dropped_calendar_index``).  With the option off no
+leg is repaired: the reported sensitivity "no repair, no fallback"
+(``configs/studies/dispersion/lcm_norepair.yaml``).
 
-**A name the screen empties** (``ExpiryScreen.unscreened_fallback``, off by default): the build
-is refused when the quote screen leaves a name without any expiry — a date of a sweep then
-fails for one name.  With the option on, that name keeps the loader's expiries unscreened and
-the build's information lists it (``names_unscreened``).
+**A name the screen empties** (``ExpiryScreen.unscreened_fallback``, on by default: owner's
+decision 2 of 2026-10-09, SPEC §8.7): a name the quote screen leaves without any expiry keeps
+the loader's expiries unscreened and the build's information lists it (``names_unscreened``).
+With the option off the build is refused, naming the name — a date of a sweep then fails for
+one name.  The index target has no such fallback: a date on which no index expiry passes is
+refused either way.
+
+Checked by ``tests/test_local_correlation.py``: ``test_expiry_screen`` (the screen and its
+defaults), ``test_calendar_repair`` (the repair on a name and on the index target, the
+fallback) and, on the study's data, ``test_dow_specification_from_the_study``.
 """
 
 from __future__ import annotations
@@ -199,26 +210,31 @@ def quote_quality(chain: pd.DataFrame, expiries: Sequence[ListedExpiry]) -> dict
 @dataclass(frozen=True)
 class ExpiryScreen:
     """Which listed expiries enter the model (module docstring; owner's decisions of 2026-10-08,
-    second round).
+    second round, and of 2026-10-09 for the last two options — SPEC §8.7).
 
     ``index_third_friday``: the index target reads standard monthly expiries only.
     ``nearest_two_sided``: the ``NEAREST_STRIKES`` listed strikes nearest the forward must each
     have a positive bid on both the call and the put (an expiry that lists fewer is dropped).
     ``max_half_spread_vp``: the median half spread inside ±1 sd is at most this many vol points
     for an expiry of up to ``long_maturity`` years, and at most ``max_half_spread_long_vp``
-    beyond (``inf``: not read).  ``calendar_repair``: the names' slices that cross in calendar
-    inside the central range are dropped (:func:`repair_calendar`; off by default).
-    ``unscreened_fallback``: a name the quote screen leaves without any expiry keeps the expiries
-    the loader returned, unscreened, and is listed in the build's information (off by default: the
-    build is refused, naming the name)."""
+    beyond (``inf``: not read).  ``calendar_repair``: the slices of a name and of the index
+    target that cross in calendar inside the central range are dropped (:func:`repair_calendar`;
+    on by default, owner's decisions 1 and 5 of 2026-10-09).  ``unscreened_fallback``: a name the
+    quote screen leaves without any expiry keeps the expiries the loader returned, unscreened,
+    and is listed in the build's information (on by default, owner's decision 2 of 2026-10-09;
+    off: the build is refused, naming the name).
+
+    The defaults are M12's; both options off is the reported sensitivity "no repair, no
+    fallback" (the defaults until 2026-10-09).  Checked by ``test_expiry_screen`` and
+    ``test_calendar_repair`` (``tests/test_local_correlation.py``)."""
 
     index_third_friday: bool = True
     nearest_two_sided: bool = True
     max_half_spread_vp: float = 2.0
     max_half_spread_long_vp: float = 6.0
     long_maturity: float = 1.0
-    calendar_repair: bool = False
-    unscreened_fallback: bool = False
+    calendar_repair: bool = True
+    unscreened_fallback: bool = True
 
     def __post_init__(self) -> None:
         if not (self.max_half_spread_vp > 0 and self.max_half_spread_long_vp > 0):
@@ -228,8 +244,16 @@ class ExpiryScreen:
 
     @classmethod
     def off(cls) -> ExpiryScreen:
-        """No screen: every expiry the loader returns (the study's own selection)."""
-        return cls(False, False, math.inf, math.inf)
+        """No screen, no repair, no fallback: every expiry the loader returns (the study's own
+        selection), each option switched off explicitly."""
+        return cls(
+            index_third_friday=False,
+            nearest_two_sided=False,
+            max_half_spread_vp=math.inf,
+            max_half_spread_long_vp=math.inf,
+            calendar_repair=False,
+            unscreened_fallback=False,
+        )
 
     @property
     def reads_quotes(self) -> bool:
@@ -246,9 +270,10 @@ class ExpiryScreen:
         return self.max_half_spread_long_vp
 
     def describe(self) -> dict[str, Any]:
-        """The screen as a mapping (``calendar_repair`` appears only when it is on, so that the
-        description of the default screen is what earlier records hold)."""
-        out: dict[str, Any] = {
+        """The screen as a mapping: every option, on or off, and the two constants the quote
+        rules read.  (Until 2026-10-09 ``calendar_repair`` and ``unscreened_fallback`` appeared
+        only when on; a record without the two keys was built with both off.)"""
+        return {
             "index_third_friday": self.index_third_friday,
             "nearest_two_sided": self.nearest_two_sided,
             "nearest_strikes": NEAREST_STRIKES,
@@ -256,12 +281,9 @@ class ExpiryScreen:
             "max_half_spread_long_vp": self.max_half_spread_long_vp,
             "long_maturity": self.long_maturity,
             "quote_sd": QUOTE_SD,
+            "calendar_repair": self.calendar_repair,
+            "unscreened_fallback": self.unscreened_fallback,
         }
-        if self.calendar_repair:
-            out["calendar_repair"] = True
-        if self.unscreened_fallback:
-            out["unscreened_fallback"] = True
-        return out
 
 
 def screen_reason(e: ListedExpiry, q: QuoteQuality | None, screen: ExpiryScreen) -> tuple[str, str]:
@@ -358,7 +380,7 @@ def name_market(
 
 
 #: The calendar repair reads crossings inside the mean ± this many standard deviations of a
-#: name's log-moneyness at each slice (the range measured in SPEC §8.7, decision 8).
+#: leg's log-moneyness at each slice (the range measured in SPEC §8.7, decision 8).
 CALENDAR_CENTRAL_SD: Final[float] = 2.0
 CALENDAR_MAX_ROUNDS: Final[int] = 5
 
@@ -393,11 +415,16 @@ def repair_calendar(
     records: FitRecords | None,
     origin: str,
 ) -> tuple[list[ListedExpiry], list[dict[str, Any]]]:
-    """``(kept, dropped)``: the expiries of one name with the slices that cross in calendar
-    inside the central range removed (module docstring).  Each dropped expiry is a record like
-    the screen's, with ``rule = "calendar"``.  Of a crossing pair the slice that is not a
+    """``(kept, dropped)``: the expiries of one leg — a name on its own curve, or the index
+    target on the flat curve it is fitted on (``leg = "index"``; owner's decision 5 of
+    2026-10-09, SPEC §8.7) — with the slices that cross in calendar inside the central range
+    removed (module docstring; :func:`calendar_crossings`).  Each dropped expiry is a record
+    like the screen's, with ``rule = "calendar"``.  Of a crossing pair the slice that is not a
     third-Friday expiry is dropped, the shorter one when both are or neither is; the surface is
-    refitted and checked again, at most ``CALENDAR_MAX_ROUNDS`` times."""
+    refitted and checked again, at most ``CALENDAR_MAX_ROUNDS`` times.  The slices read are the
+    ones the surface of ``horizon`` holds (C8's selection, :func:`~volsto.market.svi_slices.
+    fit_svi_surface`): a listed expiry the selection leaves out is neither checked nor dropped.
+    Checked by ``test_calendar_repair`` (``tests/test_local_correlation.py``)."""
     kept = list(expiries)
     dropped: list[dict[str, Any]] = []
     for _ in range(CALENDAR_MAX_ROUNDS):
@@ -482,14 +509,21 @@ def lc_spec_from_smiles(
     """The specification of the local correlation model on a basket of the study (module
     docstring) and what the build measured: per name the SVI fits' root-mean-square errors in
     vol points, the names whose last listed expiry is before the horizon (their surface is
-    extrapolated flat in implied vol), the same for the index, and the expiries the screen
-    dropped (``"dropped"``: one record per expiry with its leg and reason; ``"screen"``: the
-    settings).
+    extrapolated flat in implied vol), the same for the index, the names kept unscreened
+    (``"names_unscreened"``), and the expiries the screen and the calendar repair dropped
+    (``"dropped"``: one record per expiry with its leg, rule and reason;
+    ``"n_dropped_calendar_index"``: how many of them the calendar repair dropped on the index
+    target; ``"screen"``: the settings).
 
-    ``screen``: the expiry screen (default :class:`ExpiryScreen` — third-Friday index expiries
-    and the quote screen on every leg); it needs ``quotes`` (per name) and ``index_quotes``,
+    ``screen``: the expiry screen (default :class:`ExpiryScreen` — third-Friday index expiries,
+    the quote screen on every leg, the calendar repair of every leg and the unscreened fallback
+    of a name the quote screen empties); it needs ``quotes`` (per name) and ``index_quotes``,
     the :func:`quote_quality` of the day.  ``ExpiryScreen.off()`` takes every expiry given.
+    Each leg is screened first and repaired after; a name is repaired on the carry curve of the
+    expiries its screen kept, the index target on the flat curve.
     ``weights`` are normalised to sum to 1; ``lc.particle.horizon`` is replaced by ``horizon``.
+    Checked by ``test_calendar_repair`` and ``test_dow_specification_from_the_study``
+    (``tests/test_local_correlation.py``).
     """
     if not (len(names) == len(weights) == len(spots)):
         raise ValueError("names, weights and spots must have the same length")
@@ -543,6 +577,15 @@ def lc_spec_from_smiles(
     dropped += gone
     if not index_expiries:
         raise ValueError("the index: no listed expiry passes the screen")
+    n_dropped_calendar_index = 0
+    if screen.calendar_repair:
+        # the names' rule on the index target (owner's decision 5 of 2026-10-09): the same
+        # horizon, records and origin as the index surface built below, on the same flat curve
+        index_expiries, gone = repair_calendar(
+            "index", index_expiries, flat, horizon, records, f"{origin}:index"
+        )
+        dropped += gone
+        n_dropped_calendar_index = len(gone)
     index_cfg, index_fits = _surface_config(
         index_expiries, flat, horizon, records, f"{origin}:index"
     )
@@ -579,6 +622,7 @@ def lc_spec_from_smiles(
         "n_names_unscreened": len(unscreened),
         "index_extrapolated": bool(max(float(e.T) for e in index_expiries) < horizon),
         "index_slices": list(index_cfg.times),
+        "n_dropped_calendar_index": n_dropped_calendar_index,
         "screen": screen.describe(),
         "dropped": dropped,
     }

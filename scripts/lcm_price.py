@@ -23,7 +23,29 @@ What it does (the row of ``scripts/disp_lcm.py`` is its output):
    ``full`` — also the single-name vegas (``λ`` recalibrated and held), the all-names bump, the
    index vega, the two index skew vegas and the model-risk range over four ``R_low`` × two
    families;
-4. logs a table and writes the row as JSON with the reproducibility record.
+4. adds the columns of the owner's checks and decisions of 2026-10-09 (SPEC §8.7), functions of
+   the row alone (:func:`derived_columns`): the listed-variance forward
+   ``listed_fwd = P_D·√(EQV/EV)`` of the study's entry and its ratio to the copula's ``P_D``;
+   ``lc_over_copula = E_LC[D]/P_D`` and ``cc_over_copula = E_CC[D]/P_D``; the flags
+   ``flag_unscreened`` (a name the quote screen emptied is kept on its unscreened expiries),
+   ``flag_clip_low`` / ``flag_clip_high`` (the clipped mass inside ±2.5 sd at ``λ = 0``, resp.
+   at the cap, exceeds 1 %) and ``flag_clip`` (either); ``indicative`` (the 24m tenor);
+5. logs a table and writes the row as JSON with the reproducibility record.
+
+Dropped expiries.  ``n_dropped`` and the counts by rule (``n_dropped_third_friday``,
+``n_dropped_strikes``, ``n_dropped_spread``, ``n_dropped_calendar``) are over every leg, the
+index included; ``n_dropped_index`` is the index's under any rule and
+``n_dropped_calendar_index`` the index's under the calendar repair (decision 5: the names' rule
+on the DJX surface), so the names' calendar drops are ``n_dropped_calendar −
+n_dropped_calendar_index``.
+
+Status (:func:`row_status`).  ``ok``; ``check`` when a gating sanity check fails — no NaN
+(``check_no_nan``), the basket's forward within three standard errors (``check_forward``), the
+index smile at the money and at 90 % within 0.15 vol points unless the wing binds
+(``check_index``); ``failed`` with the reason when the date raises.  The names' 2 % check
+(``check_names``: ``Σ w E^LC[R_i²]`` within 2 % of the listed strips) is a reported
+diagnostic, not a gate (owner's decision 3 of 2026-10-09): the column stays, and a row whose
+only failing check it is has status ``ok``.
 
 Standard errors are on antithetic pair means; ratios and ``κ`` use the delta method.  A date
 that fails returns a row with ``status = "failed"`` and the reason.  Outputs go under
@@ -40,10 +62,11 @@ import json
 import logging
 import math
 import os
+import pickle
 import sys
 import time
 import traceback
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -96,6 +119,19 @@ CONFIG_KEYS = {
 }  # fmt: skip
 SD_GRID = (-2.5, -2.0, -1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0, 2.5)
 MULT_TAGS = ("050", "075", "100", "125", "150", "200")
+# the sanity checks that set a row's status; the names' 2 % check is reported, not a gate
+# (owner's decision 3 of 2026-10-09)
+GATING_CHECKS = ("check_no_nan", "check_forward", "check_index")
+# a date is flagged when the clipped mass inside ±CLIP_GATE_SD sd at λ = 0, or at the cap,
+# exceeds this (owner's decision 5 of 2026-10-09)
+CLIP_FLAG_MASS = 0.01
+# the tenors run on the reference dates only and labelled indicative (owner's decision 5)
+INDICATIVE_TENORS = ("24m",)
+DERIVED_COLUMNS = (
+    "listed_fwd_ratio", "listed_fwd", "lc_over_copula", "lc_over_copula_se", "cc_over_copula",
+    "cc_over_copula_se", "flag_unscreened", "flag_clip_low", "flag_clip_high", "flag_clip",
+    "indicative",
+)  # fmt: skip
 
 
 # ---------------------------------------------------------------------------------------------
@@ -248,6 +284,110 @@ def index_errors(levels: np.ndarray, pillars: Sequence[float], surface: Any) -> 
 
 
 # ---------------------------------------------------------------------------------------------
+# the columns that are functions of the row alone, and the status
+# ---------------------------------------------------------------------------------------------
+
+
+def _number(row: Mapping[str, Any], key: str) -> float:
+    """``row[key]`` as a float; NaN when it is absent, ``None`` or not a number."""
+    value = row.get(key)
+    if value is None or isinstance(value, str | bytes):
+        return float("nan")
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def derived_columns(row: Mapping[str, Any]) -> dict[str, Any]:
+    """The columns of the owner's checks and decisions of 2026-10-09 (SPEC §8.7), as a pure
+    function of the row (so that the rows of earlier passes can be given them): the keys are
+    ``DERIVED_COLUMNS``, the row is not modified.
+
+    Check (c), the listed-variance forward — the copula's ``κ`` on the listed dispersion
+    variance.  With ``EQV`` and ``EV`` (the row's ``EV_copula``) of the study's entry, basket
+    B1, and ``κ_cop = P_D/√EV``::
+
+        listed_fwd       = κ_cop·√EQV = P_D_copula·√(EQV/EV_copula)
+        listed_fwd_ratio = listed_fwd/P_D_copula = √(EQV/EV_copula)
+
+    No Monte Carlo number of this model enters: no standard error.
+
+    Check (b), like for like against the copula::
+
+        lc_over_copula = ED_lc/P_D_copula      lc_over_copula_se = ED_lc_se/P_D_copula
+        cc_over_copula = ED_cc/P_D_copula      cc_over_copula_se = ED_cc_se/P_D_copula
+
+    The standard errors are the Monte Carlo errors of the numerators over ``P_D``: the
+    copula's own error (``P_D_se`` of the entry) is not in the row and is not included.
+
+    Decisions 2 and 5, the flags (a flagged row stays in the table; the summaries are reported
+    with and without it)::
+
+        flag_unscreened = n_names_unscreened > 0
+        flag_clip_low   = clip_low_inner_max  > 0.01    (clipped mass at λ = 0 inside ±2.5 sd)
+        flag_clip_high  = clip_high_inner_max > 0.01    (the same at the cap)
+        flag_clip       = flag_clip_low or flag_clip_high
+        indicative      = tenor == "24m"                (run on the four reference dates only)
+
+    The comparisons are strict ("exceeds 1 %").  An input that is absent or not finite gives
+    NaN for a quantity and ``False`` for a flag: a failed row carries no flag.
+    Test: ``tests/test_lcm_scripts.py::test_derived_columns``."""
+    nan = float("nan")
+    eqv, ev, p_d = (_number(row, k) for k in ("EQV", "EV_copula", "P_D_copula"))
+    known = math.isfinite(eqv) and math.isfinite(ev) and eqv >= 0.0 and ev > 0.0
+    ratio = math.sqrt(eqv / ev) if known else nan
+    priced = math.isfinite(p_d) and p_d > 0.0
+    out: dict[str, Any] = {
+        "listed_fwd_ratio": ratio,
+        "listed_fwd": p_d * ratio if priced else nan,
+    }
+    for tag in ("lc", "cc"):
+        # the Monte Carlo error of the numerator alone: the copula's own P_D_se is not included
+        out[f"{tag}_over_copula"] = _number(row, f"ED_{tag}") / p_d if priced else nan
+        out[f"{tag}_over_copula_se"] = _number(row, f"ED_{tag}_se") / p_d if priced else nan
+    low = bool(_number(row, "clip_low_inner_max") > CLIP_FLAG_MASS)
+    high = bool(_number(row, "clip_high_inner_max") > CLIP_FLAG_MASS)
+    out.update(
+        flag_unscreened=bool(_number(row, "n_names_unscreened") > 0),
+        flag_clip_low=low,
+        flag_clip_high=high,
+        flag_clip=low or high,
+        indicative=row.get("tenor") in INDICATIVE_TENORS,
+    )
+    return out
+
+
+def row_status(checks: Mapping[str, Any]) -> tuple[str, str]:
+    """``(status, reason)`` of a row that was priced, from its sanity checks: ``("check",
+    "sanity checks: <the gates that fail>")`` when one of ``GATING_CHECKS`` — ``check_no_nan``,
+    ``check_forward``, ``check_index`` — fails, ``("ok", "")`` otherwise.  ``check_names`` (the
+    names' 2 %) is a reported diagnostic, not a gate (owner's decision 3 of 2026-10-09): it is
+    neither read nor named here.  A row that failed has no checks and keeps its status.
+    Test: ``tests/test_lcm_scripts.py::test_row_status``."""
+    failed = [k for k in GATING_CHECKS if not checks[k]]
+    if failed:
+        return "check", "sanity checks: " + ", ".join(failed)
+    return "ok", ""
+
+
+def failed_columns(date: str, tenor: str) -> dict[str, Any]:
+    """:func:`derived_columns` of a date that failed: the listed-variance forward needs the
+    study's entry alone (``EQV``, ``EV`` and ``P_D`` of basket B1), so a failed row carries it
+    whenever the entry can be read; the model's ratios are NaN and the flags ``False``.  Only
+    the derived columns are returned (a failed row has no ``EQV`` or ``P_D_copula`` column).
+    Test: ``tests/test_lcm_scripts.py::test_failed_columns``."""
+    known: dict[str, Any] = {"tenor": tenor}
+    try:
+        with (dd.OUT / "entries" / tenor / f"{date}.pkl").open("rb") as fh:
+            b1 = pickle.load(fh)["B1"]
+        known.update(EQV=float(b1["EQV"]), EV_copula=float(b1["EV"]), P_D_copula=float(b1["P_D"]))
+    except Exception as exc:  # the row is a failure already: its reason is not replaced
+        log.info("%s %s: no entry for the listed-variance forward (%s)", date, tenor, exc)
+    return derived_columns(known)
+
+
+# ---------------------------------------------------------------------------------------------
 # one date
 # ---------------------------------------------------------------------------------------------
 
@@ -287,11 +427,15 @@ def run_date(
     for g in info["dropped"]:
         by_rule[g["rule"]] = by_rule.get(g["rule"], 0) + 1
     last_index = float(max(info["index_slices"]))
+    # the screen as built (spec_for): a key the YAML leaves out is ExpiryScreen's default
+    screen = ExpiryScreen(**cfg["screen"])
     row.update(
         n_dropped=len(info["dropped"]), n_dropped_third_friday=by_rule.get("third_friday", 0),
         n_dropped_strikes=by_rule.get("strikes", 0), n_dropped_spread=by_rule.get("spread", 0),
-        n_dropped_calendar=by_rule.get("calendar", 0), calendar_repair=bool(cfg["screen"].get("calendar_repair", False)),
+        n_dropped_calendar=by_rule.get("calendar", 0), calendar_repair=bool(screen.calendar_repair),
         n_dropped_index=sum(g["leg"] == "index" for g in info["dropped"]),
+        # the index expiries the calendar repair dropped (owner's decision 5 of 2026-10-09)
+        n_dropped_calendar_index=int(info.get("n_dropped_calendar_index", 0)),
         svi_rms_vp_median=info["svi_rms_vp_median"], svi_rms_vp_max=info["svi_rms_vp_max"],
         svi_rms_vp_index=float(np.max(info["svi_rms_vp_index"])),
         n_names_extrapolated=info["n_names_extrapolated"], index_extrapolated=bool(info["index_extrapolated"]),
@@ -491,14 +635,12 @@ def run_date(
     row["check_index"] = bool(
         row["wing_binds"] or (abs(row["idx_err_atm"]) <= 0.15 and abs(row["idx_err_90"]) <= 0.15)
     )
+    # the names' 2 %: a reported diagnostic, not a gate (owner's decision 3 of 2026-10-09)
     row["check_names"] = bool(abs(row["sum_w_ER2_lc"] / sum_wm - 1.0) <= 0.02)
-    if not (
-        row["check_no_nan"] and row["check_forward"] and row["check_index"] and row["check_names"]
-    ):
-        failed = [
-            k for k in ("check_no_nan", "check_forward", "check_index", "check_names") if not row[k]
-        ]
-        row["status"], row["reason"] = "check", "sanity checks: " + ", ".join(failed)
+    row["status"], row["reason"] = row_status(row)
+    # --- the owner's checks (b), (c) and flags of 2026-10-09: after the sanity checks, which
+    # read every float of the row, so that check_no_nan keeps its meaning
+    row.update(derived_columns(row))
     row["seconds_total"] = time.perf_counter() - t_start
     row["output_root"] = str(out)
     return row
@@ -625,7 +767,7 @@ def safe_row(date: str, tenor: str, cfg: dict[str, Any], **kwargs: Any) -> dict[
         log.error("%s %s failed: %s\n%s", date, tenor, exc, traceback.format_exc())
         return {"date": date, "tenor": tenor, "budget": kwargs.get("budget", "production"), "risk": kwargs.get("risk", "none"),
                 "git_commit": code_version(), "lc_code_tag": LC_CODE_TAG, "status": "failed",
-                "reason": f"{type(exc).__name__}: {exc}"[:500]}  # fmt: skip
+                "reason": f"{type(exc).__name__}: {exc}"[:500], **failed_columns(date, tenor)}  # fmt: skip
 
 
 def log_row(row: dict[str, Any]) -> None:
@@ -647,6 +789,18 @@ def log_row(row: dict[str, Any]) -> None:
         "E_LC[D] %.6f (%.6f); E_CC[D] %.6f (%.6f); LC/CC %.5f (%.5f); copula P_D %.6f; kappa LC %.4f (%.4f), CC %.4f (%.4f)",
         r["ED_lc"], r["ED_lc_se"], r["ED_cc"], r["ED_cc_se"], r["ratio"], r["ratio_se"], r["P_D_copula"],
         r["kappa_lc"], r["kappa_lc_se"], r["kappa_cc"], r["kappa_cc_se"],
+    )  # fmt: skip
+    log.info(
+        "against the copula's P_D: LC %.5f (%.5f), CC %.5f (%.5f) (the errors of the numerators; P_D's own is not included); "
+        "listed-variance forward P_D x sqrt(EQV/EV) %.6f = %.5f x P_D",
+        r["lc_over_copula"], r["lc_over_copula_se"], r["cc_over_copula"], r["cc_over_copula_se"],
+        r["listed_fwd"], r["listed_fwd_ratio"],
+    )  # fmt: skip
+    log.info(
+        "flags: unscreened %s (%s); clipped mass inside ±%.1f sd above %.0f %% at lambda = 0 %s (%.4f), at the cap %s (%.4f); "
+        "index expiries dropped by the calendar repair %d; names within 2 %% of the listed strips %s (a diagnostic, not a gate); indicative %s",
+        r["flag_unscreened"], r["names_unscreened"] or "none", CLIP_GATE_SD, 100 * CLIP_FLAG_MASS, r["flag_clip_low"], r["clip_low_inner_max"],
+        r["flag_clip_high"], r["clip_high_inner_max"], r["n_dropped_calendar_index"], r["check_names"], r["indicative"],
     )  # fmt: skip
     log.info(
         "calls LC/CC at K_050..K_200: %s",
