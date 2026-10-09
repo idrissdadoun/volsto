@@ -271,7 +271,14 @@ index vega, two index skew vegas and the model-risk range for today (SPEC §8.7,
   0.2 vp of their quotes), and not the cap (raising `ρ_max` from 0.98 to 0.995 moves the wing
   by 0.04 vp). In a sell-off the index needs the names' volatilities to rise *because the
   index fell*, not only because each name fell: cross-dependent volatility (Guyon, Risk 2016),
-  per-name stochastic volatility with correlated factors, or common jumps.
+  per-name stochastic volatility with correlated factors, or common jumps. Over the study's
+  208 priced dates (3m, development budget, SPEC §8.7, LC7 results) the clip binds on more
+  than 1 % of the mass inside ±2.5 sd on 196, on 10.7 % in the median; the forward's LC/CC is
+  0.970 on average against 0.942 for the study's model S over its copula, the two agree on
+  average on the 50 dates where the clipped mass is below 5 % (−2.5 % and −2.6 %), and the
+  clipped mass and model S's effect are correlated at −0.63 across dates: what this model
+  misses of model S's correction is the wing it does not reach. A prototype of the first
+  extension is on branch `cross-dependent-vol` (`docs/cross_dependent_vol.md` there).
 * **Deterministic correlation given the index.** Given `(t, k_B)` the correlation has no
   randomness of its own, so the model understates the variability of dispersion: far calls on
   dispersion are too cheap relative to stochastic-correlation models fitted to the same smiles
@@ -280,8 +287,11 @@ index vega, two index skew vegas and the model-risk range for today (SPEC §8.7,
 * **Sub-baskets.** `λ`'s state is the index, so every constituent must be simulated, and the
   correlation inside the subset is the choice of `R_low` and `R_high`, not the market's.
 * **Existence and uniqueness** of the McKean equation are open; see §4.
-* **Data.** The single-name upside wings and the long-dated index expiries are extrapolations
-  or thin quotes: 12m and 24m numbers carry the study's caveat, and on 2026-10-02 the DJX
+* **Data.** The names' weekly slices cross in calendar on most dates from 2011 on, and the
+  Dupire surface is floored there: with the crossing slices dropped (an option, off by default)
+  the forward falls by 0.5 % on average over the sweep and the call at 1.25 times `P_D` by
+  10 %, the forward's LC/CC by 0.002 (SPEC §8.7, LC7 addendum and results). The single-name
+  upside wings and the long-dated index expiries are extrapolations or thin quotes: 12m and 24m numbers carry the study's caveat, and on 2026-10-02 the DJX
   slices beyond one year are not consistent with the shorter ones in the wings (SPEC §8.7,
   [review] LC4G-g).
 * **Smaller ones.** Discrete dividends; pricing beyond the calibration horizon is refused; the
