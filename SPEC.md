@@ -1645,7 +1645,8 @@ The study of §8.4 on every weekly entry of the ORATS history (§18.10). Specifi
 | S10 | carry mode | PASS |
 | S11 | the Dow baseline of 2026-10-02 | PASS (the smile REPORTED: 11 cells over the gate, downside wing) |
 | R1–R4 | sticky-moneyness delta, the decomposition's sum, name deltas against the common delta, paired vega errors | PASS |
-| LC7 | the scripts: order, configuration, resume, delta-method errors | PASS |
+| LC7 | the scripts: order, configuration, resume, delta-method errors; the calendar repair and the fallback (off by default) | PASS |
+| LC7 sanity checks, 3m development pass (208 priced dates) | no NaN 199; forward 206; index 207; names within 2 % of the listed strips **87** | REPORTED (status `check` on 123 dates; 11 dates failed) |
 | suite | fast: 1001 passed, 359 skipped, 4 failed — the four failures of the branch's baseline (`test_shadow_rotation` ×3, `test_snapshot_portability`), none in M12's code | unchanged |
 
 - **Owner decisions needed** (each has a [review] item above with the alternatives; what is in place is the most conservative reversible option and is labelled [provisional] where it changes a number).
@@ -1655,6 +1656,9 @@ The study of §8.4 on every weekly entry of the ORATS history (§18.10). Specifi
   4. *The calendar repair* (LC4G-e): not built (`E[D]` moves by 0.040 %, below the 0.05 % of the decision); the calls move by 0.08 to 0.10 %.
   5. *The companion's fit* (LC7-b, LC7-f): its Monte Carlo error is not in `ratio_se`; fitting `λ_c` on the pricing paths, or on more paths at the development budget, would remove most of it.
   6. *S3's dip* (LC4G-b) and *the first-weeks bias of the names* (LC5-d): both are discretisation effects of the first steps that the quarter-step schedule reduced and did not remove.
+  7. *Which configuration is M12's result* (LC7-j, added with the LC7 results): the calendar repair of the names' weekly slices moves `E^LC[D]` by −0.49 % on average over the sweep and the calls at `K_125` by −10.5 %; it is built, off by default, and the production pass runs without it as ordered. Recommendation: on.
+  8. *A name the quote screen empties* (LC7-i): ten dates of the sweep fail for one name, eight of them in the crisis of 2008–09; the fallback is built, off by default.
+  9. *The index target against the study's index level* (LC7-k): about ten dates on which the two at-the-money correlations differ by more than 0.05.
 - **Not done in M12:** no pull request, no merge; the specification file is unchanged (LC4G-f); the uncertain-`λ` overlay, sub-basket products and a pairwise local correlation are in the note's limits only.
 
 ## 9. Viewers
