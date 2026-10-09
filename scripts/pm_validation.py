@@ -43,6 +43,7 @@ SCRATCH = Path(
 S3_LOG = SCRATCH / "r4" / "s3-gate" / "s3_run2.log"
 RUNAWAY = SCRATCH / "pm" / "verify" / "runaway"
 S3_GATE_VP = 0.05
+S3_EVIDENCE = ("where_s3_smile.log", "diag_s3_wing.log", "fast_run.log")
 CELL = re.compile(r"(-?\d+\.\d+) \((\d+\.\d+)\)")
 MULTS = (
     ("0.5", "050"),
@@ -87,6 +88,14 @@ def copy_sources(s3_log: Path, runaway: Path) -> tuple[Path, Path]:
     d3.mkdir(parents=True, exist_ok=True)
     dr.mkdir(parents=True, exist_ok=True)
     shutil.copy2(s3_log, d3 / "test_s3_identical_names_production.log")
+    for (
+        name
+    ) in S3_EVIDENCE:  # the four-seed repricing, lambda against the trusted range, the fast run
+        if (s3_log.parent / name).exists():
+            shutil.copy2(s3_log.parent / name, d3 / name)
+    repair_check = SCRATCH / "r4" / "lib-defaults" / "index_repair_3m.json"
+    if repair_check.exists():
+        shutil.copy2(repair_check, pc.PM / "diagnostics" / "index_repair_3m.json")
     for f in sorted(runaway.iterdir()):
         if f.suffix in (".py", ".json", ".log"):
             shutil.copy2(f, dr / f.name)
@@ -118,7 +127,7 @@ def build(s3_log: Path, runaway: Path) -> None:
             f"{int(r.months)}m {r.diff_vp:+.4f} ± {r.se_vp:.4f} vp" for r in over.itertuples()
         )
         + f". Every cell from −2.5 to +2.0 sd passes (largest |difference| {abs(worst_in['diff_vp']):.4f} ± {worst_in['se_vp']:.4f} vp at {int(worst_in['months'])}m, {worst_in['sd']:+.1f} sd). "
-        "The same three cells are over on each of four pricing seeds (the test's author reran it; log lines in `diagnostics/s3`). The gate is as decided and has not been changed; the two floors on λ pass."
+        "The same three cells are over on each of four pricing seeds (2024 to 2027, one calibration, a repricing outside the test: `diagnostics/s3/where_s3_smile.log`). The gate is as decided and has not been changed; the two floors on λ pass."
     )
     add("")
     add("| pillar | " + " | ".join(f"{sd:+.1f} sd" for sd in sorted(s3["sd"].unique())) + " |")
@@ -139,7 +148,7 @@ def build(s3_log: Path, runaway: Path) -> None:
             records.append(pc.record(
                 f"V.s3.gate.{int(months)}m.sd{r.sd:+.1f}", "V", f"S3: index smile under the calibrated lambda minus under lambda = 1, {int(months)}m, {r.sd:+.1f} sd", r.diff_vp, r.se_vp,
                 date="synthetic (identical names)", tenor=f"{int(months)}m", unit="vol points", definition="basket implied vol of the calibrated model minus the same with lambda = 1 imposed, on the same 800000 pricing paths; paired standard error; gate 0.05 vp",
-                budget="8e5 particles / 8e5 paths (the test's production size)", commit="a102ef8 (test file; the gate is the one of d4faa74)", source=src, notes="OVER THE GATE: FAIL" if r.over_gate else "within the gate",
+                budget="8e5 particles / 8e5 paths (the test's production size)", commit="the working tree that became a102ef8 (log written 08:39, before the commit; the gate is the one of d4faa74)", source=src, notes="OVER THE GATE: FAIL" if r.over_gate else "within the gate",
             ))  # fmt: skip
     add("")
     add(
@@ -147,13 +156,14 @@ def build(s3_log: Path, runaway: Path) -> None:
     )
     add("")
     add(
-        "What it means for the Dow numbers: the +2.5 sd strike lies beyond the upper end of the range on which the particle estimate of λ is trusted (about +2.07 at-the-money sd in this test); above it the default tail rule gives a λ of about 0.98 instead of 1. "
-        "The downside wing (−2.5 sd), where the Dow calibration binds, passes at 0.010 vp. The failure is recorded for the owner; nothing was tuned to remove it."
+        "Where it comes from (a scratch diagnostic with the test's seeds and sizes, `diagnostics/s3/diag_s3_wing.log`): the +2.5 sd strike is beyond the upper end of the range on which the particle estimate of λ is trusted, the 0.5 % to 99.5 % quantiles of the particle cloud (+2.06 to +2.08 at-the-money sd at the three pillars); "
+        "above it λ is extrapolated by the default tail rule and is about 0.98 at +2.5 sd and 0.94 to 0.95 at +3 sd instead of 1. With λ set to 1 above the trusted range only, no cell is over the gate (largest 0.0101 ± 0.0013 vp). "
+        "At −2.5 sd the difference is 0.010 vp. What this implies for the Dow numbers has not been measured: the test has a true λ of 1 and a cap of 1, and says what the particle estimate and its tail rule cost, not what the Dow's binding cap costs. The failure is recorded for the owner; nothing was tuned to remove it."
     )
     add("")
     records.append(pc.record(
         "V.s3.gate.cells_over", "V", "S3: cells over the 0.05 vp gate", float(len(over)), None, date="synthetic (identical names)", unit="count of 33 cells",
-        definition="number of (pillar, strike) cells with |difference| above 0.05 vol points", budget="8e5 particles / 8e5 paths", commit="a102ef8", source=src, n=len(s3), notes="the gate FAILS (a count, no standard error)",
+        definition="number of (pillar, strike) cells with |difference| above 0.05 vol points", budget="8e5 particles / 8e5 paths", commit="the working tree that became a102ef8", source=src, n=len(s3), notes="the gate FAILS (a count, no standard error)",
     ))  # fmt: skip
 
     # V1 (continued): the error against the target and its dt halving, reported and not gated
@@ -217,23 +227,23 @@ def build(s3_log: Path, runaway: Path) -> None:
     ):
         records.append(pc.record(
             rid, "V", label, value, err, date="synthetic (identical names)", unit="vol points", definition="basket implied vol of the calibrated model against the analytic target of identical names; the two step sizes calibrated and priced on common random numbers",
-            budget="8e5 particles / 8e5 paths (the test's production size)", commit="a102ef8", source=src, notes="a maximum over 33 cells: no standard error" if err is None else "paired standard error",
+            budget="8e5 particles / 8e5 paths (the test's production size)", commit="the working tree that became a102ef8", source=src, notes="a maximum over 33 cells: no standard error" if err is None else "paired standard error",
         ))  # fmt: skip
 
     # V2: other validation items
     add("### V2. Other validation items, as they stand at the freeze")
     add("")
     add(
-        "- **Row gates** (no NaN, forward, index smile): no gating check fails on the four production rows of sections A and B. The index gate (0.15 vp at the money and at the 90 % strike) is waived when the wing binds; on 2026-10-02 and 2017-04-03 the error at the 90 % strike is outside it (section A/B flags tables)."
+        "- **Row gates** (no NaN, forward, index smile): no gating check fails on the four production rows of sections A and B. The index gate (0.15 vp at the money and at the 90 % strike) is waived on all four because the wing binds on each; on 2026-10-02 and 2017-04-03 the error at the 90 % strike is outside it (flags tables of sections A and B)."
     )
     add(
         "- **Names' 2 % check** (Σ w E[R_i²] of the model against the listed strips): a reported diagnostic since the owner's decision 3, not a gate. Which tail puts it above the strips, and how well the Monte Carlo number is resolved there: V4."
     )
     add(
-        "- **Golden baseline S11** (`tests/golden/lcm_baseline_2026-10-02.json`): recorded on the old defaults (no calendar repair); it has NOT been re-recorded under the defaults of 9 Oct, and the slow Dow tests (C2 Dow, S5 Dow, S11) have NOT been rerun under them. The fast suites of the local correlation files pass (70 tests) at commit a102ef8."
+        "- **Golden baseline S11** (`tests/golden/lcm_baseline_2026-10-02.json`): recorded on the old defaults (no calendar repair); it has NOT been re-recorded under the defaults of 9 Oct, and the slow Dow tests (C2 Dow, S5 Dow, S11) have NOT been rerun under them. The fast tests of the local correlation files pass at commit a102ef8: 70 = 54 (`tests/test_local_correlation.py`) + 9 (`tests/test_lcm_report.py`) + 7 (`tests/test_lcm_scripts.py`), one run before that commit."
     )
     add(
-        "- **Section C's rows** are from the variant development pass at commit 5b4700b (names' calendar repair and unscreened fallback on; the index repair of decision 5 not yet in the code). On the dates where the index repair would drop a DJX slice at 3m (32 of 218 dates built in a specification-only check) the current defaults give a different specification from those rows."
+        "- **Section C's rows** are from the variant development pass at commit 5b4700b (names' calendar repair and unscreened fallback on; the index repair of decision 5 not yet in the code). On the dates where the index repair drops a DJX slice at 3m (32 of the 218 dates built in a specification-only check, `diagnostics/index_repair_3m.json`; none of the four dates of sections A and B) the current defaults give a different specification from those rows."
     )
     add("")
 
@@ -243,6 +253,7 @@ def build(s3_log: Path, runaway: Path) -> None:
     path_rows: list[dict[str, Any]] = []
     ratio_rows: list[dict[str, Any]] = []
     done = []
+    x_max = 0.0
     for f in sorted(run_copy.glob("result_*.json")):
         doc = json.loads(f.read_text())
         date = doc["date"]
@@ -252,6 +263,7 @@ def build(s3_log: Path, runaway: Path) -> None:
         fsrc = f"{f} (independent verification on the model of rows/3m_development_repair/{date}.json, bit for bit)"
         for model in ("lc", "cc"):
             m = doc["models"][model]
+            x_max = max(x_max, max(float(nm["X_max"]) for nm in m["per_name"]))
             for key, row in m["rows"].items():
                 tag = "ED" if key == "E[D]" else dict(MULTS)[key]
                 path_rows.append({
@@ -262,9 +274,9 @@ def build(s3_log: Path, runaway: Path) -> None:
                 })  # fmt: skip
                 records.append(pc.record(
                     f"V.runaway.{date}.{model}.{tag}.share_above_3x", "V", f"share of {'E[D]' if key == 'E[D]' else 'the call at ' + key + ' x P_D'} carried by paths with a name above 3 times its spot, {model.upper()}",
-                    row["share_gt_3"], None, date=date, unit="share of the price", definition="sum of the payoff over the paths on which max_i S_i(T)/S_i(0) > 3, over the sum over all paths",
+                    row["share_gt_3"], row.get("share_gt_3_se"), date=date, unit="share of the price", definition="sum of the payoff over the paths on which max_i S_i(T)/S_i(0) > 3, over the sum over all paths",
                     budget=bud, commit="model of the stored row (5b4700b); measured at a102ef8", source=fsrc, n=int(m["n_gt"]["3"]),
-                    notes=f"n = paths above 3x of {meta['n_paths']}; the 10 largest paths carry {100 * row['top10']:.1f} % of the price; no usable standard error where a handful of paths carry the price",
+                    notes=f"n = paths above 3x of {meta['n_paths']}; the 10 largest paths carry {100 * row['top10']:.1f} % of the price; the se is the delta method on antithetic pair means and is not reliable where a handful of paths carry the price",
                 ))  # fmt: skip
         for key, tag in MULTS:
             r = doc["ratios"][tag]
@@ -300,9 +312,14 @@ def build(s3_log: Path, runaway: Path) -> None:
     ratios = pd.DataFrame(ratio_rows)
     pc.save_table(paths, "V_runaway_paths")
     pc.save_table(ratios, "V_runaway_ratios")
+    n3 = paths["n_paths_above_3x"]
+    s150 = paths[paths.price_of == "call at 1.5 x P_D"]["share_paths_above_3x"]
+    s200 = paths[paths.price_of == "call at 2.0 x P_D"]["share_paths_above_3x"]
     add(
-        "Beyond the last listed call strike the names' Dupire local volatility is an extrapolation (several hundred per cent in places, up to the 500 % cap, alternating in time with the 1 % floor). A few paths per 200000 therefore end with one name at 3 to 40 times its spot in three months "
-        "— above every strike listed for that name — and these paths carry most of the calls at 1.5 and 2 times the forward, under LC and under CC. The owner's decision 3 leaves the tails as they are; the numbers below say how much of each price they are. "
+        "Beyond the last listed call strike the names' Dupire local volatility is an extrapolation (several hundred per cent in places, up to the 500 % cap, alternating in time with the 1 % floor: `diagnostics/runaway/cause_<date>.log`). "
+        f"On the two dates measured, {int(n3.min())} to {int(n3.max())} paths per 200000 end with one name above 3 times its spot in three months (up to {x_max:.0f} times), above every strike listed for that name at the expiries around the horizon, "
+        f"and these paths carry {100 * s200.min():.0f} to {100 * s200.max():.0f} % of the calls at 2 times the forward and {100 * s150.min():.0f} to {100 * s150.max():.0f} % at 1.5 times, under LC and under CC (table below). "
+        "The owner's decision 3 leaves the tails as they are; the numbers below say how much of each price they are. "
         f"Measured at the development budget on {' and '.join(done)} (the model of the stored development rows, bit for bit), independently of the analyst who first reported it."
     )
     add("")
@@ -341,10 +358,44 @@ def build(s3_log: Path, runaway: Path) -> None:
             f"| {r.date} | {r.strike_multiple:g}x | {num(r.lc_over_cop)} → {num(r.lc_over_cop_ex)} | {r.lc_over_cc:.4f} → {r.lc_over_cc_ex:.4f} | {num(r.cc_over_cop)} → {num(r.cc_over_cop_ex)} |"
         )
     add("")
+    today, other = "2026-10-02", next(d for d in done if d != "2026-10-02")
+
+    def share(date: str, model: str, what: str) -> float:
+        return float(
+            paths[(paths.date == date) & (paths.model == model) & (paths.price_of == what)][
+                "share_paths_above_3x"
+            ].iloc[0]
+        )
+
+    def ratio(date: str, mult: float, col: str) -> float:
+        return float(ratios[(ratios.date == date) & (ratios.strike_multiple == mult)][col].iloc[0])
+
+    def move(date: str, mult: float, col: str) -> float:
+        return 100.0 * (ratio(date, mult, col + "_ex") / ratio(date, mult, col) - 1.0)
+
+    a_recs = {r["id"]: r for r in json.loads((pc.PM / "parts" / "A_today.json").read_text())}
+    b_recs = {r["id"]: r for r in json.loads((pc.PM / "parts" / "B_reference.json").read_text())}
+    lc_cop = a_recs["A.ratio.lc_over_copula"]
+    times_se = share(today, "LC", "E[D]") * lc_cop["value"] / lc_cop["se"]
+    smaller = [
+        b_recs[f"B.{d}.call.K_{m}.cc"]["value"] / b_recs[f"B.{d}.call.K_{m}.lc"]["value"]
+        for d in pc.REFERENCE_DATES[1:]
+        for m in ("150", "200")
+    ]
     add(
-        "Sensitivity, not a corrected price: the same ratios with the payoff of those paths (under either model) set to zero. **Reading for the report:** the forward E[D] is not affected (0.2 %); the at-the-forward call moves by 2–3 %; "
-        "the call at 1.25x by 8–19 %; the ratios at 1.5x and 2.0x, against CC and against the copula, are essentially these paths and should not be quoted as model results (LC/copula of 11 and 20 at 2.0x is entirely them). "
-        "The same holds for the production rows of sections A and B (K_150, K_200) and for the K_150 column and the upper strikes of figure F2 in section C, where the mean across dates sits well above the median. "
+        "Sensitivity, not a corrected price: the same ratios with the payoff of those paths (under either model) set to zero. **Reading for the report.** "
+        f"(1) The forward: these paths are {100 * share(today, 'LC', 'E[D]'):.2f} % of E[D] under LC and {100 * share(today, 'CC', 'E[D]'):.2f} % under CC today, so LC/CC does not move; the copula has no such paths, "
+        f"so against the copula the same sensitivity is about −{100 * share(today, 'LC', 'E[D]'):.1f} %, which is {times_se:.0f} times the Monte Carlo error printed for today's LC/copula in section A. "
+        f"(2) The call at the forward: LC/copula moves by {move(today, 1.0, 'lc_over_cop'):+.1f} % today and {move(other, 1.0, 'lc_over_cop'):+.1f} % on {other}; at 1.25 times the forward by {move(today, 1.25, 'lc_over_cop'):+.1f} % and {move(other, 1.25, 'lc_over_cop'):+.1f} %. "
+        f"(3) At 1.5 times LC/copula goes from {num(ratio(today, 1.5, 'lc_over_cop'))} to {num(ratio(today, 1.5, 'lc_over_cop_ex'))} today and from {num(ratio(other, 1.5, 'lc_over_cop'))} to {num(ratio(other, 1.5, 'lc_over_cop_ex'))} on {other}; "
+        f"at 2 times from {num(ratio(today, 2.0, 'lc_over_cop'))} and {num(ratio(other, 2.0, 'lc_over_cop'))} to {num(ratio(today, 2.0, 'lc_over_cop_ex'))} and {num(ratio(other, 2.0, 'lc_over_cop_ex'))}: "
+        "the ratios to the copula at these strikes are mostly these paths and should not be quoted as model results. LC/CC moves less today "
+        f"({ratio(today, 1.5, 'lc_over_cc'):.4f} to {ratio(today, 1.5, 'lc_over_cc_ex'):.4f} at 1.5 times, {ratio(today, 2.0, 'lc_over_cc'):.4f} to {ratio(today, 2.0, 'lc_over_cc_ex'):.4f} at 2 times) because the paths are in both models; "
+        f"on {other} it moves from {ratio(other, 1.5, 'lc_over_cc'):.4f} to {ratio(other, 1.5, 'lc_over_cc_ex'):.4f} and from {ratio(other, 2.0, 'lc_over_cc'):.4f} to {ratio(other, 2.0, 'lc_over_cc_ex'):.4f}. "
+        "(4) What is measured and what is not: the measurement is at the development budget, on these two dates, on the model of the stored development rows. "
+        f"Today's production row has LC/copula of {a_recs['A.call.K_150.lc_over_copula']['value']:.2f} at K_150 and {a_recs['A.call.K_200.lc_over_copula']['value']:.1f} at K_200 (section A4), "
+        f"against {ratio(today, 1.5, 'lc_over_cop'):.2f} and {ratio(today, 2.0, 'lc_over_cop'):.1f} in the measured model, so the caveat is expected to apply to it. "
+        f"It has not been measured on the three reference dates of section B, where CC's calls at K_150 and K_200 are {min(smaller):.1f} to {max(smaller):.0f} times LC's (B2), so whether the same paths carry them there is not known, nor on the other dates of section C. "
         "Files: `tables/V_runaway_paths.csv`, `tables/V_runaway_ratios.csv`, `diagnostics/runaway/` (scripts, logs and JSON results of the measurement)."
     )
     # V4: the names' second moment by region (owner's decision 3)
