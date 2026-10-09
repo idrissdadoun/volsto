@@ -26,6 +26,14 @@ bid-ask spread inside ±1 at-the-money standard deviation of the forward is abov
 Every expiry dropped is logged with its reason and returned in the build's information.  The
 screen lives here and not in the study's loader: the study's published numbers were made with
 every expiry its own guards kept, and its loader is unchanged.
+
+**Calendar repair** (``ExpiryScreen.calendar_repair``, off by default; :func:`repair_calendar`):
+a name's fitted slices may cross in calendar between neighbouring short expiries — the total
+variance falls from one slice to the next somewhere inside the range the name's distribution
+visits — and the Dupire surface is floored there.  With the option on, such slices are dropped
+before the surface is built: of a crossing pair the slice that is not a third-Friday expiry
+goes, the shorter one when both are or neither is, round after round until no pair crosses
+inside the central range (or ``CALENDAR_MAX_ROUNDS`` rounds).  The index target is not touched.
 """
 
 from __future__ import annotations
@@ -57,6 +65,7 @@ from volsto.market.svi_slices import (
     FIT_MIN_WIDTH,
     FIT_WIDTH_SD,
     SviSliceFit,
+    SviSlices,
     fit_svi_surface,
     svi_fit_key,
     svi_fit_settings,
@@ -192,13 +201,15 @@ class ExpiryScreen:
     have a positive bid on both the call and the put (an expiry that lists fewer is dropped).
     ``max_half_spread_vp``: the median half spread inside ±1 sd is at most this many vol points
     for an expiry of up to ``long_maturity`` years, and at most ``max_half_spread_long_vp``
-    beyond (``inf``: not read)."""
+    beyond (``inf``: not read).  ``calendar_repair``: the names' slices that cross in calendar
+    inside the central range are dropped (:func:`repair_calendar`; off by default)."""
 
     index_third_friday: bool = True
     nearest_two_sided: bool = True
     max_half_spread_vp: float = 2.0
     max_half_spread_long_vp: float = 6.0
     long_maturity: float = 1.0
+    calendar_repair: bool = False
 
     def __post_init__(self) -> None:
         if not (self.max_half_spread_vp > 0 and self.max_half_spread_long_vp > 0):
@@ -226,7 +237,9 @@ class ExpiryScreen:
         return self.max_half_spread_long_vp
 
     def describe(self) -> dict[str, Any]:
-        return {
+        """The screen as a mapping (``calendar_repair`` appears only when it is on, so that the
+        description of the default screen is what earlier records hold)."""
+        out: dict[str, Any] = {
             "index_third_friday": self.index_third_friday,
             "nearest_two_sided": self.nearest_two_sided,
             "nearest_strikes": NEAREST_STRIKES,
@@ -235,6 +248,9 @@ class ExpiryScreen:
             "long_maturity": self.long_maturity,
             "quote_sd": QUOTE_SD,
         }
+        if self.calendar_repair:
+            out["calendar_repair"] = True
+        return out
 
 
 def screen_reason(e: ListedExpiry, q: QuoteQuality | None, screen: ExpiryScreen) -> tuple[str, str]:
@@ -330,6 +346,84 @@ def name_market(
     )
 
 
+#: The calendar repair reads crossings inside the mean ± this many standard deviations of a
+#: name's log-moneyness at each slice (the range measured in SPEC §8.7, decision 8).
+CALENDAR_CENTRAL_SD: Final[float] = 2.0
+CALENDAR_MAX_ROUNDS: Final[int] = 5
+
+
+def calendar_crossings(
+    surface: SviSlices, horizon: float, central_sd: float = CALENDAR_CENTRAL_SD
+) -> list[tuple[float, float, float, float]]:
+    """``(T_s, T_{s+1}, min dw, k)`` for each pair of consecutive slices whose total variance
+    falls somewhere inside the central range of the two slices.  The range of slice ``s`` is the
+    lognormal one at its own at-the-money variance, read at ``t = min(T_s, horizon)``: mean
+    ``−½v``, standard deviation ``√v``, ``v = w_s(0)·t/T_s`` — what the particle cloud's mean
+    ± ``central_sd`` standard deviations is to first order, without a calibration."""
+    times = np.asarray(surface.times, dtype=np.float64)
+    w0 = np.array([float(surface.total_variance(0.0, float(t))) for t in times])
+    v = w0 * np.minimum(times, horizon) / times
+    sd = np.sqrt(v)
+    lo = [float(x) for x in -0.5 * v - central_sd * sd]
+    hi = [float(x) for x in -0.5 * v + central_sd * sd]
+    report = surface.arbitrage_report(k_lo=lo, k_hi=hi)
+    return [
+        (float(times[i]), float(times[i + 1]), float(c), float(k))
+        for i, (c, k) in enumerate(zip(report.min_calendar, report.argmin_calendar, strict=True))
+        if c < -report.tol
+    ]
+
+
+def repair_calendar(
+    leg: str,
+    expiries: Sequence[ListedExpiry],
+    curve: ForwardCurve,
+    horizon: float,
+    records: FitRecords | None,
+    origin: str,
+) -> tuple[list[ListedExpiry], list[dict[str, Any]]]:
+    """``(kept, dropped)``: the expiries of one name with the slices that cross in calendar
+    inside the central range removed (module docstring).  Each dropped expiry is a record like
+    the screen's, with ``rule = "calendar"``.  Of a crossing pair the slice that is not a
+    third-Friday expiry is dropped, the shorter one when both are or neither is; the surface is
+    refitted and checked again, at most ``CALENDAR_MAX_ROUNDS`` times."""
+    kept = list(expiries)
+    dropped: list[dict[str, Any]] = []
+    for _ in range(CALENDAR_MAX_ROUNDS):
+        if len(kept) < 2:
+            break
+        surface, _fits = fit_svi_surface(
+            kept, curve, horizon=horizon, records=records, origin=origin
+        )
+        pairs = calendar_crossings(surface, horizon)
+        if not pairs:
+            break
+        by_time = {round(float(e.T), 9): e for e in kept}
+        listed = {e.expiry for e in kept}
+        gone: dict[str, str] = {}
+        for t_a, t_b, c, k in pairs:
+            a, b = by_time[round(t_a, 9)], by_time[round(t_b, 9)]
+            out = b if third_friday(a.expiry, listed) and not third_friday(b.expiry, listed) else a
+            gone.setdefault(
+                out.expiry,
+                f"calendar crossing with the {'next' if out is a else 'previous'} slice "
+                f"(T = {t_a:.4f} -> {t_b:.4f}): total variance falls by {-c:.2e} at k = {k:+.4f}",
+            )
+        for e in kept:
+            if e.expiry in gone:
+                dropped.append({"leg": leg, "expiry": e.expiry, "T": float(e.T), "rule": "calendar",
+                                "reason": gone[e.expiry]})  # fmt: skip
+                log.info(
+                    "calendar repair: %s %s (T = %.4f) dropped: %s",
+                    leg,
+                    e.expiry,
+                    e.T,
+                    gone[e.expiry],
+                )
+        kept = [e for e in kept if e.expiry not in gone]
+    return kept, dropped
+
+
 def _surface_config(
     expiries: Sequence[ListedExpiry],
     curve: ForwardCurve,
@@ -406,6 +500,12 @@ def lc_spec_from_smiles(
         dropped += gone
         if not expiries:
             raise ValueError(f"{name}: no listed expiry passes the screen")
+        if screen.calendar_repair:
+            curve = ForwardCurve.from_config(name_market(expiries, float(spot), carry))
+            expiries, gone = repair_calendar(
+                name, expiries, curve, horizon, records, f"{origin}:{name}"
+            )
+            dropped += gone
         market = name_market(expiries, float(spot), carry)
         cfg, fits = _surface_config(
             expiries, ForwardCurve.from_config(market), horizon, records, f"{origin}:{name}"

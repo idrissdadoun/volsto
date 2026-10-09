@@ -13,6 +13,8 @@
 #   2  3m production pass (8e5, deltas)
 #   3  today's full risk at production budget
 #   4  12m development pass          5  24m development pass
+#   R  3m development pass with the calendar repair of the names' slices on (lcm_repair.yaml;
+#      rows, logs and table carry the suffix _repair)
 ROOT=${1:?usage: lcm_sweep.sh <worktree that holds outputs/dispersion_lc> [steps]}
 STEPS=${2:-"0 1 2 3 4 5"}
 PY=${PY:-$ROOT/.venv/bin/python}
@@ -45,6 +47,9 @@ for step in $STEPS; do
         --workers "$WORKERS" --root "$ROOT" ;;
     5) run scripts/disp_lcm.py --tenor 24m --dates monthly --budget development --risk none \
         --workers "$WORKERS" --root "$ROOT" ;;
+    R) run scripts/disp_lcm.py --tenor 3m --dates monthly --budget development --risk none \
+        --workers "$WORKERS" --config configs/studies/dispersion/lcm_repair.yaml --tag repair \
+        --root "$ROOT" ;;
     *) echo "unknown step $step" ;;
     esac
 done

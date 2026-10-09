@@ -3,13 +3,17 @@ dates — one process of ``scripts/lcm_price.py`` per date, resumable, one row p
 
     python scripts/disp_lcm.py --tenor 3m|12m|24m --dates monthly|today|reference|<d1,d2,...>
         [--budget production|development] [--risk none|deltas|full] [--workers N|auto]
-        [--root <dir>] [--config <yaml>] [--limit N] [--varswap] [--no-report] [--no-retry]
+        [--root <dir>] [--config <yaml>] [--tag <name>] [--limit N] [--varswap] [--no-report]
+        [--no-retry]
 
 Dates.  ``monthly``: the converged dates of the study's model S table
 (``outputs/dispersion/model_s_3m.parquet``, 218 dates) and today, 219 in all — at 12m and 24m
 those of them with an entry of that tenor.  ``reference``: the four dates of the reference
 implementation.  The order of a pass is today and the reference dates first, then every 8th
 date, then the gaps by halving (4, 2, 1): a pass stopped early covers the whole period.
+
+``--tag <name>`` runs a variant of the configuration (``--config``) beside the main pass: its
+rows, logs and table carry the suffix ``_<name>``.
 
 Rows.  Each date's row is ``<root>/outputs/dispersion_lc/rows/<tenor>_<budget>/<date>.json``
 (what ``lcm_price.py`` writes); the pass's table is ``lcm_<tenor>.parquet`` at the production
@@ -84,18 +88,24 @@ def interleaved(dates: Sequence[str], first: Sequence[str] = REFERENCE_DATES) ->
 class Sweep:
     """A pass: its folders, the rows it has, the dates left."""
 
-    def __init__(self, tenor: str, budget: str, risk: str, cfg: dict[str, Any], root: Path) -> None:
+    def __init__(
+        self, tenor: str, budget: str, risk: str, cfg: dict[str, Any], root: Path, tag: str = ""
+    ) -> None:
         self.tenor, self.budget, self.risk, self.cfg = tenor, budget, risk, cfg
         self.out = lp.out_root(cfg, root)
         self.root = root
-        self.tag = f"{tenor}_{budget}"
+        self.tag = f"{tenor}_{budget}" + (f"_{tag}" if tag else "")
         self.rows = self.out / "rows" / self.tag
         self.logs = self.out / "logs" / self.tag
         self.rows.mkdir(parents=True, exist_ok=True)
         self.logs.mkdir(parents=True, exist_ok=True)
         self.commit = code_version()
         self.digest = lp.config_digest(cfg, tenor, budget)
-        self.table = self.out / (f"lcm_{tenor}.parquet" if budget == "production" else f"lcm_{tenor}_dev.parquet")  # fmt: skip
+        stem = (f"lcm_{tenor}" if budget == "production" else f"lcm_{tenor}_dev") + (
+            f"_{tag}" if tag else ""
+        )
+        self.table = self.out / f"{stem}.parquet"
+        self.label = tag
 
     def row(self, date: str) -> dict[str, Any] | None:
         path = self.rows / f"{date}.json"
@@ -217,13 +227,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap.add_argument(
         "--varswap", action="store_true", help="the basket variance swap on the reference dates"
     )
+    ap.add_argument(
+        "--tag",
+        default="",
+        help="a suffix for the pass's rows, logs and table (a variant of the configuration)",
+    )
     ap.add_argument("--no-report", action="store_true")
     ap.add_argument("--no-retry", action="store_true")
     args = ap.parse_args(argv)
     cfg = lp.load_config(args.config)
     risk = args.risk or cfg["risk"]
     root = Path(args.root).resolve() if args.root else lp.ROOT
-    sweep = Sweep(args.tenor, args.budget, risk, cfg, root)
+    sweep = Sweep(args.tenor, args.budget, risk, cfg, root, args.tag)
     logging.basicConfig(
         level=logging.INFO, format="%(message)s",
         handlers=[logging.StreamHandler(sys.stdout), logging.FileHandler(sweep.out / "logs" / f"{sweep.tag}.log")],
@@ -284,7 +299,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     )  # fmt: skip
     if not args.no_report:
         report = Path(__file__).resolve().parent / "lcm_report.py"
-        cmd = [sys.executable, str(report), "--tenor", args.tenor, "--budget", args.budget, "--root", str(root)]  # fmt: skip
+        cmd = [sys.executable, str(report), "--tenor", args.tenor, "--budget", args.budget, "--root", str(root),
+               "--config", args.config, "--tag", args.tag]  # fmt: skip
         code = subprocess.run(cmd, check=False).returncode
         log.info("report: exit code %d", code)
     return 0

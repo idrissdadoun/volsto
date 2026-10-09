@@ -2729,6 +2729,81 @@ def test_lcm_delta_method_errors() -> None:
     assert value == pytest.approx(mean, rel=1e-12) and se == pytest.approx(mean_err, rel=1e-6)
 
 
+def test_calendar_repair() -> None:
+    """The calendar repair of the names' slices (``ExpiryScreen.calendar_repair``, off by
+    default): slices whose total variance falls from one expiry to the next inside the central
+    range are dropped — of a crossing pair the one that is not a third Friday, the shorter one
+    when neither is — until none crosses; without crossings, and with the option off, nothing
+    changes; the index target is never touched; every dropped expiry is recorded."""
+    from volsto.market.svi_slices import fit_svi_surface
+    from volsto.studies.disp_lc import (
+        ExpiryScreen,
+        calendar_crossings,
+        lc_spec_from_smiles,
+        repair_calendar,
+    )
+
+    forward, rate = 1.0, 0.0
+    k = np.linspace(-0.4, 0.4, 33)
+
+    def expiry(date: str, T: float, vol: float) -> Any:
+        return types.SimpleNamespace(
+            expiry=date, T=T, forward=forward, rate=rate, k=k, vol=np.full(k.size, vol)
+        )
+
+    # monthly slices at 20 % and three weeklies: 10-23 at 15 % is below the third Friday 10-16
+    # before it (total variance 0.15^2 * 21/365 < 0.20^2 * 14/365), 11-13 at 24 % is above the
+    # third Friday 11-20 after it, and 10-30 at 20 % is consistent with its neighbours
+    clean = [expiry("2026-10-16", 14 / 365, 0.20), expiry("2026-11-20", 49 / 365, 0.20),
+             expiry("2026-12-18", 77 / 365, 0.20), expiry("2027-01-15", 105 / 365, 0.20)]  # fmt: skip
+    crossed = sorted([*clean, expiry("2026-10-23", 21 / 365, 0.15), expiry("2026-10-30", 28 / 365, 0.20),
+                      expiry("2026-11-13", 42 / 365, 0.24)], key=lambda e: e.T)  # fmt: skip
+    curve = ForwardCurve.flat(1.0, 0.0, 0.0)
+    kept, dropped = repair_calendar("AAA", clean, curve, 0.25, None, "test")
+    assert [e.expiry for e in kept] == [e.expiry for e in clean] and dropped == []
+    kept, dropped = repair_calendar("AAA", crossed, curve, 0.25, None, "test")
+    gone = {d["expiry"] for d in dropped}
+    # a third Friday against a weekly: the weekly goes, whichever comes first; then nothing
+    # crosses
+    assert gone == {"2026-10-23", "2026-11-13"}, gone
+    assert all(
+        d["rule"] == "calendar" and d["leg"] == "AAA" and "falls by" in d["reason"] for d in dropped
+    )
+    surface, _ = fit_svi_surface(kept, curve, horizon=0.25, origin="test")
+    assert calendar_crossings(surface, 0.25) == []
+    before, _ = fit_svi_surface(crossed, curve, horizon=0.25, origin="test")
+    assert len(calendar_crossings(before, 0.25)) >= 2
+    again, more = repair_calendar("AAA", kept, curve, 0.25, None, "test")
+    assert [e.expiry for e in again] == [e.expiry for e in kept] and more == []
+    # in the builder: off by default; on, the names' crossing slices go and the index stays
+    names, w, spots = ["AAA", "BBB"], [0.5, 0.5], [1.0, 1.0]
+    smiles = {"AAA": crossed, "BBB": clean}
+    index = [expiry("2026-10-16", 14 / 365, 0.15), expiry("2026-10-23", 21 / 365, 0.25),
+             expiry("2026-11-20", 49 / 365, 0.15), expiry("2027-01-15", 105 / 365, 0.15)]  # fmt: skip
+    off = dataclasses.replace(ExpiryScreen.off())
+    on = dataclasses.replace(ExpiryScreen.off(), calendar_repair=True)
+    assert ExpiryScreen().calendar_repair is False and "calendar_repair" not in off.describe()
+    assert on.describe()["calendar_repair"] is True
+    settings: dict[str, Any] = {
+        "lc": LocalCorrelationConfig(
+            particle=ParticleConfig(n_particles=1000, horizon=0.25, seed=1)
+        ),
+        "sim": SimConfig(n_paths=1000, dt_max=DAILY, seed=1),
+    }
+    spec_off, info_off = lc_spec_from_smiles(
+        names, w, spots, smiles, index, 1.0, 0.25, screen=off, **settings
+    )
+    spec_on, info_on = lc_spec_from_smiles(
+        names, w, spots, smiles, index, 1.0, 0.25, screen=on, **settings
+    )
+    assert info_off["dropped"] == [] and len(spec_off.surfaces[0].times) == 7
+    assert {d["expiry"] for d in info_on["dropped"]} == {"2026-10-23", "2026-11-13"}
+    assert all(d["leg"] == "AAA" for d in info_on["dropped"])
+    assert len(spec_on.surfaces[0].times) == 5 and spec_on.surfaces[1] == spec_off.surfaces[1]
+    assert spec_on.index_surface == spec_off.index_surface  # the crossing index slice is kept
+    assert lc_cache.lc_spec_key(spec_on) != lc_cache.lc_spec_key(spec_off)
+
+
 # ---------------------------------------------------------------------------------------------
 # LC4 acceptance (slow): helpers
 # ---------------------------------------------------------------------------------------------

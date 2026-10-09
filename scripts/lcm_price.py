@@ -290,6 +290,7 @@ def run_date(
     row.update(
         n_dropped=len(info["dropped"]), n_dropped_third_friday=by_rule.get("third_friday", 0),
         n_dropped_strikes=by_rule.get("strikes", 0), n_dropped_spread=by_rule.get("spread", 0),
+        n_dropped_calendar=by_rule.get("calendar", 0), calendar_repair=bool(cfg["screen"].get("calendar_repair", False)),
         n_dropped_index=sum(g["leg"] == "index" for g in info["dropped"]),
         svi_rms_vp_median=info["svi_rms_vp_median"], svi_rms_vp_max=info["svi_rms_vp_max"],
         svi_rms_vp_index=float(np.max(info["svi_rms_vp_index"])),

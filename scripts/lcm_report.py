@@ -114,8 +114,11 @@ def agreement(a: pd.Series, b: pd.Series) -> dict[str, Any]:
     }  # fmt: skip
 
 
-def load(tenor: str, budget: str, out: Path) -> tuple[pd.DataFrame, Path]:
-    path = out / (f"lcm_{tenor}.parquet" if budget == "production" else f"lcm_{tenor}_dev.parquet")
+def load(tenor: str, budget: str, out: Path, label: str = "") -> tuple[pd.DataFrame, Path]:
+    stem = (f"lcm_{tenor}" if budget == "production" else f"lcm_{tenor}_dev") + (
+        f"_{label}" if label else ""
+    )
+    path = out / f"{stem}.parquet"
     rows = pd.read_parquet(path)
     entries = pd.read_parquet(dd.OUT / f"entries_{tenor}.parquet")
     entries = entries[entries["basket"] == "B1"].drop_duplicates("date").set_index("date")
@@ -130,9 +133,9 @@ def load(tenor: str, budget: str, out: Path) -> tuple[pd.DataFrame, Path]:
     return frame.sort_index(), path
 
 
-def build(tenor: str, budget: str, out: Path) -> Path:
-    frame, source = load(tenor, budget, out)
-    tag = tenor if budget == "production" else f"{tenor}_dev"
+def build(tenor: str, budget: str, out: Path, label: str = "") -> Path:
+    frame, source = load(tenor, budget, out, label)
+    tag = (tenor if budget == "production" else f"{tenor}_dev") + (f"_{label}" if label else "")
     figures = out / "figures"
     figures.mkdir(parents=True, exist_ok=True)
     ok = frame[frame["status"] != "failed"].copy()
@@ -517,10 +520,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap.add_argument("--budget", default="production", choices=("production", "development"))
     ap.add_argument("--config", default=str(lp.CONFIG))
     ap.add_argument("--root", default=None)
+    ap.add_argument("--tag", default="", help="the suffix of a variant pass (disp_lcm.py --tag)")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
     cfg = lp.load_config(args.config)
-    path = build(args.tenor, args.budget, lp.out_root(cfg, args.root))
+    path = build(args.tenor, args.budget, lp.out_root(cfg, args.root), args.tag)
     log.info("written %s", path)
     return 0
 
