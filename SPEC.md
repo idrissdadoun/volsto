@@ -1564,6 +1564,63 @@ The study of §8.4 on every weekly entry of the ORATS history (§18.10). Specifi
 - **[review] LC7-b, corrected.** The companion's fit noise at the development budget (10⁵ paths) moves LC/CC by up to 0.19 % (2019-09-03: 0.9601 against 0.9583 on 8·10⁵), more than the 0.08 % estimated above.
 - **The 2-year Δt check on the schedule of decision 2** (decision 9 of the second round; `scripts/lcm_diagnostics.py dt --date 2026-10-02 --tenor 24m --particles 200000 --paths 200000`, common random numbers): `E[D]` +0.001 % ± 0.009 (0.341848 at 2y); calls +0.005 ± 0.03, −0.04 ± 0.08, −0.20 ± 0.19, −0.48 ± 0.47 % at 0.75 to 1.5 times `E[D]`; index smile at most 0.034 vp (± 0.023) over five pillars. Inside S5's gates.
 
+**LC7 results (as measured, 2026-10-09; the passes that were still running are named at the end).**
+- **The four reference dates at 3m, production budget** (8·10⁵ particles and paths, the companion fitted on 4·10⁵; `scripts/disp_lcm.py --dates reference --budget production --risk deltas --varswap`, commit c69ffab, default configuration, every row with the status `ok`; rows in `outputs/dispersion_lc/rows/3m_production/`).
+
+| | 2026-10-02 | 2019-09-03 | 2017-04-03 | 2008-07-07 |
+|---|---|---|---|---|
+| `E^LC[D]` | 0.106235 ± 0.000034 | 0.071289 ± 0.000020 | 0.053264 ± 0.000015 | 0.097830 ± 0.000025 |
+| **LC/CC** | **0.97008 ± 0.00011** | **0.95816 ± 0.00010** | **0.94535 ± 0.00013** | **0.98075 ± 0.00007** |
+| the reference implementation (its own world) | 0.9743 | 0.9453 | 0.9110 | 0.9761 |
+| the study's model S over its copula | 0.9735 (not converged) | 0.9440 | 0.8761 | 0.9800 |
+| `E^CC[D]` over the copula's `P_D` | 0.9992 | 0.9937 | 1.0029 | 1.0022 |
+| clipped mass inside ±2.5 sd | 1.81 % | 13.3 % | 15.4 % | 2.1 % |
+| index error at 3m: at the money; 90 %; −2.5 sd (vp) | −0.001; −0.452; −1.471 | +0.016; −0.128; −0.385 | −0.020; −1.575; −2.186 | +0.001; −0.042; −0.227 |
+| S8, reported: `E^LC[V]/E^Q[V]` | 1.0491 | 1.0169 | 1.1373 | 1.0102 |
+| `ED_wing` / `E^CC[D]` | 0.9588 ± 0.0005 | 0.9604 ± 0.0013 | 0.9017 ± 0.0011 | 0.9842 ± 0.0008 |
+| `ED_eqv` / `E^CC[D]` | 0.9471 ± 0.0012 | 0.9502 ± 0.0003 | 0.8864 ± 0.0003 | 0.9758 ± 0.0003 |
+| calls LC/CC at 0.75, 1, 1.25, 1.5 times the CC forward | 0.910, 0.901, 0.950, 1.003 ± 0.010 | 0.838, 0.609, 0.293, 0.106 ± 0.002 | 0.800, 0.602, 0.369, 0.262 ± 0.005 | 0.930, 0.893, 0.934, 0.921 ± 0.011 |
+| forward, sticky-strike delta (% per +1 %): LC; CC | +2.294 ± 0.004; +0.349 ± 0.003 | +1.323 ± 0.003; −2.400 ± 0.002 | +1.740 ± 0.005; −2.571 ± 0.002 | +1.468 ± 0.001; −0.513 ± 0.001 |
+| its skew channel; correlation channel | −0.651; +1.944 | −3.400; +3.724 | −3.571; +4.311 | −1.513; +1.981 |
+| S9, reported: basket variance swap under LC; log contract of the model's own smile; the listed strip (vp) | 16.331 ± 0.007; 16.352 ± 0.029; 17.466 | 19.585 ± 0.008; 19.584 ± 0.033; 19.758 | 12.153 ± 0.004; 12.163 ± 0.020; 13.660 | 23.846 ± 0.005; 23.859 ± 0.032; 23.943 |
+| seconds per date (the machine shared) | 485 (cache hit) | 687 | 712 | 698 |
+
+  S9's first comparison (the model against its own smile) is within 0.022 vp on the four dates, inside 0.30; the second (its smile against the listed strip) is −1.11, −0.17, −1.50 and −0.08 vp — the wing the model does not reach. LC/CC agrees with the diagnostics runs of the second follow-up, whose companion was fitted on 8·10⁵ paths, within 0.0001.
+- **The 3m development pass over the study's dates, default configuration** (2·10⁵ particles and paths, `λ_c` fitted on 10⁵ paths, no risk, no calendar repair; commit b7b8bd3; 3 h 10 min on two workers; `outputs/dispersion_lc/lcm_3m_dev.parquet`, `report_3m_dev.md`). 219 dates — the 218 converged dates of model S and 2026-10-02: **208 priced** (85 with the status `ok`, 123 `check`) and **11 failed**, again on the retry: a name with no expiry passing the quote screen on ten (GM on eight dates from 2008-10-06 to 2009-06-01, AXP on 2009-03-02, UNH on 2013-04-01) and DJX itself on 2023-07-03.
+
+| across dates | n | mean | quartiles (25 %, median, 75 %) | range |
+|---|---|---|---|---|
+| `E^LC[D]/E^CC[D]` | 208 | 0.9697 ± 0.0012 | 0.9595, 0.9661, 0.9784 | 0.9388 to 1.0727 |
+| model S over its copula | 207 | 0.9419 ± 0.0023 | 0.9197, 0.9466, 0.9700 | 0.8408 to 1.0009 |
+| `E^CC[D]` over the copula's `P_D` | 208 | 0.9992 ± 0.0018 | 0.9912, 1.0004, 1.0065 | 0.7803 to 1.0942 |
+| `ED_wing / E^CC[D]` | 208 | 0.9500 ± 0.0023 | 0.9309, 0.9470, 0.9639 | 0.8699 to 1.1894 |
+| `ED_eqv / E^CC[D]` | 208 | 0.9231 ± 0.0030 | 0.9031, 0.9227, 0.9444 | 0.7033 to 1.1705 |
+| clipped mass inside ±2.5 sd | 208 | 12.3 % | 5.2 %, 10.7 %, 17.6 % | 0 to 47.9 % |
+| index error at the 90 % strike (vp) | 208 | −0.62 | −0.90, −0.49, −0.24 | −2.35 to +0.03 |
+| index error at the money (vp) | 208 | −0.05 | −0.09, −0.04, −0.00 | −0.58 to +0.20 |
+
+  (± on a mean: the standard error of the mean across dates; a date's own Monte Carlo error on LC/CC is 0.00026 in the median, to which the companion's fit adds up to 0.002, LC7-b.) *Calls, LC/CC against model S over the copula, medians:* 0.932 against 0.893 at `K_050`, 0.879 against 0.823 at `K_075`, 0.751 against 0.735 at `K_100`, 0.536 against 0.611 at `K_125`, 0.413 against 0.520 at `K_150`. *Agreement across dates of the two effects* (ratio minus 1; Pearson, Spearman): the forward +0.10, +0.21, with opposite directions on 11 dates; the calls +0.10, +0.22 at `K_050`, +0.56, +0.65 at `K_100`, +0.67, +0.68 at `K_125`, +0.48, +0.46 at `K_150`.
+- **The wing binds on almost every date.** The clipped mass inside ±2.5 sd is above 1 % on 196 of the 208 dates (on the high side on 195, on the low side on 48). The correlation across dates between the clipped mass and model S's effect is −0.63: the dates on which model S moves the forward most are those on which this model is clipped most. On the 50 dates with a clipped mass below 5 % the two models move the forward by the same amount on average (−2.5 % for LC, −2.6 % for model S; Spearman +0.37); on the 157 others LC moves it by −3.2 % and model S by −6.8 %. The wing-corrected `ED_wing` moves it by −5.0 % on average and follows model S across dates (Spearman +0.53), `ED_eqv` by −7.7 % (+0.54). LC/CC is above 1 on 10 dates: dates of very high implied correlation, where the cap binds near the money as well (2011-12-05, `ρ_CC` 0.82; 2020-04-27, 0.77), and dates on which the screened index target's at-the-money level is far from the study's (2021-06-01 and 2021-07-06: `ρ_CC` 0.50 and 0.69 against the copula's 0.29 and 0.42; `E^CC[D]/P_D` 0.86 and 0.78).
+- **Sanity checks on the 208 rows.** No NaN: 199 (the nine others have one, the standard error of the index cell at +2.5 sd); the forward within 3 standard errors: 206; the index at the money and at the 90 % strike within 0.15 vp where the clipped mass is below 1 %: 207 (2024-05-06: −0.32 vp at the 90 % strike with a clipped mass of 0.6 %); the names' second moment within 2 % of the listed strips: **87** — its median excess is +2.3 % (LC7-a and the calendar crossings of the addendum). Seconds per date: 105 in the median (calibration 20, companion 49, two pricing passes 17 each).
+- **The variant pass: calendar repair and unscreened fallback on** (`lcm_repair.yaml`, tag `repair`; commit 5b4700b; 1 h 49 min on four workers; `lcm_3m_dev_repair.parquet`, `report_3m_dev_repair.md`, `report_3m_dev_repair_vs_main.md`). 216 dates priced (147 `ok`, 69 `check`), 3 failed: 2008-12-01 and 2009-03-02 (the SVI fit of an unscreened smile is refused: "initial guess is outside of provided bounds") and 2023-07-03 (the index). Eight dates are priced by the variant only (GM unscreened on seven, UNH on one; LC/CC 0.925 to 1.000 there, mean 0.979). On the 208 dates both passes price, variant against main: the repair drops 25 slices per date on average (2.4 in 2007–10, 22 in 2011–14, **51 in 2015–18**, 25 in 2019–22, 24 in 2023–26; at most 75);
+
+| variant minus main, 208 dates | mean | median | extremes |
+|---|---|---|---|
+| `E^LC[D]`, relative | **−0.49 %** | −0.23 % | −5.6 % to +0.5 % |
+| `E^CC[D]`, relative | −0.29 % | −0.11 % | −5.4 % to +0.6 % |
+| LC/CC of the forward | −0.0020 | −0.0009 | −0.0154 to +0.0049 |
+| call at `K_100`: LC level; LC/CC | −4.5 %; −0.011 | −2.6 %; −0.006 | −35 % to +3 %; −0.11 to +0.04 |
+| call at `K_125`: LC level; LC/CC | **−10.5 %**; −0.017 | −7.0 %; −0.012 | −72 % to +7 %; −0.15 to +0.09 |
+| call at `K_150`: LC level; LC/CC | −18.8 %; −0.026 | −14.3 %; −0.020 | −97 % to +16 %; −0.29 to +0.11 |
+| names' second moment over the listed strips | +3.1 % → +1.9 % | +2.3 % → +1.5 % | |
+| clipped mass inside ±2.5 sd | −1.3 points | −0.3 points | −33 to +2 points |
+
+  With the repair: LC/CC of the forward 0.9681 on average (median 0.9657) over 216 dates; its agreement with model S across dates rises to Pearson +0.24, Spearman +0.35; the names' check passes on 154 of 216 dates. The mean move of `E^LC[D]` is ten times the 0.05 % of decision 8, and by period it follows the number of weekly expiries listed.
+- **[review] LC7-j: which configuration is M12's result.** As ordered the production pass runs on the default configuration (no repair). On this evidence the repaired configuration is the better one for levels and for the calls from `K_100` up; for the forward's LC/CC the two agree within 0.2 % on average and 1.5 % at worst. Recommendation: the repair on; then decide the fallback separately (it adds the crisis dates, on one unscreened name of small weight each).
+- **[review] LC7-k: the index target against the study's index level.** On about ten dates `ρ_CC` and the copula's `ρ` differ by more than 0.05 (the third-Friday target against the study's bracketed interpolation over every listed expiry); `E^CC[D]/P_D` then leaves 1 by several percent and LC/CC is not comparable with model S over its copula. They are in every statistic above.
+- **[review] LC7-l: the fallback and the fitter.** An unscreened smile can be one the SVI fitter refuses (two dates); those dates stay failed.
+- **Passes running or queued when this was written (04:20, 9 Oct):** the 3m production pass on the default configuration (215 dates to run after the four reference dates; about 20 hours on two workers), then today's full risk, then 12m and 24m at the development budget. Their results are not in this note.
+
 **LC8 — documentation, and the acceptance summary for the owner's review (2026-10-09).**
 - **Built.** §1 (the layout lines of `market/svi_slices.py`, `calibration/fit_records.py`, `calibration/local_correlation.py`, `calibration/lc_cache.py`, the `multi/` package, `risk/local_correlation.py`, `studies/disp_lc.py`); §4.3 (the second code tag and its guard); §12 (the M12 entry); `docs/methodology.md` §11 (nine entry-point rows); `docs/local_correlation.md` — the theory note in the specification's eight sections, with this repository's own measured numbers on the four reference dates in place of the reference implementation's.
 - **Acceptance summary** (a FAIL stays a FAIL; REPORTED: not gated by the owner's rule because the clipped mass inside ±2.5 sd exceeds 1 %).
