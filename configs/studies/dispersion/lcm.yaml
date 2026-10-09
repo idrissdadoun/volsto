@@ -1,0 +1,45 @@
+# Local correlation model (SPEC §8.7, M12) on the dispersion study's Dow basket.
+# Read by scripts/lcm_price.py (one date) and scripts/disp_lcm.py (the sweep).  Every key is
+# explicit; an unknown key is an error.
+basket: B1
+index: DJX
+carry: study             # "study": the names' parity forwards; "zero": no carry (the reference)
+discount: zero           # the study's products are undiscounted
+lc:
+  family: particle
+  r_low: equi
+  r_high: ones
+  rho_min: 0.02
+  rho_max: 0.98
+  mode: performance
+  clip_policy: report
+  max_clipped_mass: 0.01
+  lambda_tail: regressions
+  target_average: step
+  arbitrage: flag
+particle:                # horizon: each date's T; n_particles: the budget's
+  bandwidth_factor: 1.5
+  quantile_clip: 0.005
+  tail_extrapolation: log_quadratic
+  seed: 12345
+sim:                     # n_paths: the budget's
+  seed: 2024
+  chunk_size: 20000
+  schedule:              # quarter steps over the first two weeks, daily after (owner, 2026-10-08)
+    breaks: [0.03968253968253968]                              # 10/252
+    dts: [0.000992063492063492, 0.003968253968253968]          # 1/1008, 1/252
+screen:                  # the expiry screen (owner, 2026-10-08, second round)
+  index_third_friday: true
+  nearest_two_sided: true
+  max_half_spread_vp: 2.0
+  max_half_spread_long_vp: 6.0
+  long_maturity: 1.0
+budgets:                 # particles, pricing paths, paths of the constant-correlation fit
+  production: {n_particles: 800000, n_paths: 800000, companion_paths: 400000}
+  development: {n_particles: 200000, n_paths: 200000, companion_paths: 100000}
+products:
+  call_multiples: [0.5, 0.75, 1.0, 1.25, 1.5, 2.0]             # the study's K = k × P_D
+risk: deltas             # none | deltas | full
+delta_bump: arith        # S·(1 ± 0.01), the reference's convention
+outputs: outputs/dispersion_lc                                 # never outputs/dispersion (the study's)
+cache: outputs/dispersion_lc/cache

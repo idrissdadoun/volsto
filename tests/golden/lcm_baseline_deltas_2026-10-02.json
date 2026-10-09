@@ -1,0 +1,66 @@
+{
+ "date": "2026-10-02",
+ "tenor": "3m",
+ "convention": "sticky-strike common deltas as elasticities (percent of the model's own price per +1 % on every spot), arithmetic bump of 1 %; (value, standard error of the paired combination); recorded, not asserted by a test",
+ "cells": {
+  "delta_fwd_lc": [
+   2.293668013933415,
+   0.004472743455896017
+  ],
+  "delta_fwd_cc": [
+   0.3492343497492277,
+   0.0026988116249703088
+  ],
+  "delta_C100_lc": [
+   11.590414906260705,
+   0.05009686114169819
+  ],
+  "delta_C100_cc": [
+   3.358392424177422,
+   0.03357724458280447
+  ],
+  "delta_skew_channel": [
+   -0.6507656502507723,
+   0.0026988116249703088
+  ],
+  "delta_correlation_channel": [
+   1.9444336641841877,
+   0.0036972800435244044
+  ]
+ },
+ "delta_homogeneity": 1.0,
+ "delta_bump": "arith",
+ "delta_bump_size": 0.01,
+ "base": {
+  "ED_lc": [
+   0.10623462415202801,
+   3.368329823798611e-05
+  ],
+  "ED_cc": [
+   0.10951094288003431,
+   3.507232458136618e-05
+  ],
+  "K_100": 0.10959940011802283,
+  "C_100_lc": [
+   0.007786624490353273,
+   2.0937261730514272e-05
+  ],
+  "C_100_cc": [
+   0.008642669611356303,
+   2.33321494495343e-05
+  ],
+  "lambda_c": 0.1586505613902579,
+  "rho_cc": 0.17547755016245273
+ },
+ "record": {
+  "git_commit": "9579c41",
+  "lc_code_tag": "lc1",
+  "spec_key": "b790d0ce1f7fb472da03902781ff51e065d14baecb22d60af3a64bd34ded4c0a",
+  "particle_seed": 12345,
+  "pricing_seed": 2024,
+  "n_particles": 800000,
+  "n_paths": 800000,
+  "companion_paths": 400000,
+  "command": "python scripts/lcm_price.py --date 2026-10-02 --budget production --risk deltas --varswap"
+ }
+}

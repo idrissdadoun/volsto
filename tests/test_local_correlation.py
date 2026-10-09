@@ -2654,6 +2654,82 @@ def test_paired_vega_standard_error(toy_spec: LocalCorrelationSpec, tmp_path: Pa
 
 
 # ---------------------------------------------------------------------------------------------
+# LC7: the scripts of the study (the sweep's order, the configuration, the errors)
+# ---------------------------------------------------------------------------------------------
+
+
+def lcm_scripts() -> tuple[Any, Any]:
+    """``scripts/lcm_price.py`` and ``scripts/disp_lcm.py`` as modules."""
+    import sys
+
+    scripts = str(Path(__file__).resolve().parents[1] / "scripts")
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    import disp_lcm
+    import lcm_price
+
+    return lcm_price, disp_lcm
+
+
+def test_lcm_sweep_order_and_configuration(tmp_path: Path) -> None:
+    """The sweep's order is a permutation of its dates that starts with the reference dates
+    present, then every 8th date, so that a pass stopped early covers the whole period; the
+    YAML loads strictly; the resume digest moves with the budget, the tenor and the YAML; a
+    row counts as done only for the same commit and digest, a status that is not a failure and
+    at least the risk asked for; the outputs are refused outside ``outputs/dispersion_lc``."""
+    lp, sweep = lcm_scripts()
+    dates = [f"2020-{m:02d}-{d:02d}" for m in range(1, 13) for d in (3, 17)] + ["2026-10-02"]
+    order = sweep.interleaved(dates)
+    assert sorted(order) == sorted(dates) and order[0] == "2026-10-02"
+    rest = [d for d in dates if d != "2026-10-02"]
+    assert order[1:4] == rest[0::8] and order[4:7] == rest[4::8]
+    first_ten = sorted(order[:10])
+    assert first_ten[0][:7] == "2020-01" and first_ten[-2][:7] >= "2020-09"  # spread over the year
+    cfg = lp.load_config()
+    assert cfg["budgets"]["production"]["n_particles"] == 800_000
+    assert cfg["outputs"] == "outputs/dispersion_lc" and cfg["risk"] == "deltas"
+    bad = tmp_path / "bad.yaml"
+    bad.write_text(lp.CONFIG.read_text() + "\nsurprise: 1\n")
+    with pytest.raises(ValueError, match="surprise"):
+        lp.load_config(bad)
+    digest = lp.config_digest(cfg, "3m", "production")
+    assert digest != lp.config_digest(cfg, "3m", "development")
+    assert digest != lp.config_digest(cfg, "12m", "production")
+    assert digest != lp.config_digest({**cfg, "delta_bump": "log"}, "3m", "production")
+    with pytest.raises(ValueError, match="dispersion_lc"):
+        lp.out_root({**cfg, "outputs": "outputs/dispersion"}, tmp_path)
+    run = sweep.Sweep("3m", "development", "deltas", cfg, tmp_path)
+    assert run.table.name == "lcm_3m_dev.parquet" and not run.done("2020-01-03")
+    row = {"date": "2020-01-03", "status": "ok", "git_commit": run.commit, "config_digest": run.digest, "risk": "deltas"}  # fmt: skip
+    for change, done in (({}, True), ({"risk": "full"}, True), ({"risk": "none"}, False), ({"status": "check"}, True),
+                         ({"status": "failed"}, False), ({"git_commit": "0000000"}, False), ({"config_digest": "x"}, False)):  # fmt: skip
+        (run.rows / "2020-01-03.json").write_text(json.dumps({**row, **change}))
+        assert run.done("2020-01-03") is done, change
+    assert run.write_table() == 1 and pd.read_parquet(run.table)["date"].tolist() == ["2020-01-03"]
+    assert "--varswap" in run.command("2020-01-03", True, str(lp.CONFIG))
+
+
+def test_lcm_delta_method_errors() -> None:
+    """``lcm_price.delta_method`` — the standard error of a smooth function of means on the same
+    paths, by a numerical gradient on antithetic pair means — equals the closed forms of
+    ``ratio_se`` and ``kappa_se``, and for the mean itself the pair-mean standard error."""
+    lp, _ = lcm_scripts()
+    rng = np.random.default_rng(5)
+    z = rng.standard_normal(40_000)
+    d = np.abs(0.1 * z + 0.02) + 0.01 * rng.standard_normal(z.size) ** 2
+    v = (0.1 * z) ** 2 + 0.002
+    value, se = lp.delta_method(lambda m: m[0] / m[1], [d, v])
+    ratio, ratio_err = ratio_se(d, v)
+    assert value == pytest.approx(ratio, rel=1e-12) and se == pytest.approx(ratio_err, rel=1e-5)
+    value, se = lp.delta_method(lambda m: m[0] / math.sqrt(m[1]), [d, v])
+    kappa, kappa_err = kappa_se(d, v)
+    assert value == pytest.approx(kappa, rel=1e-12) and se == pytest.approx(kappa_err, rel=1e-5)
+    value, se = lp.delta_method(lambda m: m[0], [d])
+    mean, mean_err = mean_se(d)
+    assert value == pytest.approx(mean, rel=1e-12) and se == pytest.approx(mean_err, rel=1e-6)
+
+
+# ---------------------------------------------------------------------------------------------
 # LC4 acceptance (slow): helpers
 # ---------------------------------------------------------------------------------------------
 
