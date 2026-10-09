@@ -102,7 +102,7 @@ TERMS = (
     ),
     (
         "names_drift",
-        "measured drift of the names' second moment (zero in the model)",
+        "effect on ½ d ln E[V] of the measured drift of the names' second moment (zero in the model)",
         "(1/2) d ln E[V] as measured minus the same with the names' second moment held; zero in the model (each name keeps its law); its standard error is how far the paths confirm that",
     ),
     (
@@ -509,7 +509,7 @@ def one_date(date: str, budget: str, path: Path, part: Part) -> tuple[list[str],
             if c["measured_resolved"]
             else " (not resolved as measured: within two standard errors of zero)"
         )
-        drift = f"measured drift of the names' second moment {p3(a['names_drift'], a['names_drift_se'])}"
+        drift = f"effect on ½ d ln E[V] of the measured drift of the names' second moment {p3(a['names_drift'], a['names_drift_se'])}"
         drift += (
             " (more than two standard errors from zero)"
             if abs(a["names_drift"]) > 2.0 * a["names_drift_se"]
@@ -679,9 +679,24 @@ def one_date(date: str, budget: str, path: Path, part: Part) -> tuple[list[str],
                 if all("same order" in compare[b]["verdict"] for b in betas)
                 else "not separated at three standard errors"
             )
+
+            def who(kappa_larger: bool) -> str:
+                return "κ larger" if kappa_larger else "the basket still short larger"
+
+            listed = ", ".join(f"{who(signs_listed[b])} at β = {b:g}" for b in betas)
+            if all(not signs_target[b] for b in betas):
+                target = "the basket still short is the larger part at every β"
+            elif all(signs_target[b] for b in betas):
+                target = "κ is the larger part at every β"
+            else:
+                target = ", ".join(f"{who(signs_target[b])} at β = {b:g}" for b in betas)
             verdict = (
-                f"{'both reasons hold and ' if all(compare[b]['both'] for b in betas) else ''}the two parts are {order}"
-                + (f" (which is larger depends on {' and on '.join(depends)})" if depends else "")
+                f"{'both reasons hold; ' if all(compare[b]['both'] for b in betas) else ''}against M_B^listed the two parts are {order} ({listed})"
+                + (
+                    f"; against the model's own index target (point values) {target}"
+                    if depends
+                    else ""
+                )
             )
         else:
             verdict = "the split differs between the β (numbers below)"
@@ -727,7 +742,7 @@ def build() -> None:
         "How to read the numbers. "
         '(1) Two targets. "Shortfall", "wing estimate", "still short", "shortfall closed" and E[R̄²]/M_B^listed are against M_B^listed = Σ w M_i − EQV, the study\'s listed index second moment (rows with ± standard errors: fields of `cdv_scan.attribution`, paired on the pricing paths, delta method). '
         f"The model is calibrated to its own SVI index surface; the strip of that surface is the regions' target and gives the second table of each date ({POINT}: closed forms of the rows' moments, which return the stored fields to 1e-9 when M_B^listed is put in). The first lines of each date give both moments and their difference. "
-        f'(2) κ. With the {HELD} at its β = 0 estimate N₀ (the model keeps each name\'s law, so this moment is the same under every β; the paths confirm it only to the standard error of the row "measured drift"), '
+        f'(2) κ. With the {HELD} at its β = 0 estimate N₀ (the model keeps each name\'s law, so this moment is the same under every β; the paths confirm it only to the standard error of the row "effect on ½ d ln E[V] of the measured drift", which is in units of ½ d ln E[V], not of the moment itself), '
         "d ln E[D] = d ln κ + ½ d ln E[V] and ½ d ln E[V] = wing estimate + still short, so the gap to the wing estimate is the κ part plus the basket still short. The κ as measured (E[D]/√E[V] under each β, the names' second moment not held) is printed beside it; "
         '"not resolved as measured" means the measured d ln κ is within two standard errors of zero. '
         "(3) Regions. The regions are regions of option strike of the out-of-the-money strip of E[(L − 1)²], L the basket level in forward moneyness; a path that ends below −3.5 sd adds to every region below the forward. "
