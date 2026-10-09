@@ -130,8 +130,8 @@ def findings(b: Book) -> list[str]:
         f"**Reference dates (production budget).** LC/CC is {b.pm(f'B.{d1}.ratio.lc_over_cc', 4)} on {d1}, {b.pm(f'B.{d2}.ratio.lc_over_cc', 4)} on {d2} and {b.pm(f'B.{d3}.ratio.lc_over_cc', 4)} on {d3}, "
         f"against {b.v(f'B.{d1}.ref.lc_over_cc', 4)}, {b.v(f'B.{d2}.ref.lc_over_cc', 4)} and {b.v(f'B.{d3}.ref.lc_over_cc', 4)} for the parametric reference implementation and "
         f"{b.v(f'B.{d1}.ratio.s_over_copula', 4)}, {b.v(f'B.{d2}.ratio.s_over_copula', 4)} and {b.v(f'B.{d3}.ratio.s_over_copula', 4)} for model S over the copula; "
-        f"the calendar repair of decisions 1–2 moved LC/CC by {b.pm(f'B.{d1}.sens.lc_over_cc.change', 4, sign=True)} and {b.pm(f'B.{d2}.sens.lc_over_cc.change', 4, sign=True)} on the first two dates, far more than the Monte Carlo errors, "
-        f"and by {b.pm(f'B.{d0}.sens.lc_over_cc.change', 4, sign=True)} today."
+        f"the calendar repair of decisions 1–2 moved LC/CC by {b.pm(f'B.{d1}.new_minus_old.ratio.lc_over_cc', 4, sign=True)} and {b.pm(f'B.{d2}.new_minus_old.ratio.lc_over_cc', 4, sign=True)} on the first two dates, far more than the Monte Carlo errors, "
+        f"and by {b.pm(f'B.{d0}.new_minus_old.ratio.lc_over_cc', 4, sign=True)} today."
     )
     out.append(
         f"**Risk today.** The sticky-strike common delta is {b.pm('A.delta.lc_ss', 3, sign=True)} % of E[D] per +1 % under LC against {b.pm('A.delta.cc_ss', 3, sign=True)} % under CC (correlation channel {b.pm('A.delta.correlation_channel', 3, sign=True)}); "
