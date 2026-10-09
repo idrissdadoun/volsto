@@ -85,6 +85,7 @@ def num(x: float) -> str:
 
 def copy_sources(s3_log: Path, runaway: Path) -> tuple[Path, Path]:
     d3, dr = pc.PM / "diagnostics" / "s3", pc.PM / "diagnostics" / "runaway"
+    pc.guard_frozen(d3 / "x")
     d3.mkdir(parents=True, exist_ok=True)
     dr.mkdir(parents=True, exist_ok=True)
     shutil.copy2(s3_log, d3 / "test_s3_identical_names_production.log")

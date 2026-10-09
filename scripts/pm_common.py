@@ -33,6 +33,8 @@ LC_OUT = PM.parent
 STUDY = ROOT / "outputs" / "dispersion"
 REFERENCE_DATES = ("2026-10-02", "2019-09-03", "2017-04-03", "2008-07-07")
 MULT_TAGS = ("050", "075", "100", "125", "150", "200")
+#: files of the package that stay open after the freeze
+FROZEN_OPEN = ("STATUS.md", "STATUS_removed.md", "ERRATA.md", "AUDIT.md", "AUDIT_DONE")
 BUDGETS = {
     "production": "8e5 particles / 8e5 paths (constant-correlation fit on 4e5 paths)",
     "development": "2e5 particles / 2e5 paths (constant-correlation fit on 1e5 paths)",
@@ -92,7 +94,24 @@ def pm(value: float | None, se: float | None = None, digits: int = 4) -> str:
     return f"{value:.{digits}f} ± {se:.{digits}f}"
 
 
+def guard_frozen(path: Path) -> None:
+    """Refuse to write a file of the frozen package.  Once ``pm_update/FROZEN`` exists (the
+    freeze of 12:30 on 2026-10-09: "never change a frozen number") only ``STATUS.md``,
+    ``ERRATA.md``, ``AUDIT.md``, ``AUDIT_DONE`` and what is under ``later/`` and ``1y/`` may be
+    written; anything else raises."""
+    if not (PM / "FROZEN").exists():
+        return
+    try:
+        rel = Path(path).resolve().relative_to(PM.resolve())
+    except ValueError:
+        return  # not in the package
+    if rel.parts and (rel.parts[0] in ("later", "1y") or rel.name in FROZEN_OPEN):
+        return
+    raise RuntimeError(f"the package is frozen ({PM / 'FROZEN'}): {path} is not written")
+
+
 def _atomic(path: Path, text: str) -> None:
+    guard_frozen(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(text)
@@ -121,6 +140,7 @@ def save_table(frame: pd.DataFrame, name: str, base: Path = PM) -> Path:
 def save_figure(fig: Any, name: str, frame: pd.DataFrame, base: Path = PM) -> Path:
     """``figures/<name>.pdf`` (vector) with ``figures/<name>.csv``, the data behind it."""
     path = base / "figures" / f"{name}.pdf"
+    guard_frozen(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path)
     _atomic(base / "figures" / f"{name}.csv", frame.to_csv(index=False, float_format="%.10g"))

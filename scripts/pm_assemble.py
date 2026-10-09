@@ -59,6 +59,7 @@ def head_commit() -> str:
 
 
 def assemble(base: Path, title: str, intro: str) -> tuple[int, list[str]]:
+    pc.guard_frozen(base / "NUMBERS.md")
     parts = base / "parts"
     md: list[str] = [f"# {title}", "", intro, ""]
     records: list[dict[str, Any]] = []
