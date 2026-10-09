@@ -256,6 +256,21 @@ def one_date(date: str, budget: str, path: Path, part: Part) -> tuple[list[str],
     if stored_cc is not None and abs(stored_cc - ed_cc) > 1e-15:
         raise ValueError(f"{row_path}: E_CC[D] is not the one the scan used")
     row_rel = row_path.relative_to(pc.LC_OUT.parent.parent)
+    cc_source = f"the {budget} row `{row_rel}`, commit {row_commit}"
+    cc_file = row_path
+    risk_path = pc.PM / "parts" / "A_risk_today_raw.json"
+    if budget == "production" and risk_path.exists():
+        # today's risk run is the scan's own pricing run (its base E_LC[D] is the scan's beta = 0
+        # E[D] to the last bit): its E_CC[D] is the like-for-like denominator, as in section A8
+        risk = json.loads(risk_path.read_text())
+        if (
+            risk["spec_key"] == meta["spec_key"]
+            and abs(risk["base"]["ED_lc"][0] - float(rows[0.0]["ED"])) < 1e-12
+        ):
+            ed_cc, ed_cc_se = (float(x) for x in risk["base"]["ED_cc"])
+            row_commit = str(risk["commit"])
+            cc_file = risk_path
+            cc_source = f"today's risk run `{risk_path.relative_to(pc.LC_OUT.parent.parent)}`, commit {row_commit}: the scan's own pricing run"
 
     # --- the two targets and the bridge
     r0 = rows[0.0]
@@ -298,10 +313,8 @@ def one_date(date: str, budget: str, path: Path, part: Part) -> tuple[list[str],
     def flagged(r: dict[str, Any]) -> bool:
         return max(r["clip_high_inner"], r["clip_low_inner"]) > FLAG_LEVEL
 
-    cc_label = (
-        f"E[D]/E_CC[D] (E_CC[D] of the {budget} row `{row_rel}`, commit {row_commit}; unpaired)"
-    )
-    cc_note = f"E_CC[D] {ed_cc:.6f} ± {ed_cc_se:.6f} of the M12 row of the same specification key ({row_path}, commit {row_commit}); unpaired: delta-method error from the two standard errors taken as independent (pm_common.ratio_se)"
+    cc_label = f"E[D]/E_CC[D] (E_CC[D] of {cc_source}; unpaired)"
+    cc_note = f"E_CC[D] {ed_cc:.6f} ± {ed_cc_se:.6f} of {cc_source} (same specification key; {cc_file}); unpaired: delta-method error from the two standard errors taken as independent (pm_common.ratio_se)"
     idx_def = "basket implied vol at the horizon minus the model's SVI index target at the strike, in vol points (row field idx_<k>, strikes in at-the-money sd)"
     #: key, label, value and se of a row, digits, definition, notes
     core: list[tuple[str, str, Any, int, str, str]] = [
@@ -334,7 +347,7 @@ def one_date(date: str, budget: str, path: Path, part: Part) -> tuple[list[str],
             cells.append(("yes" if v else "no") if key == "flagged" else pc.pm(v, se, digits))
             rec(f"beta{b:g}.core.{key}", f"CDV scan, {label}, beta = {b:g}", v, se, "", f"{definition}; beta = 0 is the local correlation model on the scan's paths",
                 "; ".join(x for x in (f"g_max {g_max}", notes) if x),
-                **({"commit": f"{commit} (scan), {row_commit} (row of E_CC[D])", "source": f"{src}; {row_path}"} if key == "ED_over_cc" else {}))  # fmt: skip
+                **({"commit": f"{commit} (scan), {row_commit} (row of E_CC[D])", "source": f"{src}; {cc_file}"} if key == "ED_over_cc" else {}))  # fmt: skip
         add(f"| {label} | " + " | ".join(cells) + " |")
     add("")
     d_row = r0["ED"] - float(m12["ED_lc"])

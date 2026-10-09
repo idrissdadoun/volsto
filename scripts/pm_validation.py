@@ -513,6 +513,7 @@ def build(s3_log: Path, runaway: Path) -> None:
         + "On the paths of the model at λ = 0 (the names' law does not depend on the correlation), the same total is "
         + "; ".join(budget_lines)
         + ". "
+        + f"On today's production row (section A, 8e5 paths, other pricing paths again) the same gap is {a_recs['A.names.mc_over_listed']['value']:+.2f} ± {a_recs['A.names.mc_over_listed']['se']:.2f} % of the strips, inside the 2 % of the check: the printed ± does not cover the spread between these runs. "
         "The tails are unchanged, as decided. Files: `tables/V_names_second_moment_by_region.csv`, `diagnostics/names/` (the two diagnostic files; other screens and budgets are in `outputs/dispersion_lc/diagnostics/strips_*.json`)."
     )
     pc.write_part("V_validation", records, "\n".join(md))

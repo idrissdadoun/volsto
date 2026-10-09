@@ -34,7 +34,7 @@ SECTIONS = (
     ("A_today", "A. Today (2026-10-02), 3m, production budget"),
     (
         "A_check_e",
-        "A9. Check (e): why the cross-dependent volatility moves the forward less than the wing estimate",
+        "A (continued). Check (e): why the prototype moves the forward less than the fixed-κ estimate",
     ),
     ("B_reference", "B. The three reference dates, 3m, production budget"),
     ("C_history", "C. History, 3m, development budget, decisions 1-2 on"),
@@ -100,17 +100,24 @@ def assemble(base: Path, title: str, intro: str) -> tuple[int, list[str]]:
 
 INTRO = (
     "Frozen results package for the PM report of 2026-10-09 (local correlation model, milestone M12, branch "
-    "`local-correlation`). **How to read it.** `a ± b`: value and its Monte Carlo standard error on antithetic pair "
-    "means (ratios: delta method; LC/CC is paired on common paths). Numbers from the dispersion study's own tables "
-    "(the copula's `P_D`, model S's `P_D_S`, their calls, `EV`, `EQV`) are quoted as they are and carry no error of "
-    "ours. Budgets: production = 8·10⁵ particles and 8·10⁵ pricing paths (the constant-correlation companion fitted on "
-    "4·10⁵ paths); development = 2·10⁵ and 2·10⁵ (companion on 10⁵). M12 defaults since commit d4faa74 (owner's "
-    "decisions of 2026-10-09): the calendar repair of the names' and of the index's crossing slices on, a name with no "
-    "expiry passing the quote screen kept unscreened and flagged. LC = the calibrated local correlation model; CC = "
-    "its constant-correlation companion; copula = the study's model (`P_D`); model S = the study's skewed model "
-    "(`P_D_S`). Every number is also in `numbers.json` with its definition, budget, commit and source file; the tables "
-    "are in `tables/` and each figure in `figures/` has its CSV beside it. `STATUS.md` has the timeline; anything "
-    "produced after the freeze is in `later/`; a correction to a frozen number would be in `ERRATA.md`."
+    "`local-correlation`). **How to read it.** `a ± b`: in sections A, B and the per-date table of D, the value and its "
+    "pricing Monte Carlo standard error on antithetic pair means (ratios: delta method; LC/CC is paired on common "
+    "paths); in section C and in D's group table, a mean and its standard error across dates; in the arithmetic of "
+    "section C, a sampling error over trades (reader note 1 says what each ± leaves out). Numbers from the dispersion "
+    "study's own tables (the copula's `P_D`, model S's `P_D_S`, their calls, `EV`, `EQV`) are quoted as they are. "
+    "Budgets: production = 8·10⁵ particles and 8·10⁵ pricing paths (the constant-correlation companion fitted on 4·10⁵ "
+    "paths); development = 2·10⁵ and 2·10⁵ (companion on 10⁵). Code by section: sections A and B, rows at commit "
+    "d4faa74 (the defaults of the owner's decisions of 2026-10-09: calendar repair of the names' and of the index's "
+    "crossing slices, a name with no expiry passing the quote screen kept unscreened and flagged) and today's risk at "
+    "0155bac (same library); section C, the development pass at commit 5b4700b (decisions 1-2 on, the index repair of "
+    "decision 5 not yet in the code: reader note 3); section D and the cross-dependent prototype, branch "
+    "`cross-dependent-vol` at d4dd888 (the defaults of 9 Oct merged in). LC = the calibrated local correlation model; "
+    "CC = its constant-correlation companion; copula = the study's model (`P_D`); model S = the study's skewed model "
+    "(`P_D_S`). Every number is also in `numbers.json` with its definition, budget, source file and, for the numbers "
+    "computed here, the commit; the tables are in `tables/` and each figure in `figures/` has its CSV beside it; the "
+    "files behind the validation section are in `diagnostics/`. `STATUS.md` has the timeline; anything produced after "
+    "the freeze is in `later/`; a correction to a frozen number would be in `ERRATA.md`. The one-year (12m) addendum is "
+    "a separate page, `1y/NUMBERS_1Y.md`, with its own deadline."
 )
 
 
