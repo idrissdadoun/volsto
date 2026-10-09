@@ -34,6 +34,14 @@ behind LC's E[V] (:func:`moment_rows`); the t-ratio, the 3-lag Hansen-Hodrick st
 the range of the bootstrap bounds over 40 seeds; the call's strike against each model's own
 forward.  ``--base DIR`` writes the part and its tables to another folder (a dry run).
 
+Added after the second verification of 2026-10-09: on how many trades the index gate is waived
+because the wing binds and on how many of those the index smile error is outside the gate's
+tolerance (the rows without the dates that fail the gate are not a test of the index smile); the
+mean LC price over the mean copula price on the samples of the split (the form in which the LC
+model part holds on the sub-samples: against the copula's, not as a level); the caveat of the
+package's section V3 on the LC calls at 1.25 and 1.5 times the copula's forward price, with the
+shares read from ``parts/V_validation.json``; the labels of every interval and standard error.
+
 Writes ``parts/C_arith.json`` and ``.md`` and ``tables/C_arith_*.csv`` of the package.  Reads the
 study's tables only (nothing is written outside the package).
 """
@@ -42,6 +50,7 @@ study's tables only (nothing is written outside the package).
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 from pathlib import Path
@@ -80,6 +89,16 @@ SEEDS_RANGE = tuple(range(1, 41))
 #: The names' diagnostic of ``lcm_price`` (``check_names``): sum_w E_LC[R_i^2] within 2 % of the
 #: listed strips.  Not a gate (owner's decision 3 of 2026-10-09).
 NAMES_TOL = 0.02
+#: The index gate of ``lcm_price`` (``check_index``): the index smile error at the money and at
+#: 90 % of the forward within 0.15 vol points, waived when the wing binds (``wing_binds``: the
+#: clipped mass inside +-2.5 standard deviations above 1 %).  Checked against the rows' own
+#: ``check_index`` in :func:`samples`.
+INDEX_TOL = 0.15
+#: The index smile error's target, as sections A and B of the package word it.
+IDX_TARGET = "index smile error against its target (the model's own SVI fit of the DJX smile, not the study's listed vols)"
+#: The strikes of the study's T5_model_S on which section V3 of the package (another builder's
+#: part) measured the share of the LC call carried by runaway paths.
+RUNAWAY_STRIKES = ("125", "150")
 N_RESAMPLES = 2000
 SEED_RATIO = 11  # disp_stats.bootstrap_ratio
 SEED_SPLIT = 5  # disp_report.py, kq_ci (the interval of D4)
@@ -227,6 +246,13 @@ def samples(lc_table: Path) -> dict[str, Any]:
     current = [lp.row_status({k: bool(r[k]) for k in lp.GATING_CHECKS}) for r in inter[list(lp.GATING_CHECKS)].to_dict("records")]  # fmt: skip
     inter["status_current"], inter["reason_current"] = [c[0] for c in current], [c[1] for c in current]  # fmt: skip
     inter["index_gate_ok"] = inter["check_index"].astype(bool)
+    # the gate's two legs: waived when the wing binds, else both errors within the tolerance
+    wing = inter["wing_binds"].astype(bool)
+    outside = (inter["idx_err_atm"].abs() > INDEX_TOL) | (inter["idx_err_90"].abs() > INDEX_TOL)
+    if not ((wing | ~outside) == inter["index_gate_ok"]).all():
+        raise ValueError("check_index is not (wing_binds or both index errors within 0.15 vol points)")  # fmt: skip
+    inter["idx_outside_tol"] = outside
+    low = inter.loc[inter["idx_err_90"].idxmin()]
     inter["names_dev"] = inter["sum_w_ER2_lc"] / inter["sum_w_M"] - 1.0
     inter["names_in_2pct"] = inter["names_dev"].abs() <= NAMES_TOL
     if not (inter["names_in_2pct"] == inter["check_names"].astype(bool)).all():
@@ -267,6 +293,11 @@ def samples(lc_table: Path) -> dict[str, Any]:
             "no_nan_failed": no_nan_failed, "no_nan_only": int((~only_gate["check_no_nan"] & only_gate["check_forward"] & only_gate["check_index"]).sum()),
             "forward_failed": int((~only_gate["check_forward"]).sum()),
             "index_failed": inter.loc[~inter["index_gate_ok"], ["date", "wing_binds", "idx_err_atm", "idx_err_atm_se", "idx_err_90", "idx_err_90_se", "check_no_nan", "check_forward", "flagged"]].to_dict("records"),
+            "index_waived": {
+                "wing_binds": int(wing.sum()), "wing_binds_outside": int((wing & outside).sum()), "outside": int(outside.sum()), "within": int((~outside).sum()),
+                "median_90": float(inter["idx_err_90"].median()), "median_90_waived_outside": float(inter.loc[wing & outside, "idx_err_90"].median()),
+                "lowest_90": float(low["idx_err_90"]), "lowest_90_se": float(low["idx_err_90_se"]), "lowest_90_date": str(low["date"]), "lowest_90_wing_binds": bool(low["wing_binds"]),
+            },
             "names_outside": int((~inter["names_in_2pct"]).sum()), "names_outside_and_gate": int((~inter["names_in_2pct"] & (inter["status_current"] == "check")).sum()),
             "stored_reasons": inter.loc[inter["status"] != "ok", "reason"].value_counts().to_dict(),
             "lc_rows": len(lc), "lc_priced": len(priced), "lc_failed": lc.loc[~lc["date"].isin(priced["date"]), ["date", "status", "reason"]].to_dict("records"),
@@ -360,6 +391,12 @@ def split(g: pd.DataFrame, model: str, block: int) -> dict[str, dict[str, float]
     c = finite(g[FWD["copula"]], g[EVCOL["copula"]], g["EQV"], g["D"], g["V"])
     point["model_part_minus_copula"] = point["model_part"] - split_of(*c.mean(axis=0))["model_part"]  # fmt: skip
     draws["model_part_minus_copula"] = draws["model_part"] - split_of(*c[index].mean(axis=1).T)["model_part"]  # fmt: skip
+    # the same difference in another form: the copula's model part x (price over copula - 1)
+    point["price_over_copula"] = a[:, 0].mean() / c[:, 0].mean()
+    draws["price_over_copula"] = mu[:, 0] / c[index].mean(axis=1)[:, 0]
+    other_form = split_of(*c.mean(axis=0))["model_part"] * (point["price_over_copula"] - 1.0)
+    if not abs(point["model_part_minus_copula"] - other_form) < 1e-12:
+        raise ValueError("model part minus the copula's is not the copula's model part x (price over copula - 1)")  # fmt: skip
     out = {}
     for k, v in point.items():
         lo, hi = np.percentile(draws[k], [2.5, 97.5])
@@ -528,7 +565,7 @@ def split_rows(S: dict[str, Any]) -> pd.DataFrame:
             r = split(g, model, block)
             row: dict[str, Any] = {"sample": sample, "n_trades": int(r["n"]["value"]), "model": model, "boot_block": block,
                                    "mean_price_pct": 100 * r["mean_price"]["value"], "mean_payoff_pct": 100 * r["mean_payoff"]["value"]}  # fmt: skip
-            for k in (*(f for f, _ in FACTORS), "kappa_model", "kappa_realised", "model_part_minus_copula"):  # fmt: skip
+            for k in (*(f for f, _ in FACTORS), "kappa_model", "kappa_realised", "model_part_minus_copula", "price_over_copula"):  # fmt: skip
                 row[k] = r[k]["value"]
                 row[f"{k}_se_boot"], row[f"{k}_ci95_lo"], row[f"{k}_ci95_hi"] = r[k]["se"], r[k]["lo"], r[k]["hi"]  # fmt: skip
             # Monte Carlo error of the LC row: relative errors of the mean price and of the mean
@@ -550,10 +587,13 @@ def split_rows(S: dict[str, Any]) -> pd.DataFrame:
                 row[f"kappa_realised_mc_{kind}"] = 0.0
             # the difference of two model parts: LC's error and the copula's (the study's P_D_se)
             row["model_part_minus_copula_mc_bound"] = 0.0
+            row["price_over_copula_mc_bound"] = 0.0
             if model == "lc":
                 gs = g[g["strip_ok"]]
                 cop = split(g, "copula", block)["model_part"]["value"]
                 row["model_part_minus_copula_mc_bound"] = row["model_part_mc_bound"] + cop * mc_mean(gs["P_D_se"])[1] / gs["P_D"].mean()  # fmt: skip
+                # a ratio of two means of prices: the relative errors of the two add (a bound)
+                row["price_over_copula_mc_bound"] = row["price_over_copula"] * (mc_mean(gs["ED_lc_se"])[1] / gs["ED_lc"].mean() + mc_mean(gs["P_D_se"])[1] / gs["P_D"].mean())  # fmt: skip
             rows.append(row)
     return pd.DataFrame(rows)
 
@@ -598,6 +638,41 @@ def reproduction(gap: pd.DataFrame, payout: pd.DataFrame, sp: pd.DataFrame) -> p
 def sample_of_key(key: str) -> str:
     """The sample of a reproduction key (``...<model>.<sample>[.lo|.hi|.se]``)."""
     return next(p for p in key.split(".") if p in ("weekly", "weekly_is", "weekly_oos", "study_monthly"))  # fmt: skip
+
+
+def runaway_shares() -> dict[str, Any] | None:
+    """The share of the LC call at each strike of ``RUNAWAY_STRIKES`` carried by the paths on
+    which one name ends above 3 times its spot, as section V3 of the package measured it: the
+    records ``V.runaway.<date>.lc.<strike>.share_above_3x`` of ``parts/V_validation.json`` (another
+    builder's part, read from the package whatever ``--base``).  ``None`` when they are not there
+    (the caveat is then written without the shares)."""
+    path = pc.PM / "parts" / "V_validation.json"
+    if not path.exists():
+        return None
+    recs = [r for r in json.loads(path.read_text()) if r["id"].startswith("V.runaway.") and r["value"] is not None]  # fmt: skip
+    out: dict[str, Any] = {"dates": set(), "development": True}
+    for m in RUNAWAY_STRIKES:
+        rows = [r for r in recs if r["id"].endswith(f".lc.{m}.share_above_3x")]
+        if len(rows) < 2:
+            return None
+        out[m] = (min(r["value"] for r in rows), max(r["value"] for r in rows))
+        out["dates"] |= {r["id"].split(".")[2] for r in rows}
+        out["development"] &= all("development" in r["budget"] for r in rows)
+    out["dates"] = sorted(out["dates"])
+    return out
+
+
+def runaway_text(shares: dict[str, Any] | None) -> str:
+    """What section V3 measured, in words (the shares are V3's records, quoted)."""
+    if shares is None:
+        return "section V3 of the package"
+    (lo125, hi125), (lo150, hi150) = shares["125"], shares["150"]
+    budget = "at the development budget" if shares["development"] else "at the budget stated in V3"
+    return (
+        f"section V3 of the package, measured {budget} on {len(shares['dates'])} dates ({', '.join(shares['dates'])}): the paths on which one name ends above 3 times its spot carry "
+        f"{100 * lo150:.0f} to {100 * hi150:.0f} % of the LC call at 1.5 times the copula's forward price and {100 * lo125:.0f} to {100 * hi125:.0f} % at 1.25 times "
+        "(records `V.runaway.<date>.lc.150.share_above_3x` and `.lc.125.share_above_3x`)"
+    )  # fmt: skip
 
 
 # --------------------------------------------------------------------- records and the Markdown
@@ -648,11 +723,16 @@ DEF_MOMENT = {
     "dispersion_lc_over_listed": "sqrt(mean EV_lc / mean EQV): the split's 'dispersion priced, model over listed' of LC",
     "dispersion_lc_names_at_listed": "sqrt((mean sum_w M_i - mean E_LC[Rbar^2]) / mean EQV): LC's 'dispersion priced, model over listed' with the names' second moment set to the listed strips",
 }
+DEF_IDX = "LC Monte Carlo implied volatility of the index minus its target (the model's own SVI fit of the DJX smile, not the study's listed vols) {what} at the tenor ({k} of the LC table)"
 DEF_GAP = (
     "mean over trades of the study's P&L of the gap (Palladium forward minus the vega-neutral package; {how}) "
     "at the copula's price + (copula forward price - {model} forward price) of the entry date, % of notional"
 )
 DEF_PAYOUT = "sum over trades of the realised payoff of {product} over the sum of its {model} price (the study's 'sum payoff / sum price')"
+DEF_PRICE_RATIO = (
+    "mean {model} forward price over mean copula forward price, pooled over the same trades (sum of the model's prices / sum of P_D); "
+    "the model part of {model} minus the copula's = the copula's model part x (this ratio - 1)"
+)
 DEF_SPLIT = {
     "price_over_payoff": "mean {model} forward price over mean realised D, pooled over trades",
     "listed_part": "sqrt(mean EQV / mean realised V): the listed options' squared dispersion against the realised one (no model)",
@@ -693,6 +773,7 @@ def build(S: dict[str, Any]) -> tuple[list[dict[str, Any]], str, dict[str, pd.Da
         ))  # fmt: skip
 
     # -- samples
+    waived = meta["index_waived"]
     counts = [
         ("lc_rows", "LC variant development pass: entry dates", meta["lc_rows"]),
         ("lc_priced", "LC variant development pass: priced dates", meta["lc_priced"]),
@@ -714,15 +795,30 @@ def build(S: dict[str, Any]) -> tuple[list[dict[str, Any]], str, dict[str, pd.Da
         ("trades.intersection_index_ok", "trades of the intersection without the dates that fail the index gate", len(S["intersection_index_ok"])),
         ("trades.intersection_names_in", "trades of the intersection inside the names' 2 % diagnostic", len(S["intersection_names_in"])),
         ("trades.intersection_names_out", "trades of the intersection outside the names' 2 % diagnostic", len(S["intersection_names_out"])),
+        ("trades.intersection.wing_binds", "trades of the intersection on which the index gate is waived because the wing binds (wing_binds of the LC table: clipped mass above 1 %)", waived["wing_binds"]),
+        ("trades.intersection.wing_binds_index_outside_tolerance", f"trades of the intersection on which the index gate is waived (the wing binds) and the {IDX_TARGET} exceeds {INDEX_TOL} vol points at the money or at 90 % of the forward", waived["wing_binds_outside"]),
+        ("trades.intersection.index_outside_tolerance", f"trades of the intersection on which the {IDX_TARGET} exceeds {INDEX_TOL} vol points at the money or at 90 % of the forward (the wing binding or not)", waived["outside"]),
+        ("trades.intersection.index_within_tolerance", f"trades of the intersection on which the {IDX_TARGET} is within {INDEX_TOL} vol points at the money and at 90 % of the forward", waived["within"]),
     ]  # fmt: skip
     for id_, quantity, value in counts:
         add(f"sample.{id_}", quantity, value, None, model="lc" if "lc" in id_ or "intersection" in id_ else "copula", bullet="none", table="C_arith_sample",
             n=int(value), unit="count", definition="a count of entry dates (one trade per entry date)", notes="a count, no standard error")  # fmt: skip
     for r in meta["index_failed"]:
-        for k, what in (("idx_err_90", "at the 90 % strike"), ("idx_err_atm", "at the money")):
+        for k, what in (("idx_err_90", "at 90 % of the forward"), ("idx_err_atm", "at the money")):
             add(f"sample.index_gate.{k}.{r['date']}", f"index smile error {what} on {r['date']}, a date that FAILS the index gate", r[k], r[f"{k}_se"], model="lc", bullet="none", table="C_arith_trades",
-                n=1, unit="vol points", definition=f"LC Monte Carlo implied volatility of the index minus the listed one {what} at the tenor ({k} of the LC table); the gate: both within 0.15 vol points unless the wing binds",
+                n=1, unit="vol points", definition=f"{DEF_IDX.format(what=what, k=k)}; the gate: both within {INDEX_TOL} vol points, waived when the wing binds",
                 notes=f"se = the Monte Carlo standard error of the row ({k}_se); wing_binds = {bool(r['wing_binds'])}; the date is in every summary of the part except the rows 'without the dates that fail the index gate'")  # fmt: skip
+    what90 = "at 90 % of the forward"
+    idx_common = dict(model="lc", bullet="none", table="C_arith_trades", unit="vol points")
+    add("sample.index_gate.idx_err_90.median.intersection", f"index smile error {what90}, median over the {len(S['intersection'])} trades of the intersection", waived["median_90"], None, n=len(S["intersection"]), **idx_common,
+        definition="the median over the trades of: " + DEF_IDX.format(what=what90, k="idx_err_90"),
+        notes="a median over trades of per-date Monte Carlo estimates: no standard error attached (each date's is idx_err_90_se in tables/C_arith_trades.csv)")  # fmt: skip
+    add("sample.index_gate.idx_err_90.median.wing_binds_index_outside_tolerance", f"index smile error {what90}, median over the {waived['wing_binds_outside']} trades on which the gate is waived (the wing binds) and the error exceeds {INDEX_TOL} vol points at the money or {what90}",
+        waived["median_90_waived_outside"], None, n=waived["wing_binds_outside"], **idx_common, definition="the median over those trades of: " + DEF_IDX.format(what=what90, k="idx_err_90"),
+        notes="a median over trades of per-date Monte Carlo estimates: no standard error attached (each date's is idx_err_90_se in tables/C_arith_trades.csv)")  # fmt: skip
+    add("sample.index_gate.idx_err_90.lowest.intersection", f"index smile error {what90}, lowest over the {len(S['intersection'])} trades of the intersection (on {waived['lowest_90_date']})", waived["lowest_90"], waived["lowest_90_se"], n=1, **idx_common,
+        definition="the lowest over the trades of: " + DEF_IDX.format(what=what90, k="idx_err_90"),
+        notes=f"se = the Monte Carlo standard error of that date's row (idx_err_90_se), not an error of the minimum over trades; the date: {waived['lowest_90_date']}, wing_binds = {waived['lowest_90_wing_binds']}")  # fmt: skip
 
     # -- reproduction
     for r in rep.to_dict("records"):
@@ -788,11 +884,15 @@ def build(S: dict[str, Any]) -> tuple[list[dict[str, Any]], str, dict[str, pd.Da
                 notes=note_price + "; a mean of entry prices, no sampling s.e. attached")  # fmt: skip
 
     # -- payout per 1 of premium
+    caveat_v3 = runaway_text(runaway_shares())
     for r in payout.to_dict("records"):
         if r["sample"] == "weekly":
             continue
         name = "the Palladium forward" if r["product"] == "forward" else f"the Palladium call struck at {int(r['product'][-3:]) / 100:g} x the copula forward's price"  # fmt: skip
         mc = f"; Monte Carlo error of the LC prices in this ratio: {sig(r['mc_se_indep'])} with independent dates, at most {sig(r['mc_se_bound'])}" if r["model"] == "lc" else ""  # fmt: skip
+        if r["model"] == "lc" and r["product"][-3:] in RUNAWAY_STRIKES:
+            mc += f"; CAVEAT: the LC premium at this strike is carried in part by a few runaway paths ({caveat_v3}); the Monte Carlo bound does not cover this; " + (
+                "not to be quoted" if r["product"] == "call_150" else "to be read with care")  # fmt: skip
         base = f"payout.{r['product']}.{r['model']}.{r['sample']}"
         common = dict(model=r["model"], bullet="payout", table="C_arith_payout", n=r["n_trades"], unit="ratio", sample=r["sample"],
                       definition=DEF_PAYOUT.format(product=name, model=MODEL_LABEL[r["model"]]))  # fmt: skip
@@ -805,7 +905,8 @@ def build(S: dict[str, Any]) -> tuple[list[dict[str, Any]], str, dict[str, pd.Da
                 + (f"; over the seeds {SEEDS_RANGE[0]} to {SEEDS_RANGE[-1]} (the study's is {SEED_RATIO}) this bound runs from {r[f'ci95_{end}_seed_min']:.3f} to {r[f'ci95_{end}_seed_max']:.3f}" if np.isfinite(r[f"ci95_{end}_seed_min"]) else ""))  # fmt: skip
         if r["model"] == "lc":
             add(base + ".mc_bound", f"Monte Carlo error bound of the payout per 1 of premium of {name} at the LC price, {SAMPLE_LABEL[r['sample']]}", r["mc_se_bound"], None, **common,
-                notes=f"ratio x sum of the per-date standard errors over the sum of prices, valid whatever the dependence between dates; with independent dates {sig(r['mc_se_indep'])}")  # fmt: skip
+                notes=f"ratio x sum of the per-date standard errors over the sum of prices, valid whatever the dependence between dates; with independent dates {sig(r['mc_se_indep'])}"
+                      + (f"; CAVEAT: this bound does not cover the runaway paths that carry part of the LC premium at this strike ({caveat_v3})" if r["product"][-3:] in RUNAWAY_STRIKES else ""))  # fmt: skip
         if r["product"] == "call_100" and r["model"] != "copula":
             add(f"payout.strike_over_own_forward.{r['model']}.{r['sample']}", f"strike of the call (the copula's forward price) above the {MODEL_LABEL[r['model']]} forward price, {SAMPLE_LABEL[r['sample']]}",
                 100 * (r["strike_over_own_forward"] - 1.0), 100 * r["strike_over_own_forward_se_boot"],
@@ -823,19 +924,23 @@ def build(S: dict[str, Any]) -> tuple[list[dict[str, Any]], str, dict[str, pd.Da
             ("kappa_model", "kappa of the model"),
             ("kappa_realised", "kappa realised"),
             ("model_part_minus_copula", "model part minus the copula's model part"),
+            ("price_over_copula", "mean forward price over the copula's mean forward price"),
         ):
+            against = k in ("model_part_minus_copula", "price_over_copula")
             if weekly and k not in ("kappa_model", "kappa_realised"):
                 continue  # the weekly factors are reproduction records; the two kappas had none
             if k in ("listed_part", "kappa_realised") and r["model"] != "copula":
                 continue  # no model in it: one record per sample
-            if k == "model_part_minus_copula" and r["model"] == "copula":
+            if against and r["model"] == "copula":
                 continue
             free = k in ("listed_part", "kappa_realised")
-            mc = f"; Monte Carlo error of the LC prices: {sig(r[f'{k}_mc_indep'])} with independent dates, at most {sig(r[f'{k}_mc_bound'])}" if r["model"] == "lc" and k != "model_part_minus_copula" else ""  # fmt: skip
-            if r["model"] == "lc" and k == "model_part_minus_copula":
+            mc = f"; Monte Carlo error of the LC prices: {sig(r[f'{k}_mc_indep'])} with independent dates, at most {sig(r[f'{k}_mc_bound'])}" if r["model"] == "lc" and not against else ""  # fmt: skip
+            if r["model"] == "lc" and against:
                 mc = f"; Monte Carlo error of the LC prices and of the study's copula prices (P_D_se), at most {sig(r[f'{k}_mc_bound'])}"  # fmt: skip
+            if r["model"] == "model_s" and k == "price_over_copula":
+                mc = "; model S's table carries no standard error: the Monte Carlo error of the prices is not in this number"
             base = f"split.{k}.{r['model']}.{r['sample']}"
-            definition = "the model part of {model} minus the model part of the copula on the same trades" if k == "model_part_minus_copula" else DEF_SPLIT[k]  # fmt: skip
+            definition = {"model_part_minus_copula": "the model part of {model} minus the model part of the copula on the same trades", "price_over_copula": DEF_PRICE_RATIO}.get(k) or DEF_SPLIT[k]  # fmt: skip
             common = dict(model=r["model"], bullet="split", table="C_arith_split", n=r["n_trades"], unit="ratio", sample=r["sample"], definition=definition.format(model=MODEL_LABEL[r["model"]]))  # fmt: skip
             add(base, f"price-over-payoff split, {label}, {MODEL_FREE.split(':')[0] if free else MODEL_LABEL[r['model']]}, {SAMPLE_LABEL[r['sample']]}", r[k], r[f"{k}_se_boot"], **common,
                 notes=f"se = sampling s.e. over trades: the bootstrap of the study's D4 (circular blocks, {N_RESAMPLES} resamples, seed {SEED_SPLIT}) with blocks of {r['boot_block']} {'weekly' if weekly else 'monthly'} entries"
@@ -843,7 +948,7 @@ def build(S: dict[str, Any]) -> tuple[list[dict[str, Any]], str, dict[str, pd.Da
                       + f", 95 % interval {interval(r[f'{k}_ci95_lo'], r[f'{k}_ci95_hi'])}{'' if weekly else '; the study printed no interval on the monthly subset'}{mc}"
                       + (f"; {MODEL_FREE}" if free else "")
                       + ("; price over the root of the model's own E[V], as in the final report (its sidenote prints 0.729 and 0.743 on the 1,010 trades); not the kappa_Q of the study's T4_model_S (price over the root of EQV)" if k == "kappa_model" else ""))  # fmt: skip
-            if k == "model_part_minus_copula":
+            if against:
                 continue
             if r["model"] == "lc":
                 add(base + ".mc_bound", f"Monte Carlo error bound of the split's {label}, LC, {SAMPLE_LABEL[r['sample']]}", r[f"{k}_mc_bound"], None, **common,
@@ -907,8 +1012,12 @@ def markdown(S: dict[str, Any], gap: pd.DataFrame, payout: pd.DataFrame, sp: pd.
     stored_reasons = "; ".join(f"'{k}' on {v}" for k, v in meta["stored_reasons"].items())
     nan_cols = ", ".join(f"`{c}`" for c in sorted({c for r in meta["no_nan_failed"] for c in r["columns"]}))  # fmt: skip
     idx_failed = "; ".join(
-        f"{r['date']} ({r['idx_err_90']:+.2f} ± {r['idx_err_90_se']:.2f} vol points at the 90 % strike, {r['idx_err_atm']:+.2f} ± {r['idx_err_atm_se']:.2f} at the money)" for r in meta["index_failed"]
+        f"{r['date']} ({r['idx_err_90']:+.2f} ± {r['idx_err_90_se']:.2f} vol points at 90 % of the forward, {r['idx_err_atm']:+.2f} ± {r['idx_err_atm_se']:.2f} at the money)" for r in meta["index_failed"]
     )  # fmt: skip
+    wv = meta["index_waived"]
+    n_fail = len(meta["index_failed"])
+    if wv["outside"] != wv["wing_binds_outside"] + n_fail or wv["outside"] + wv["within"] != n_i:
+        raise ValueError("the counts of the index gate do not add up")
     out += [
         "**Table C_arith_sample.** The trades.",
         "",
@@ -939,9 +1048,15 @@ def markdown(S: dict[str, Any], gap: pd.DataFrame, payout: pd.DataFrame, sp: pd.
         f"recomputed here from the rows' check columns: {', '.join(f'{k} {v}' for k, v in sorted(cur.items(), reverse=True))}. Of the {cur.get('check', 0)} `check` trades: "
         f"{meta['no_nan_only']} fail `check_no_nan` and no other gate ({', '.join(r['date'] for r in meta['no_nan_failed'])}); the only non-finite column the check reads on these rows is {nan_cols} "
         "(the standard error of the index smile error at +2.5 standard deviations, a diagnostic column); no price column is among them, and every price used in this part is finite. "
-        f"{len(meta['index_failed'])} FAIL the index gate `check_index` (the index smile within 0.15 vol points at the money and at the 90 % strike, unless the wing binds), index smile error LC minus listed: {idx_failed}. "
+        f"{n_fail} FAIL the index gate `check_index` ({IDX_TARGET} within {INDEX_TOL} vol points at the money and at 90 % of the forward; the gate is waived when the wing binds, `wing_binds`: clipped mass above 1 %), "
+        f"index smile error, LC Monte Carlo minus target: {idx_failed}. "
         f"`check_forward` fails on {meta['forward_failed']} trades. The dates that fail the index gate are in every summary of this part; tables C_arith_gap, C_arith_payout and C_arith_split each carry the rows "
         f"\"{SAMPLE_LABEL['intersection_index_ok']}\" ({len(S['intersection_index_ok'])} trades). "
+        f"What the gate does not test: it is waived on {wv['wing_binds']} of the {n_i} trades because the wing binds, and on {wv['wing_binds_outside']} of those {wv['wing_binds']} the index smile error at the money or at 90 % of the forward exceeds {INDEX_TOL} vol points "
+        f"(error at 90 % of the forward: median {wv['median_90_waived_outside']:+.2f} vol points on these {wv['wing_binds_outside']} trades; over the {n_i} trades median {wv['median_90']:+.2f}, "
+        f"lowest {wv['lowest_90']:+.2f} ± {wv['lowest_90_se']:.2f} on {wv['lowest_90_date']}). With the {n_fail} dates that fail the gate, {wv['outside']} of the {n_i} trades are outside the tolerance and {wv['within']} are within it at both strikes. "
+        f"The {n_fail} dates removed are the only dates outside the tolerance on which the wing does not bind, not the only dates outside the tolerance: the {len(S['intersection_index_ok'])}-trade rows are not a test of the index-smile misfit, "
+        f"and status `ok` does not say that the index smile is repriced within {INDEX_TOL} vol points. "
         f"Separately, the names' 2 % diagnostic (`check_names`: |Σ w E_LC[R_i²] / Σ w M_i − 1| ≤ 2 %, the names' second moment under the LC Monte Carlo against the listed strips) is outside 2 % on "
         f"{meta['names_outside']} of the {n_i} trades ({meta['names_outside_and_gate']} of them also `check` under the current rule); it is not a gate.",
         "",
@@ -973,8 +1088,14 @@ def markdown(S: dict[str, Any], gap: pd.DataFrame, payout: pd.DataFrame, sp: pd.
     ]  # fmt: skip
 
     # the gap
+    n_x = len(S["intersection_index_ok"])
+    same_trades = (
+        f"The copula and model S numbers on the rows of the intersection ({n_i}, {n_u} and {n_x} trades) are on the same trades as the LC number beside them, not on the study's {n_m}: "
+        f"they differ from the study's printed numbers (last column), which are on its {n_m} trades (the row \"{SAMPLE_LABEL['study_monthly']}\" of each structure or product)."
+    )  # fmt: skip
+    not_a_test = f"The {n_x}-trade rows (without the {n_fail} dates that fail the index gate) are not a test of the index-smile misfit (status paragraph above: the gate is waived on {wv['wing_binds']} trades)."
     out += [
-        "**Table C_arith_gap.** The gap held and hedged: mean P&L per trade, % of notional, ± Hansen–Hodrick standard error over trades.",
+        f"**Table C_arith_gap.** The gap held and hedged: mean P&L per trade, % of notional, ± Hansen–Hodrick standard error over trades ({LAG_MONTHLY} lags).",
         "",
         "| structure | sample | trades | at the copula's price | at model S's price | at the LC price | LC: Monte Carlo error, at most | study printed (copula / model S) |",
         "|---|---|---|---|---|---|---|---|",
@@ -1011,7 +1132,8 @@ def markdown(S: dict[str, Any], gap: pd.DataFrame, payout: pd.DataFrame, sp: pd.
         f"+ (copula forward price − model forward price) of the entry date, per trade; ± = the study's standard error of a mean P&L (Hansen–Hodrick, `disp_stats.mean_se`) with {LAG_MONTHLY} lags for monthly entries "
         f"(the study printed none for the gap on the monthly subset; the block-bootstrap one, circular blocks of {BLOCK_MONTHLY} monthly entries, {N_RESAMPLES} resamples, seed {SEED_RATIO}, is in the CSV with its 95 % interval); "
         "the two price rows are means of entry prices and carry no sampling error; the Monte Carlo error is that of the LC prices in the mean (the mean over trades of `ED_lc_se`, plus the study's `P_D_se` in the price difference: "
-        "a bound whatever the dependence between dates, which is the standard error the records carry for the LC mean price and the price difference: the dates share their seeds, so the independent-dates figure, in the CSV, is not supported).",
+        "a bound whatever the dependence between dates, which is the standard error the records carry for the LC mean price and the price difference: the dates share their seeds, so the independent-dates figure, in the CSV, is not supported). "
+        + same_trades + " " + not_a_test,
         "",
     ]  # fmt: skip
     if ok["gap"]:
@@ -1040,7 +1162,7 @@ def markdown(S: dict[str, Any], gap: pd.DataFrame, payout: pd.DataFrame, sp: pd.
 
     # payout
     out += [
-        "**Table C_arith_payout.** Payout per 1 of premium (Σ payoff / Σ price) with the study's 95 % interval.",
+        f"**Table C_arith_payout.** Payout per 1 of premium (Σ payoff / Σ price); in brackets the 95 % block-bootstrap interval (the study's: blocks of {BLOCK_MONTHLY} monthly entries, {N_RESAMPLES} resamples, seed {SEED_RATIO}).",
         "",
         "| product | sample | trades | copula | model S | LC | LC: Monte Carlo error, at most | mean premium, % of notional (copula / S / LC) | study printed (copula / model S) |",
         "|---|---|---|---|---|---|---|---|---|",
@@ -1070,7 +1192,7 @@ def markdown(S: dict[str, Any], gap: pd.DataFrame, payout: pd.DataFrame, sp: pd.
                 mcb = sig(q.loc["lc", "mc_se_bound"]) if "lc" in q.index and ok["payout"] else ""
                 lines.append(
                     f"| {plabel[product]} | {SAMPLE_LABEL[sample]} | {len(S[sample])} | {pay_cell(product, sample, 'copula')} | {pay_cell(product, sample, 'model_s')} | "
-                    f"{pay_cell(product, sample, 'lc')} | {mcb} | {prem} | {printed_pay[product] if sample == 'study_monthly' else ''} |"
+                    f"{pay_cell(product, sample, 'lc')}{' †' if product[-3:] in RUNAWAY_STRIKES and 'lc' in q.index and ok['payout'] else ''} | {mcb} | {prem} | {printed_pay[product] if sample == 'study_monthly' else ''} |"
                 )  # fmt: skip
         return lines
 
@@ -1079,7 +1201,9 @@ def markdown(S: dict[str, Any], gap: pd.DataFrame, payout: pd.DataFrame, sp: pd.
         "",
         "Σ over trades of the realised payoff (`D` for the forward; `max(D − K, 0)` for the call, `K` = the copula forward's price of the entry date, in cash, the same for the three models) over Σ of the model's price "
         f"(`P_D`, `P_D_S`, `ED_lc`; `C_100`, `C_S_100`, `C_100_lc`); interval = the study's (`disp_stats.bootstrap_ratio`: circular blocks of {BLOCK_MONTHLY} monthly entries, {N_RESAMPLES} resamples, seed {SEED_RATIO}, 2.5th–97.5th percentile); "
-        "the study's T5_model_S prints no interval for the forward on the monthly subset (the same bootstrap is applied here); the Monte Carlo error is that of the LC prices in the ratio (ratio × Σ standard errors / Σ prices, a bound).",
+        "the study's T5_model_S prints no interval for the forward on the monthly subset (the same bootstrap is applied here); the Monte Carlo error is that of the LC prices in the ratio (ratio × Σ standard errors / Σ prices, a bound). "
+        "The table prints no ±: the brackets are the 95 % block-bootstrap interval, a sampling interval over trades; the standard error of each ratio in the records and in the CSV (`se_boot`) is the standard deviation of the same resamples. "
+        + same_trades + " " + not_a_test,
         "",
     ]  # fmt: skip
     own = payout[(payout["product"] == "call_100") & (payout["sample"] == "intersection")].set_index("model")  # fmt: skip
@@ -1091,14 +1215,14 @@ def markdown(S: dict[str, Any], gap: pd.DataFrame, payout: pd.DataFrame, sp: pd.
             f"{100 * (own.loc['lc', 'strike_over_own_forward'] - 1):.1f} % above the LC forward price and {100 * (own.loc['model_s', 'strike_over_own_forward'] - 1):.1f} % above model S's "
             "(Σ strikes / Σ of the model's own forward prices − 1): under LC and model S the call is out of the money at the model's own forward. The package carries no call struck at the LC forward.",
             "",
-            f"The LC forward payout, edge of significance: its interval includes 1 on the {f214['n_trades']} trades ({interval(f214['ci95_lo'], f214['ci95_hi'])}), and its lower bound on the {f207['n_trades']} trades "
+            f"The LC forward payout, edge of significance: its 95 % block-bootstrap interval includes 1 on the {f214['n_trades']} trades ({interval(f214['ci95_lo'], f214['ci95_hi'])}), and its lower bound on the {f207['n_trades']} trades "
             f"({f207['ci95_lo']:.3f}) is within bootstrap noise of 1: over the bootstrap seeds {SEEDS_RANGE[0]} to {SEEDS_RANGE[-1]} (the study's seed is {SEED_RATIO}) that lower bound runs from "
             f"{f207['ci95_lo_seed_min']:.3f} to {f207['ci95_lo_seed_max']:.3f} (on the {f214['n_trades']} trades from {f214['ci95_lo_seed_min']:.3f} to {f214['ci95_lo_seed_max']:.3f}); "
             "the third decimal of the bounds is not stable across bootstrap seeds. Neither result supports a claim about a sign or \"above 1\".",
             "",
         ]  # fmt: skip
     out += [
-        "**Table C_arith_payout (other strikes).** The other strikes of the study's table T5_model_S, same definitions.",
+        "**Table C_arith_payout (other strikes).** The other strikes of the study's table T5_model_S, same definitions (brackets: the same 95 % block-bootstrap interval). † = LC premium carried in part by a few runaway paths, see under the table.",
         "",
         "| product | sample | trades | copula | model S | LC | LC: Monte Carlo error, at most | mean premium, % of notional (copula / S / LC) | study printed (copula / model S) |",
         "|---|---|---|---|---|---|---|---|---|",
@@ -1106,9 +1230,23 @@ def markdown(S: dict[str, Any], gap: pd.DataFrame, payout: pd.DataFrame, sp: pd.
     out += pay_rows(("call_050", "call_075", "call_125", "call_150"))
     out += [
         "",
-        "Strikes are multiples of the copula forward's price of the entry date, fixed in cash, for the three models; the rows without the dates that fail the index gate are in the CSV.",
+        "Strikes are multiples of the copula forward's price of the entry date, fixed in cash, for the three models; the rows without the dates that fail the index gate are in the CSV. "
+        f"The copula and model S numbers on the {n_i}- and {n_u}-trade rows are on the same trades as the LC number beside them, not on the study's {n_m}.",
         "",
     ]
+    if ok["payout"]:
+        q = payout[(payout["model"] == "lc") & payout["sample"].isin(("intersection", "intersection_unflagged"))].set_index(["product", "sample"])  # fmt: skip
+        v = {k: q.loc[k, "payout_per_1_of_premium"] for k in q.index}
+        out += [
+            "† The LC calls at 1.25 and 1.5 times the copula's forward price. The LC premium at these two strikes is carried in part by a few runaway paths ("
+            + runaway_text(runaway_shares())
+            + f"). The payouts above divide the realised payoff by these LC premiums (mean premium {q.loc[('call_125', 'intersection'), 'mean_premium_pct']:.3f} % of notional at 1.25 times and "
+            f"{q.loc[('call_150', 'intersection'), 'mean_premium_pct']:.3f} % at 1.5 times on the {n_i} trades). The LC payout at 1.5 times ({v[('call_150', 'intersection')]:.3f}; {v[('call_150', 'intersection_unflagged')]:.3f} without the flagged dates) is not to be quoted; "
+            f"the one at 1.25 times ({v[('call_125', 'intersection')]:.3f}; {v[('call_125', 'intersection_unflagged')]:.3f}) is to be read with care. The Monte Carlo bound printed in the table "
+            f"({sig(q.loc[('call_150', 'intersection'), 'mc_se_bound'])} at 1.5 times, {sig(q.loc[('call_125', 'intersection'), 'mc_se_bound'])} at 1.25 times, from the rows' standard errors) does not cover this. "
+            "V3 measured the two dates named, not the trades of this table: the share on each trade is not known.",
+            "",
+        ]  # fmt: skip
 
     # the split
     out += [
@@ -1123,6 +1261,16 @@ def markdown(S: dict[str, Any], gap: pd.DataFrame, payout: pd.DataFrame, sp: pd.
         ("study_monthly", "model_s"): "0.946 = 0.964 × 0.982; 1.012 × 0.970",
     }  # fmt: skip
     subsamples = ("intersection_names_in", "intersection_names_out")
+    # the printed identities of the two split tables: the factors rounded as printed
+    id_n, id_off, id_worst = 0, 0, 0.0
+    shown = [r for r in sp.to_dict("records") if r["sample"] not in subsamples]
+    shown += [r for r in sp.to_dict("records") if r["model"] in ("copula", "lc") and r["sample"] in ("intersection", *subsamples)]  # fmt: skip
+    for r in shown:
+        for prod, x, y in (("price_over_payoff", "listed_part", "model_part"), ("model_part", "dispersion_model_over_listed", "kappa_model_over_realised")):  # fmt: skip
+            if not abs(r[prod] - r[x] * r[y]) < 1e-12:
+                raise ValueError(f"the split's identity {prod} = {x} x {y} does not hold unrounded")
+            gap4 = abs(round(float(f"{r[x]:.4f}") * float(f"{r[y]:.4f}"), 4) - float(f"{r[prod]:.4f}"))  # fmt: skip
+            id_n, id_off, id_worst = id_n + 1, id_off + (gap4 > 1e-9), max(id_worst, gap4)
     for r in sp.to_dict("records"):
         if r["sample"] in subsamples:
             continue  # the table by the names' diagnostic, below
@@ -1137,8 +1285,10 @@ def markdown(S: dict[str, Any], gap: pd.DataFrame, payout: pd.DataFrame, sp: pd.
         "",
         "All ratios pooled over the trades (`disp_tables.richness`): price over payoff = mean model forward price / mean realised D; listed-option part = √(mean EQV / mean realised V), EQV the listed options' E[V] (the same for every model); "
         "dispersion priced, model over listed = √(mean model E[V] / mean EQV) (`EV`, `EV_S`, `EV_lc`); κ of the model = mean price / √(mean model E[V]); κ realised = mean D / √(mean V); "
-        f"± on the monthly rows = standard deviation over the resamples of the study's D4 bootstrap (circular blocks of {BLOCK_MONTHLY} monthly entries, {N_RESAMPLES} resamples, seed {SEED_SPLIT}); the study printed no interval on these rows (95 % intervals in the CSV). "
-        "The factors are printed with 4 decimals so that the printed factors multiply to the printed product (the study printed 3). The listed-option part and κ realised are model-free: no model price is in them and they are the same for the three models on a sample. "
+        f"± on the monthly rows = bootstrap standard deviation, a sampling error over trades (standard deviation over the resamples of the study's D4 bootstrap: circular blocks of {BLOCK_MONTHLY} monthly entries, {N_RESAMPLES} resamples, seed {SEED_SPLIT}); the study printed no interval on these rows (95 % intervals in the CSV). "
+        f"The factors are printed with 4 decimals (the study printed 3); the printed factors multiply to the printed product to within {id_worst:.4f} (the unrounded ones exactly): "
+        f"on {id_off} of the {id_n} printed identities of the two split tables the product of the printed factors, rounded to 4 decimals, differs from the printed product by {id_worst:.4f}. "
+        + not_a_test + " The listed-option part and κ realised are model-free: no model price is in them and they are the same for the three models on a sample. "
         "κ of the model is the price over the root of the model's own E[V], as in the final report (its sidenote prints 0.729 and 0.743 on the 1,010 trades); it differs by definition from the κ_Q of the study's table T4_model_S, "
         "which is the price over the root of EQV.",
         "",
@@ -1163,9 +1313,9 @@ def markdown(S: dict[str, Any], gap: pd.DataFrame, payout: pd.DataFrame, sp: pd.
             out.append(f"| {SAMPLE_LABEL[sample]}, {MODEL_LABEL[model]} | {int(r['n_trades'])} | " + " | ".join(cells) + " |")  # fmt: skip
     out += [
         "",
-        f"Inside = |Σ w E_LC[R_i²] / Σ w M_i − 1| ≤ 2 % on the entry date (`check_names` of the LC table), outside = the others; ± = the same bootstrap on the trades of the sub-sample in date order "
-        f"(blocks of {BLOCK_MONTHLY} consecutive trades of the sub-sample, which are not consecutive months); model part minus the copula's = the LC model part less the copula's on the same trades and the same resamples "
-        "(model S's rows on these sub-samples are in the CSV).",
+        f"Inside = |Σ w E_LC[R_i²] / Σ w M_i − 1| ≤ 2 % on the entry date (`check_names` of the LC table), outside = the others; ± = bootstrap standard deviation, a sampling error over trades (the bootstrap of the split table on the trades of the sub-sample in date order: "
+        f"blocks of {BLOCK_MONTHLY} consecutive trades of the sub-sample, which are not consecutive months); model part minus the copula's = the LC model part less the copula's on the same trades and the same resamples "
+        "(model S's rows on these sub-samples are in the CSV; the mean LC price over the mean copula price of each sample is column `price_over_copula` of the CSV).",
         "",
         "**Table C_arith_second_moments.** Mean E_LC[V] against mean EQV. E[V] = Σ w E[R_i²] − E[R̄²], so mean E_LC[V] − mean EQV = (names' second moment under the LC Monte Carlo − names' listed strips) + (listed index strip − basket's second moment under LC).",
         "",
@@ -1188,21 +1338,35 @@ def markdown(S: dict[str, Any], gap: pd.DataFrame, payout: pd.DataFrame, sp: pd.
         "basket = E[R̄²] of the model (`E_Rbar2_lc`) over the listed index strip (`M_B_listed`); ± = the bootstrap of the split table on the same trades (sampling over trades); "
         f"the Monte Carlo error of the LC names' ratio on the {n_i} trades is {sig(mo.loc['intersection', 'names_ratio_lc_mc_indep'])} with independent dates and at most {sig(mo.loc['intersection', 'names_ratio_lc_mc_bound'])} whatever their dependence, "
         f"and of the LC basket's ratio {sig(mo.loc['intersection', 'basket_ratio_lc_mc_indep'])} and at most {sig(mo.loc['intersection', 'basket_ratio_lc_mc_bound'])} "
-        "(from the rows' standard errors over the mean listed moment; `tables/C_arith_second_moments.csv`).",
+        "(from the rows' standard errors over the mean listed moment; `tables/C_arith_second_moments.csv`). These Monte Carlo errors are computed from the rows' standard errors and are not the uncertainty of the names' ratio: "
+        "section V4 of the package locates the names' excess over the listed strips in the calls beyond the last listed strike, where the names' second moment is not pinned down by the Monte Carlo. " + not_a_test,
         "",
     ]  # fmt: skip
     if ok["split"]:
-        a, lc_rows = mo.loc["intersection"], {smp: by.loc[(smp, "lc")] for smp in ("intersection", *subsamples)}  # fmt: skip
+        four = ("intersection", "intersection_unflagged", *subsamples)
+        a, lc_rows, cop_rows = mo.loc["intersection"], {smp: by.loc[(smp, "lc")] for smp in four}, {smp: by.loc[(smp, "copula")] for smp in four}  # fmt: skip
         pair = {smp: f"{r['dispersion_model_over_listed']:.4f} × {r['kappa_model_over_realised']:.4f}" for smp, r in lc_rows.items()}  # fmt: skip
+        nt = {smp: int(r["n_trades"]) for smp, r in lc_rows.items()}
+        where = {"intersection": f"on the {nt['intersection']} trades", "intersection_unflagged": f"on the {nt['intersection_unflagged']} without the flagged dates",
+                 subsamples[0]: f"on the {nt[subsamples[0]]} inside the names' diagnostic", subsamples[1]: f"on the {nt[subsamples[1]]} outside it"}  # fmt: skip
+        level = ", ".join(f"{lc_rows[smp]['model_part']:.4f} ± {lc_rows[smp]['model_part_se_boot']:.4f} {where[smp]}" for smp in four)  # fmt: skip
+        level_cop = ", ".join(f"{cop_rows[smp]['model_part']:.4f}" for smp in four)
+        diff = ", ".join(f"{lc_rows[smp]['model_part_minus_copula']:+.4f} ± {lc_rows[smp]['model_part_minus_copula_se_boot']:.4f} {where[smp]}" for smp in four)  # fmt: skip
+        ratio = ", ".join(f"{lc_rows[smp]['price_over_copula']:.4f} ± {lc_rows[smp]['price_over_copula_se_boot']:.4f} {where[smp]}" for smp in four)  # fmt: skip
+        levels = [float(lc_rows[smp]["model_part"]) for smp in four]
         out += [
-            f"Reading of the LC split. On the {n_i} trades {100 * a['share_names']:.0f} % of the excess of mean E_LC[V] over mean EQV is the names' second moment under the LC Monte Carlo above the names' listed strips "
+            f"Reading of the LC split. On the {n_i} trades {100 * a['share_names']:.0f} % of the excess of mean E_LC[V] over mean EQV is the names' second moment under LC above the names' listed strips "
             f"(pooled ratio {a['names_ratio_lc']:.3f}; the copula's is {a['names_ratio_copula']:.3f}) and {100 * a['share_basket']:.0f} % the basket's second moment under LC below the listed index strip (pooled ratio {a['basket_ratio_lc']:.3f}). "
-            f"About half of what puts LC's factor \"dispersion priced, model over listed\" ({a['dispersion_lc_over_listed']:.4f}) above 1 therefore comes from the Monte Carlo second moment of the names exceeding the listed strips, "
+            f"About half of what puts LC's factor \"dispersion priced, model over listed\" ({a['dispersion_lc_over_listed']:.4f}) above 1 therefore comes from the names' second moment under LC, "
+            "which exceeds the listed strips in the calls beyond the last listed strike (section V4) and is not pinned down by the Monte Carlo there, "
             f"not from correlation (the names' second moment does not depend on correlation); with the names at the listed strips the factor is {a['dispersion_lc_names_at_listed']:.4f}. "
-            f"The two sub-factors of the LC model part are not stable across the sub-samples: {pair['intersection']} on the {int(lc_rows['intersection']['n_trades'])} trades, {pair[subsamples[0]]} on the {int(lc_rows[subsamples[0]]['n_trades'])} inside the names' diagnostic, "
-            f"{pair[subsamples[1]]} on the {int(lc_rows[subsamples[1]]['n_trades'])} outside it. Their product, the model part, is stable against the copula's: LC model part minus the copula's is "
-            f"{lc_rows['intersection']['model_part_minus_copula']:+.4f} on the {int(lc_rows['intersection']['n_trades'])}, {lc_rows[subsamples[0]]['model_part_minus_copula']:+.4f} inside and {lc_rows[subsamples[1]]['model_part_minus_copula']:+.4f} outside. "
-            "The two LC sub-factors are not to be quoted as \"LC prices that much more dispersion than listed because of its correlation\"; the model part is the number that holds on the sub-samples.",
+            f"The two sub-factors of the LC model part are not stable across the sub-samples: {pair['intersection']} on the {nt['intersection']} trades, {pair[subsamples[0]]} on the {nt[subsamples[0]]} inside the names' diagnostic, "
+            f"{pair[subsamples[1]]} on the {nt[subsamples[1]]} outside it. The level of the LC model part is not stable either: {level} (from {min(levels):.4f} to {max(levels):.4f}; the copula's on the same samples: {level_cop}). "
+            f"What holds on the sub-samples is the difference between the LC model part and the copula's on the same trades: {diff}. "
+            f"This difference is the pooled LC over copula price ratio in another form (it equals the copula's model part × (mean LC price / mean copula price − 1)); mean LC price over mean copula price: {ratio} "
+            f"(± = bootstrap standard deviation over trades, the split table's; Monte Carlo error of the prices in the ratio on the {nt['intersection']} trades at most {sig(lc_rows['intersection']['price_over_copula_mc_bound'])}). "
+            "Quote the LC model part against the copula's on the same trades (the difference, or the price ratio), not its level and not its two sub-factors; "
+            "the two LC sub-factors are not to be quoted as \"LC prices that much more dispersion than listed because of its correlation\".",
             "",
         ]  # fmt: skip
     out += [
@@ -1239,6 +1403,7 @@ def trades_table(S: dict[str, Any]) -> pd.DataFrame:
         shift = g["P_D"] - g[FWD[model]]
         t[f"GAP_U_at_{model}"] = (g["GAP_U"] + shift).to_numpy(float)
         t[f"GAP_H_at_{model}"] = (g["GAP_H"] + shift).to_numpy(float)
+    t["idx_outside_tol"] = g["idx_outside_tol"].to_numpy(bool)
     return t
 
 
@@ -1269,7 +1434,8 @@ def main() -> None:
         return
     stated = rep[rep["sample_stated"]]
     pc.status(
-        f"C_arith revised after verification (parts/C_arith.json and .md, tables/C_arith_*.csv): the study's arithmetic at the LC price on {len(S['intersection'])} trades "
+        f"C_arith revised after the second verification (wording, labels and caveats; no existing value changed; new records: index gate waived, mean LC price over mean copula price) "
+        f"(parts/C_arith.json and .md, tables/C_arith_*.csv): the study's arithmetic at the LC price on {len(S['intersection'])} trades "
         f"({len(S['intersection_unflagged'])} without the flagged dates, {len(S['intersection_index_ok'])} without the dates that fail the index gate), LC rows of commit {meta['commit']} ({meta['lc_table']}); "
         f"{int(stated['match'].sum())} of {len(rep)} printed numbers of the study reproduced on a stated sample, {len(rep) - len(stated)} printed to one digit without a stated sample."
     )  # fmt: skip

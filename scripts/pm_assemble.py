@@ -34,7 +34,7 @@ SECTIONS = (
     ("A_today", "A. Today (2026-10-02), 3m, production budget"),
     (
         "A_check_e",
-        "A (continued). Check (e): why the prototype moves the forward less than the fixed-κ estimate",
+        "A9. Check (e): why the prototype moves the forward less than the fixed-κ estimate",
     ),
     ("B_reference", "B. The three reference dates, 3m, production budget"),
     ("C_history", "C. History, 3m, development budget, decisions 1-2 on"),

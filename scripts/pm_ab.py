@@ -6,12 +6,13 @@ decisions on.
                             [--no-status]
 
 Reads (never writes there): the production rows ``outputs/dispersion_lc/rows/3m_production/
-<date>.json`` (one per date), today's risk ``pm_update/parts/A_risk_today_raw.json``, the
+<date>.json`` (one per date), today's risk ``pm_update/parts/A_risk_today_raw.json`` (and, for
+the clipped mass of its recalibrated models, the calibration cache ``outputs/dispersion_lc/cache``), the
 cross-dependent scan ``outputs/dispersion_lc/cdv/pm/cdv_scan_2026-10-02_3m.json``, the study's
 ``entries_3m.parquet`` (basket B1) and ``model_s_3m.parquet``, the parametric reference's
 fixtures ``tests/golden/lcm_reference/<tag>.json``, the old-default rows
 ``rows/3m_production_norepair`` (check (a) and table B4, the sensitivity to the owner's decisions
-1-2) and, for check (a), the log of the independent rebuild of the reference.
+1, 2 and 5) and, for check (a), the log of the independent rebuild of the reference.
 
 Writes one part per section — ``parts/A_today.{json,md}``, ``parts/B_reference.{json,md}`` —
 and the CSV behind every table (``tables/A_*.csv``, ``tables/B_*.csv``).  Pure reading and
@@ -66,9 +67,15 @@ ENTRIES = pc.STUDY / "entries_3m.parquet"
 MODEL_S = pc.STUDY / "model_s_3m.parquet"
 FIXTURES = ROOT / "tests" / "golden" / "lcm_reference"
 REF_TAGS = ("today", "typical", "steep", "typical_alt")
-CHECK_A_LOG = Path(
+#: the log of the independent rebuild of the reference (check a): the package's copy when it is
+#: there (the orchestrator copies it), the session's scratch log otherwise
+CHECK_A_PKG = pc.PM / "diagnostics" / "check_a" / "s4_ratio_by_tag.log"
+CHECK_A_SCRATCH = Path(
     "/private/tmp/claude-501/-Users-idrissdadoun-Code-volsto/75dd7f23-d74c-43a9-b99e-61c23722b22c/scratchpad/r4/check-a/s4_ratio_by_tag.log"
 )
+CHECK_A_LOG = CHECK_A_PKG if CHECK_A_PKG.exists() else CHECK_A_SCRATCH
+#: the calibration cache (read only): ``<key>/spec.json`` and ``<key>/diagnostics.json``
+CACHE = pc.LC_OUT / "cache"
 REF_NAME = "the parametric reference implementation"
 REF_RUN = "stand-alone run of 2026-10-07"
 REF_COMMIT = "n/a (stand-alone reference implementation, run of 2026-10-07)"
@@ -86,7 +93,7 @@ INDEX_GATE = (
 )
 PM_SE = (
     "Every ± is the pricing Monte Carlo standard error given the calibrated model and the expiry screen; it does not contain the calibration's own noise "
-    "(the particle seed) nor the sensitivity to the screen (the owner's decisions 1-2: table B4)."
+    "(the particle seed) nor the sensitivity to the screen (the owner's decisions 1, 2 and 5: table B4)."
 )
 CDV_BETAS = (3.0, 6.0)
 NAN = float("nan")
@@ -349,7 +356,7 @@ D_EQV = "ED_eqv = κ_LC·√EQV"
 D_KAPPA = "κ = E[D]/√E[V], V = Σ w_i (R_i − R̄)²"
 D_CLIP = "largest share of particles, over the calibration slices, whose λ is clipped"
 D_CLIP_MAX = "the larger of the two sides (each at its worst slice)"
-D_IDX = "index implied vol of the model minus the target's at the horizon, vol points (target: the model's own SVI index surface, not the study's listed vols)"
+D_IDX = "index implied vol of the model minus the target's at the horizon, vol points (target = the model's own SVI fit of the DJX smile, not the study's listed vols)"
 D_DELTA = "percent of the model's own E[D] per +1 % on every spot (arithmetic bump of 1 %, central)"
 D_STICKY = (
     "each name's local volatility held as a function of absolute spot and λ held as a function of the absolute basket level, "
@@ -360,6 +367,22 @@ D_DELTA_SE = (
     "the ± of a delta is the error of the bumped difference over the base price taken as a constant: the base price's own error is left out "
     "(first order: the size of Δ times se(P₀)/P₀, covariance not counted)"
 )
+
+
+D_TARGET = "target = the model's own SVI fit of the DJX smile"
+D_FLAG_CLIP = (
+    "flag_clip: clipped mass above 1 % on either side inside ±2.5 sd (the flag the owner's decision 5 defines for the long-dated runs; "
+    "decision 5 itself is the calendar repair of the DJX target)"
+)
+D_UPPER = (
+    "√(se_new² + se_old²) is an upper bound of the error of the difference, not its error: the two runs share their particle and pricing seeds, "
+    "so their pricing noise is largely common, but they are two calibrations and are not paired path by path"
+)
+D_NEW_DEFAULTS = (
+    "the new defaults have the owner's decisions 1, 2 and 5 on (1: calendar repair of the names' slices; 2: a name with no screened expiry "
+    "is kept unscreened; 5: calendar repair of the DJX target)"
+)
+PENDING_CLAUSE = "; `pending: <file>` marks a number whose input has not arrived"
 
 
 def core_items(x: Inputs) -> dict[str, Item]:
@@ -474,6 +497,10 @@ def core_items(x: Inputs) -> dict[str, Item]:
         if far:
             put(f"call.K_{m}.copula_t", f"call K_{m}, copula: the call over its standard error", div(c_cop, c_cop_se), None, ent_kw, digits=1,
                 definition=f"C_{m}/C_se_{m} of the entry: how many standard errors the copula's call is from zero", notes="a value over its own standard error: no standard error")  # fmt: skip
+            put(f"call.K_{m}.lc_t", f"call K_{m}, LC: the call over its standard error", div(num(r, f"C_{m}_lc"), num(r, f"C_{m}_lc_se")), None, row_kw, digits=1,
+                definition=f"C_{m}_lc/C_{m}_lc_se of the row: how many standard errors the LC call is from zero", notes="a value over its own standard error: no standard error")  # fmt: skip
+            put(f"call.K_{m}.lc_over_cc_rel_error", f"call K_{m}, LC/CC (paired): relative error", 100 * div(num(r, f"C_{m}_ratio_se"), abs(num(r, f"C_{m}_ratio"))), None, row_kw,
+                unit="%", digits=0, definition=f"100 × the row's C_{m}_ratio_se over C_{m}_ratio", notes="a relative error: no standard error of its own")  # fmt: skip
         put(f"call.K_{m}.s_over_copula", f"call K_{m}, S/copula", NAN if zero else div(num(s, f"C_S_{m}"), c_cop), None, s_kw,
             definition="model S's call over the copula's", source=f"{rel(MODEL_S)}; {rel(ENTRIES)} (basket B1)", na=zero or x.model_s_na or x.entry_na)  # fmt: skip
         put(f"call.K_{m}.lc_over_cc", f"call K_{m}, LC/CC", num(r, f"C_{m}_ratio"), num(r, f"C_{m}_ratio_se"), row_kw,
@@ -487,6 +514,13 @@ def core_items(x: Inputs) -> dict[str, Item]:
     for key, col, where in (("atm", "idx_err_atm", "at the money"), ("90", "idx_err_90", "90 % of the forward"),
                             ("m15", "idx_err_m15", "−1.5 sd"), ("m20", "idx_err_m20", "−2 sd"), ("m25", "idx_err_m25", "−2.5 sd")):  # fmt: skip
         put(f"idx_err.{key}", f"index error, {where}", num(r, col), num(r, f"{col}_se"), row_kw, unit="vol points", definition=f"{D_IDX}; {where} (sd = at-the-money vol × √T)", digits=3)  # fmt: skip
+    at_T = {str(q.get("strike")): q for q in (r or {}).get("index_errors") or [] if abs(float(q["T"]) - num(r, "T")) <= 1e-9}  # fmt: skip
+    for key, strike, where in (("p20", "+2.0", "+2 sd"), ("p25", "+2.5", "+2.5 sd")):
+        q = at_T.get(strike)
+        put(f"idx_err.{key}", f"index error, {where}", float(q["error_vp"]) if q else NAN, float(q["stderr_vp"]) if q else None, row_kw, unit="vol points", digits=3,
+            definition=f"{D_IDX}; {where} (sd = at-the-money vol × √T): the row's index_errors at the horizon", na=row_kw["na"] or "not in the row's index_errors")  # fmt: skip
+    put("fwd_err", "basket forward error", num(r, "forward_error"), num(r, "forward_error_se"), row_kw, unit="forward", fmt="sci",
+        definition="the row's forward_error: the Monte Carlo mean of the basket's forward-moneyness level at the horizon minus 1 (scripts/lcm_price.py); its expectation is zero, so its value is pricing noise")  # fmt: skip
     for key, col, where in (
         ("inner_low", "clip_low_inner_max", "inside ±2.5 sd, at λ = 0"),
         ("inner_high", "clip_high_inner_max", "inside ±2.5 sd, at the cap"),
@@ -533,7 +567,7 @@ def core_items(x: Inputs) -> dict[str, Item]:
     put("input.floored_names_max", "largest share, over the names, of a name's Dupire grid that is floored", 100 * num(r, "floored_names_max"), None, row_kw, unit="% of grid nodes",
         digits=1, definition="the row's floored_names_max × 100: the largest over the names of floored nodes over all nodes of the name's Dupire grid", notes=diag)  # fmt: skip
     put("input.n_flagged_names", "names whose SVI surface has an arbitrage violation", num(r, "n_flagged_names"), None, row_kw, unit="names", digits=0,
-        definition="the row's n_flagged_names: names whose SVI surface's arbitrage report has a violation (build_lc_market)", notes=diag)  # fmt: skip
+        definition="the row's n_flagged_names: names whose SVI surface's arbitrage report (on |k| ≤ 1, k the log-moneyness to the forward) has a violation (build_lc_market)", notes=diag)  # fmt: skip
     put("input.n_flagged_central", "legs with an arbitrage violation inside the central ±3 sd of the particle cloud", num(r, "n_flagged_central"), None, row_kw, unit="legs",
         digits=0, definition="the row's n_flagged_central: legs (the names and the index target) whose SVI surface has a violation inside the cloud mean ± 3 sd of the calibration particles "
         "(arbitrage_visited.flagged_central)", notes=diag)  # fmt: skip
@@ -681,14 +715,14 @@ def flags_table(part: Part, inputs: Sequence[Inputs], name: str, base: Path) -> 
         ("n_dropped_calendar_index", "of these, by the calendar repair on the index"),
         ("n_names_extrapolated", "names priced beyond their last listed expiry"),
         ("index_extrapolated", "index target extrapolated"),
-        ("flag_clip", "flag_clip (decision 5: clipped mass above 1 % on either side inside ±2.5 sd)"),
+        ("flag_clip", D_FLAG_CLIP),
         ("flag_clip_low", "clipped mass at λ = 0 inside ±2.5 sd above 1 %"),
         ("flag_clip_high", "clipped mass at the cap inside ±2.5 sd above 1 %"),
         ("wing_binds", "wing binds (the larger one-sided clipped mass inside ±2.5 sd above 1 %)"),
         ("index_gate", "index gate (0.15 vol points at the money and at the 90 % strike)"),
-        ("index_flagged", "index_flagged: the index target's SVI surface has an arbitrage violation"),
+        ("index_flagged", "index_flagged: the index target's SVI surface has an arbitrage violation on −1 ≤ k ≤ 1"),
         ("floored_index_pct", "floored_index: share of the index target's Dupire grid that is floored"),
-        ("n_flagged_names", "n_flagged_names: names whose SVI surface has an arbitrage violation"),
+        ("n_flagged_names", "n_flagged_names: names whose SVI surface has an arbitrage violation on −1 ≤ k ≤ 1"),
         ("n_flagged_central", "n_flagged_central: legs (names and index) with a violation inside the central ±3 sd of the particle cloud"),
         ("floored_names_max_pct", "floored_names_max: largest share, over the names, of a name's Dupire grid that is floored"),
         ("check_names", "names' 2 % check passes (a diagnostic, not a gate)"),
@@ -711,12 +745,14 @@ def flags_table(part: Part, inputs: Sequence[Inputs], name: str, base: Path) -> 
     part.text(
         f"What each row says about itself (`tables/{name}.csv`). Status ok means that no gating check fails (check_no_nan, check_forward, check_index); "
         "it does not mean that the index smile is repriced at the 90 % strike: check_index passes whenever the wing binds, whatever the two errors, "
-        "and the index-gate line gives them. flag_clip is the row's own flag; the two one-sided clip flags are recomputed from the row's clipped masses (strictly above 1 %). "
+        "and the index-gate line gives them. flag_clip is the row's own flag (it is not the owner's decision 5, which is the calendar repair of the DJX target); "
+        "the two one-sided clip flags are recomputed from the row's clipped masses (strictly above 1 %). "
         "n_dropped counts expiries (one per leg and expiry) dropped by any rule, so the calendar repair's drops are part of it, not in addition. "
-        "The four input diagnostics are the row's own columns: an arbitrage violation is one found by the SVI surface's arbitrage report; "
+        "The four input diagnostics are the row's own columns: an arbitrage violation is one found by the SVI surface's arbitrage report on |k| ≤ 1 "
+        "(k the log-moneyness to the forward: the far wings are included), so index_flagged and n_flagged_names are on |k| ≤ 1 and only n_flagged_central is on the range the particles visit; "
         "a floored node is a node of the Dupire local-variance grid where the floor is applied; the central range is the calibration cloud's mean ± 3 sd. "
         "'Calendar repair on, 0 index slices dropped' does not mean inputs without violations: these lines say what remains. "
-        "The 90 % strike is 90 % of the forward; the index errors are model minus target, the target being the model's own SVI index surface. "
+        f"The 90 % strike is 90 % of the forward; the index errors are model minus target ({D_TARGET}, not the study's listed vols). "
         f"Source: {rel(inputs[0].row_path.parent)}/<date>.json; model S: {rel(MODEL_S)}.",
         "",
     )
@@ -778,18 +814,45 @@ K200_KEYS = (
     "call.K_200.copula_t",
     "call.K_200.lc_over_copula_rel_error",
     "call.K_200.cc_over_copula_rel_error",
+    "call.K_200.lc_t",
+    "call.K_200.lc_over_cc_rel_error",
 )
 SENS_KEYS = (
     ("ED.lc", "E_LC[D]"), ("ED.cc", "E_CC[D]"), ("ratio.lc_over_cc", "LC/CC"), ("ratio.lc_over_copula", "LC/copula"),
     ("ratio.cc_over_copula", "CC/copula"), ("delta.lc_ss", "Δ sticky strike, LC"), ("delta.cc_ss", "Δ sticky strike, CC"),
     ("clip.inner_total", "clipped mass inside ±2.5 sd, the larger of the two sides (% of particles)"),
+    ("fwd_err", "basket forward error (pricing noise: its expectation is zero)"),
 )  # fmt: skip
 OLD_WHAT = "old defaults (no calendar repair, no fallback)"
 
 
+def decisions_acting(xs: Sequence[Inputs]) -> str:
+    """Which of the owner's decisions 1, 2 and 5 act on the new-default rows of ``xs``, from the
+    rows' own columns (decision 2: ``n_names_unscreened``; decision 5: ``n_dropped_calendar_index``;
+    decision 1: ``n_dropped_calendar`` minus the index's)."""
+    rows = [x.row for x in xs if x.row is not None]
+    keys = ("n_names_unscreened", "n_dropped_calendar_index", "n_dropped_calendar")
+    if len(rows) != len(xs) or not all(ok(num(r, k)) for r in rows for k in keys):
+        return ""
+    when = f"these {len(xs)} dates" if len(xs) > 1 else xs[0].date
+    unscreened = [int(num(r, "n_names_unscreened")) for r in rows]
+    index = [int(num(r, "n_dropped_calendar_index")) for r in rows]
+    names = [int(num(r, "n_dropped_calendar")) - i for r, i in zip(rows, index, strict=True)]
+    dropped = "; ".join(f"{x.date}: {n}" for x, n in zip(xs, names, strict=True))
+    if not any(unscreened) and not any(index):
+        return (
+            f"On {when} no name is kept unscreened (n_names_unscreened = 0) and decision 5 drops no DJX slice (n_dropped_calendar_index = 0), "
+            f"so the change shown is that of decision 1, the names' calendar repair (expiries of the names dropped by it: {dropped})."
+        )
+    return (
+        f"On {when} the three decisions act together: names kept unscreened {', '.join(map(str, unscreened))}; DJX slices dropped by decision 5 "
+        f"{', '.join(map(str, index))}; expiries of the names dropped by decision 1: {dropped}."
+    )
+
+
 def old_inputs(x: Inputs) -> Inputs:
     """The same date on the old defaults: the row of the production pass stopped before the
-    owner's decisions 1-2 became the defaults (``rows/3m_production_norepair``)."""
+    owner's decisions became the defaults (``rows/3m_production_norepair``)."""
     path = OLD_ROWS_DIR / f"{x.date}.json"
     row, why = load_json(path)
     if row is not None and str(row.get("date")) != x.date:
@@ -800,9 +863,10 @@ def old_inputs(x: Inputs) -> Inputs:
 
 def sens_items(x: Inputs) -> list[tuple[str, Item, Item, Item]]:
     """``(label, old, new, new minus old)`` for each quantity of ``SENS_KEYS``: the old-default
-    row against section B's row of the same date.  The error of the difference is
-    ``√(se_new² + se_old²)``: the two runs share their seeds but are not paired path by path
-    (two calibrations), so this is not a paired error."""
+    row against section B's row of the same date.  The ± of the difference is
+    ``√(se_new² + se_old²)``: the two runs share their seeds (their pricing noise is largely
+    common) but are not paired path by path (two calibrations), so it is an upper bound of the
+    error of the difference, not a paired error."""
     new_c, old_c = core_items(x), core_items(old_inputs(x))
     out = []
     for key, label in SENS_KEYS:
@@ -812,12 +876,12 @@ def sens_items(x: Inputs) -> list[tuple[str, Item, Item, Item]]:
         diff = nv - ov if ok(nv) and ok(ov) else NAN
         se = math.hypot(new.se, old.se) if ok(diff) and new.se is not None and old.se is not None and ok(new.se) and ok(old.se) else None  # fmt: skip
         if se:
-            note = f"error √(se_new² + se_old²), the two runs taken as independent (same seeds, two calibrations: not a paired error); difference over this error {diff / se:+.1f}"
+            note = f"the ± is an upper bound: {D_UPPER}; difference over this upper bound {diff / se:+.1f}"
         else:
             note = "no standard error: " + (new.notes or "the two values have none")
         it_old = replace(old, key=f"old_defaults.{key}", label=f"{label}, {OLD_WHAT}")
-        it_diff = Item(f"new_minus_old.{key}", f"{label}: new defaults minus old defaults", diff, se, unit=new.unit, digits=new.digits, fmt="signed",
-                       definition=f"{label} of the row with the owner's decisions 1-2 on (calendar repair, unscreened fallback) minus the same of the row on the {OLD_WHAT}; same date, budget and seeds",
+        it_diff = Item(f"new_minus_old.{key}", f"{label}: new defaults minus old defaults", diff, se, unit=new.unit, digits=new.digits, fmt="sci" if new.fmt == "sci" else "signed",
+                       definition=f"{label} of the row on the new defaults (the owner's decisions 1, 2 and 5 on) minus the same of the row on the {OLD_WHAT}; same date, budget and seeds",
                        budget=new.budget if new.budget == old.budget else f"{new.budget}; old: {old.budget}", commit=f"{new.commit} minus {old.commit}",
                        source=f"{new.source}; {old.source}", pending=new.pending or old.pending, na=new.na or old.na, notes=note)  # fmt: skip
         out.append((label, it_old, new, it_diff))
@@ -831,9 +895,16 @@ def in_se(it: Item) -> str:
 
 def k200_sentence(xs: Sequence[Inputs]) -> str:
     """Why the K_200 ratios to the copula are not usable: the copula's call and its t per date."""
-    bits, rels = [], []
+    bits, rels, paired, weak = [], [], [], []
     for x in xs:
         c = core_items(x)
+        rel_lc, t_lc = c["call.K_200.lc_over_cc_rel_error"].value, c["call.K_200.lc_t"].value
+        if rel_lc is not None and ok(rel_lc) and t_lc is not None and ok(t_lc):
+            paired.append(
+                f"{rel_lc:.0f} % on {x.date} (the LC call is {t_lc:.1f} standard errors from zero)"
+            )
+            if rel_lc > 10.0:
+                weak.append(x.date)
         t = c["call.K_200.copula_t"].value
         bits.append(f"{c['call.K_200.copula'].cell()} on {x.date} ({t:.1f} standard errors from zero)" if t is not None and ok(t) else f"{c['call.K_200.copula'].cell()} on {x.date}")  # fmt: skip
         rels += [c[f"call.K_200.{tag}_over_copula_rel_error"].value for tag in ("lc", "cc")]
@@ -846,6 +917,17 @@ def k200_sentence(xs: Sequence[Inputs]) -> str:
         + f". The K_200 ratios to the copula (LC/copula, CC/copula) have relative errors{span} "
         "and are not usable as ratios: they are printed with two significant digits and their relative error (at that noise level a delta-method error is not an interval). "
         "S/copula at K_200 has the same denominator and no error. The K_200 call levels are printed with three significant digits in scientific notation."
+        + (
+            " The paired LC/CC ratio at K_200 has a relative error of "
+            + "; ".join(paired)
+            + (
+                f": on {', '.join(weak)} it is not usable as a ratio either, although it is printed with four decimals."
+                if weak
+                else "."
+            )
+            if paired
+            else ""
+        )
     )
 
 
@@ -862,9 +944,91 @@ def one_line(kind: str, x: Inputs) -> str:
     )
 
 
-def risk_items(risk: dict[str, Any] | None, pending: str, row: Inputs) -> tuple[dict[str, Item], list[Item], list[str]]:  # fmt: skip
+D_ROTA = "+1 rota adds −0.02/√max(T, 1/12) × 0.5·tanh(k/0.5) to the index implied vol at every maturity T (k the log-moneyness to the forward)"
+D_PUT90 = "a tent in k added to the index implied vol at every pillar of the index target: 1 vol point at 90 % of the forward, linear to zero at 85 % and at 95 %, zero beyond"
+#: the eight combinations of scripts/pm_today_risk.py (variant_specs): the one that is not a variant is the base
+VARIANT_GRID = tuple(
+    f"{r_low} / {family}"
+    for family in ("particle", "parametric")
+    for r_low in ("equi 0", "equi 0.02", "equi 0.10", "historical-scaled:252,0.05")
+)
+
+
+def variant_key(label: str) -> str:
+    """The key of ``cache_calibrations`` for a model-risk variant's label."""
+    left, _, family = label.partition(" / ")
+    if left.startswith("equi "):
+        return f"equi|{float(left[5:]):g}|{family}"
+    return f"{left}||{family}"
+
+
+def cache_calibrations(spec_key: str, hist_digest: str) -> dict[str, dict[str, Any]]:
+    """The calibrations of the cache (read only) whose specification differs from the base's
+    (``spec_key``) by one named change alone — another ``R_low`` or λ family (the model-risk
+    variants) or a bump of the names' or of the index target's surface (the recalibrated vegas)
+    — keyed ``"<r_low>|<rho_min>|<family>"`` or ``"vega:<name>"``, with what its
+    ``diagnostics.json`` says of the clipped mass.  A change found in two entries is left out."""
+    base, _ = load_json(CACHE / spec_key / "spec.json")
+    if base is None:
+        return {}
+    tag = json.dumps(base.get("label"))
+    lc_b = base.get("lc") or {}
+    found: dict[str, list[str]] = {}
+    for path in sorted(CACHE.glob("*/spec.json")):
+        if path.parent.name == spec_key:
+            continue
+        text = path.read_text()
+        if tag not in text:
+            continue
+        try:
+            doc = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        top = {k for k in set(base) | set(doc) if base.get(k) != doc.get(k)}
+        lc_d = doc.get("lc") or {}
+        lc = {k for k in set(lc_b) | set(lc_d) if lc_b.get(k) != lc_d.get(k)}
+        family = str(lc_d.get("family"))
+        name = ""
+        if top == {"perturbations"}:
+            bumps = doc.get("perturbations") or []
+            one = {"kind": "parallel", "params": {"size": 0.01}}
+            if len(bumps) == len(doc.get("names") or []) and all(b == one for b in bumps):
+                name = "vega:names_recalibrated"
+        elif top == {"index_perturbation"}:
+            bump = doc.get("index_perturbation") or {}
+            kind, params = bump.get("kind"), bump.get("params") or {}
+            if kind == "parallel" and params == {"size": 0.01}:
+                name = "vega:index"
+            elif kind == "rotation" and params.get("size") == 1.0:
+                name = "vega:skew_rotation"
+            elif kind == "table" and all(v == [0.0, 0.01, 0.0] for v in params.get("values") or [[]]):  # fmt: skip
+                name = "vega:skew_put90"
+        elif family in ("particle", "parametric") and top == {"lc"} and lc and lc <= {"family", "rho_min"} and lc_d.get("r_low") == "equi":  # fmt: skip
+            name = f"equi|{float(lc_d['rho_min']):g}|{family}"
+        elif family in ("particle", "parametric") and top == {"lc", "r_low_source"} and lc <= {"family", "r_low"} and doc.get("r_low_source") == hist_digest:  # fmt: skip
+            name = f"{lc_d.get('r_low')}||{family}"
+        if name:
+            found.setdefault(name, []).append(path.parent.name)
+    out: dict[str, dict[str, Any]] = {}
+    for name, keys in found.items():
+        diag, _ = load_json(CACHE / keys[0] / "diagnostics.json")
+        if len(keys) != 1 or diag is None:
+            continue
+        c, rec = diag.get("calibration") or {}, diag.get("record") or {}
+        low = [float(v) for v in c.get("clipped_low_inner") or []]
+        out[name] = {
+            "key": keys[0], "commit": str(rec.get("git_commit", "")), "low": num(c, "max_clipped_low_inner"),
+            "high": num(c, "max_clipped_high_inner"), "n_slices": len(low), "n_low_flagged": sum(1 for v in low if v > CLIP_FLAG),
+            "strikes": c.get("strikes"), "converged": c.get("converged"), "source": rel(CACHE / keys[0] / "diagnostics.json"),
+        }  # fmt: skip
+    return out
+
+
+def risk_items(risk: dict[str, Any] | None, pending: str, row: Inputs) -> tuple[dict[str, Item], list[Item], list[str], dict[str, Any]]:  # fmt: skip
     """Today's risk: the deltas, the −3 sd index errors, the vegas in both units and the
-    model-risk variants.  A piece absent from the file is pending."""
+    model-risk variants, with the clipped mass of each recalibrated model read from the
+    calibration cache.  A piece absent from the file is pending.  The last output says which
+    variant is which (``meta``), the base's label and the horizon."""
     out: dict[str, Item] = {}
     notes: list[str] = []
     src = rel(RISK_FILE) if pending == "" else pending
@@ -909,6 +1073,13 @@ def risk_items(risk: dict[str, Any] | None, pending: str, row: Inputs) -> tuple[
         q = errs.get(strike)
         put(f"idx_err.risk.m{strike[1:].replace('.', '')}", f"index error, −{strike[1:]} sd", None if q is None else (q["error_vp"], q["stderr_vp"]), wait,
             unit="vol points", definition=f"{D_IDX}; {strike} sd (today's risk run)", digits=3, na="" if q or wait else "not in the file")  # fmt: skip
+    cal = (
+        cache_calibrations(str(risk.get("spec_key", "")), str((risk.get("historical_scaled") or {}).get("digest", "")))
+        if risk
+        else {}
+    )  # fmt: skip
+    clip_note = "a calibration diagnostic: no standard error"
+    by_change = "of the cached calibration, identified by its specification differing from the base's by this change alone"
     # the vegas: value = change of E_LC[D] in units of notional per vol point (per +1 rota)
     wait = piece("vegas")
     base = ((risk or {}).get("vegas_base") or (risk or {}).get("base") or {}).get("ED_lc")
@@ -917,15 +1088,15 @@ def risk_items(risk: dict[str, Any] | None, pending: str, row: Inputs) -> tuple[
         ("names_recalibrated", "vega[all names] recalibrated", "vol point on every name's surface, λ recalibrated to the unchanged index smile"),
         ("names_held", "vega[all names] held", "vol point on every name's surface, λ held"),
         ("index", "index vega", "vol point on the index target"),
-        ("skew_rotation", "index skew vega (rotation)", "+1 rota of the index smile"),
-        ("skew_put90", "index skew vega (put90)", "vol point at the 90 % strike of the index (tent)"),
+        ("skew_rotation", "index skew vega (rotation)", f"+1 rota of the index smile ({D_ROTA})"),
+        ("skew_put90", "index skew vega (put90)", f"vol point at 90 % of the forward of the index ({D_PUT90})"),
     ):  # fmt: skip
         v = vegas.get(name)
         na = "" if v or wait else "not in the file"
         val, se = (float(v["value"]), float(v["stderr"])) if v else (NAN, NAN)
         unit = str(v.get("unit", "")) if v else ""
         put(f"vega.{key}.pct_notional", f"{name}, % of notional", (100 * val, 100 * se), wait, unit=f"% of notional {unit}".strip(),
-            definition=f"100 × the change of E_LC[D] (units of notional) per {per}; paired on the pricing seed", na=na)  # fmt: skip
+            definition=f"100 × the change of E_LC[D] (units of notional) per {per}; a one-sided +1 bump (bumped minus base), paired on the pricing seed", na=na)  # fmt: skip
         if base and ok(val):
             pct = (
                 100 * val / float(base[0]),
@@ -936,6 +1107,46 @@ def risk_items(risk: dict[str, Any] | None, pending: str, row: Inputs) -> tuple[
         put(f"vega.{key}.pct_price", f"{name}, % of the price", pct, wait, unit=f"% of E_LC[D] {unit}".strip(),
             definition=f"100 × the change of E_LC[D] per {per}, over the run's base E_LC[D]; delta method on the two errors", digits=3,
             na=na or ("" if base else "the file has no base E_LC[D]"))  # fmt: skip
+    # what +1 rota is at the horizon, and the rotation vega per vol point of 90 %/110 % skew there
+    horizon = num(row.row, "T") if row.row is not None else NAN
+    if ok(horizon) and "index skew vega (rotation)" in vegas:
+        per_k = (
+            100 * 0.02 / math.sqrt(max(horizon, 1.0 / 12.0))
+        )  # vol points per unit of 0.5·tanh(k/0.5)
+        at90, at110 = (-per_k * 0.5 * math.tanh(math.log(m) / 0.5) for m in (0.9, 1.1))
+        skew = at90 - at110
+        f_kw: dict[str, Any] = {
+            "budget": "a formula: no simulation", "commit": kw["commit"], "unit": "vol points", "digits": 3,
+            "source": "volsto/market/surface.py (delta_sigma_from_config, kind 'rotation'); volsto/risk/local_correlation.py (index_skew_vega: size 1, t_min 1/12, k_cap 0.5)",
+            "notes": "computed from the bump's formula: no standard error",
+        }  # fmt: skip
+        for key, label, v, fmt in (
+            ("rota_90", "+1 rota at the horizon: change of the index implied vol at 90 % of the forward", at90, "signed"),
+            ("rota_110", "+1 rota at the horizon: change of the index implied vol at 110 % of the forward", at110, "signed"),
+            ("rota_skew", "+1 rota at the horizon: change of the 90 %/110 % skew of the index implied vol", skew, ""),
+        ):  # fmt: skip
+            out[f"vega.skew_rotation.{key}"] = Item(f"vega.skew_rotation.{key}", label, v, None, fmt=fmt,
+                                                    definition=f"{D_ROTA}; here T = {horizon:g}, in vol points" + ("" if fmt else ": the change at 90 % minus the change at 110 %"), **f_kw)  # fmt: skip
+        for u in ("pct_price", "pct_notional"):
+            it = out[f"vega.skew_rotation.{u}"]
+            if it.value is not None and ok(it.value) and it.se is not None and not it.pending:
+                out[f"vega.skew_rotation.per_skew_vp.{u}"] = replace(
+                    it, key=f"vega.skew_rotation.per_skew_vp.{u}", value=it.value / skew, se=it.se / skew,
+                    label=f"index skew vega (rotation), per vol point of 90 %/110 % skew at the horizon (derived), {'% of the price' if u == 'pct_price' else '% of notional'}",
+                    unit=it.unit.replace("per +1 rota", "per vol point of 90 %/110 % skew at the horizon"),
+                    definition=f"derived: the rotation vega per +1 rota ({it.definition}) divided by the {skew:.6f} vol points of 90 %/110 % skew that +1 rota adds at the horizon (an exact divisor); "
+                    "every other maturity moves as the rota prescribes, so it is not the vega to a bump of the horizon's skew alone",
+                    notes="derived by a plain division by an exact number",
+                )  # fmt: skip
+    # the clipped mass of the recalibrated models (not in the risk file: the calibration cache)
+    for key in ("names_recalibrated", "index", "skew_rotation", "skew_put90"):
+        info = cal.get(f"vega:{key}")
+        if info and ok(info["high"]) and ok(info["low"]):
+            for side, where in (("high", "at the cap"), ("low", "at λ = 0")):
+                out[f"vega.{key}.clip_{side}_inner"] = Item(
+                    f"vega.{key}.clip_{side}_inner", f"recalibrated model of the vega {key}: clipped mass inside ±2.5 sd, {where}", 100 * info[side], None, unit="% of particles", digits=3,
+                    definition=f"{D_CLIP}; inside ±2.5 sd, {where} (max_clipped_{side}_inner × 100 {by_change})", notes=clip_note, budget=budget, commit=info["commit"], source=info["source"],
+                )  # fmt: skip
     # the model-risk range
     wait = piece("model_risk")
     mr = (risk or {}).get("model_risk") or {}
@@ -961,6 +1172,31 @@ def risk_items(risk: dict[str, Any] | None, pending: str, row: Inputs) -> tuple[
         )
         variants.append(Item(f"model_risk.{i}_{slug}.minus_base_pct", f"{label}: minus base, % of the price", pct[0], pct[1], pending=w, unit="% of E_LC[D]", digits=3,
                              definition="100 × (variant − base)/base E_LC[D]; the paired error of the difference over the base", **kw))  # fmt: skip
+    meta: list[dict[str, Any]] = []
+    for i, label in enumerate(labels):
+        r, info = done.get(label), cal.get(variant_key(label))
+        slug = re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_")
+        m: dict[str, Any] = {"label": label, "family": label.rpartition(" / ")[2], "prefix": f"model_risk.{i}_{slug}",
+                             "price": float(r["price"]) if r else NAN, "info": info, "flag_low": None}  # fmt: skip
+        if info and ok(info["low"]) and ok(info["high"]):
+            m["flag_low"] = bool(info["low"] > CLIP_FLAG)
+            for side, where in (("low", "at λ = 0"), ("high", "at the cap")):
+                out[f"{m['prefix']}.clip_{side}_inner"] = Item(
+                    f"{m['prefix']}.clip_{side}_inner", f"{label}: clipped mass inside ±2.5 sd, {where}", 100 * info[side], None, unit="% of particles", digits=3,
+                    definition=f"{D_CLIP}; inside ±2.5 sd, {where} (max_clipped_{side}_inner × 100 {by_change})",
+                    notes=clip_note + (f"; above 1 % on {info['n_low_flagged']} of {info['n_slices']} slices" if side == "low" else ""),
+                    budget=budget, commit=info["commit"], source=info["source"],
+                )  # fmt: skip
+        meta.append(m)
+    hs = (risk or {}).get("historical_scaled") or {}
+    for key, label, definition in (
+        ("scale", "historical-scaled R_low: the scale s", "s of R_low = (1 − s)·I + s·Ĉ: the target mean correlation over the weighted mean pairwise correlation of Ĉ"),
+        ("shrinkage", "historical-scaled R_low: shrinkage of the historical correlation towards the identity", "the shrinkage intensity of Ĉ (volsto/multi/family.py, historical_scaled_correlation)"),
+        ("mean_correlation", "historical-scaled R_low: weighted mean pairwise correlation of the shrunk historical correlation Ĉ", "ρ̄_w(Ĉ) over the window of the variant"),
+    ):  # fmt: skip
+        if ok(num(hs, key)):
+            out[f"model_risk.historical_scaled.{key}"] = Item(f"model_risk.historical_scaled.{key}", label, num(hs, key), None, digits=3, definition=definition,
+                                                              notes="an input of the variant, computed from the names' returns: no standard error", **kw)  # fmt: skip
     missing = [lab for lab in labels if lab not in done]
     complete = bool(rows) and not missing
     n_txt = f"{len(rows)} of {len(labels)} variants" if labels else "no variant"
@@ -973,6 +1209,18 @@ def risk_items(risk: dict[str, Any] | None, pending: str, row: Inputs) -> tuple[
         out[f"model_risk.{key}"] = Item(f"model_risk.{key}", label, num(mr, key), None, pending=wait_range, unit="notional", digits=6,
                                         definition=f"the {'lowest' if key == 'low' else 'highest'} E[D] over the variants ({n_txt})",
                                         notes="an extreme over the variants: no standard error of its own", **kw)  # fmt: skip
+    particle = [m for m in meta if m["family"] == "particle"]
+    known = bool(particle) and all(m["flag_low"] is not None for m in particle)
+    like = [m for m in particle if m["flag_low"] is False and ok(m["price"])]
+    for key, pick in (("low", min), ("high", max)):
+        out[f"model_risk.like_base.{key}"] = Item(
+            f"model_risk.like_base.{key}", f"model-risk range of the particle variants not flagged at λ = 0, {key}", pick(m["price"] for m in like) if known and like else NAN, None,
+            pending=wait_range, unit="notional", digits=6,
+            definition=f"the {'lowest' if key == 'low' else 'highest'} E[D] over the variants calibrated like the base to the whole index smile (particle family) whose clipped mass at λ = 0 inside ±2.5 sd "
+            "is not above 1 %" + (f" ({', '.join(m['label'] for m in like)})" if known and like else ""),
+            notes="an extreme over the variants: no standard error of its own", na="" if known and like else "the clipped mass of a particle variant is not readable in the calibration cache",
+            **{**kw, "source": f"{rel(RISK_FILE)}; clipped masses: {rel(CACHE)}/<key>/diagnostics.json"},
+        )  # fmt: skip
     if base_mr:
         out["model_risk.base"] = Item("model_risk.base", "base E_LC[D] of the risk run", float(base_mr[0]), float(base_mr[1]), unit="notional", digits=6,
                                       definition=D_ED + ", the risk run's base", **kw)  # fmt: skip
@@ -981,25 +1229,49 @@ def risk_items(risk: dict[str, Any] | None, pending: str, row: Inputs) -> tuple[
         out["risk_base.ED_cc"] = Item("risk_base.ED_cc", "base E_CC[D] of the risk run", float(base_cc[0]), float(base_cc[1]), unit="notional", digits=6,
                                       definition=D_ED + ", the risk run's constant-correlation companion", **kw)  # fmt: skip
     if risk is not None and row.priced and row.row is not None:
-        if risk.get("spec_key") and risk.get("spec_key") != row.row.get("spec_key"):
-            notes.append(f"- MISMATCH: the risk file's specification key {str(risk.get('spec_key'))[:12]} is not the row's {str(row.row.get('spec_key'))[:12]}.")  # fmt: skip
-        b = (risk.get("base") or {}).get("ED_lc")
-        if b:
-            notes.append(f"- The risk run's base E_LC[D] {float(b[0]):.6f} ± {float(b[1]):.6f} against the row's {num(row.row, 'ED_lc'):.6f} ± {num(row.row, 'ED_lc_se'):.6f} "
-                         f"(difference {float(b[0]) - num(row.row, 'ED_lc'):+.2e}); risk commit {risk.get('commit')}, row commit {row.row_commit}.")  # fmt: skip
-        b_cc = (risk.get("base") or {}).get("ED_cc")
-        if b_cc:
-            notes.append(f"- The risk run's base E_CC[D] {float(b_cc[0]):.6f} ± {float(b_cc[1]):.6f} against the row's {num(row.row, 'ED_cc'):.6f} ± {num(row.row, 'ED_cc_se'):.6f} "
-                         f"(difference {float(b_cc[0]) - num(row.row, 'ED_cc'):+.2e}). The risk run's numbers (−3 sd index error, deltas, vegas, model-risk differences and their "
-                         "% of the price) rest on this base, not on the row's.")  # fmt: skip
+        rr = row.row
+        if risk.get("spec_key") and risk.get("spec_key") != rr.get("spec_key"):
+            notes.append(f"- MISMATCH: the risk file's specification key {str(risk.get('spec_key'))[:12]} is not the row's {str(rr.get('spec_key'))[:12]}.")  # fmt: skip
+        b, b_cc = (risk.get("base") or {}).get("ED_lc"), (risk.get("base") or {}).get("ED_cc")
+        if b and b_cc:
+            same = all(risk.get(k) is not None and risk.get(k) == rr.get(k) for k in ("spec_key", "particle_seed", "pricing_seed"))  # fmt: skip
+            d_lc, d_cc = float(b[0]) - num(rr, "ED_lc"), float(b_cc[0]) - num(rr, "ED_cc")
+            notes.append(
+                "- Section A's row and the risk run are two production pricing runs of one specification: the specification key "
+                f"({str(rr.get('spec_key'))[:12]}), the particle seed ({rr.get('particle_seed')}) and the pricing seed ({rr.get('pricing_seed')}) "
+                f"{'are the same in the two files' if same else 'are NOT all the same in the two files'}, and the companion's constant λ_c is {num(rr, 'lambda_c'):.6f} in the row and "
+                f"{num(risk, 'lambda_c'):.6f} in the risk run (gap {abs(num(risk, 'lambda_c') - num(rr, 'lambda_c')):.1e}). "
+                f"E_LC[D] is {num(rr, 'ED_lc'):.6f} ± {num(rr, 'ED_lc_se'):.6f} in the row and {float(b[0]):.6f} ± {float(b[1]):.6f} in the risk run "
+                f"(difference {d_lc:+.2e}, {abs(d_lc) / num(rr, 'ED_lc_se'):.1f} of one standard error); E_CC[D] is {num(rr, 'ED_cc'):.6f} ± {num(rr, 'ED_cc_se'):.6f} and "
+                f"{float(b_cc[0]):.6f} ± {float(b_cc[1]):.6f} (difference {d_cc:+.2e}). Risk commit {risk.get('commit')}, row commit {row.row_commit}."
+            )
+            notes.append(
+                "- Which cells rest on which run. The row: A1 to A4, A5 except its −3 sd line, the 'row' lines of A6, the LC column of A8 except its −3 and −3.5 sd lines. "
+                "The risk run: the −3 sd line of A5, the 'risk run' lines of A6, all of A7 (the vegas, the model-risk differences and their % of the price are of the risk run's base E_LC[D], not of the row's), "
+                "the −3 and −3.5 sd lines of the LC column of A8. The CDV scan, whose β = 0 pricing is the risk run's: the CDV columns of A8."
+            )
+            notes.append(
+                "- Why the two runs give two values: in the code the row's pricing pass observes the basket at the index target's slices before the horizon and at the horizon "
+                "(`scripts/lcm_price.py`: Pass on lcm_diagnostics.repricing_pillars), the risk run and the scan at the horizon alone (`scripts/pm_today_risk.py`, run_deltas; "
+                "`scripts/cdv_scan.py` of the volsto-cdv worktree: simulate_cdv on [T]); the time grid and the draws are built from these dates (TimeGrid.build, model.draws_for). "
+                "This is read in the code; it was not confirmed by a rerun."
+            )
         q = errs.get("-2.5")
         if q:
-            notes.append(f"- Index error at −2.5 sd: risk run {float(q['error_vp']):+.3f} ± {float(q['stderr_vp']):.3f}, row {num(row.row, 'idx_err_m25'):+.3f} ± {num(row.row, 'idx_err_m25_se'):.3f} vol points.")  # fmt: skip
-    return out, variants, notes
+            notes.append(f"- Index error at −2.5 sd: risk run {float(q['error_vp']):+.3f} ± {float(q['stderr_vp']):.3f}, row {num(rr, 'idx_err_m25'):+.3f} ± {num(rr, 'idx_err_m25_se'):.3f} vol points.")  # fmt: skip
+    base_label = next((v for v in VARIANT_GRID if v not in labels), "") if len(labels) == len(VARIANT_GRID) - 1 else ""  # fmt: skip
+    return (
+        out,
+        variants,
+        notes,
+        {"meta": meta, "base_label": base_label, "horizon": horizon, "cal": cal},
+    )
 
 
-def cdv_block(part: Part, cdv: dict[str, Any] | None, pending: str, x: Inputs, risk_out: Mapping[str, Item], core: Mapping[str, Item]) -> None:  # fmt: skip
-    """The cross-dependent scan at β = 3 and β = 6 next to the local correlation row (β = 0)."""
+def cdv_block(part: Part, cdv: dict[str, Any] | None, pending: str, x: Inputs, risk_out: Mapping[str, Item], core: Mapping[str, Item],
+              risk: dict[str, Any] | None) -> list[str]:  # fmt: skip
+    """The cross-dependent scan at β = 3 and β = 6 next to the local correlation row (β = 0).
+    Returns the lines of the consistency list that concern the scan."""
     part.text("### A8. Cross-dependent volatility (CDV) at β = 3 and β = 6 — check (e)", "")
     rec = (cdv or {}).get("record") or {}
     budget = budget_of(num(rec, "n_particles"), num(rec, "n_paths"), None) if cdv else ""
@@ -1034,6 +1306,9 @@ def cdv_block(part: Part, cdv: dict[str, Any] | None, pending: str, x: Inputs, r
     spec = (
         ("ED", "E[D]", "notional", 6, D_ED + ", cross-dependent model at this β"),
         ("ED_over_cc", "E[D]/E_CC[D]", "", 5, "E[D] over the E_CC[D] the scan read"),
+        ("ED_over_cc_chained", "E[D]/E_CC[D], chained: the row's paired LC/CC times the scan's paired E[D]/E[D](β = 0)", "", 5,
+         "the row's paired E_LC[D]/E_CC[D] (ratio, ratio_se) times exp of the scan's paired log-change of E[D] from β = 0 (attribution_from_beta_0.dln_ED); "
+         "error: the two relative errors combined as independent (two pricing runs)"),
         ("ED_over_copula", "E[D]/P_D (copula)", "", 5, "E[D] over the copula's P_D; delta method, independent"),
         ("ED_over_beta0", "E[D]/E[D](β = 0)", "", 5, "exp of the scan's paired log-change of E[D] from β = 0 (attribution_from_beta_0.dln_ED)"),
         ("kappa", "κ", "", 4, D_KAPPA),
@@ -1045,9 +1320,13 @@ def cdv_block(part: Part, cdv: dict[str, Any] | None, pending: str, x: Inputs, r
         ("clip_high_inner", "clipped mass inside ±2.5 sd, at the cap", "% of particles", 3, D_CLIP + "; inside ±2.5 sd, at the cap"),
         ("clip_low", "clipped mass, whole cloud, at λ = 0", "% of particles", 3, D_CLIP + "; whole cloud, at λ = 0"),
         ("clip_high", "clipped mass, whole cloud, at the cap", "% of particles", 3, D_CLIP + "; whole cloud, at the cap"),
+        ("clip_inner_max", "flagged (clipped mass above 1 % inside ±2.5 sd): the larger of the two sides", "% of particles", 3,
+         D_CLIP + f"; inside ±2.5 sd, {D_CLIP_MAX}: 100 × max(clip_low_inner, clip_high_inner) of the scan; flagged when above 1 %"),
         ("idx_-2.5", "index error, −2.5 sd", "vol points", 3, D_IDX + "; −2.5 sd"),
         ("idx_-3.0", "index error, −3.0 sd", "vol points", 3, D_IDX + "; −3.0 sd"),
         ("idx_-3.5", "index error, −3.5 sd", "vol points", 3, D_IDX + "; −3.5 sd"),
+        ("idx_+2.0", "index error, +2.0 sd", "vol points", 3, D_IDX + "; +2.0 sd"),
+        ("idx_+2.5", "index error, +2.5 sd", "vol points", 3, D_IDX + "; +2.5 sd"),
         ("idx_+0.0", "index error, at the money", "vol points", 3, D_IDX + "; at the money"),
         ("idx_90%", "index error, 90 % strike", "vol points", 3, D_IDX + "; the 90 % strike"),
     )  # fmt: skip
@@ -1058,7 +1337,21 @@ def cdv_block(part: Part, cdv: dict[str, Any] | None, pending: str, x: Inputs, r
         "clip_low_inner": core["clip.inner_low"], "clip_high_inner": core["clip.inner_high"], "clip_low": core["clip.cloud_low"],
         "clip_high": core["clip.cloud_high"], "idx_-2.5": core["idx_err.m25"], "idx_-3.0": risk_out["idx_err.risk.m30"],
         "idx_-3.5": risk_out["idx_err.risk.m35"], "idx_+0.0": core["idx_err.atm"], "idx_90%": core["idx_err.90"],
+        "ED_over_cc_chained": core["ratio.lc_over_cc"], "idx_+2.0": core["idx_err.p20"], "idx_+2.5": core["idx_err.p25"],
+        "clip_inner_max": replace(core["clip.inner_total"], mark={True: " — flagged", False: " — not flagged"}.get((x.row or {}).get("flag_clip"), "")),
     }  # fmt: skip
+    part.add("A_cdv", "A.", x.date, [core["idx_err.p20"], core["idx_err.p25"]])
+    # the scan's β = 0 pricing is the risk run's when its E[D] equals the risk run's base E_LC[D]
+    run_lc, run_cc = ((risk or {}).get("base") or {}).get("ED_lc"), (
+        (risk or {}).get("base") or {}
+    ).get("ED_cc")
+    run_gap = abs(num(rows.get(0.0), "ED") - float(run_lc[0])) if run_lc and 0.0 in rows else NAN
+    same_run = bool(run_cc) and ok(run_gap) and run_gap <= 1e-12
+    if ok(run_gap) and not same_run:
+        log.warning(
+            "the scan's β = 0 E[D] is not the risk run's base E_LC[D] (gap %.3g): E[D]/E_CC[D] falls back",
+            run_gap,
+        )
     body: list[list[str]] = []
     cells: dict[tuple[str, float], str] = {}
     own_ratio = True
@@ -1074,10 +1367,21 @@ def cdv_block(part: Part, cdv: dict[str, Any] | None, pending: str, x: Inputs, r
         for key, label, unit, digits, definition in spec:
             v: float
             se: float | None
-            na, note, wait_cc = "", "", ""
+            na, note, wait_cc, mark = "", "", "", ""
             if key == "ED_over_cc":
                 v, se = num(r, "ED_over_cc"), NAN
-                if ok(v):
+                if same_run and run_cc and r is not None:
+                    v = div(num(r, "ED"), float(run_cc[0]))
+                    se = pc.ratio_se(
+                        num(r, "ED"), num(r, "ED_se"), float(run_cc[0]), float(run_cc[1])
+                    )
+                    definition = (
+                        f"the scan's E[D] over E_CC[D] of the same pricing run: the risk run's base E_CC[D] in {rel(RISK_FILE)} (the scan's β = 0 E[D] equals the risk run's base E_LC[D] to 1e-12); "
+                        "delta method on the two errors, unpaired (pm_common.ratio_se)"
+                    )
+                    note = "value changed on 2026-10-09 (second revision): the denominator was the row's E_CC[D], from another pricing run"
+                    own_ratio = False
+                elif ok(v):
                     se = pc.ratio_se(num(r, "ED"), num(r, "ED_se"), ed_cc_file, cc_se if ok(cc_se) else 0.0)  # fmt: skip
                     definition = f"{definition}: {cc_src}; delta method"
                 elif r is not None and x.row is None:
@@ -1089,6 +1393,25 @@ def cdv_block(part: Part, cdv: dict[str, Any] | None, pending: str, x: Inputs, r
                     se = pc.ratio_se(num(r, "ED"), num(r, "ED_se"), cc, cc_err)
                     definition = f"E[D] over E_CC[D] of section A's row {rel(x.row_path)} (the scan's file holds no E_CC[D]); delta method on the two errors, unpaired"
                     own_ratio = False
+            elif key == "ED_over_cc_chained":
+                a = attributions.get(beta)
+                lc_cc, lc_cc_se = num(x.row, "ratio"), num(x.row, "ratio_se")
+                if beta == 0.0 and r and ok(lc_cc):
+                    v, se = lc_cc, lc_cc_se
+                    note = "at β = 0 the second factor is 1 by definition: this is the row's paired LC/CC"
+                elif ok(num(a, "dln_ED")) and ok(num(a, "dln_ED_se")) and ok(lc_cc):
+                    v = lc_cc * math.exp(num(a, "dln_ED"))
+                    se = v * math.hypot(lc_cc_se / lc_cc, num(a, "dln_ED_se"))
+                else:
+                    v, se = NAN, None
+                    na = "needs the row's paired ratio and the scan's paired attribution"
+            elif key == "clip_inner_max":
+                lo_c, hi_c = num(r, "clip_low_inner"), num(r, "clip_high_inner")
+                v, se = (100 * max(lo_c, hi_c) if ok(lo_c) and ok(hi_c) else NAN), None
+                note = "a calibration diagnostic: no standard error"
+                if ok(v):
+                    mark = " — flagged" if v > 100 * CLIP_FLAG else " — not flagged"
+                    note += f"; flagged: {'yes' if v > 100 * CLIP_FLAG else 'no'}"
             elif key == "ED_over_copula":
                 v = div(num(r, "ED"), p_d)
                 se = pc.ratio_se(num(r, "ED"), num(r, "ED_se"), p_d, p_d_se) if ok(v) else NAN
@@ -1115,13 +1438,15 @@ def cdv_block(part: Part, cdv: dict[str, Any] | None, pending: str, x: Inputs, r
             if not ok(v) and not na:
                 na = "not in the file"
             it = Item(f"cdv.beta_{beta:g}.{key.replace('idx_', 'idx_err_').replace('%', 'pct').replace('+', 'p').replace('-', 'm').replace('.', '')}",
-                      f"CDV β = {beta:g}: {label}", v, se, unit=unit, definition=definition, digits=digits, pending=wait or wait_cc, na=na, notes=note, **kw)  # fmt: skip
+                      f"CDV β = {beta:g}: {label}", v, se, unit=unit, definition=definition, digits=digits, pending=wait or wait_cc, na=na, notes=note, mark=mark, **kw)  # fmt: skip
             items.append(it)
             cells[(key, beta)] = it.cell()
         part.add("A_cdv", "A.", x.date, items)
     shown = [k for k in spec if k[0] not in ("idx_+0.0", "idx_90%")]
     for key, label, unit, _digits, _definition in shown:
         ref = base_col.get(key)
+        if key == "ED_over_cc" and same_run:
+            label = "E[D]/E_CC[D] (LC column: the row's paired ratio; CDV columns: over E_CC[D] of the scan's own pricing run, unpaired)"
         body.append([f"{label}{' (' + unit + ')' if unit else ''}", ref.cell() if ref else "—", *[cells[(key, b)] for b in betas]])  # fmt: skip
     part.table(
         [
@@ -1132,6 +1457,7 @@ def cdv_block(part: Part, cdv: dict[str, Any] | None, pending: str, x: Inputs, r
         body,
     )
     r6, r0 = rows.get(6.0), rows.get(0.0)
+    notes: list[str] = []
     if r6 is not None and ok(num(r6, "kappa_se")):
         part.text(
             f"At β = 6 κ and E[V] are not resolved: κ ± {num(r6, 'kappa_se'):.3f}, E[V]/EQV ± {num(r6, 'EV_over_EQV_se'):.3f} "
@@ -1144,18 +1470,77 @@ def cdv_block(part: Part, cdv: dict[str, Any] | None, pending: str, x: Inputs, r
             f"Pending: {pending}. The budget (production or development) is the one the file will state.",
             "",
         )
-    else:
+        return notes
+    # the β = 0 index errors: one estimate, two standard errors
+    pairs: list[tuple[str, float, Item]] = []
+    for strike, tag in (("-2.5", "m25"), ("-3.0", "m30"), ("-3.5", "m35")):
+        it = risk_out.get(f"idx_err.risk.{tag}")
+        if r0 is None or it is None or it.value is None or not ok(it.value) or not it.se:
+            continue
+        if abs(num(r0, f"idx_{strike}") - it.value) > 1e-9 or not ok(num(r0, f"idx_{strike}_se")):
+            continue
+        ratio = num(r0, f"idx_{strike}_se") / it.se
+        pairs.append((strike, ratio, it))
+        part.add("A_cdv", "A.", x.date, [Item(
+            f"cdv.beta_0.idx_err_{tag}.se_scan_over_risk", f"CDV β = 0: index error, −{strike[1:]} sd: the scan's standard error over the risk run's", ratio, None, digits=3,
+            definition="the scan's standard error (the option price's Monte Carlo error over the Black vega at the target vol) over the risk run's (the same over the Black vega at the model vol), "
+            "for one estimate on the same paths", notes="a ratio of two standard errors of one estimate: no standard error of its own",
+            **{**kw, "source": f"{rel(CDV_FILE)}; {rel(RISK_FILE)}"})])  # fmt: skip
+    if pairs:
+        below = [abs(it.value) for _, _, it in pairs if it.value is not None]
+        smaller = [100 * (1 - ratio) for _, ratio, _ in pairs]
         part.text(
-            f"Cross-dependent volatility prototype (`scripts/cdv_scan.py` of the volsto-cdv worktree), {budget}, commit {rec.get('git_commit')}, `{rel(CDV_FILE)}`; "
-            f"g_max = {', '.join(f'{g:g}' for g in g_max) or 'not stated'}; β = 0 is the local correlation model. "
-            f"E[D]/E_CC[D] is {'the ratio the scan wrote (' + cc_src + ')' if own_ratio else 'over E_CC[D] of the row of section A, unpaired (the scan file holds no E_CC[D])'}; E[D]/E[D](β = 0) is "
-            f"{'paired on the scan pricing paths (attribution_from_beta_0)' if attributions else 'unpaired (the file has no paired attribution)'}. "
-            "The split follows the row's convention: E[V] − EQV = single-name part − basket part. "
-            f"M12 specification key of the scan: {str(rec.get('spec_key', 'not stated'))[:12]}"
-            f"{'' if x.row is None else (' (the same as the row of section A)' if rec.get('spec_key') == x.row.get('spec_key') else ' (NOT the key of the row of section A, ' + str(x.row.get('spec_key', ''))[:12] + ')')}. "
-            f"The LC column is section A's production row ({x.row_budget}, commit {x.row_commit or 'pending'}).",
+            "Footnote to the index-error lines. In the column CDV β = 0 the values at −2.5, −3.0 and −3.5 sd are the risk run's values (one estimate on the same paths), "
+            "but they carry another standard error: the scan divides the Monte Carlo error of the option price by the Black vega at the target vol "
+            "(`scripts/cdv_scan.py` of the volsto-cdv worktree, smile_errors); the row and the risk run divide it by the Black vega at the model vol "
+            "(`scripts/lcm_price.py`, index_errors; `scripts/pm_today_risk.py`, index_errors_at), which is the delta-method error of the model's implied vol. "
+            f"At β = 0, where the model is {min(below):.1f} to {max(below):.1f} vol points below the target at these strikes, the scan's errors are "
+            f"{min(smaller):.0f} to {max(smaller):.0f} % smaller than the risk run's ("
+            + "; ".join(
+                f"−{strike[1:]} sd: ± {num(r0, f'idx_{strike}_se'):.3f} in the scan against ± {it.se:.3f} in the risk run"
+                for strike, _, it in pairs
+            )
+            + "). Every ± of the index-error lines in the three CDV columns is the scan's (vega at the target vol); at β = 3 and β = 6 there is no risk run to compare with and the size of the effect is not computed here. "
+            "In the LC column the −2.5 sd line is the row's (another pricing run), the −3.0 and −3.5 sd lines are the risk run's, the +2.0 and +2.5 sd lines are the row's.",
             "",
         )
+    if same_run and run_lc and run_cc:
+        how_cc = (
+            f"E[D]/E_CC[D] in the three CDV columns is the scan's E[D] over E_CC[D] of the same pricing run, the risk run's base E_CC[D] {float(run_cc[0]):.6f} ± {float(run_cc[1]):.6f} "
+            f"(`{rel(RISK_FILE)}`): the scan's β = 0 E[D] equals the risk run's base E_LC[D] (gap {run_gap:.1e}, checked to 1e-12). "
+            "Its error is the delta method on the two errors, unpaired (pm_common.ratio_se), so it is larger than the paired error of the LC column, which is the row's paired LC/CC from the row's own pricing run. "
+        )
+        as_row = x.row is not None and all(rec.get(k) == x.row.get(k) for k in ("spec_key", "particle_seed", "pricing_seed"))  # fmt: skip
+        notes.append(
+            f"- The CDV scan at β = 0 is the risk run's pricing: its E[D] {num(r0, 'ED'):.6f} ± {num(r0, 'ED_se'):.6f} equals the risk run's base E_LC[D] (gap {run_gap:.1e}); "
+            f"the scan's specification key, particle seed and pricing seed {'are those of the row' if as_row else 'are NOT all those of the row'} "
+            f"(scan commit {rec.get('git_commit')}). The three E[D]/E_CC[D] of the CDV columns of A8 are over the risk run's base E_CC[D], not over the row's."
+        )
+    else:
+        how_cc = f"E[D]/E_CC[D] is {'the ratio the scan wrote (' + cc_src + ')' if own_ratio else 'over E_CC[D] of the row of section A, unpaired (the scan and the risk run are not shown to be one pricing run)'}. "
+    ev_lc, ev_0 = core["EV_over_EQV.lc"], rows.get(0.0)
+    two_runs = (
+        f" The column CDV β = 0 is the same model as the LC column in another pricing run (the risk run's): the two columns are two estimates of the same quantities, and their ± differ too "
+        f"(E[V]/EQV ± {ev_lc.se:.4f} in the row against ± {num(ev_0, 'EV_over_EQV_se'):.4f} in the scan; κ ± {core['kappa.lc'].se:.4f} against ± {num(ev_0, 'kappa_se'):.4f}): "
+        "read the ± of E[V]/EQV, κ and the single-name part as indicative."
+        if ev_0 is not None and ev_lc.se is not None and core["kappa.lc"].se is not None
+        else ""
+    )
+    part.text(
+        f"Cross-dependent volatility prototype (`scripts/cdv_scan.py` of the volsto-cdv worktree), {budget}, commit {rec.get('git_commit')}, `{rel(CDV_FILE)}`; "
+        f"g_max = {', '.join(f'{g:g}' for g in g_max) or 'not stated'}; β = 0 is the local correlation model. "
+        + how_cc
+        + "The chained line multiplies the row's paired LC/CC by the scan's paired E[D]/E[D](β = 0); its error combines the two relative errors as independent (two pricing runs); at β = 0 it is the row's paired LC/CC. "
+        f"E[D]/E[D](β = 0) is {'paired on the scan pricing paths (attribution_from_beta_0)' if attributions else 'unpaired (the file has no paired attribution)'}. "
+        "The split follows the row's convention: E[V] − EQV = single-name part − basket part. "
+        "κ is printed here as measured at each β; A9 (check (e)) prints κ with the names' second moment held at its β = 0 estimate. "
+        "The flagged line is the larger of the two one-sided clipped masses inside ±2.5 sd, each at its worst slice, against the 1 % flag. "
+        f"M12 specification key of the scan: {str(rec.get('spec_key', 'not stated'))[:12]}"
+        f"{'' if x.row is None else (' (the same as the row of section A)' if rec.get('spec_key') == x.row.get('spec_key') else ' (NOT the key of the row of section A, ' + str(x.row.get('spec_key', ''))[:12] + ')')}. "
+        f"The LC column is section A's production row ({x.row_budget}, commit {x.row_commit or 'pending'}).{two_runs} Numbers in `tables/A_cdv.csv`.",
+        "",
+    )
+    return notes
 
 
 def build_a(inputs: Mapping[str, Inputs], risk: dict[str, Any] | None, risk_pending: str, cdv: dict[str, Any] | None,
@@ -1163,7 +1548,7 @@ def build_a(inputs: Mapping[str, Inputs], risk: dict[str, Any] | None, risk_pend
     x = inputs[TODAY]
     part = Part("A")
     c = core_items(x)
-    r_out, variants, risk_notes = risk_items(risk, risk_pending, x)
+    r_out, variants, risk_notes, risk_info = risk_items(risk, risk_pending, x)
     # no section heading here: scripts/pm_assemble.py writes "## A. Today (2026-10-02), 3m, production budget"
     if rows_dir.resolve() != ROWS_DIR.resolve():
         part.text(
@@ -1171,34 +1556,25 @@ def build_a(inputs: Mapping[str, Inputs], risk: dict[str, Any] | None, risk_pend
             "",
         )
     part.text(
-        f"Cells are value ± standard error; `pending: <file>` marks a number whose input has not arrived. {PM_SE}",
+        f"Cells are value ± standard error{PENDING_CLAUSE}. {PM_SE}",
         "",
     )
     sens = {label: (old, new, diff) for label, old, new, diff in sens_items(x)}
     if all(ok(diff.value) for _, _, diff in sens.values()):
+        fw_old, fw_new, _ = sens[SENS_KEYS[-1][1]]
+        shown = ("LC/CC", "E_LC[D]", "E_CC[D]", "Δ sticky strike, LC", "Δ sticky strike, CC")
         part.text(
-            f"Sensitivity of today's numbers to the owner's decisions 1-2 (table B4 of section B; {OLD_WHAT}: `{rel(OLD_ROWS_DIR)}/{TODAY}.json`, "
-            f"commit {sens['LC/CC'][0].commit}, same budget and seeds), old → new, new minus old: "
+            f"Sensitivity of today's numbers to the owner's decisions 1, 2 and 5 (table B4 of section B): {D_NEW_DEFAULTS}; {OLD_WHAT}: `{rel(OLD_ROWS_DIR)}/{TODAY}.json`, "
+            f"commit {sens['LC/CC'][0].commit}, same budget and seeds. {decisions_acting([x])} Old → new, new minus old: "
             + "; ".join(
                 f"{label} {sens[label][0].cell()} → {sens[label][1].cell()}, {sens[label][2].cell()}"
-                + (
-                    f" ({in_se(sens[label][2])} standard errors of the difference)"
-                    if sens[label][2].se
-                    else ""
-                )
-                for label in (
-                    "LC/CC",
-                    "E_LC[D]",
-                    "E_CC[D]",
-                    "Δ sticky strike, LC",
-                    "Δ sticky strike, CC",
-                )
+                for label in shown
             )
-            + ". The standard error of a difference is √(se_new² + se_old²) (the two runs taken as independent).",
+            + f". The ± of a difference is an upper bound: {D_UPPER} (today's basket forward error, which is pure pricing noise, is {fw_old.cell()} in the old row and {fw_new.cell()} in the new one).",
             "",
         )
     else:
-        part.text(f"Sensitivity to the owner's decisions 1-2: table B4 of section B (pending: `{rel(OLD_ROWS_DIR)}/{TODAY}.json`).", "")  # fmt: skip
+        part.text(f"Sensitivity to the owner's decisions 1, 2 and 5: table B4 of section B (pending: `{rel(OLD_ROWS_DIR)}/{TODAY}.json`).", "")  # fmt: skip
     flags_table(part, [x], "A_flags", base)
     input_keys = ("input.floored_index", "input.floored_names_max", "input.n_flagged_names", "input.n_flagged_central",
                   "names.svi_over_listed", "names.mc_over_svi", "names.mc_z", "names.mc_over_listed", "names.svi_minus_listed_over_EQV", "names.mc_minus_svi_over_EQV")  # fmt: skip
@@ -1216,7 +1592,7 @@ def build_a(inputs: Mapping[str, Inputs], risk: dict[str, Any] | None, risk_pend
                [["LC (calibrated local correlation)", cell("ED.lc")], ["CC (constant-correlation companion)", cell("ED.cc")],
                 ["copula (P_D)", cell("ED.copula")], ["model S (P_D_S)", cell("ED.model_s")]])  # fmt: skip
     part.text(
-        f"D = Σ w_i |R_i − R̄| at the horizon, basket B1 (price weights). {one_line('', x).strip()}",
+        f"D = Σ w_i |R_i − R̄| at the horizon, basket B1 (price weights). {one_line('', x).strip()} Numbers in `tables/A_forward.csv`.",
         "",
     )
     # A2
@@ -1232,7 +1608,8 @@ def build_a(inputs: Mapping[str, Inputs], risk: dict[str, Any] | None, risk_pend
         "LC/CC = E_LC[D]/E_CC[D], paired on the pricing paths; LC/copula = E_LC[D]/P_D, CC/copula = E_CC[D]/P_D, S/copula = P_D_S/P_D "
         "(errors over the copula: delta method on the numerator's error and P_D_se, independent; S/copula has none, model S's table has no errors). "
         f"Listed-variance forward = {D_LISTED}: no Monte Carlo number of this model, no error. {D_WING}; {D_EQV}; over CC with the row's own errors. "
-        + one_line("", x).strip(),
+        + one_line("", x).strip()
+        + " Numbers in `tables/A_ratios.csv`.",
         "",
     )
     # A3
@@ -1254,7 +1631,8 @@ def build_a(inputs: Mapping[str, Inputs], risk: dict[str, Any] | None, risk_pend
         f"The single-name part is the sum of two terms: the model's SVI strips over the listed strips, {cell('names.svi_over_listed')} % ({cell('names.svi_minus_listed_over_EQV')} of EQV), "
         f"and the Monte Carlo second moment over the SVI strips, {cell('names.mc_over_svi')} % ({cell('names.mc_minus_svi_over_EQV')} of EQV; names_mc_z = {cell('names.mc_z')}); "
         f"Monte Carlo over listed {cell('names.mc_over_listed')} % (`tables/A_inputs.csv`). "
-        + one_line("", x).strip(),
+        + one_line("", x).strip()
+        + " Numbers in `tables/A_kappa_ev.csv`.",
         "",
     )
     # A4
@@ -1283,7 +1661,8 @@ def build_a(inputs: Mapping[str, Inputs], risk: dict[str, Any] | None, risk_pend
         "(S/copula has none); a ratio is n/a when the copula's call is zero. "
         + k200_sentence([x])
         + " "
-        + one_line("", x).strip(),
+        + one_line("", x).strip()
+        + " Numbers in `tables/A_calls.csv`.",
         "",
     )
     # A5
@@ -1319,7 +1698,8 @@ def build_a(inputs: Mapping[str, Inputs], risk: dict[str, Any] | None, risk_pend
         f"−3 sd from today's risk run (`{rel(RISK_FILE)}`{', commit ' + str(risk.get('commit')) if risk else ''}). "
         f"Clipped mass = {D_CLIP} (at λ = 0, at the cap), inside ±2.5 sd and on the whole cloud: a calibration diagnostic, no standard error. "
         f"The line '{D_CLIP_MAX}' is the row's clip_inner_max = max(largest mass at λ = 0 over the slices, largest mass at the cap over the slices): "
-        "it is not the mass clipped on the two sides together (the row does not carry the per-slice masses, so the largest over the slices of the sum of the two sides is not given here).",
+        "it is not the mass clipped on the two sides together (the row does not carry the per-slice masses, so the largest over the slices of the sum of the two sides is not given here). "
+        "Numbers in `tables/A_index_clip.csv`.",
         "",
     )
     # A6
@@ -1366,75 +1746,201 @@ def build_a(inputs: Mapping[str, Inputs], risk: dict[str, Any] | None, risk_pend
         part.text(
             "The sticky-moneyness delta of the forward is exactly 1 path by path (a common move at sticky moneyness scales D by the spot factor): "
             f"the ± printed for it ({sm.se:.5f} at five decimals) is the base price's relative error of the risk run, se(E_LC[D])/E_LC[D] = {float(risk_base[1]) / float(risk_base[0]):.5f}, "
-            "not an uncertainty on the delta.",
+            "not an uncertainty on the delta. The level term Δ^LC_sm − Δ^CC_sm is likewise exactly 0 for the forward (the two sticky-moneyness deltas are both exactly 1): "
+            f"the ± printed for it ({r_out['delta.risk.level_term'].cell()}) is not an uncertainty on the term either.",
             "",
         )
     part.text(
         f"Elasticities: {D_DELTA}. Row: homogeneity = 1 exactly, skew channel = Δ^CC_ss − 1, correlation channel = Δ^LC_ss − Δ^CC_ss (paired); Δ^LC_ss is their sum. "
         "Risk run: homogeneity = Δ^LC_sm, skew channel = Δ^CC_ss − Δ^CC_sm, correlation channel = (Δ^LC_ss − Δ^LC_sm) − (Δ^CC_ss − Δ^CC_sm); Δ^LC_ss is their sum. "
         f"Row: {x.row_budget}, commit {x.row_commit or 'pending'}, `{rel(x.row_path)}`; risk run: `{rel(RISK_FILE)}`"
-        f"{', ' + r_out['delta.risk.lc_ss'].budget + ', commit ' + str(risk.get('commit')) if risk else ''}.",
+        f"{', ' + r_out['delta.risk.lc_ss'].budget + ', commit ' + str(risk.get('commit')) if risk else ''}. Numbers in `tables/A_deltas.csv`.",
         "",
     )
     # A7
     part.text("### A7. Vegas and the model-risk range", "")
     vkeys = ("names_recalibrated", "names_held", "index", "skew_rotation", "skew_put90")
-    part.add(
-        "A_vegas",
-        "A.",
-        TODAY,
-        [r_out[f"vega.{k}.{u}"] for k in vkeys for u in ("pct_price", "pct_notional")],
-    )
+    part.add("A_vegas", "A.", TODAY, [r_out[f"vega.{k}.{u}"] for k in vkeys for u in ("pct_price", "pct_notional")])  # fmt: skip
+    extra_keys = (
+        "vega.skew_rotation.per_skew_vp.pct_price", "vega.skew_rotation.per_skew_vp.pct_notional",
+        "vega.skew_rotation.rota_90", "vega.skew_rotation.rota_110", "vega.skew_rotation.rota_skew",
+        *[f"vega.{k}.clip_{side}_inner" for k in vkeys for side in ("high", "low")],
+    )  # fmt: skip
+    part.add("A_vegas", "A.", TODAY, [r_out[k] for k in extra_keys if k in r_out])
     names = {"names_recalibrated": "all names +1 vol point, λ recalibrated", "names_held": "all names +1 vol point, λ held",
-             "index": "index +1 vol point", "skew_rotation": "index skew, rotation (per +1 rota)", "skew_put90": "index skew, put90 (per vol point at the 90 % strike)"}  # fmt: skip
-    part.table(["vega of E_LC[D]", "% of the price", "% of notional"],
-               [[names[k], r_out[f"vega.{k}.pct_price"].cell(), r_out[f"vega.{k}.pct_notional"].cell()] for k in vkeys])  # fmt: skip
-    part.text(
-        "Each vega is the change of E_LC[D] per vol point (per +1 rota for the rotation), paired on the pricing seed: % of notional = 100 × the change in units of notional; "
-        "% of the price = 100 × the change over the run's base E_LC[D] (delta method). "
-        f"`{rel(RISK_FILE)}`{', ' + r_out['vega.index.pct_price'].budget + ', commit ' + str(risk.get('commit')) if risk else ''}. Per-name vegas are not reported.",
-        "",
-    )
-    range_items = [r_out[k] for k in ("model_risk.low", "model_risk.high") if k in r_out]
-    if "model_risk.base" in r_out:
-        range_items.append(r_out["model_risk.base"])
-    if "risk_base.ED_cc" in r_out:
-        range_items.append(r_out["risk_base.ED_cc"])
-    part.add("A_model_risk", "A.", TODAY, range_items)
-    part.add("A_model_risk", "A.", TODAY, variants)
-    body = [["base (the calibrated model)", r_out["model_risk.base"].cell() if "model_risk.base" in r_out else f"pending: {risk_pending}" if risk is None else "n/a", "—", "—"]]  # fmt: skip
-    for i in range(0, len(variants), 3):
-        body.append(
-            [
-                variants[i].label.replace(": E[D]", ""),
-                variants[i].cell(),
-                variants[i + 1].cell(),
-                variants[i + 2].cell(),
-            ]
+             "index": "index +1 vol point", "skew_rotation": "index skew, rotation (per +1 rota)", "skew_put90": "index skew, put90 (per vol point at 90 % of the forward, a tent)"}  # fmt: skip
+    short_names = {"names_recalibrated": "all names +1", "index": "index +1", "skew_rotation": "rotation", "skew_put90": "put90"}  # fmt: skip
+
+    def clip_cell(k: str) -> str:
+        it = r_out.get(f"vega.{k}.clip_high_inner")
+        if it is not None:
+            return it.cell()
+        return (
+            "λ held: the base's calibration"
+            if k == "names_held"
+            else "not recorded in the risk file"
         )
-    body.append(["range, low", r_out["model_risk.low"].cell(), "—", "—"])
-    body.append(["range, high", r_out["model_risk.high"].cell(), "—", "—"])
-    part.table(
-        [
-            "variant (R_low / family, recalibrated)",
-            "E[D]",
-            "minus base",
-            "minus base, % of the price",
-        ],
-        body,
+
+    vbody = [[names[k], r_out[f"vega.{k}.pct_price"].cell(), r_out[f"vega.{k}.pct_notional"].cell(), clip_cell(k)] for k in vkeys]  # fmt: skip
+    per_p, per_n = r_out.get("vega.skew_rotation.per_skew_vp.pct_price"), r_out.get("vega.skew_rotation.per_skew_vp.pct_notional")  # fmt: skip
+    if per_p is not None and per_n is not None:
+        vbody.insert(4, ["index skew, rotation, per vol point of 90 %/110 % skew at the horizon (derived)", per_p.cell(), per_n.cell(), "as the line above"])  # fmt: skip
+    part.table(["vega of E_LC[D] (one-sided +1 bump)", "% of the price", "% of notional",
+                "clipped mass of the recalibrated model inside ±2.5 sd, at the cap (% of particles)"], vbody)  # fmt: skip
+    vb = ((risk or {}).get("vegas_base") or (risk or {}).get("base") or {}).get("ED_lc")
+    vb_txt = (
+        f" ({float(vb[0]):.6f} ± {float(vb[1]):.6f}; not the row's {cell('ED.lc')})" if vb else ""
     )
-    part.text(
-        "Model-risk range = the lowest and the highest E[D] over the variants (another R_low or family, each recalibrated to the same index smile); "
-        "the differences to the base are paired on the pricing seed. "
-        f"The family named 'parametric' in the variants is M12's parametric λ family (the calibrated model's surfaces and screen, another form of λ); it is not {REF_NAME} of section B. "
-        f"`{rel(RISK_FILE)}`{', ' + r_out['model_risk.low'].budget + ', commit ' + str(risk.get('commit')) if risk else ''}.",
-        "",
+    vega_text = [
+        "Every vega is a one-sided +1 bump (the bumped model minus the base; no down bump), paired on the pricing seed. % of notional = 100 × the change of E_LC[D] in units of notional; "
+        f"% of the price = 100 × that change over the risk run's base E_LC[D]{vb_txt}, delta method on the two errors.",
+        "The bumps: 1 vol point added to every name's implied vol surface at once, with λ recalibrated to the unchanged index smile or held; 1 vol point added to the index target, λ recalibrated; "
+        "the two skew bumps of the index target, λ recalibrated (`volsto/risk/local_correlation.py`, index_skew_vega; `volsto/market/surface.py`, delta_sigma_from_config).",
+    ]
+    rota = [r_out.get(f"vega.skew_rotation.{k}") for k in ("rota_90", "rota_110", "rota_skew")]
+    if rota[0] is not None and rota[1] is not None and rota[2] is not None:
+        vega_text.append(
+            f"Rotation: {D_ROTA}, in vol units: 2/√T vol points per unit of k at the money, the maturity floored at one month; a positive rota lifts the puts and lowers the calls. "
+            f"At the 3m horizon (T = {risk_info['horizon']:g}) that is {rota[0].cell()} vol points at 90 % of the forward and {rota[1].cell()} at 110 %, that is {rota[2].cell()} vol points of 90 %/110 % skew; "
+            f"shorter maturities move more. The derived line divides the rotation vega by these {rota[2].cell()} vol points (an exact divisor): it is per vol point of 90 %/110 % skew at the horizon "
+            "with every other maturity moved as the rota prescribes, not the vega to a bump of the horizon's skew alone."
+        )
+    vega_text.append(f"put90: {D_PUT90}.")
+    clips = {
+        k: r_out[f"vega.{k}.clip_high_inner"] for k in vkeys if f"vega.{k}.clip_high_inner" in r_out
+    }
+    if clips:
+        all_flagged = all(
+            it.value is not None and it.value > 100 * CLIP_FLAG for it in clips.values()
+        )
+        vega_text.append(
+            f"The recalibrated models {'carry the same clip flag as the base' if all_flagged else 'do NOT all carry the clip flag of the base'}: clipped mass at the cap inside ±2.5 sd: "
+            + "; ".join(f"{short_names[k]}, {it.cell()} %" for k, it in clips.items())
+            + f" (base {cell('clip.inner_high')} %; the flag is above 1 %), so the index and skew vegas are those of the capped model. "
+            f"These clipped masses are not recorded in the risk file: they are read from the calibration cache (`{rel(CACHE)}/<key>/diagnostics.json`, max_clipped_high_inner), "
+            "each entry identified by its specification differing from the base's by the bump alone."
+        )
+    else:
+        vega_text.append("The clipped mass of the recalibrated models is not recorded in the risk file, and no cached calibration was identified for them.")  # fmt: skip
+    vega_text.append(
+        f"`{rel(RISK_FILE)}`{', ' + r_out['vega.index.pct_price'].budget + ', commit ' + str(risk.get('commit')) if risk else ''}. Per-name vegas are not reported. Numbers in `tables/A_vegas.csv`."
     )
+    part.text(" ".join(vega_text), "")
+    # the model-risk range
+    meta: list[dict[str, Any]] = risk_info["meta"]
+    range_keys = ("model_risk.low", "model_risk.high", "model_risk.like_base.low", "model_risk.like_base.high", "model_risk.base", "risk_base.ED_cc")  # fmt: skip
+    part.add("A_model_risk", "A.", TODAY, [r_out[k] for k in range_keys if k in r_out])
+    part.add("A_model_risk", "A.", TODAY, variants)
+    clip_keys = [f"{m['prefix']}.clip_{side}_inner" for m in meta for side in ("low", "high")]
+    hs_keys = [
+        f"model_risk.historical_scaled.{k}" for k in ("scale", "shrinkage", "mean_correlation")
+    ]
+    part.add("A_model_risk", "A.", TODAY, [r_out[k] for k in (*clip_keys, *hs_keys) if k in r_out])
+    whole, two = "the whole index smile (particle)", "two index vols at the horizon: at the money and 90 % of the forward (parametric)"  # fmt: skip
+    base_label = risk_info["base_label"]
+    body = [[f"base{': ' + base_label if base_label else ''} (the calibrated model)",
+             whole, r_out["model_risk.base"].cell() if "model_risk.base" in r_out else f"pending: {risk_pending}" if risk is None else "n/a", "—", "—",
+             f"{cell('clip.inner_low')} / {cell('clip.inner_high')} (the row's)"]]  # fmt: skip
+    for i, m in zip(range(0, len(variants), 3), meta, strict=True):
+        lo, hi = r_out.get(f"{m['prefix']}.clip_low_inner"), r_out.get(
+            f"{m['prefix']}.clip_high_inner"
+        )
+        if lo is not None and hi is not None:
+            clip_txt = f"{lo.cell()} / {hi.cell()}{' — flagged at λ = 0' if m['flag_low'] else ''}"
+        elif m["family"] == "parametric":
+            clip_txt = "none recorded (not a particle calibration)"
+        else:
+            clip_txt = "not in the risk file"
+        body.append([m["label"], whole if m["family"] == "particle" else two, variants[i].cell(), variants[i + 1].cell(), variants[i + 2].cell(), clip_txt])  # fmt: skip
+    body.append(
+        ["range (a), all variants: low", "—", r_out["model_risk.low"].cell(), "—", "—", "—"]
+    )
+    body.append(
+        ["range (a), all variants: high", "—", r_out["model_risk.high"].cell(), "—", "—", "—"]
+    )
+    body.append(["range (b), particle variants not flagged at λ = 0: low", "—", r_out["model_risk.like_base.low"].cell(), "—", "—", "—"])  # fmt: skip
+    body.append(["range (b), particle variants not flagged at λ = 0: high", "—", r_out["model_risk.like_base.high"].cell(), "—", "—", "—"])  # fmt: skip
+    part.table(["variant (R_low / λ family, recalibrated)", "λ calibrated to", "E[D]", "minus base", "minus base, % of the price",
+                "clipped mass inside ±2.5 sd: at λ = 0 / at the cap (% of particles)"], body)  # fmt: skip
+    hs = (risk or {}).get("historical_scaled") or {}
+    hs_txt = (
+        f"({' to '.join(str(d) for d in hs.get('window') or [])}; {int(num(hs, 'n_observations'))} observations), shrunk towards the identity (shrinkage {num(hs, 'shrinkage'):.3f}), "
+        f"and s is set so that the weighted mean pairwise correlation of R_low is 0.05 (s = {num(hs, 'scale'):.3f}; that of Ĉ is {num(hs, 'mean_correlation'):.3f})"
+        if ok(num(hs, "scale")) and ok(num(hs, "n_observations"))
+        else "shrunk towards the identity, and s is set so that the weighted mean pairwise correlation of R_low is 0.05"
+    )
+    fits = [m["info"] for m in meta if m["family"] == "parametric" and m["info"]]
+    fit_txt = (
+        f"; the {len(fits)} cached fits state the strikes [1.0, 0.9] × the forward and converged"
+        if fits and all(f["strikes"] == [1.0, 0.9] and f["converged"] is True for f in fits)
+        else ""
+    )
+    mr_text = [
+        "What the variants are (`scripts/pm_today_risk.py`, variant_specs; `volsto/config.py`, LocalCorrelationConfig). "
+        + (f"The base is {base_label}. " if base_label else "")
+        + "'equi x' = R_low is the equicorrelation matrix at x (rho_min = x). 'historical-scaled:252,0.05' = R_low = (1 − s)·I + s·Ĉ, where Ĉ is the correlation of the names' daily log returns "
+        f"over the last 252 days {hs_txt}. 'particle' = λ calibrated by the particle method to the whole index smile, like the base. "
+        "'parametric' = M12's own two-parameter family λ(t, k) = clip(λ0 − slope·k, 0, λ_max), fitted to two index implied vols at the horizon, at the money and at 90 % of the forward "
+        f"(`volsto/calibration/local_correlation.py`, calibrate_parametric_lambda{fit_txt}): it is not calibrated like the base, and it is not {REF_NAME} of section B. "
+        "Each variant is recalibrated and priced on the common pricing seed; the differences to the base are paired on that seed."
+    ]
+    for m in meta:
+        lo = r_out.get(f"{m['prefix']}.clip_low_inner")
+        if m["flag_low"] and lo is not None and m["info"]:
+            mr_text.append(
+                f"The variant {m['label']} is a flagged calibration: λ is clipped at 0 on up to {lo.cell()} % of the particles inside ±2.5 sd at its worst slice "
+                f"(above 1 % on {m['info']['n_low_flagged']} of {m['info']['n_slices']} slices)."
+            )
+    if any(m["info"] for m in meta):
+        mr_text.append(
+            f"The clipped masses of the variants are not in the risk file: they are read from the calibration cache (`{rel(CACHE)}/<key>/diagnostics.json`, max_clipped_low_inner and "
+            "max_clipped_high_inner), each entry identified by its specification differing from the base's by the variant's change alone."
+        )
+    else:
+        mr_text.append("The clipped mass of the variants is not in the risk file.")
+    priced = [
+        (m, variants[i + 2])
+        for i, m in zip(range(0, len(variants), 3), meta, strict=True)
+        if ok(m["price"])
+    ]
+    if priced and ok(r_out["model_risk.low"].value) and not r_out["model_risk.low"].pending:
+        m_lo, m_hi = (
+            min(priced, key=lambda t: t[0]["price"])[0],
+            max(priced, key=lambda t: t[0]["price"])[0],
+        )
+
+        def what(m: Mapping[str, Any]) -> str:
+            return f"{m['label']}{' (flagged at λ = 0)' if m['flag_low'] else ''}"
+
+        like = [
+            (m, pct) for m, pct in priced if m["family"] == "particle" and m["flag_low"] is False
+        ]
+        b_lo, b_hi = r_out["model_risk.like_base.low"], r_out["model_risk.like_base.high"]
+        mr_text.append(
+            f"Two ranges of E[D], neither with a standard error of its own. (a) All {len(priced)} variants: {r_out['model_risk.low'].cell()} to {r_out['model_risk.high'].cell()}; "
+            f"its low end is {what(m_lo)} and its high end is {what(m_hi)}: this range mixes the two families"
+            f"{' and a flagged calibration' if any(m['flag_low'] for m, _ in priced) else ''}. "
+            + (
+                "(b) The variants calibrated like the base to the whole index smile and not flagged at λ = 0 — "
+                + "; ".join(
+                    f"{m['label']}, {pct.cell()} % of the price from the base" for m, pct in like
+                )
+                + f": {b_lo.cell()} to {b_hi.cell()}."
+                if like and ok(b_lo.value)
+                else f"(b) The variants calibrated like the base and not flagged at λ = 0: {b_lo.cell()}."
+            )
+        )
+    mr_text.append(
+        f"`{rel(RISK_FILE)}`{', ' + r_out['model_risk.low'].budget + ', commit ' + str(risk.get('commit')) if risk else ''}. Numbers in `tables/A_model_risk.csv`."
+    )
+    part.text(" ".join(mr_text), "")
     # A8
-    cdv_block(part, cdv, cdv_pending, x, r_out, c)
-    checks = consistency([x]) + risk_notes
+    cdv_notes = cdv_block(part, cdv, cdv_pending, x, r_out, c, risk)
+    checks = consistency([x]) + risk_notes + cdv_notes
     if checks:
         part.text("### A. Consistency of the inputs", "", *checks, "")
+    if not part.pending:  # no cell is pending: the clause that explains the mark is dropped
+        part.lines = [line.replace(PENDING_CLAUSE, "") for line in part.lines]
     return part
 
 
@@ -1475,6 +1981,11 @@ def check_a(part: Part, inputs: Mapping[str, Inputs], rebuild_log: Path) -> None
         if doc is not None:
             old[d] = doc
     rebuild = parse_rebuild(rebuild_log)
+    in_package = os.path.abspath(rebuild_log).startswith(str(pc.PM) + os.sep)
+    log_what = (
+        "the log of the verification run, kept in the package" if in_package else REBUILD_SOURCE
+    )
+    exact = "an exact comparison of inputs, not a Monte Carlo estimate: no standard error"
     items: list[tuple[str, Item]] = []
     body = []
     labels_ok = []
@@ -1497,8 +2008,8 @@ def check_a(part: Part, inputs: Mapping[str, Inputs], rebuild_log: Path) -> None
         rb = rebuild.get(d)
         it_rb = Item("check_a.lc_over_cc.rebuild", "the reference's world rebuilt on the library, LC/CC", rb["ratio"] if rb else NAN, rb["se"] if rb else NAN, digits=5,
                      definition="E_LC[D]/E_CC[D] of the fixture's world rebuilt with the library (tests/_lcm_reference.py), paired; an independent verification run",
-                     budget=f"{short(rb['n_paths'])} paths, seed {rb['seed']:.0f}" if rb else "", commit=REBUILD_COMMIT, source=f"{rebuild_log} ({REBUILD_SOURCE})",
-                     pending="" if rb else str(rebuild_log), notes=f"z against the fixture {rb['z']:+.2f}" if rb else "")  # fmt: skip
+                     budget=f"{short(rb['n_paths'])} paths, seed {rb['seed']:.0f}" if rb else "", commit=REBUILD_COMMIT, source=f"{rel(rebuild_log)} ({log_what})",
+                     pending="" if rb else rel(rebuild_log), notes=f"z against the fixture {rb['z']:+.2f}" if rb else "")  # fmt: skip
         gaps = []
         for tag, what, m12 in (
             ("old_defaults", f"M12 on the {OLD_WHAT}", it_old),
@@ -1532,11 +2043,11 @@ def check_a(part: Part, inputs: Mapping[str, Inputs], rebuild_log: Path) -> None
         )
         it_gap_f = Item("check_a.label_gap.fixture", "fixture vs the study's entry of the date: largest gap of T and the index ATM vol", max(t_gap, sig_gap) if ok(t_gap) and ok(sig_gap) else NAN, None,
                         digits=12, definition="max(|T_fixture − T_entry|, |sigB_fixture − sig_B_DJX_entry|), entry of basket B1", budget="exact comparison", commit=STUDY_COMMIT,
-                        source=f"{ref.source}; {rel(ENTRIES)}")  # fmt: skip
+                        source=f"{ref.source}; {rel(ENTRIES)}", notes=exact)  # fmt: skip
         it_gap_r = Item("check_a.label_gap.row", "old-default row vs the study's entry of the date: largest gap of T, P_D, EQV, rho_cop", row_gap, None, digits=12,
                         definition="max over T, P_D_copula/P_D, EQV, rho_cop of |row − entry|, entry of basket B1", budget="exact comparison",
                         commit=str(o.get("git_commit", "")) if o else "", source=f"{rel(OLD_ROWS_DIR / f'{d}.json')}; {rel(ENTRIES)}",
-                        pending="" if o else rel(OLD_ROWS_DIR / f"{d}.json"))  # fmt: skip
+                        pending="" if o else rel(OLD_ROWS_DIR / f"{d}.json"), notes=exact)  # fmt: skip
         for it in (it_old, it_new, it_ref, it_rb, it_gap_f, it_gap_r, *gaps):
             items.append((d, it))
         body.append(
@@ -1602,12 +2113,13 @@ def check_a(part: Part, inputs: Mapping[str, Inputs], rebuild_log: Path) -> None
                 f"no SVI surfaces, no expiry screen, no calendar repair; described under B1), not by a label. "
                 f"M12 − reference depends on which M12 column is used: with the old defaults (the number of the check) it is {gap_cells[b_date][0]} on {b_date} and "
                 f"{gap_cells[a_date][0]} on {a_date}; with section B's rows (decisions on) it is {gap_cells[b_date][1]} on {b_date} and {gap_cells[a_date][1]} on {a_date}. "
-                f"The screen alone (decisions 1-2) moves M12's LC/CC by {moves.get(b_date, 'n/a')} on {b_date} and {moves.get(a_date, 'n/a')} on {a_date} (table B4), "
+                f"The change of defaults alone (the owner's decisions 1, 2 and 5; table B4 says which of them acts) moves M12's LC/CC by {moves.get(b_date, 'n/a')} on {b_date} and "
+                f"{moves.get(a_date, 'n/a')} on {a_date} (the ± is an upper bound of the error of the difference: table B4), "
                 "so part of the gap to the reference is the treatment of the inputs, not the correlation model."
             )
         else:
             sentences.append(
-                f"Pending: the rebuild of the reference's worlds on the library ({rebuild_log})."
+                f"Pending: the rebuild of the reference's worlds on the library ({rel(rebuild_log)})."
             )
         n_a, n_b = (
             core_items(inputs[a_date])["ratio.lc_over_cc"],
@@ -1630,7 +2142,7 @@ def check_a(part: Part, inputs: Mapping[str, Inputs], rebuild_log: Path) -> None
         f"reference: `{rel(FIXTURES)}/<tag>.json` ({ref_budget(inputs[b_date].ref)}); "
         f"rebuild: an independent verification run with `tests/_lcm_reference.py`, {REBUILD_COMMIT}, "
         f"{', '.join(sorted({short(v['n_paths']) + ' paths, seed ' + format(v['seed'], '.0f') for d, v in rebuild.items() if d in (a_date, b_date)})) or 'pending'}; "
-        f"source: {REBUILD_SOURCE} (`{rebuild_log}`). The gaps M12 − reference carry √(se² + se²), independent runs. Numbers in `tables/B_check_a.csv`.",
+        f"source: `{rel(rebuild_log)}` ({log_what}). The gaps M12 − reference carry √(se² + se²), independent runs. Numbers in `tables/B_check_a.csv`.",
         "",
     )
 
@@ -1648,7 +2160,7 @@ def build_b(inputs: Mapping[str, Inputs], base: Path, rows_dir: Path, rebuild_lo
             "",
         )
     part.text(
-        f"Cells are value ± standard error; `pending: <file>` marks a number whose input has not arrived. {TODAY} (section A) is repeated for reference. {PM_SE}",
+        f"Cells are value ± standard error{PENDING_CLAUSE}. {TODAY} (section A) is repeated for reference. {PM_SE}",
         "",
     )
     moved = []
@@ -1659,7 +2171,8 @@ def build_b(inputs: Mapping[str, Inputs], base: Path, rows_dir: Path, rebuild_lo
                 f"{d} {diff.cell()} ({abs(diff.value) / new.se:.1f} times the printed error of LC/CC)"
             )
     if moved:
-        part.text("Size of the screen's effect on LC/CC (new defaults minus old defaults, table B4): " + "; ".join(moved) + ".", "")  # fmt: skip
+        part.text("Size of the effect of the change of defaults on LC/CC (new defaults minus old defaults; the ± is an upper bound of the error of the difference: table B4): "
+                  + "; ".join(moved) + ".", "")  # fmt: skip
     flags_table(part, xs, "B_flags", base)
     head = ["quantity", *[f"{d}{' (today)' if d == TODAY else ''}" for d in dates]]
 
@@ -1726,7 +2239,7 @@ def build_b(inputs: Mapping[str, Inputs], base: Path, rows_dir: Path, rebuild_lo
         f"Copula: `{rel(ENTRIES)}`, basket B1; model S: `{rel(MODEL_S)}` (no standard errors; NOT converged on "
         f"{', '.join(x.date for x in xs if x.s_mark) or 'none of these dates'}); these are the study's tables entries_3m.parquet and model_s_3m.parquet, which have no commit column. "
         f"The lines 'parametric reference implementation' are not M12: `{rel(FIXTURES)}/<tag>.json`, {ref_budget(x0.ref)}; {REF_WORLD} "
-        f"(tags {', '.join(f'{x.ref_tag} = {x.date}' for x in xs)}).",
+        f"(tags {', '.join(f'{x.ref_tag} = {x.date}' for x in xs)}). Numbers in `tables/B_core.csv`.",
         "",
     )
     part.text("#### B1 (continued). The single-name part of E_LC[V] − EQV: two terms", "")
@@ -1796,20 +2309,26 @@ def build_b(inputs: Mapping[str, Inputs], base: Path, rows_dir: Path, rebuild_lo
         + " The last eight lines are like for like: each model's LC call over its CC call at the strike m × its own E_CC[D] "
         "(M12: the row's Cfwd_<m>_ratio, paired on the pricing paths; the strikes are multiples of M12's E_CC[D], not the study's K_m, which are multiples of the copula's P_D). "
         f"The lines 'parametric reference implementation' are not M12: {ref_budget(x0.ref)}; {REF_WORLD}. "
-        "Budgets, commits and sources as under B1.",
+        "Budgets, commits and sources as under B1. Numbers in `tables/B_calls.csv`.",
         "",
     )
     check_a(part, inputs, rebuild_log)
     # B4: the same four dates on the old defaults
     part.text(
-        "### B4. Sensitivity to the owner's decisions 1-2 (old defaults: no calendar repair, no fallback)",
+        "### B4. Sensitivity to the owner's decisions 1, 2 and 5 (new defaults: the three on; old defaults: no calendar repair, no fallback)",
         "",
     )
+    part.text(f"{D_NEW_DEFAULTS[0].upper()}{D_NEW_DEFAULTS[1:]}. {decisions_acting(xs)}", "")
     body_s = []
     olds = {d: old_inputs(inputs[d]) for d in dates}
+    fwd_lines, fwd_over = [], []
     for d in dates:
         for label, old, new, diff in sens_items(inputs[d]):
-            part.add("B_sensitivity", f"B.{d}.", d, [old, diff])
+            part.add("B_sensitivity", f"B.{d}.", d, [new, old, diff] if new.key == "fwd_err" else [old, diff])  # fmt: skip
+            if new.key == "fwd_err":
+                fwd_lines.append(f"{d}: {old.cell()} old, {new.cell()} new")
+                if diff.value is not None and ok(diff.value) and diff.se:
+                    fwd_over.append(abs(diff.value) / diff.se)
             body_s.append(
                 [
                     label,
@@ -1822,14 +2341,33 @@ def build_b(inputs: Mapping[str, Inputs], base: Path, rows_dir: Path, rebuild_lo
             )
     order = {label: i for i, (_, label) in enumerate(SENS_KEYS)}
     body_s.sort(key=lambda row: order[row[0]])
-    part.table(["quantity", "date", "old defaults", "new defaults (sections A and B)", "new minus old", "in standard errors of the difference"], body_s)  # fmt: skip
+    part.table(["quantity", "date", "old defaults", "new defaults (sections A and B)", "new minus old ± an upper bound of its error", "difference over that upper bound"], body_s)  # fmt: skip
+    today_s = {label: (old, new, diff) for label, old, new, diff in sens_items(inputs[TODAY])}
+
+    def moved_by(label: str) -> str:
+        old, new, diff = today_s[label]
+        if (
+            not (ok(old.value) and ok(new.value) and ok(diff.value))
+            or old.value is None
+            or new.value is None
+            or diff.value is None
+        ):
+            return "n/a"
+        return f"{fmt_cell(diff.value, None, diff.digits, 'signed')} ({fmt_cell(old.value, None, old.digits)} → {fmt_cell(new.value, None, new.digits)})"
+
+    clip_label = SENS_KEYS[-2][1]
     part.text(
         "The owner's decision 1 asked to keep the no-repair results as a reported sensitivity: this table is that. "
         f"Old defaults = no calendar repair of the slices, no unscreened fallback: `{rel(OLD_ROWS_DIR)}/<date>.json` (the production pass stopped at 07:45), "
         f"commit {', '.join(sorted({o.row_commit for o in olds.values() if o.row_commit})) or 'pending'}, "
         f"{', '.join(sorted({o.row_budget for o in olds.values() if o.row is not None})) or 'pending'}. "
-        f"New defaults = sections A and B's rows (decisions 1-2 on), commit {', '.join(sorted({x.row_commit for x in xs if x.row_commit})) or 'pending'}, same budget and seeds. "
-        "The standard error of a difference is √(se_new² + se_old²), the two runs taken as independent: they share the particle and pricing seeds but are two calibrations, so it is not a paired error. "
+        f"New defaults = sections A and B's rows (decisions 1, 2 and 5 on), commit {', '.join(sorted({x.row_commit for x in xs if x.row_commit})) or 'pending'}, same budget and seeds. "
+        f"The ± of a difference: {D_UPPER}. The last line of the table shows it: the basket forward error is pure pricing noise (its expectation is zero), and between the two runs it differs by "
+        f"{min(fwd_over, default=NAN):.2f} to {max(fwd_over, default=NAN):.2f} of that bound on the {len(fwd_over)} dates "
+        f"({'; '.join(fwd_lines)}). The column 'difference over that upper bound' therefore understates how many standard errors a difference is: it is not a test, "
+        "and a small value in it does not show that the change of defaults has no effect. "
+        f"Size of the moves today ({TODAY}), new minus old (old → new): LC/CC {moved_by('LC/CC')}; E_LC[D] {moved_by('E_LC[D]')}; the LC sticky-strike delta {moved_by('Δ sticky strike, LC')}; "
+        f"the clipped mass inside ±2.5 sd, the larger of the two sides, {moved_by(clip_label)} % of particles. "
         "Ratios to the copula use the same P_D of the study's entry in the two columns. The clipped mass is a calibration diagnostic without standard error. "
         "Numbers in `tables/B_sensitivity.csv`.",
         "",
@@ -1837,6 +2375,8 @@ def build_b(inputs: Mapping[str, Inputs], base: Path, rows_dir: Path, rebuild_lo
     checks = consistency(xs)
     if checks:
         part.text("### B. Consistency of the inputs", "", *checks, "")
+    if not part.pending:  # no cell is pending: the clause that explains the mark is dropped
+        part.lines = [line.replace(PENDING_CLAUSE, "") for line in part.lines]
     return part
 
 

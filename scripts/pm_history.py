@@ -8,7 +8,7 @@ Reads (read-only) ``outputs/dispersion_lc/lcm_3m_dev_repair.parquet`` (one row p
 
 - ``tables/C_history_by_date.csv``: one row per date (failed dates stay, their numbers empty);
 - ``tables/C_history_summaries.csv``: long format ``quantity, label, sample, statistic, value,
-  se, se_kind, mc_se, nw_se, lag1_autocorr, n``;
+  se, se_kind, mc_se, nw_se, lag1_autocorr, n, nw_se_12, nw_se_24``;
 - ``tables/C_history_samples.csv`` (the samples and the tercile bounds) and
   ``tables/C_history_regression.csv`` (check (d));
 - ``figures/F1_forward_over_copula.pdf/.csv`` and ``figures/F2_calls_over_copula_by_strike.pdf/.csv``;
@@ -38,14 +38,18 @@ serial-correlation adjustment); ``mc_se`` is an upper bound of its Monte Carlo e
 dates fixed — the dates share the particle and pricing seeds, so the per-date errors are added
 linearly (the mean of the per-date errors), not in quadrature; ``nw_se`` is the Newey-West
 standard error of the mean (Bartlett kernel, 6 lags, the lags counted in consecutive dates of the
-sample).  A pooled ratio ``R = Σa/Σb``:
+sample); ``nw_se_12`` and ``nw_se_24`` are the same at 12 and 24 lags (the 6-lag error is a lower
+value: the error still grows with the lag, and the sample has gaps).  A pooled ratio ``R = Σa/Σb``:
 ``se`` is the across-dates linearisation ``√(n/(n−1)·Σ(a_i − R·b_i)²)/Σb``; ``mc_se`` is the
 same upper bound, ``Σ sd(a_i − R·b_i)/Σb``.  The study's own numbers (model S, the copula's κ
 and E[V], the listed-variance forward) carry no Monte Carlo error here.
 
 Check (d) is an ordinary least squares fit with an intercept, classical, HC1 and Newey-West
-(Bartlett, 6 lags, the factor n/(n − k) of HC1) standard errors (numpy only, QR); when the notes of the independent check are on disk its results are compared
-to the digit.
+(Bartlett, 6 lags, the factor n/(n − k) of HC1) standard errors (numpy only, QR); each leg of its
+regressand (LC/CC, S/copula) is also fitted on the clipped mass alone.  When the results file of
+the independent check is on disk (its copy under ``diagnostics/check_d`` of the package first) the
+fits are compared with it to the digit.  A failed date's step and leg are read from the traceback
+in the run's log of the date (``outputs/dispersion_lc/logs/3m_development_repair``).
 
 Run: ``.venv/bin/python scripts/pm_history.py`` (idempotent; rerun when the table changes).
 """
@@ -78,10 +82,14 @@ PART = "C_history"
 ROWS = pc.LC_OUT / "lcm_3m_dev_repair.parquet"
 ENTRIES = pc.STUDY / "entries_3m.parquet"
 MODEL_S = pc.STUDY / "model_s_3m.parquet"
-#: The independent check of (d) (another agent's notes; compared when present).
-CHECK_D_JSON = Path(
+#: The independent check of (d) (another agent's results; compared when present): the copy kept in
+#: the package, and the session scratch file it was copied from (read when the copy is missing).
+CHECK_D_PACKAGE = pc.PM / "diagnostics" / "check_d" / "check_d_results.json"
+CHECK_D_SCRATCH = Path(
     "/private/tmp/claude-501/-Users-idrissdadoun-Code-volsto/75dd7f23-d74c-43a9-b99e-61c23722b22c/scratchpad/r4/check-d/check_d_results.json"
 )
+#: The logs of the run behind the table (one per date; a failed date's log has its traceback).
+RUN_LOGS = pc.LC_OUT / "logs" / "3m_development_repair"
 #: The stopped production pass at the old defaults: today's row is shown beside check (b).
 PRODUCTION_OLD = pc.LC_OUT / "lcm_3m_norepair.parquet"
 #: Today's production row at the new defaults (decisions 1-2 and 5 on): section A's row.
@@ -103,6 +111,14 @@ INDEX_MOMENT_LIST = 0.15
 NAMES_TOL = 0.02
 #: Newey-West: Bartlett kernel, this many lags.
 NW_LAGS = 6
+#: The longer lags at which the error of the mean is also given (the error still grows with the lag).
+NW_MORE_LAGS = (12, 24)
+#: Two consecutive dates of a sample more than this many calendar days apart are counted as a gap.
+GAP_DAYS = 45
+#: The commit field of a record read from the study's tables.
+STUDY_COMMIT = "the study's tables (no commit column)"
+#: The unit of the clipped-mass quantities (sections A and B print the same masses in %).
+CLIP_UNIT = "fraction of the particles"
 #: The rows of C.2 that carry the Newey-West error in the Markdown.
 HEADLINE = ("lc_over_cc", "lc_over_copula", "cc_over_copula", "s_over_copula", "listed_fwd_ratio", "y_check_d")  # fmt: skip
 #: The samples added to the base ones (no version without the flagged dates).
@@ -181,9 +197,9 @@ def quantities() -> list[Quantity]:
         Quantity("EV_single_part", "E[V] split, single-name part", "Σw E_LC[R_i²] − Σw M_i^listed (EV_lc − EQV = single-name part − basket part)", "EV_single_part_se", digits=6),
         Quantity("EV_basket_part", "E[V] split, basket part", "E_LC[R̄²] − M_B^listed", "EV_basket_part_se", digits=6),
         Quantity("EV_basket_part_rel_MB", "basket part / M_B^listed", "(E_LC[R̄²] − M_B^listed) / M_B^listed; se: `EV_basket_part_se` / M_B^listed", "EV_basket_part_rel_MB_se"),
-        Quantity("clip_inner_max", "clipped mass inside ±2.5 sd", f"`clip_inner_max` = max(`clip_low_inner_max`, `clip_high_inner_max`): {CLIP_DEF}"),
-        Quantity("clip_low_inner_max", "clipped mass at λ = 0", "the fraction of the particles inside ±2.5 sd on which λ is clipped at its lower bound 0, at the calibration slice where that fraction is largest (`clip_low_inner_max`)"),
-        Quantity("clip_high_inner_max", "clipped mass at the cap", "the fraction of the particles inside ±2.5 sd on which λ is clipped at its cap, at the calibration slice where that fraction is largest (`clip_high_inner_max`)"),
+        Quantity("clip_inner_max", f"clipped mass inside ±2.5 sd ({CLIP_UNIT})", f"`clip_inner_max` = max(`clip_low_inner_max`, `clip_high_inner_max`): {CLIP_DEF}"),
+        Quantity("clip_low_inner_max", f"clipped mass at λ = 0 ({CLIP_UNIT})", "the fraction of the particles inside ±2.5 sd on which λ is clipped at its lower bound 0, at the calibration slice where that fraction is largest (`clip_low_inner_max`)"),
+        Quantity("clip_high_inner_max", f"clipped mass at the cap ({CLIP_UNIT})", "the fraction of the particles inside ±2.5 sd on which λ is clipped at its cap, at the calibration slice where that fraction is largest (`clip_high_inner_max`)"),
     ]  # fmt: skip
     for m in CALL_TAGS:
         k = f"K = {mult(m)} × P_D (the study's cash strike `K_{m}`, the same under every model)"
@@ -588,6 +604,8 @@ def summarise(d: pd.DataFrame, mask: pd.Series, q: Quantity) -> dict[str, dict[s
         mc = float(s.mean()) if s.notna().all() else np.nan
     sem = float(v.std(ddof=1) / math.sqrt(n)) if n > 1 else np.nan
     out["mean"] = {"value": float(v.mean()), "se": sem, "mc_se": mc, "n": n, "nw_se": newey_west_se(v.to_numpy()), "ac1": lag1_autocorr(v.to_numpy())}  # fmt: skip
+    for lags in NW_MORE_LAGS:
+        out["mean"][f"nw_se_{lags}"] = newey_west_se(v.to_numpy(), lags)
     quart = v.quantile([0.25, 0.5, 0.75]).to_numpy()
     for name, value in (("q25", quart[0]), ("median", quart[1]), ("q75", quart[2]), ("min", v.min()), ("max", v.max())):  # fmt: skip
         out[name] = {"value": float(value), "se": np.nan, "mc_se": np.nan, "n": n}
@@ -632,7 +650,7 @@ def all_summaries(
             stats = summarise(d, mask, q)
             table[(q.key, name)] = stats
             for stat, cell in stats.items():
-                rows.append({"quantity": q.key, "label": q.label, "sample": name, "statistic": stat, "value": cell["value"], "se": cell["se"], "se_kind": SE_KIND.get(stat, ""), "mc_se": cell["mc_se"], "nw_se": cell.get("nw_se", np.nan), "lag1_autocorr": cell.get("ac1", np.nan), "n": cell["n"]})  # fmt: skip
+                rows.append({"quantity": q.key, "label": q.label, "sample": name, "statistic": stat, "value": cell["value"], "se": cell["se"], "se_kind": SE_KIND.get(stat, ""), "mc_se": cell["mc_se"], "nw_se": cell.get("nw_se", np.nan), "lag1_autocorr": cell.get("ac1", np.nan), "n": cell["n"], **{f"nw_se_{lags}": cell.get(f"nw_se_{lags}", np.nan) for lags in NW_MORE_LAGS}})  # fmt: skip
     return table, pd.DataFrame(rows)
 
 
@@ -682,24 +700,40 @@ FITS = (
 )
 
 
+#: The two legs of the regressand of check (d), each on the clipped mass alone (sample ``S``): the
+#: key of the fit, the column regressed and the label of the fit.
+LEG_FITS = (
+    ("leg_lc_over_cc", "lc_over_cc", "regressand LC/CC: clipped mass alone"),
+    ("leg_s_over_copula", "s_over_copula", "regressand S/copula: clipped mass alone"),
+)
+
+
 def regressions(
     d: pd.DataFrame, masks: dict[str, pd.Series]
 ) -> tuple[dict[tuple[str, str], dict[str, Any]], pd.DataFrame]:
+    """The fits of check (d) (regressand ``y_check_d``; ``FITS``) and, on the sample ``S``, the
+    fit of each leg of the regressand on the clipped mass alone (``LEG_FITS``)."""
     fits: dict[tuple[str, str], dict[str, Any]] = {}
     rows = []
+
+    def keep(sample: str, key: str, label: str, fit: dict[str, Any]) -> None:
+        fits[(sample, key)] = fit
+        for j, term in enumerate(fit["names"]):
+            rows.append({
+                "sample": sample, "fit": key, "fit_label": label, "term": term, "coef": fit["coef"][j], "se": fit["se"][j], "t": fit["t"][j],
+                "se_hc1": fit["se_hc1"][j], "t_hc1": fit["t_hc1"][j], "r2": fit["r2"], "r2_adj": fit["r2_adj"], "n": fit["n"],
+                "se_nw": fit["se_nw"][j], "t_nw": fit["t_nw"][j], "resid_lag1_autocorr": fit["resid_ac1"],
+            })  # fmt: skip
+
     for sample in ("S", "S_unflagged", "S_dropidx_lt4", "S_dropidx_0"):
         sub = d.loc[masks[sample]]
         for key, label, regs in FITS:
             if sample.startswith("S_dropidx") and key != "rel":
                 continue
-            fit = ols(sub["y_check_d"], sub[regs], regs)
-            fits[(sample, key)] = fit
-            for j, term in enumerate(fit["names"]):
-                rows.append({
-                    "sample": sample, "fit": key, "fit_label": label, "term": term, "coef": fit["coef"][j], "se": fit["se"][j], "t": fit["t"][j],
-                    "se_hc1": fit["se_hc1"][j], "t_hc1": fit["t_hc1"][j], "r2": fit["r2"], "r2_adj": fit["r2_adj"], "n": fit["n"],
-                    "se_nw": fit["se_nw"][j], "t_nw": fit["t_nw"][j], "resid_lag1_autocorr": fit["resid_ac1"],
-                })  # fmt: skip
+            keep(sample, key, label, ols(sub["y_check_d"], sub[regs], regs))
+    sub = d.loc[masks["S"]]
+    for key, column, label in LEG_FITS:
+        keep("S", key, label, ols(sub[column], sub[["clip_inner_max"]], ["clip_inner_max"]))
     return fits, pd.DataFrame(rows)
 
 
@@ -708,9 +742,10 @@ def compare_check_d(
 ) -> tuple[str, dict[str, float]]:
     """One sentence, and its counts: the fits against the independent check's JSON, to its 6
     significant digits."""
-    if not CHECK_D_JSON.exists():
+    path = check_d_path()
+    if path is None:
         return "The independent check's results file is not on disk: not compared in this run.", {}
-    results = json.loads(CHECK_D_JSON.read_text())
+    results = json.loads(path.read_text())
     block = next(
         (b for b in results.values() if isinstance(b, dict) and b.get("table") == rows_name), None
     )
@@ -747,13 +782,69 @@ def compare_check_d(
             worst = max(worst, abs(float(a) - float(b)) / max(abs(float(b)), 1e-300))
             if not same:
                 off.append(name)
+    where = (
+        f"`{check_d_source(path)}`, the copy kept in the package of the checking session's results file"
+        if path == CHECK_D_PACKAGE
+        else f"`{path}`, a session scratch file that is not part of the package and cannot be audited from it later"
+    )
     text = (
-        f"Against the independent check (`{CHECK_D_JSON.parent.name}/check_d_results.json`, a session scratch file under /private/tmp that is not part of the package and cannot be audited from it later; its own `ols`; the two-regressor fits raw and relative on all dates and the raw one without the flagged dates): "
+        f"Against the independent check ({where}; its own `ols`; the two-regressor fits raw and relative on all dates and the raw one without the flagged dates): "
         f"{agree} of {total} numbers (coefficients, classical and HC1 standard errors, t, R², n) agree to the 6 significant digits it prints; largest relative difference {worst:.1e}."
     )
     if off:
         text += f" Not to the digit: {', '.join(off)}."
     return text, {"compared": total, "agree": agree, "worst_relative_difference": worst}
+
+
+def check_d_path() -> Path | None:
+    """The independent check's results file: the copy in the package when it exists, else the
+    session scratch file, else ``None``."""
+    for path in (CHECK_D_PACKAGE, CHECK_D_SCRATCH):
+        if path.exists():
+            return path
+    return None
+
+
+def check_d_source(path: Path) -> str:
+    """The path of the independent check's file as a record cites it."""
+    if path == CHECK_D_PACKAGE:
+        return f"outputs/dispersion_lc/pm_update/{path.relative_to(pc.PM)}"
+    return str(path)
+
+
+def failure_clause(date: str, reason: str) -> str:
+    """One clause for a failed date: the step and the leg that failed, read from the reason and
+    from the traceback in the run's log of the date (the call of ``lc_spec_from_smiles`` in which
+    the date raised: the names are fitted one by one first, the index after them)."""
+    log = RUN_LOGS / f"{date}.log"
+    lines = log.read_text().splitlines() if log.exists() else []
+    call = ""
+    for i, line in enumerate(lines[:-1]):
+        if "in lc_spec_from_smiles" in line:
+            call = lines[i + 1].strip()
+    if "no listed expiry passes the screen" in reason:
+        who = reason.split(":")[1].strip() if reason.count(":") > 1 else "the index"
+        leg = "the index leg" if who == "the index" else f"the names' leg ({who})"
+        what = "the DJX" if who == "the index" else who
+        return f"{leg}, at the quote screen of the expiries: no listed expiry of {what} passes it, so there is no smile to fit; nothing is calibrated or priced"
+    if "Initial guess is outside of provided bounds" in reason:
+        if not call:
+            return "an SVI slice fit (`fit_svi_slice`): the start value of the bounded least squares is outside its bounds; the run's log of the date is not on disk, so the leg is not identified"
+        leg = "the index leg" if call.startswith("index_") else "the names' leg"
+        whose = "the index's" if call.startswith("index_") else "one name's"
+        if "repair_calendar" in call:
+            step = f"in the calendar repair of {whose} slices (decision 1)"
+        elif "_surface_config" in call:
+            step = f"in the fit of {whose} SVI surface"
+        else:
+            step = f"in `{call}`"
+        tail = (
+            ""
+            if call.startswith("index_")
+            else "; the log does not say which name; the index leg is not reached"
+        )
+        return f"{leg}, {step}: the SVI fit of a slice (`fit_svi_slice`) stops because the start value of its bounded least squares is outside the bounds{tail}; nothing is calibrated or priced"
+    return "step and leg not identified from the reason"
 
 
 # ----------------------------------------------------------------------------- the part
@@ -771,7 +862,7 @@ class Book:
         show_se: bool = True, study: bool = False, **kwargs: Any,
     ) -> str:  # fmt: skip
         kwargs.setdefault("budget", pc.BUDGETS["study"] if study else pc.BUDGETS["development"])
-        kwargs.setdefault("commit", "" if study else self.commit)
+        kwargs.setdefault("commit", STUDY_COMMIT if study else self.commit)
         kwargs.setdefault("source", self.source)
         if study and not kwargs.get("notes"):
             kwargs["notes"] = STUDY_NOTE
@@ -810,6 +901,15 @@ def build_markdown(
     priced = d["priced"].astype(bool)
     md_qs = [q for q in qs if q.in_md]
     n_of = dict(zip(sample_table["sample"], sample_table["n"], strict=True))
+    sample_def = dict(zip(sample_table["sample"], sample_table["definition"], strict=True))
+
+    def in_sample(sample: str) -> str:
+        """What a sample is, for the definition of a record (the records name it by its key)."""
+        return f" Sample `{sample}`: {sample_def[sample]}."
+
+    def unit_of(q: Quantity) -> str:
+        return CLIP_UNIT if q.key.startswith("clip_") else ""
+
     src = f"outputs/dispersion_lc/{rows_path.name} + outputs/dispersion/entries_3m.parquet (B1) + outputs/dispersion/model_s_3m.parquet → tables/C_history_summaries.csv"
 
     def stat_cell(q: Quantity, sample: str, stat: str, with_se: bool = True) -> str:
@@ -825,33 +925,44 @@ def build_markdown(
             )
             if np.isfinite(cell["mc_se"]):
                 notes = f"Monte Carlo standard error with the dates fixed, upper bound (seeds shared across dates): {cell['mc_se']:.2g}"
-            definition = f"{q.definition}. {kind}"
+            definition = f"{q.definition}. {kind}.{in_sample(sample)}"
         else:
-            definition = f"{q.definition}. {stat} over the dates of the sample"
+            definition = f"{q.definition}. {stat} over the dates of the sample.{in_sample(sample)}"
             notes = (
                 notes + "; " if notes else ""
             ) + "an order statistic across dates: no standard error given"
         return book.num(
             f"C.hist.{q.key}.{stat}.{sample}", f"{q.label}: {stat}, {sample}", cell["value"], cell["se"] if stat in ("mean", "pooled") else None,
-            digits=q.digits, show_se=with_se, study=q.study, definition=definition, n=cell["n"], notes=notes, source=src,
+            digits=q.digits, show_se=with_se, study=q.study, definition=definition, n=cell["n"], notes=notes, source=src, unit=unit_of(q),
         )  # fmt: skip
 
     def n_cell(sample: str) -> str:
         return book.num(f"C.hist.n_dates.{sample}", f"dates in the sample {sample}", n_of[sample], spec=".0f", definition=str(sample_table.set_index("sample").loc[sample, "definition"]), n=int(n_of[sample]), unit="dates", source=src)  # fmt: skip
 
-    def nw_cell(q: Quantity, sample: str) -> str:
+    def nw_cell(q: Quantity, sample: str, more: bool = False) -> str:
+        """The Newey-West error of the mean at ``NW_LAGS`` lags (with ``more``: also at
+        ``NW_MORE_LAGS``, after a slash each) and the lag-1 autocorrelation in brackets."""
         cell = table[(q.key, sample)].get("mean")
         if cell is None or not np.isfinite(cell["nw_se"]):
             return ""
         base = f"{q.definition}. Over the dates of the sample in their order"
+        longer = ", ".join(f"C.hist.{q.key}.mean_nw_se_{lags}.{sample}" for lags in NW_MORE_LAGS)
         nw = book.num(
             f"C.hist.{q.key}.mean_nw_se.{sample}", f"{q.label}: Newey-West standard error of the mean, {sample}", cell["nw_se"], spec=f".{q.digits}f", study=q.study,
-            definition=f"{base}: the Newey-West standard error of the mean (Bartlett kernel, {NW_LAGS} lags counted in consecutive dates of the sample, no small-sample factor)",
-            n=cell["n"], source=src, notes="a standard error of the mean across dates that allows for serial correlation: it has no standard error of its own",
+            definition=f"{base}: the Newey-West standard error of the mean (Bartlett kernel, {NW_LAGS} lags counted in consecutive dates of the sample, no small-sample factor).{in_sample(sample)}",
+            n=cell["n"], source=src,
+            notes=f"a standard error of the mean across dates that allows for serial correlation up to {NW_LAGS} rows of the sample: a lower value, the error still grows with the lag ({' and '.join(str(x) for x in NW_MORE_LAGS)} lags: {longer} where printed, and the summaries CSV); the lags are counted in rows of the sample, which has gaps; it has no standard error of its own",
         )  # fmt: skip
+        if more:
+            for lags in NW_MORE_LAGS:
+                nw += " / " + book.num(
+                    f"C.hist.{q.key}.mean_nw_se_{lags}.{sample}", f"{q.label}: Newey-West standard error of the mean at {lags} lags, {sample}", cell[f"nw_se_{lags}"], spec=f".{q.digits}f", study=q.study,
+                    definition=f"{base}: the Newey-West standard error of the mean (Bartlett kernel, {lags} lags counted in consecutive rows of the sample, which has gaps; no small-sample factor).{in_sample(sample)}",
+                    n=cell["n"], source=src, notes="a standard error of the mean across dates that allows for serial correlation: it has no standard error of its own",
+                )  # fmt: skip
         ac = book.num(
             f"C.hist.{q.key}.mean_lag1_autocorr.{sample}", f"{q.label}: lag-1 autocorrelation across dates, {sample}", cell["ac1"], spec="+.2f", study=q.study,
-            definition=f"{base}: Σ e_t e_(t−1) / Σ e_t², e the deviation from the mean of the sample", n=cell["n"], source=src, notes="a statistic of the series of dates: no standard error given",
+            definition=f"{base}: Σ e_t e_(t−1) / Σ e_t², e the deviation from the mean of the sample.{in_sample(sample)}", n=cell["n"], source=src, notes="a statistic of the series of dates: no standard error given",
         )  # fmt: skip
         return f"± {nw} ({ac})"
 
@@ -866,7 +977,7 @@ def build_markdown(
         )
         return book.num(
             f"C.hist.{q.key}.{stat}_mc_bound.{sample}", f"{q.label}: Monte Carlo bound of the {stat}, {sample}", cell["mc_se"], spec=f".{q.digits}f",
-            definition=f"{q.definition}. The Monte Carlo standard error of the {stat} with the dates fixed, an upper bound: the dates share the particle and pricing seeds, so the per-date errors are added linearly ({how})",
+            definition=f"{q.definition}. The Monte Carlo standard error of the {stat} with the dates fixed, an upper bound: the dates share the particle and pricing seeds, so the per-date errors are added linearly ({how}).{in_sample(sample)}",
             n=cell["n"], source=src, notes="a bound on a standard error: it has no standard error of its own",
         )  # fmt: skip
 
@@ -908,8 +1019,10 @@ def build_markdown(
     statuses = d["status"].value_counts().to_dict()
     stored = d["status_stored"].value_counts().to_dict()
     monthly_dates, s_converged = study_dates()
+    n_model_s_rows = len(pd.read_parquet(MODEL_S, columns=["date"]))
     table_dates = set(d["date"])
     absent = [x for x in monthly_dates if x not in table_dates]
+    failed_dates = d.loc[~priced, "date"].tolist()
     not_monthly = sorted(table_dates - set(monthly_dates))
     not_in_s = sorted(table_dates - s_converged)
     gate_fail = {k: d.loc[priced & ~truth(d[k]), "date"].tolist() for k in GATING_CHECKS}
@@ -958,18 +1071,31 @@ def build_markdown(
         "(column `names_within_2pct` of the per-date CSV; the gap is `names_gap`)." + today_status
     )
     add("")
+    # what F1 leaves empty although the study has it: the listed-variance forward needs the entry
+    # alone; model S has a number on its converged dates only
+    entries = pd.read_parquet(ENTRIES, columns=["date", "basket", "EQV", "EV"])
+    b1 = entries[entries["basket"] == "B1"].set_index("date")
+    no_line = [*absent, *failed_dates]
+    has_fwd = int(((b1.loc[no_line, "EQV"] > 0.0) & (b1.loc[no_line, "EV"] > 0.0)).sum())
+    f1_empty = (
+        f"the listed-variance forward is left empty although the study has it on {count('f1_empty_listed_fwd_in_study', 'failed dates and absent monthly dates on which the study has the listed-variance forward (EQV and EV of the B1 entry)', has_fwd)} of these {len(no_line)} dates (it needs the entry alone, not the LC run); "
+        f"model S is left empty on the {len(failed_dates)} failed dates although it converged on "
+        f"{count('failed_s_converged', 'failed dates of the table on which model S converged', len(set(failed_dates) & s_converged))} of them, "
+        f"and has no converged number on the {len(absent)} absent dates (it converged on {len(set(absent) & s_converged)} of them)."
+    )
     add(
-        f"Dates. The table's {len(d)} dates are the {count('table_in_model_s', 'dates of the table on which model S converged (model_s_3m, converged)', len(table_dates & s_converged))} dates on which model S converged (of the {count('model_s_converged_study', 'dates on which model S converged in model_s_3m', len(s_converged))} of `model_s_3m.parquet`) plus {', '.join(not_in_s) or 'none'}; "
+        f"Dates. The table's {len(d)} dates are the {count('table_in_model_s', 'dates of the table on which model S converged (model_s_3m, converged)', len(table_dates & s_converged))} dates on which model S converged (all {count('model_s_converged_study', 'dates on which model S converged in model_s_3m', len(s_converged))} converged dates of `model_s_3m.parquet`, which has {count('model_s_rows', 'rows of model_s_3m.parquet (one per date, converged or not)', n_model_s_rows)} rows) plus {', '.join(not_in_s) or 'none'}; "
         f"they are not all of the study's monthly dates. Of the study's {count('study_monthly', 'monthly B1 dates of the study (entries_3m, monthly)', len(monthly_dates))} monthly B1 dates (`entries_3m.parquet`, `monthly`), "
         f"{count('study_monthly_in_table', 'monthly B1 dates of the study that have a row in the table', len(monthly_dates) - len(absent))} have a row in the table and "
         f"{count('study_monthly_absent', 'monthly B1 dates of the study with no row in the table', len(absent))} have none: {', '.join(absent) or 'none'} "
         f"(model S converged on {count('study_monthly_absent_s_converged', 'monthly B1 dates with no row in the table on which model S converged', len(set(absent) & s_converged))} of them). "
         f'"All priced dates" is therefore conditional on model S converging, except for {TODAY}, and the sample "∩ model S converged" differs from it by that date only. '
-        f"In the table and not flagged monthly in the entries: {', '.join(not_monthly) or 'none'}."
+        f"In the table and not flagged monthly in the entries: {', '.join(not_monthly) or 'none'}. "
+        f"Figure F1 draws nothing on the {len(absent)} monthly dates with no row and on the {int((~priced).sum())} failed dates: {f1_empty}"
     )
     add("")
     add(
-        "Files: `tables/C_history_by_date.csv` (per date), `tables/C_history_summaries.csv` (long: quantity, sample, statistic, value, se, mc_se, nw_se, lag1_autocorr, n), "
+        "Files: `tables/C_history_by_date.csv` (per date), `tables/C_history_summaries.csv` (long: quantity, sample, statistic, value, se, mc_se, nw_se, lag1_autocorr, n, nw_se_12, nw_se_24), "
         "`tables/C_history_samples.csv`, `tables/C_history_regression.csv`, `figures/F1_forward_over_copula.pdf/.csv`, `figures/F2_calls_over_copula_by_strike.pdf/.csv`."
     )
     add("")
@@ -991,6 +1117,7 @@ def build_markdown(
         "C.hist.clip_tercile_bound.low",
         "clipped mass inside ±2.5 sd: 1/3 quantile on all priced dates",
         lo,
+        unit=CLIP_UNIT,
         definition=f"the 1/3 quantile of clip_inner_max over all priced dates (linear interpolation); clip_inner_max: {CLIP_DEF}",
         n=int(n_of["all"]),
         source=src,
@@ -999,27 +1126,32 @@ def build_markdown(
         "C.hist.clip_tercile_bound.high",
         "clipped mass inside ±2.5 sd: 2/3 quantile on all priced dates",
         hi,
+        unit=CLIP_UNIT,
         definition=f"the 2/3 quantile of clip_inner_max over all priced dates (linear interpolation); clip_inner_max: {CLIP_DEF}",
         n=int(n_of["all"]),
         source=src,
     )
     add(
         f"A date is priced when its status is not `failed`; flagged when a name is kept unscreened (`n_names_unscreened > 0`). Terciles of the clipped mass inside ±2.5 sd (`clip_inner_max`: the larger of the two one-sided clipped masses, not their sum; C.1) on all priced dates: "
-        f"low ≤ {lo_s} < middle ≤ {hi_s} < high; the samples without flagged dates keep these bounds. Model S numbers are used on its converged dates only (the study's convention)."
+        f"low ≤ {lo_s} < middle ≤ {hi_s} < high (fractions of the particles: {100 * lo:.2f} % and {100 * hi:.2f} %; sections A and B print the clipped mass in %); the samples without flagged dates keep these bounds. Model S numbers are used on its converged dates only (the study's convention)."
     )
     add("")
     failed = d[d["status"] == "failed"]
     add(
         md_table(
-            ["failed date", "reason"],
-            [[r["date"], r["reason"]] for _, r in failed.iterrows()],
-            "ll",
+            ["failed date", "what failed (step, leg)", "exception text (`reason` of the per-date CSV)"],
+            [[r["date"], failure_clause(r["date"], r["reason"]), r["reason"]] for _, r in failed.iterrows()],
+            "lll",
         )
         if len(failed)
         else "No failed date."
-    )
+    )  # fmt: skip
     add("")
-    add("Failed dates: no number of the run; they stay in the per-date CSV with the reason.")
+    add(
+        "Failed dates: no number of the run; they stay in the per-date CSV with the exception text (`reason`). "
+        f"The step and the leg are read from the traceback of the run's log of the date (`outputs/dispersion_lc/logs/{RUN_LOGS.name}/<date>.log`) and the code path it names "
+        "(`scripts/lcm_price.py` → `volsto/studies/disp_lc.py::lc_spec_from_smiles`: each name's smile is screened, repaired and fitted in turn, then the index's is screened and fitted): all three dates stop while the model's inputs (the SVI surfaces) are built, before the local correlation is calibrated."
+    )
     add("")
     flagged = d[priced & truth(d["flag_unscreened"])]
     if len(flagged):
@@ -1059,13 +1191,31 @@ def build_markdown(
     wing = priced & truth(d["wing_binds"])
     wing_err = wing & truth(d["index_error_above_gate"])
     ok_dates = priced & (d["status"] == "ok")
-    worst_ok = d.loc[d.loc[ok_dates, "idx_err_90"].astype(float).idxmin()]
+    e90 = d.loc[ok_dates, "idx_err_90"].astype(float)
+    eatm = d.loc[ok_dates, "idx_err_atm"].astype(float)
+    worst_ok = d.loc[e90.idxmin()]
+    worst_atm = d.loc[eatm.abs().idxmax()]
+    target = "its target (the model's own SVI fit of the DJX smile, not the study's listed vols)"
+    err_def = f"the model's index implied volatility minus {target}, in vol points"
+    by_csv = "tables/C_history_by_date.csv"
+
+    def ok_count(column: str, level: float) -> str:
+        v = e90 if column == "idx_err_90" else eatm
+        tag = f"ok_{column}_above_{level:g}".replace(".", "p")
+        return count(tag, f"dates with status ok on which |{column}| exceeds {level:g} vol points ({column}: {err_def})", int((v.abs() > level).sum()))  # fmt: skip
+
     add(
-        f"What `ok` means for the index. The index gate `check_index` asks the model's index smile within {INDEX_GATE_VP:g} vol points of the listed one at the money and at the 90 % strike (`idx_err_atm`, `idx_err_90`), "
-        f"and is waived when the wing binds (`wing_binds`: `clip_inner_max` above {CLIP_FLAG_MASS:g}). The wing binds on {count('wing_binds', 'priced dates on which the wing binds (clip_inner_max > 0.01): the index gate is waived', int(wing.sum()))} of the {int(priced.sum())} priced dates; "
-        f"on {count('wing_binds_index_error_above_gate', 'priced dates on which the wing binds and |idx_err_atm| or |idx_err_90| exceeds 0.15 vol points', int(wing_err.sum()))} of those |`idx_err_atm`| or |`idx_err_90`| exceeds {INDEX_GATE_VP:g} vol points "
-        f"(the lowest `idx_err_90` on an `ok` date: {book.num('C.hist.idx_err_90.min_ok', 'lowest idx_err_90 on a date with status ok', float(worst_ok['idx_err_90']), spec='+.2f', unit='vol points', date=str(worst_ok['date']), definition='`idx_err_90` of the row: the model index implied volatility minus the listed one at the 90 % strike, in vol points; the minimum over the dates with status ok', source='tables/C_history_by_date.csv', notes='the Monte Carlo error of the date is the column `idx_err_90_se` of the source table; not read here')} vol points, on {worst_ok['date']}); "
-        f"`check_index` fails on {len(gate_fail['check_index'])}. Status `ok` therefore does not mean that the index smile is repriced at the 90 % strike."
+        f"What `ok` means for the index. The index gate `check_index` asks the model's index smile within {INDEX_GATE_VP:g} vol points of {target} at the money and at 90 % of the forward "
+        "(`idx_err_atm`, `idx_err_90`: the model's index implied volatility minus that target, in vol points), "
+        f"and is waived when the wing binds (`wing_binds`: `clip_inner_max` above {CLIP_FLAG_MASS:g}, i.e. {pct(CLIP_FLAG_MASS)} of the particles). The wing binds on {count('wing_binds', 'priced dates on which the wing binds (clip_inner_max > 0.01): the index gate is waived', int(wing.sum()))} of the {int(priced.sum())} priced dates; "
+        f"on {count('wing_binds_index_error_above_gate', 'priced dates on which the wing binds and |idx_err_atm| or |idx_err_90| exceeds 0.15 vol points', int(wing_err.sum()))} of those |`idx_err_atm`| or |`idx_err_90`| exceeds {INDEX_GATE_VP:g} vol points; "
+        f"`check_index` fails on {len(gate_fail['check_index'])}. "
+        f"On the {int(ok_dates.sum())} `ok` dates: |`idx_err_90`| exceeds {INDEX_GATE_VP:g} vol points on {ok_count('idx_err_90', INDEX_GATE_VP)}, 0.5 on {ok_count('idx_err_90', 0.5)} and 1 on {ok_count('idx_err_90', 1.0)} "
+        f"(median `idx_err_90` {book.num('C.hist.idx_err_90.median_ok', 'median idx_err_90 over the dates with status ok', float(e90.median()), spec='+.2f', unit='vol points', definition=f'`idx_err_90` of the row: {err_def}, at 90 % of the forward; the median over the dates with status ok', n=int(ok_dates.sum()), source=by_csv, notes='an order statistic across dates: no standard error given')} vol points; "
+        f"the lowest: {book.num('C.hist.idx_err_90.min_ok', 'lowest idx_err_90 on a date with status ok', float(worst_ok['idx_err_90']), spec='+.2f', unit='vol points', date=str(worst_ok['date']), definition=f'`idx_err_90` of the row: {err_def}, at 90 % of the forward; the minimum over the dates with status ok', source=by_csv, notes='the Monte Carlo error of the date is the column `idx_err_90_se` of the source table; not read here')} vol points, on {worst_ok['date']}); "
+        f"|`idx_err_atm`| exceeds {INDEX_GATE_VP:g} vol points on {ok_count('idx_err_atm', INDEX_GATE_VP)} "
+        f"(the largest in size: {book.num('C.hist.idx_err_atm.max_abs_ok', 'idx_err_atm of largest size on a date with status ok', float(worst_atm['idx_err_atm']), spec='+.2f', unit='vol points', date=str(worst_atm['date']), definition=f'`idx_err_atm` of the row: {err_def}, at the money; the value of largest absolute size over the dates with status ok', source=by_csv, notes='the Monte Carlo error of the date is the column `idx_err_atm_se` of the source table; not read here')} vol points, on {worst_atm['date']}). "
+        f"Status `ok` therefore does not mean that the model's index smile is within {INDEX_GATE_VP:g} vol points of that target, at the money or at 90 % of the forward."
     )
     add("")
     # the index second moment against the listed strip
@@ -1123,7 +1273,8 @@ def build_markdown(
         )
         + f". \"Without the flagged dates\" removes only the {int(n_of['all']) - int(n_of['all_unflagged'])} dates on which a name is kept unscreened: "
         f"{count('names_outside_2pct_unflagged', 'priced dates with the names diagnostic outside 2 % that are not flagged (they stay in the summaries without the flagged dates)', unflagged_out)} of the {int(names_out.sum())} dates stay in every summary without the flagged dates. "
-        "C.2c gives the rows this moves on the dates inside 2 %."
+        "C.2c gives the rows this moves on the dates inside 2 %. "
+        "Section V4 measures in which region of strikes the names' second moment under LC exceeds the listed strips; section V3 is the caveat on the high-strike calls (rows call 1.25× and 1.5× below)."
     )
     add("")
     # ---------------------------------------------------------------- C.1 definitions
@@ -1149,29 +1300,48 @@ def build_markdown(
         'the Monte Carlo error with the dates fixed is the column `mc_se` of the summaries CSV (an upper bound: the dates share the seeds), printed in C.2 as "MC bound".'
     )
     add("")
+    last = NW_MORE_LAGS[-1]
     factors = {
-        smp: [table[(k, smp)]["mean"]["nw_se"] / table[(k, smp)]["mean"]["se"] for k in HEADLINE]
+        (smp, lags): [table[(k, smp)]["mean"]["nw_se" if lags == NW_LAGS else f"nw_se_{lags}"] / table[(k, smp)]["mean"]["se"] for k in HEADLINE]
         for smp in ("all", "all_unflagged")
-    }
+        for lags in (NW_LAGS, last)
+    }  # fmt: skip
 
-    def factor(which: str, smp: str) -> str:
-        value = min(factors[smp]) if which == "min" else max(factors[smp])
+    def factor(which: str, smp: str, lags: int = NW_LAGS) -> str:
+        value = min(factors[(smp, lags)]) if which == "min" else max(factors[(smp, lags)])
+        stem = "nw_over_se" if lags == NW_LAGS else f"nw{lags}_over_se"
         return book.num(
-            f"C.hist.nw_over_se.{which}.{smp}", f"Newey-West error over the printed across-dates error of the mean: {which} over the headline rows, {smp}", value, spec=".1f",
-            definition=f"nw_se / se of the mean, the {which} over the rows {', '.join(by_key[k].label for k in HEADLINE)}, sample {smp}", n=int(n_of[smp]), source=src,
+            f"C.hist.{stem}.{which}.{smp}", f"Newey-West error at {lags} lags over the printed across-dates error of the mean: {which} over the headline rows, {smp}", value, spec=".1f",
+            definition=f"the Newey-West standard error of the mean at {lags} lags over its across-dates standard error sd/√n, the {which} over the rows {', '.join(by_key[k].label for k in HEADLINE)}.{in_sample(smp)}", n=int(n_of[smp]), source=src,
         )  # fmt: skip
 
+    # the gaps of the sample in which the lags are counted (rows, not months)
+    days = pd.to_datetime(d.loc[priced, "date"]).diff().dt.days.dropna()
+    n_gaps = count("gaps_all_priced", f"pairs of consecutive priced dates more than {GAP_DAYS} calendar days apart", int((days > GAP_DAYS).sum()))  # fmt: skip
+    longest = book.num("C.hist.longest_gap_days.all", "longest gap between two consecutive priced dates", float(days.max()), spec=".0f", unit="calendar days", definition="the largest difference in calendar days between two consecutive dates of the sample of all priced dates", n=int(n_of["all"]), source=src, notes="a count of days")  # fmt: skip
+    lag_list = f"{NW_LAGS}, {' and '.join(str(x) for x in NW_MORE_LAGS)}"
+    # the headline rows on which the error of the mean still grows from the shortest to the longest lag
+    growth = {k: table[(k, "all")]["mean"][f"nw_se_{last}"] / table[(k, "all")]["mean"]["nw_se"] for k in HEADLINE}  # fmt: skip
+    grows = [by_key[k].label for k in HEADLINE if growth[k] > 1.10]
+    flat = [by_key[k].label for k in HEADLINE if growth[k] <= 1.10]
+    grows_s = f"On all priced dates the {last}-lag error is more than 10 % above the {NW_LAGS}-lag one on the rows {', '.join(grows) or 'none'}" + (f"; not on {', '.join(flat)}" if flat else "") + "."  # fmt: skip
     add(
-        "Serial correlation. The printed ± of a mean treats the monthly dates as independent; the entries are monthly, the trade lasts three months, and the series are serially correlated. "
-        f"The Newey-West standard error of the mean (Bartlett kernel, {NW_LAGS} lags counted in consecutive dates of the sample) is given in C.2 for the rows {', '.join(by_key[k].label for k in HEADLINE)}, with the lag-1 autocorrelation: "
-        f"on these rows the printed ± is {factor('min', 'all')} to {factor('max', 'all')} times smaller than the Newey-West error on all priced dates ({factor('min', 'all_unflagged')} to {factor('max', 'all_unflagged')} times without the flagged dates). "
-        "The tables by sample (C.3–C.5), the pooled ratios and C.6 print the independent-dates ± only; the Newey-West error of every mean is the column `nw_se` of the summaries CSV (for a half or a tercile the lags are counted in consecutive dates of that sample)."
+        "Serial correlation. The printed ± of a mean treats the dates as independent; the entries are monthly, the trade lasts three months, and the series are serially correlated. "
+        f"The Newey-West standard error of the mean (Bartlett kernel) is given in C.2a and C.2b at {lag_list} lags for the rows {', '.join(by_key[k].label for k in HEADLINE)}, with the lag-1 autocorrelation. "
+        f"Newey-West at {NW_LAGS} lags is a lower value: the error still grows with the lag ({' and '.join(str(x) for x in NW_MORE_LAGS)} lags shown); lags are counted in rows of the sample, which has gaps. "
+        f"{grows_s} "
+        f"The gaps: on all priced dates {n_gaps} pairs of consecutive rows are more than {GAP_DAYS} calendar days apart, the longest {longest} days. "
+        f"Over the {len(HEADLINE)} rows the Newey-West error on all priced dates is {factor('min', 'all')} to {factor('max', 'all')} times the printed ± at {NW_LAGS} lags and {factor('min', 'all', last)} to {factor('max', 'all', last)} times at {last} lags "
+        f"({factor('min', 'all_unflagged')} to {factor('max', 'all_unflagged')} times and {factor('min', 'all_unflagged', last)} to {factor('max', 'all_unflagged', last)} times without the flagged dates). "
+        f"The tables by sample (C.3–C.5), the pooled ratios and C.6 print the independent-dates ± only; C.2c prints the {NW_LAGS}-lag error only; the Newey-West error of every mean is in the summaries CSV "
+        f"(columns `nw_se` at {NW_LAGS} lags, {', '.join(f'`nw_se_{x}`' for x in NW_MORE_LAGS)}; for a half, a tercile or a restricted sample the lags are counted in consecutive rows of that sample)."
     )
     add("")
     low_larger = int((priced & (d["clip_larger_side"] == "low")).sum())
     high_larger = int((priced & (d["clip_larger_side"] == "high")).sum())
     add(
         f"Clipped mass. `clip_inner_max` is {CLIP_DEF} (the two maxima need not be at the same slice). "
+        "Unit: in this part and in section D the clipped masses are fractions of the particles (0.10 = 10 % of the particles); sections A and B print the same masses in %. "
         f"The lower bound (λ = 0) is the larger side on {count('clip_low_larger', 'priced dates on which clip_low_inner_max > clip_high_inner_max', low_larger)} of the {int(priced.sum())} priced dates, "
         f"the cap on {count('clip_high_larger', 'priced dates on which clip_high_inner_max > clip_low_inner_max', high_larger)}, and the two are equal on {count('clip_sides_equal', 'priced dates on which the two one-sided clipped masses are equal', int(priced.sum()) - low_larger - high_larger)} (column `clip_larger_side`). "
         "The terciles of C.0, the regressor of C.7 and the flags `flag_clip_low` / `flag_clip_high` use these columns as defined here."
@@ -1188,12 +1358,12 @@ def build_markdown(
         for q in md_qs:
             n_q = table[(q.key, sample)].get("mean", {}).get("n", 0)
             rows.append([
-                q.label, f"{n_q:d}", stat_cell(q, sample, "mean"), nw_cell(q, sample) if q.key in HEADLINE else "", mc_cell(q, sample, "mean"),
+                q.label, f"{n_q:d}", stat_cell(q, sample, "mean"), nw_cell(q, sample, more=True) if q.key in HEADLINE else "", mc_cell(q, sample, "mean"),
                 *(stat_cell(q, sample, s) for s in ("q25", "median", "q75", "min", "max")), stat_cell(q, sample, "pooled") if q.num else "", mc_cell(q, sample, "pooled") if q.num else "",
             ])  # fmt: skip
         add(
             md_table(
-                ["quantity", "n", "mean ± se", "± Newey-West (lag-1 autocorrelation)", "MC bound, mean", "q25", "median", "q75", "min", "max", "pooled ± se", "MC bound, pooled"],
+                ["quantity", "n", "mean ± se", f"± Newey-West at {lag_list.replace(', ', ' / ').replace(' and ', ' / ')} lags (lag-1 autocorrelation)", "MC bound, mean", "q25", "median", "q75", "min", "max", "pooled ± se", "MC bound, pooled"],
                 rows,
             )
         )  # fmt: skip
@@ -1203,12 +1373,16 @@ def build_markdown(
             for stat in ("mean", "pooled"):
                 cell = table[(q.key, sample)].get(stat)
                 if cell is not None and np.isfinite(cell["mc_se"]) and cell["mc_se"] > cell["se"]:
+                    dg = q.digits  # one more digit while the two print alike
+                    while dg < q.digits + 4 and f"{cell['mc_se']:.{dg}f}" == f"{cell['se']:.{dg}f}":
+                        dg += 1
                     above.append(
-                        f"{q.label} ({stat}: {cell['mc_se']:.{q.digits}f} against {cell['se']:.{q.digits}f})"
+                        f"{q.label} ({stat}: {cell['mc_se']:.{dg}f} against {cell['se']:.{dg}f})"
                     )
         add(
             "Per-date quantities over the dates of the sample; pooled = Σ numerator / Σ denominator over the same dates; n is smaller for model S (converged dates only). "
-            f"± Newey-West: the standard error of the mean with the Bartlett kernel and {NW_LAGS} lags, for the headline rows, with the lag-1 autocorrelation of the series in brackets. "
+            f"± Newey-West: the standard error of the mean with the Bartlett kernel at {lag_list} lags, for the headline rows, with the lag-1 autocorrelation of the series in brackets. "
+            f"Newey-West at {NW_LAGS} lags is a lower value: the error still grows with the lag ({' and '.join(str(x) for x in NW_MORE_LAGS)} lags shown; C.1 names the rows on which it does); lags are counted in rows of the sample, which has gaps (C.1). "
             "MC bound: the Monte Carlo standard error with the dates fixed, an upper bound; the dates share their seeds, so this error does not average out over the dates and is not contained in the across-dates ±; "
             "empty for the study's numbers and for the clipped masses, which carry no Monte Carlo error here. "
             f"The MC bound is larger than the across-dates ± for: {'; '.join(above) or 'no row'}."
@@ -1252,7 +1426,7 @@ def build_markdown(
             ("lc_over_cc", "lc_over_copula", "cc_over_copula", "s_over_copula", "listed_fwd_ratio"),
             (("all", "all priced dates"), ("all_index10", f"without the {n10} dates more than {pct(INDEX_MOMENT_FLAG)} from the listed strip"), ("all_index15", f"without the {n15} dates more than {pct(INDEX_MOMENT_LIST)} from the listed strip")),
             f"Without the dates where the model's index second moment is more than {pct(INDEX_MOMENT_FLAG)} ({pct(INDEX_MOMENT_LIST)}) from the listed strip: |basket part / M_B^listed| > {INDEX_MOMENT_FLAG:g} ({INDEX_MOMENT_LIST:g}), C.0. "
-            "± is the standard error across dates (independent dates); the Newey-West column is as in C.2. Model S rows: its converged dates within the sample.",
+            f"± is the standard error across dates (independent dates); the Newey-West column is at {NW_LAGS} lags, a lower value as in C.2 (the error still grows with the lag on the rows named in C.1; {', '.join(f'`nw_se_{x}`' for x in NW_MORE_LAGS)} of the summaries CSV; the rows of a restricted sample are further apart in time). Model S rows: its converged dates within the sample.",
         ),
         (
             ("EV_over_EQV_lc", "kappa_lc", "EV_single_part", "EV_basket_part", "C_lc_over_copula_150", "lc_over_cc", "lc_over_copula"),
@@ -1268,7 +1442,7 @@ def build_markdown(
             for sample, label in sample_labels:
                 n_q = table[(q.key, sample)].get("mean", {}).get("n", 0)
                 rows.append([q.label, label, f"{n_q:d}", stat_cell(q, sample, "mean"), nw_cell(q, sample) if q.key in HEADLINE else "", *(stat_cell(q, sample, s) for s in ("q25", "median", "q75", "min", "max"))])  # fmt: skip
-        add(md_table(["quantity", "sample", "n", "mean ± se", "± Newey-West (lag-1 autocorrelation)", "q25", "median", "q75", "min", "max"], rows, "llrrrrrrrr"))  # fmt: skip
+        add(md_table(["quantity", "sample", "n", "mean ± se", f"± Newey-West at {NW_LAGS} lags (lag-1 autocorrelation)", "q25", "median", "q75", "min", "max"], rows, "llrrrrrrrr"))  # fmt: skip
         add("")
         add(sentence)
         add("")
@@ -1320,7 +1494,7 @@ def build_markdown(
         rows = []
         for tag, label, values, extra in runs:
             rows.append([label, *(book.num(f"C.b.{tag}.{k}", f"{by_key[k].label}, {TODAY}: {label}", values[k][0], values[k][1], digits=6, date=TODAY, definition=by_key[k].definition, **{"source": "tables/C_history_by_date.csv", **extra}) for k in keys_b)])  # fmt: skip
-        rows.append(["the owner's arithmetic", "", *(book.num(f"C.b.owner.{k}", f"{by_key[k].label}, {TODAY}: the owner's arithmetic", OWNER_B[k], date=TODAY, definition="the owner's arithmetic of check (b), as written in the request (4 decimals)", budget="the owner's arithmetic (not computed here)", commit="", source="the owner's request, check (b)") for k in keys_b[1:])])  # fmt: skip
+        rows.append(["the owner's arithmetic", "", *(book.num(f"C.b.owner.{k}", f"{by_key[k].label}, {TODAY}: the owner's arithmetic", OWNER_B[k], date=TODAY, definition="the owner's arithmetic of check (b), as written in the request (4 decimals)", budget="the owner's arithmetic (not computed here)", commit="none: the owner's arithmetic, not computed by code", source="the owner's request, check (b)") for k in keys_b[1:])])  # fmt: skip
         for tag, label, values, extra in runs:
             cells = []
             for k in keys_b[1:]:
@@ -1341,6 +1515,15 @@ def build_markdown(
             at = [tag for tag, *_ in runs].index("today_production")
             today_sentence += f"; the production row at the new defaults (decisions 1–2 and 5 on, section A's row) gives {rows[at][2]} and {rows[at][3]}"
         today_sentence += f"; the owner's arithmetic is {OWNER_B['lc_over_copula']:.4f} and {OWNER_B['cc_over_copula']:.4f}"
+        # which of today's rows gives the owner's two numbers at the 4 decimals they are written to
+        same = [label.split(" (")[0] for _tag, label, values, _extra in runs if all(f"{values[k][0]:.4f}" == f"{OWNER_B[k]:.4f}" for k in keys_b[1:])]  # fmt: skip
+        owner_s = (
+            f" Of the {len(runs)} rows of {TODAY} above, the owner's {OWNER_B['lc_over_copula']:.4f} and {OWNER_B['cc_over_copula']:.4f} are reproduced at their 4 decimals by "
+            + (" and ".join(f"the row «{x}»" for x in same) if same else "none of the rows")
+            + "; the other rows differ from them by the amounts of the table (old against new defaults, development against production budget)."
+        )
+        if new is not None:
+            owner_s += f" The row to quote for {TODAY} is section A's row: the production budget with decisions 1–2 and 5 on (LC/copula {rows[at][2]}, CC/copula {rows[at][3]}); the two other rows are shown for the comparison only."
         s_today = (
             ""
             if bool(t["model_s_converged"])
@@ -1354,6 +1537,7 @@ def build_markdown(
                 if new is not None
                 else ""
             )
+            + owner_s
             + s_today
         )
     else:
@@ -1401,12 +1585,13 @@ def build_markdown(
     add("")
     reg_src = "tables/C_history_regression.csv"
 
-    def fit_cells(sample: str, key: str, label: str, fit: dict[str, Any], j: int, term: str, with_nw: bool = False) -> list[str]:  # fmt: skip
+    def fit_cells(sample: str, key: str, label: str, fit: dict[str, Any], j: int, term: str, with_nw: bool = False, y_text: str = "y = LC/CC − P_D_S/P_D", on: str = "") -> list[str]:  # fmt: skip
         """The cells of one term of a fit (coefficient, classical se and t, HC1 se and t, R² and
-        n on the first term; the Newey-West se and t when asked), each filed as a record."""
+        n on the first term; the Newey-West se and t when asked), each filed as a record.
+        ``y_text`` names the regressand and ``on`` the regressors when the label does not."""
         base = f"C.d.{sample}.{key}.{term}"
         what = f"check (d), {label}, {sample}: {term}"
-        defn = f"OLS with an intercept of y = LC/CC − P_D_S/P_D on {label}; n = {fit['n']} dates"
+        defn = f"OLS with an intercept of {y_text} on {on or label}; n = {fit['n']} dates.{in_sample(sample)} The clipped mass is a fraction of the particles: a coefficient on it is per unit of that fraction"
         coef = book.num(f"{base}.coef", f"{what}, coefficient", fit["coef"][j], fit["se"][j], spec="+.5g", definition=defn + "; se: classical", n=fit["n"], source=reg_src, notes=f"HC1 standard error {fit['se_hc1'][j]:.4g}")  # fmt: skip
         se = f"{fit['se'][j]:.4g}"
         t = book.num(f"{base}.t", f"{what}, t (classical)", fit["t"][j], spec="+.2f", definition=defn + "; coefficient over its classical standard error", n=fit["n"], source=reg_src)  # fmt: skip
@@ -1446,7 +1631,7 @@ def build_markdown(
         )
         add("")
         add(
-            "OLS with an intercept of y = LC/CC − P_D_S/P_D across the dates where model S converged; `clip_inner_max` = clipped mass inside ±2.5 sd (the larger of the two one-sided masses, not their sum; C.1), "
+            "OLS with an intercept of y = LC/CC − P_D_S/P_D across the dates where model S converged; `clip_inner_max` = clipped mass inside ±2.5 sd, a fraction of the particles (the larger of the two one-sided masses, not their sum; C.1): its coefficient is per unit of that fraction, a tenth of it per 0.10 of clipped mass (10 % of the particles); "
             "`EV_basket_part` = E_LC[R̄²] − M_B^listed, `EV_basket_part_rel_MB` = that over M_B^listed; the regressors are the dates' Monte Carlo estimates."
         )
         add("")
@@ -1477,9 +1662,70 @@ def build_markdown(
         f"Newey-West: Bartlett kernel, {NW_LAGS} lags counted in consecutive dates of the sample, with the factor n/(n − k) of HC1 (with no lag it is HC1). The classical and HC1 columns of the first sample are those of C.7a."
     )
     add("")
+    # the two legs of the regressand on the clipped mass alone, on the same dates
+    add("**C.7d The two legs of y, each on the clipped mass alone, and their means by tercile of the clipped mass**")  # fmt: skip
+    add("")
+    rows = []
+    n_legs = fits[("S", LEG_FITS[0][0])]["n"]
+    for key, column, label in LEG_FITS:
+        fit = fits[("S", key)]
+        y_text = f"{by_key[column].label} ({by_key[column].definition})"
+        for j, term in enumerate(fit["names"]):
+            rows.append([label if j == 0 else "", term, *fit_cells("S", key, label, fit, j, term, y_text=y_text, on="the clipped mass alone (`clip_inner_max`)")])  # fmt: skip
+    add(
+        md_table(
+            ["fit", "term", "coefficient", "se classical", "t", "se HC1", "t HC1", "R²", "n"],
+            rows,
+            "llrrrrrrr",
+        )
+    )
+    add("")
+    terciles = (("clip_low", "low"), ("clip_mid", "middle"), ("clip_high", "high"))
+    leg_means: dict[str, list[str]] = {}
+    rows = []
+    for _key, column, _label in LEG_FITS:
+        q = by_key[column]
+        cells = []
+        for terc, terc_label in terciles:
+            v = d.loc[masks["S"] & masks[terc], column].astype(float)
+            cells.append(book.num(
+                f"C.d.legs.S.{column}.mean.{terc}", f"{q.label}: mean over the dates of check (d) in the {terc_label} tercile of the clipped mass", float(v.mean()), float(v.std(ddof=1) / math.sqrt(len(v))), study=q.study,
+                definition=f"{q.definition}. Mean over the dates of the sample `S` ({sample_def['S']}) that are in the sample `{terc}` ({sample_def[terc]}); se across dates (sd/√n, independent dates)",
+                n=len(v), source="tables/C_history_by_date.csv", notes=STUDY_NOTE if q.study else "the ± is the standard error across dates; the Monte Carlo error of the dates is not in it",
+            ))  # fmt: skip
+        leg_means[column] = cells
+        rows.append([q.label, *cells])
+    n_terc = [int((masks["S"] & masks[terc]).sum()) for terc, _ in terciles]
+    # the priced dates of a tercile that are not in the sample of check (d) (no model S number)
+    not_s = [
+        f"its {x} tercile also has {', '.join(d.loc[masks[terc] & ~masks['S'], 'date'])}, which has no model S number"
+        for terc, x in terciles
+        if (masks[terc] & ~masks["S"]).any()
+    ]
+    rows.insert(0, ["n dates", *(f"{x:d}" for x in n_terc)])
+    add(md_table(["mean ± se across dates", *(f"clipped mass: {x} tercile" for _, x in terciles)], rows))  # fmt: skip
+    add("")
+    add(
+        f"The same {n_legs} dates as C.7a. First table: OLS with an intercept of each leg of y on the clipped mass alone (y = LC/CC − S/copula, so the two slopes differ by the slope of y on the clipped mass alone, C.7a). "
+        "Second table: the mean of each leg over the dates of the intersection in each tercile of the clipped mass (the bounds of C.0, set on all priced dates); ± is the standard error across dates (independent dates). "
+        + (
+            f"C.3a's tercile columns are on all priced dates: {'; '.join(not_s)}, so the LC/CC mean of that column is not the one of this table. "
+            if not_s
+            else ""
+        )
+        + "The clipped mass is a fraction of the particles."
+    )
+    add("")
     add(agreement[0])
+    check_d_file = check_d_path()
+    check_d_cited = "" if check_d_file is None else check_d_source(check_d_file)
+    check_d_notes = "a count or a difference of the comparison, not a Monte Carlo estimate; " + (
+        "the source is the copy kept in the package of the checking session's results file"
+        if check_d_file == CHECK_D_PACKAGE
+        else "the source is a session scratch file, not part of the package"
+    )
     for tag, value in agreement[1].items():
-        book.num(f"C.d.independent_check.{tag}", f"check (d) against the independent check: {tag.replace('_', ' ')}", value, definition="the fits of this section compared with the independent check's results file, number by number, at its 6 significant digits", source=str(CHECK_D_JSON), notes="a count or a difference of the comparison, not a Monte Carlo estimate; the source is a session scratch file, not part of the package")  # fmt: skip
+        book.num(f"C.d.independent_check.{tag}", f"check (d) against the independent check: {tag.replace('_', ' ')}", value, definition="the fits of this section compared with the independent check's results file, number by number, at its 6 significant digits", source=check_d_cited, notes=check_d_notes)  # fmt: skip
     add("")
     # measured statements
     main, clip_only, bp_only = fits[("S", "rel")], fits[("S", "clip")], fits[("S", "bp_rel")]
@@ -1498,7 +1744,18 @@ def build_markdown(
         f"and on the basket part over M_B^listed {term_s(main, 2, nw=True)}, "
         f"intercept {main['coef'][0]:+.4f} (HC1 se {main['se_hc1'][0]:.4f}), R² {main['r2']:.4f}. "
         f"The clipped mass alone: R² {clip_only['r2']:.4f}; the basket part over M_B^listed alone: R² {bp_only['r2']:.4f}. "
-        f"Without the flagged dates (n = {fits[('S_unflagged', 'rel')]['n']}): {fits[('S_unflagged', 'rel')]['coef'][1]:+.4f} and {fits[('S_unflagged', 'rel')]['coef'][2]:+.4f}, R² {fits[('S_unflagged', 'rel')]['r2']:.4f}."
+        f"Without the flagged dates (n = {fits[('S_unflagged', 'rel')]['n']}): {fits[('S_unflagged', 'rel')]['coef'][1]:+.4f} and {fits[('S_unflagged', 'rel')]['coef'][2]:+.4f}, R² {fits[('S_unflagged', 'rel')]['r2']:.4f}. "
+        f"Unit: the clipped mass is a fraction of the particles, so {main['coef'][1]:+.4f} is per unit of that fraction: "
+        f"{book.num('C.d.S.rel.clip_inner_max.coef_per_10_points', 'check (d), clipped mass + basket part / M_B^listed, S: coefficient on the clipped mass per 10 points of clipped mass', 0.1 * main['coef'][1], 0.1 * main['se'][1], spec='+.4f', definition='0.1 × the coefficient on `clip_inner_max` (a fraction of the particles) of the two-regressor fit of y = LC/CC − P_D_S/P_D: the change of y per 10 % of the particles clipped; se: 0.1 × the classical standard error', n=main['n'], source=reg_src, notes=f'0.1 × the HC1 standard error: {0.1 * main["se_hc1"][1]:.4g}')} per 0.10 of clipped mass (10 % of the particles)."
+    )
+    add("")
+    leg_lc, leg_s = fits[("S", "leg_lc_over_cc")], fits[("S", "leg_s_over_copula")]
+    add(
+        f"By leg (C.7d), on the same {main['n']} dates, each leg on the clipped mass alone: LC/CC has slope {leg_lc['coef'][1]:+.3f} (HC1 se {leg_lc['se_hc1'][1]:.3f}), R² {leg_lc['r2']:.3f}; "
+        f"S/copula has slope {leg_s['coef'][1]:+.3f} (HC1 se {leg_s['se_hc1'][1]:.3f}), R² {leg_s['r2']:.2f}. "
+        f"Means by tercile of the clipped mass (low, middle, high): LC/CC {', '.join(leg_means['lc_over_cc'])}; S/copula {', '.join(leg_means['s_over_copula'])}. "
+        "The relation of the difference y with the clipped mass is therefore model S's discount to the copula growing with the clipped mass; LC/CC does not move with it in the fit (its slope is within one HC1 standard error of zero), and its tercile means differ without being ordered. "
+        "It is an association across dates: the fit does not show that the clipping causes the difference, and the clipped mass may stand for another property of the dates."
     )
     add("")
     add(
@@ -1508,7 +1765,7 @@ def build_markdown(
         f"without the dates with `n_dropped_index` ≥ 4 it is {term_s(lt4, 2, nw=True)}, R² {lt4['r2']:.4f}, {lt4['coef'][2] / main['coef'][2]:.1f} times the full-sample coefficient; "
         f"on the dates with no dropped index slice it is {term_s(none, 2, nw=True)}, R² {none['r2']:.4f}, {none['coef'][2] / main['coef'][2]:.1f} times. "
         f"The first two samples differ by the {main['n'] - lt4['n']} dates with `n_dropped_index` ≥ 4, which include {int((masks['S'] & ~masks['S_dropidx_lt4'] & idx15).sum())} of the {int(idx15.sum())} dates of C.0 where the model's index second moment is more than {pct(INDEX_MOMENT_LIST)} from the listed strip. "
-        f"The residuals are serially correlated: lag-1 autocorrelation {main['resid_ac1']:+.2f} on the {main['n']} dates ({lt4['resid_ac1']:+.2f} and {none['resid_ac1']:+.2f} on the two other samples); the classical and HC1 errors do not allow for it, the Newey-West ones do."
+        f"The residuals are serially correlated: lag-1 autocorrelation {main['resid_ac1']:+.2f} on the {main['n']} dates ({lt4['resid_ac1']:+.2f} and {none['resid_ac1']:+.2f} on the two other samples); the classical and HC1 errors do not allow for it; the Newey-West ones do up to {NW_LAGS} rows of the sample, a lower value (C.1)."
     )
     add("")
     # ---------------------------------------------------------------- figures
@@ -1518,7 +1775,7 @@ def build_markdown(
     add(
         "- `figures/F1_forward_over_copula.pdf` (data: `figures/F1_forward_over_copula.csv`): by entry date, LC/copula, S/copula (converged dates) and the listed-variance forward over the copula √(EQV/EV); priced dates only. "
         f"The three lines are broken (a gap) at the {int((~priced).sum())} failed dates and at the {len(absent)} monthly dates of the study that have no row in the LC table (C, Dates): no line joins across a failed or an absent month; a date with a gap on both sides is drawn as a dot. "
-        "Model S and the listed-variance forward are also left empty on the failed dates, although the study has those numbers and they do not depend on the LC run. "
+        f"On these {len(no_line)} dates {f1_empty} "
         f"The CSV has one line per date of the table (as `tables/C_history_by_date.csv`) plus one empty line per absent monthly date (`in_lc_table` False). The last LC point is the development-budget row of {TODAY}"
         + (
             f"; the study's last monthly date before it is {before_today[-1]}, which has no row in the table, so that point stands alone and is drawn as a dot. "
@@ -1529,7 +1786,9 @@ def build_markdown(
     )
     add(
         f"- `figures/F2_calls_over_copula_by_strike.pdf` (data: `figures/F2_calls_over_copula_by_strike.csv`): calls over the copula's at 0.75, 1, 1.25 and 1.5 × the forward, LC and model S, mean and interquartile range over the same {int(n_of['S'])} dates (∩ model S converged); "
-        "the CSV also carries LC on all priced dates, the medians and the pooled ratios."
+        "the CSV also carries LC on all priced dates, the medians and the pooled ratios. "
+        "At 1.25 × and 1.5 × the forward the LC and CC calls carry the caveat of section V3: on the dates measured there a few paths on which one name ends above 3 times its spot carry a large share of these calls, "
+        "and section V3 says the ratios to the copula at 1.5 × should not be quoted as model results. The same holds for the rows call 1.25× and call 1.5× of C.2 to C.5."
     )
     return "\n".join(lines)
 
