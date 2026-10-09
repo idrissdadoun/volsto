@@ -38,6 +38,7 @@ SECTIONS = (
     ),
     ("B_reference", "B. The three reference dates, 3m, production budget"),
     ("C_history", "C. History, 3m, development budget, decisions 1-2 on"),
+    ("C_check_c", "C (continued). Check (c)"),
     ("C_arith", "C (continued). The report's arithmetic at the LC price"),
     ("D_stratified", "D. Stratified cross-dependent volatility (check f)"),
     ("F_figures", "F. Figures"),

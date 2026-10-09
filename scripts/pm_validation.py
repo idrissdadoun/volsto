@@ -156,6 +156,70 @@ def build(s3_log: Path, runaway: Path) -> None:
         definition="number of (pillar, strike) cells with |difference| above 0.05 vol points", budget="8e5 particles / 8e5 paths", commit="a102ef8", source=src, n=len(s3), notes="the gate FAILS (a count, no standard error)",
     ))  # fmt: skip
 
+    # V1 (continued): the error against the target and its dt halving, reported and not gated
+    crn = next(
+        line for line in text.splitlines() if line.startswith("S3 on the common random numbers")
+    )
+    nums = re.search(
+        r"inside ±1\.5 sd (\d+\.\d+) vp at dt and (\d+\.\d+) at dt/2; inside ±2\.5 sd (\d+\.\d+) and (\d+\.\d+); largest \|dt/2 minus dt\| (\d+\.\d+) vp \(paired se (\d+\.\d+)\)",
+        crn,
+    )
+    if nums is None:
+        raise ValueError("S3 log: the common-random-numbers line is not in the expected form")
+    e15_dt, e15_half, e25_dt, e25_half, move, move_se = (float(x) for x in nums.groups())
+    target = [
+        line.strip()
+        for line in text.splitlines()
+        if line.startswith(("S3 against the target", "  dt  :", "  dt/2:"))
+    ]
+    add(
+        "**Error against the analytic target and its Δt halving (reported, not gated; decision 4).** From the log: "
+        + " ".join(f'"{line}"' for line in target)
+        + f' "{crn.strip()}".'
+    )
+    add("")
+    add(
+        f"Reading: the error against the target is the single name's own repricing error (the same under λ = 1: first quoted line). Halving every time step does not reduce it: on common random numbers the largest error inside ±1.5 sd is {e15_dt:.3f} vp at Δt and {e15_half:.3f} at Δt/2 "
+        f'({e25_dt:.3f} and {e25_half:.3f} inside ±2.5 sd), and the smile moves by at most {move:.4f} ± {move_se:.4f} vp. The lower figures of the "dt/2" line above are on other pricing paths: that difference is path noise, not convergence in Δt.'
+    )
+    add("")
+    for rid, label, value, err in (
+        (
+            "V.s3.target.max_abs_error_1p5sd.dt",
+            "S3: largest |error| against the target inside +-1.5 sd at dt, common random numbers",
+            e15_dt,
+            None,
+        ),
+        (
+            "V.s3.target.max_abs_error_1p5sd.half_dt",
+            "S3: the same with every step halved",
+            e15_half,
+            None,
+        ),
+        (
+            "V.s3.target.max_abs_error_2p5sd.dt",
+            "S3: largest |error| against the target inside +-2.5 sd at dt, common random numbers",
+            e25_dt,
+            None,
+        ),
+        (
+            "V.s3.target.max_abs_error_2p5sd.half_dt",
+            "S3: the same with every step halved",
+            e25_half,
+            None,
+        ),
+        (
+            "V.s3.target.largest_move_on_halving",
+            "S3: largest |smile at dt/2 minus smile at dt| on common random numbers",
+            move,
+            move_se,
+        ),
+    ):
+        records.append(pc.record(
+            rid, "V", label, value, err, date="synthetic (identical names)", unit="vol points", definition="basket implied vol of the calibrated model against the analytic target of identical names; the two step sizes calibrated and priced on common random numbers",
+            budget="8e5 particles / 8e5 paths (the test's production size)", commit="a102ef8", source=src, notes="a maximum over 33 cells: no standard error" if err is None else "paired standard error",
+        ))  # fmt: skip
+
     # V2: other validation items
     add("### V2. Other validation items, as they stand at the freeze")
     add("")
@@ -163,7 +227,7 @@ def build(s3_log: Path, runaway: Path) -> None:
         "- **Row gates** (no NaN, forward, index smile): no gating check fails on the four production rows of sections A and B. The index gate (0.15 vp at the money and at the 90 % strike) is waived when the wing binds; on 2026-10-02 and 2017-04-03 the error at the 90 % strike is outside it (section A/B flags tables)."
     )
     add(
-        "- **Names' 2 % check** (Σ w E[R_i²] of the model against the listed strips): a reported diagnostic since the owner's decision 3, not a gate. Its Monte Carlo number is not pinned down in the call wing (V3)."
+        "- **Names' 2 % check** (Σ w E[R_i²] of the model against the listed strips): a reported diagnostic since the owner's decision 3, not a gate. Which tail puts it above the strips, and how well the Monte Carlo number is resolved there: V4."
     )
     add(
         "- **Golden baseline S11** (`tests/golden/lcm_baseline_2026-10-02.json`): recorded on the old defaults (no calendar repair); it has NOT been re-recorded under the defaults of 9 Oct, and the slow Dow tests (C2 Dow, S5 Dow, S11) have NOT been rerun under them. The fast suites of the local correlation files pass (70 tests) at commit a102ef8."
@@ -282,6 +346,123 @@ def build(s3_log: Path, runaway: Path) -> None:
         "the call at 1.25x by 8–19 %; the ratios at 1.5x and 2.0x, against CC and against the copula, are essentially these paths and should not be quoted as model results (LC/copula of 11 and 20 at 2.0x is entirely them). "
         "The same holds for the production rows of sections A and B (K_150, K_200) and for the K_150 column and the upper strikes of figure F2 in section C, where the mean across dates sits well above the median. "
         "Files: `tables/V_runaway_paths.csv`, `tables/V_runaway_ratios.csv`, `diagnostics/runaway/` (scripts, logs and JSON results of the measurement)."
+    )
+    # V4: the names' second moment by region (owner's decision 3)
+    add("")
+    add("### V4. Decision 3: which tail puts Σ w E[R_i²] above the listed strips")
+    add("")
+    table = pd.read_parquet(pc.LC_OUT / "lcm_3m_dev_repair.parquet")
+    failing = table[
+        (table["status"] != "failed")
+        & ~table["check_names"].astype(bool)
+        & (table["n_names_unscreened"].fillna(0) == 0)
+    ].sort_values("names_mc_over_listed")
+    median_date = str(failing.iloc[(len(failing) - 1) // 2]["date"])
+    names_dir = pc.PM / "diagnostics" / "names"
+    names_dir.mkdir(parents=True, exist_ok=True)
+    region_rows: list[dict[str, Any]] = []
+    answer = []
+    for date in ("2026-10-02", median_date):
+        f = pc.LC_OUT / "diagnostics" / f"strips_{date}_3m_repair_lc_200000.json"
+        shutil.copy2(f, names_dir / f.name)
+        doc = json.loads((names_dir / f.name).read_text())
+        regs = {r["region"]: r for r in doc["regions"]}
+        total = regs["total"]
+        strips = total["study"]
+        fsrc = f"{names_dir / f.name} (scripts/lcm_diagnostics.py strips --model lc; the calibrated model's pricing paths of the development row, 2e5)"
+        for key, label in (("below the listed strikes", "puts beyond the last listed strike"), ("listed, below the forward", "puts inside the listed strikes"),
+                           ("listed, above the forward", "calls inside the listed strikes"), ("above the listed strikes", "calls beyond the last listed strike"), ("the rest", "the rest (forward terms)"), ("total", "total")):  # fmt: skip
+            r = regs[key]
+            region_rows.append(
+                {
+                    "date": date,
+                    "region": label,
+                    "model_minus_strips": r["mc_minus_study"],
+                    "se": r["mc_se"],
+                    "svi_minus_strips": r["svi_minus_study"],
+                    "model_minus_svi": r["mc_minus_svi"],
+                    "over_strips_pct": 100 * r["mc_minus_study"] / strips,
+                }
+            )
+            tag = label.split(" (")[0].replace(" ", "_")
+            records.append(pc.record(
+                f"V.names.{date}.{tag}.model_minus_strips", "V", f"names' second moment, model minus the study's listed strips, {label}", r["mc_minus_study"], r["mc_se"], date=date, unit="units of squared return (sum_i w_i ...)",
+                definition="sum_i w_i of the region's part of E[R_i^2]: the calibrated model's Monte Carlo minus the study's strip (listed strikes with its flat-vol tails); regions cut at each name's last listed strikes and at its forward",
+                budget="2e5 particles / 2e5 paths (development)", commit=str(doc["record"]["git_commit"]), source=fsrc, notes=f"{100 * r['mc_minus_study'] / strips:+.3f} % of the strips; se = the model's Monte Carlo error (not a converged number in the call wing: see the text)",
+            ))  # fmt: skip
+        wing = regs["above the listed strikes"]
+        answer.append(
+            f"{date}: model − strips {1e6 * total['mc_minus_study']:+.0f} ± {1e6 * total['mc_se']:.0f} (1e-6), i.e. {100 * total['mc_minus_study'] / strips:+.2f} % of the strips, of which calls beyond the last listed strike {1e6 * wing['mc_minus_study']:+.0f} ± {1e6 * wing['mc_se']:.0f} "
+            f"and puts beyond {1e6 * regs['below the listed strikes']['mc_minus_study']:+.0f} ± {1e6 * regs['below the listed strikes']['mc_se']:.0f}; the SVI slices' own wing against the study's flat-vol tail accounts for {1e6 * wing['svi_minus_study']:+.0f} of the call-wing excess and the model above its SVI strip for {1e6 * wing['mc_minus_svi']:+.0f}; "
+            f"the 10 largest paths carry {100 * doc['call_wing']['share_top_10']:.0f} % of the model's call-wing region"
+        )
+        if not wing["mc_minus_study"] > max(
+            abs(regs[k]["mc_minus_study"])
+            for k in (
+                "below the listed strikes",
+                "listed, below the forward",
+                "listed, above the forward",
+            )
+        ):
+            raise ValueError(
+                f"{date}: the call wing is not the largest region; the answer's sentence would be wrong"
+            )
+    budget_lines = []
+    for date in ("2026-10-02", median_date):
+        parts = []
+        for n_paths in (200000, 800000):
+            f = pc.LC_OUT / "diagnostics" / f"strips_{date}_3m_repair_zero_{n_paths}.json"
+            shutil.copy2(f, names_dir / f.name)
+            tot = {r["region"]: r for r in json.loads((names_dir / f.name).read_text())["regions"]}[
+                "total"
+            ]
+            parts.append(
+                f"{100 * tot['mc_minus_study'] / tot['study']:+.2f} % of the strips (± {1e6 * tot['mc_se']:.0f} in 1e-6) on {n_paths:.0e} paths".replace(
+                    "e+0", "e"
+                )
+            )
+            records.append(pc.record(
+                f"V.names.{date}.total.lambda0.{n_paths}.model_minus_strips", "V", f"names' second moment, model at lambda = 0 minus the study's listed strips, total, {n_paths} paths", tot["mc_minus_study"], tot["mc_se"], date=date,
+                unit="units of squared return (sum_i w_i ...)", definition="as V.names.<date>.total.model_minus_strips, on the paths of the model with lambda = 0 (no calibration; same law of the names)", budget=f"{n_paths} paths", commit="see the file's record",
+                source=str(names_dir / f.name), notes=f"{100 * tot['mc_minus_study'] / tot['study']:+.3f} % of the strips",
+            ))  # fmt: skip
+        budget_lines.append(f"{date}: " + " and ".join(parts))
+    regions = pd.DataFrame(region_rows)
+    pc.save_table(regions, "V_names_second_moment_by_region")
+    add(
+        f"**The calls beyond the last listed strike, on both dates.** Today and on the median failing date ({median_date}: the middle one of the {len(failing)} priced dates of the history outside the 2 % check with no unscreened name, by size of the gap):"
+    )
+    add("")
+    add(
+        "| date | puts beyond | puts inside the listed strikes | calls inside | calls beyond | the rest | total | total, % of the strips |"
+    )
+    add("|:--|--:|--:|--:|--:|--:|--:|--:|")
+    for date, g in regions.groupby("date", sort=False):
+        v = g.set_index("region")
+        cells = [
+            f"{1e6 * v.loc[k, 'model_minus_strips']:+.0f} ± {1e6 * v.loc[k, 'se']:.0f}"
+            for k in (
+                "puts beyond the last listed strike",
+                "puts inside the listed strikes",
+                "calls inside the listed strikes",
+                "calls beyond the last listed strike",
+                "the rest (forward terms)",
+                "total",
+            )
+        ]
+        add(f"| {date} | " + " | ".join(cells) + f" | {v.loc['total', 'over_strips_pct']:+.2f} % |")
+    add("")
+    add(
+        "Σ w_i of each region's part of E[R_i²], the calibrated model's Monte Carlo minus the study's listed strips, in 1e-6, ± the model's Monte Carlo error (development budget, the paths of the history's rows). "
+        + " ".join(f"{a}." for a in answer)
+    )
+    add("")
+    add(
+        "The Monte Carlo number is not pinned down in the call wing: a handful of paths carry the region (the same runaway paths as in V3), its standard error grows with the number of paths, and whether a date passes 2 % at a given budget is partly a draw. "
+        + "On the paths of the model at λ = 0 (the names' law does not depend on the correlation), the same total is "
+        + "; ".join(budget_lines)
+        + ". "
+        "The tails are unchanged, as decided. Files: `tables/V_names_second_moment_by_region.csv`, `diagnostics/names/` (the two diagnostic files; other screens and budgets are in `outputs/dispersion_lc/diagnostics/strips_*.json`)."
     )
     pc.write_part("V_validation", records, "\n".join(md))
     pc.status(
