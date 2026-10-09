@@ -34,6 +34,11 @@ visits — and the Dupire surface is floored there.  With the option on, such sl
 before the surface is built: of a crossing pair the slice that is not a third-Friday expiry
 goes, the shorter one when both are or neither is, round after round until no pair crosses
 inside the central range (or ``CALENDAR_MAX_ROUNDS`` rounds).  The index target is not touched.
+
+**A name the screen empties** (``ExpiryScreen.unscreened_fallback``, off by default): the build
+is refused when the quote screen leaves a name without any expiry — a date of a sweep then
+fails for one name.  With the option on, that name keeps the loader's expiries unscreened and
+the build's information lists it (``names_unscreened``).
 """
 
 from __future__ import annotations
@@ -202,7 +207,10 @@ class ExpiryScreen:
     ``max_half_spread_vp``: the median half spread inside ±1 sd is at most this many vol points
     for an expiry of up to ``long_maturity`` years, and at most ``max_half_spread_long_vp``
     beyond (``inf``: not read).  ``calendar_repair``: the names' slices that cross in calendar
-    inside the central range are dropped (:func:`repair_calendar`; off by default)."""
+    inside the central range are dropped (:func:`repair_calendar`; off by default).
+    ``unscreened_fallback``: a name the quote screen leaves without any expiry keeps the expiries
+    the loader returned, unscreened, and is listed in the build's information (off by default: the
+    build is refused, naming the name)."""
 
     index_third_friday: bool = True
     nearest_two_sided: bool = True
@@ -210,6 +218,7 @@ class ExpiryScreen:
     max_half_spread_long_vp: float = 6.0
     long_maturity: float = 1.0
     calendar_repair: bool = False
+    unscreened_fallback: bool = False
 
     def __post_init__(self) -> None:
         if not (self.max_half_spread_vp > 0 and self.max_half_spread_long_vp > 0):
@@ -250,6 +259,8 @@ class ExpiryScreen:
         }
         if self.calendar_repair:
             out["calendar_repair"] = True
+        if self.unscreened_fallback:
+            out["unscreened_fallback"] = True
         return out
 
 
@@ -493,10 +504,20 @@ def lc_spec_from_smiles(
     surfaces: list[SviSurfaceConfig] = []
     rms: dict[str, list[float]] = {}
     extrapolated: list[str] = []
+    unscreened: list[str] = []
     for name, spot in zip(names, spots, strict=True):
         expiries, gone = screen_expiries(
             name, list(smiles[name]), None if quotes is None else quotes.get(name, {}), screen
         )
+        if not expiries and screen.unscreened_fallback and smiles[name]:
+            # the name stays, on what the loader returned: nothing of it is dropped
+            expiries, gone = list(smiles[name]), []
+            unscreened.append(name)
+            log.info(
+                "expiry screen: %s has no expiry that passes; kept unscreened (%d expiries)",
+                name,
+                len(expiries),
+            )
         dropped += gone
         if not expiries:
             raise ValueError(f"{name}: no listed expiry passes the screen")
@@ -554,6 +575,8 @@ def lc_spec_from_smiles(
         "n_slices_by_name": {k: len(v) for k, v in rms.items()},
         "names_extrapolated": extrapolated,
         "n_names_extrapolated": len(extrapolated),
+        "names_unscreened": unscreened,
+        "n_names_unscreened": len(unscreened),
         "index_extrapolated": bool(max(float(e.T) for e in index_expiries) < horizon),
         "index_slices": list(index_cfg.times),
         "screen": screen.describe(),

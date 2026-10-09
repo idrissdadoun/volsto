@@ -2802,6 +2802,28 @@ def test_calendar_repair() -> None:
     assert len(spec_on.surfaces[0].times) == 5 and spec_on.surfaces[1] == spec_off.surfaces[1]
     assert spec_on.index_surface == spec_off.index_surface  # the crossing index slice is kept
     assert lc_cache.lc_spec_key(spec_on) != lc_cache.lc_spec_key(spec_off)
+    # a name the quote screen empties: refused by default, kept unscreened with the fallback
+    from volsto.studies.disp_lc import QuoteQuality
+
+    def quality(e: Any, half: float) -> QuoteQuality:
+        return QuoteQuality(e.expiry, e.T, 5, 5, half, 3, 3)
+
+    quotes = {
+        "AAA": {e.expiry: quality(e, 5.0) for e in crossed},
+        "BBB": {e.expiry: quality(e, 0.5) for e in clean},
+    }
+    index_quotes = {e.expiry: quality(e, 0.5) for e in index}
+    strict = ExpiryScreen(index_third_friday=False)
+    with pytest.raises(ValueError, match="AAA: no listed expiry passes the screen"):
+        lc_spec_from_smiles(names, w, spots, smiles, index, 1.0, 0.25, screen=strict, quotes=quotes,
+                            index_quotes=index_quotes, **settings)  # fmt: skip
+    lenient = dataclasses.replace(strict, unscreened_fallback=True)
+    spec_fb, info_fb = lc_spec_from_smiles(names, w, spots, smiles, index, 1.0, 0.25, screen=lenient, quotes=quotes,
+                                           index_quotes=index_quotes, **settings)  # fmt: skip
+    assert info_fb["names_unscreened"] == ["AAA"] and info_fb["n_names_unscreened"] == 1
+    assert info_fb["dropped"] == [] and spec_fb.surfaces[0] == spec_off.surfaces[0]
+    assert info_off["names_unscreened"] == [] and lenient.describe()["unscreened_fallback"] is True
+    assert "unscreened_fallback" not in strict.describe()
 
 
 # ---------------------------------------------------------------------------------------------

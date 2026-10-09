@@ -267,6 +267,41 @@ def build(tenor: str, budget: str, out: Path, label: str = "") -> Path:
         f"mean LC/CC {ok.loc[binds, 'ratio'].mean():.4f}, ED_wing/CC {ok.loc[binds, 'ED_wing_ratio'].mean():.4f}, ED_eqv/CC {ok.loc[binds, 'ED_eqv_ratio'].mean():.4f} (n {int(binds.sum())}); "
         f"where it does not: {ok.loc[~binds, 'ratio'].mean():.4f}, {ok.loc[~binds, 'ED_wing_ratio'].mean():.4f}, {ok.loc[~binds, 'ED_eqv_ratio'].mean():.4f} (n {int((~binds).sum())})."
     )
+    if has_s:
+        add("")
+        add(
+            "Against model S across dates (the effect is the ratio minus 1; model S over its copula):"
+        )
+        add("")
+        add("| LC quantity | dates | mean effect | model S, same dates | Pearson | Spearman |")
+        add("|---|---:|---:|---:|---:|---:|")
+        free = ok["clip_inner_max"] < 0.05
+        for label, col, mask in (
+            ("E_LC[D] / E_CC[D], all dates", "ratio", ok["ratio"].notna()),
+            ("E_LC[D] / E_CC[D], clipped mass inside ±2.5 sd below 5 %", "ratio", free),
+            ("E_LC[D] / E_CC[D], clipped mass 5 % or more", "ratio", ~free),
+            ("ED_wing / E_CC[D], all dates", "ED_wing_ratio", ok["ratio"].notna()),
+            ("ED_eqv / E_CC[D], all dates", "ED_eqv_ratio", ok["ratio"].notna()),
+        ):
+            both = pd.concat(
+                [ok.loc[mask, col] - 1.0, ok.loc[mask, "S_ratio"] - 1.0], axis=1, keys=["a", "b"]
+            ).dropna()
+            if len(both) < 3:
+                add(f"| {label} | {len(both)} | n/a | n/a | n/a | n/a |")
+                continue
+            add(
+                f"| {label} | {len(both)} | {both['a'].mean():+.4f} | {both['b'].mean():+.4f} | "
+                f"{both['a'].corr(both['b']):+.3f} | {both['a'].corr(both['b'], method='spearman'):+.3f} |"
+            )
+        both = pd.concat(
+            [ok["clip_inner_max"], ok["S_ratio"] - 1.0], axis=1, keys=["a", "b"]
+        ).dropna()
+        if len(both) >= 3:
+            add("")
+            add(
+                f"Correlation across dates of the clipped mass inside ±2.5 sd with model S's effect: {both['a'].corr(both['b']):+.3f} "
+                f"(n {len(both)}): the dates on which model S moves the forward most are those on which the model is clipped most."
+            )
     # --- 4. kappa, deltas
     add("")
     add("## 4. κ = E[D]/√E[V]" + (", and the deltas" if "delta_fwd_lc" in ok.columns else ""))

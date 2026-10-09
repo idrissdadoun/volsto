@@ -295,6 +295,7 @@ def run_date(
         svi_rms_vp_median=info["svi_rms_vp_median"], svi_rms_vp_max=info["svi_rms_vp_max"],
         svi_rms_vp_index=float(np.max(info["svi_rms_vp_index"])),
         n_names_extrapolated=info["n_names_extrapolated"], index_extrapolated=bool(info["index_extrapolated"]),
+        n_names_unscreened=info["n_names_unscreened"], names_unscreened=",".join(info["names_unscreened"]),
         index_last_slice=last_index,
     )  # fmt: skip
     # --- calibration, through the cache
