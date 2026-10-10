@@ -1,6 +1,7 @@
 """Section C of the PM results package of 2026-10-09 (``outputs/dispersion_lc/pm_update``): the
 3m history of the local correlation model at the development budget with the owner's decisions
-1-2 on, the answers to checks (b) and (d), and figures F1 and F2.
+1-2 on, the answers to checks (b) and (d), and figures F1 and F2 (``--budget production``: the
+same part on the production-budget pass, written elsewhere; see the end of this text).
 
 Reads (read-only) ``outputs/dispersion_lc/lcm_3m_dev_repair.parquet`` (one row per date),
 ``outputs/dispersion/entries_3m.parquet`` (basket B1, one row per date: checked) and
@@ -52,6 +53,24 @@ fits are compared with it to the digit.  A failed date's step and leg are read f
 in the run's log of the date (``outputs/dispersion_lc/logs/3m_development_repair``).
 
 Run: ``.venv/bin/python scripts/pm_history.py`` (idempotent; rerun when the table changes).
+
+Another pass (added after the freeze of the package; the defaults are the frozen part's and
+reproduce it byte for byte): ``--budget production`` reads the production-budget pass
+``lcm_3m.parquet`` (commit d4faa74: decisions 1, 2 and 5 on) with the logs of that run; ``--rows``
+and ``--logs`` name another table or log folder; ``--base <folder>`` writes ``parts/``, ``tables/``
+and ``figures/`` under that folder instead of the package (the package is frozen: its own files
+are refused by ``pm_common.guard_frozen``) and appends no line to the package's ``STATUS.md``.  The budget of the priced rows must be the one asked
+for, and every label that names the budget, the commit, the decisions or the source follows the
+table read (:class:`Pass`); no statistic depends on the option.  What differs by construction on
+the production pass: the status stored in the rows is already under decision 3 and is printed as
+the row's own; the row of the reference date in the table is section A's production row, and C.6
+shows the frozen development row beside it; ``n_dropped_index`` of the rows counts the index
+slices dropped under any rule, decision 5's calendar repair included, so the slices dropped by the
+quote screen — what this part tabulates and conditions on — are ``n_dropped_index −
+n_dropped_calendar_index`` (column ``n_dropped_index_screen`` of the per-date CSV).
+
+    .venv/bin/python scripts/pm_history.py --budget production --no-status \\
+        --base outputs/dispersion_lc/pm_update/later/production_3m/history
 """
 
 # ruff: noqa: RUF001, E501 — report prose: typographic signs and long table lines
@@ -79,7 +98,45 @@ LOG = logging.getLogger("pm_history")
 
 SECTION = "C"
 PART = "C_history"
-ROWS = pc.LC_OUT / "lcm_3m_dev_repair.parquet"
+
+
+@dataclass(frozen=True)
+class Pass:
+    """The pass behind the table read (``--budget``): what the part's labels say about it.  The
+    statistics do not depend on it."""
+
+    budget: str  #: key of ``pm_common.BUDGETS``
+    sizes: tuple[float, float, float]  #: particles, paths, paths of the constant-correlation fit
+    rows: Path  #: the table read by default
+    logs: Path  #: the logs of the run behind it, one per date
+    title: str  #: the heading after "C. History, 3m, " (``{commit}``: the commit of the rows)
+    decisions: str  #: the owner's decisions that are on, as the labels write them
+    repairs: str  #: what those decisions switch on
+
+
+PASSES = {
+    "development": Pass(
+        "development",
+        (2e5, 2e5, 1e5),
+        pc.LC_OUT / "lcm_3m_dev_repair.parquet",
+        pc.LC_OUT / "logs" / "3m_development_repair",
+        "development budget, decisions 1–2 on",
+        "decisions 1–2 on",
+        "calendar repair of the names' slices and the unscreened fallback on (decisions 1–2)",
+    ),
+    "production": Pass(
+        "production",
+        (8e5, 8e5, 4e5),
+        pc.LC_OUT / "lcm_3m.parquet",
+        pc.LC_OUT / "logs" / "3m_production",
+        "after the freeze: production budget, commit {commit}, decisions 1, 2 and 5 on",
+        "decisions 1, 2 and 5 on",
+        "calendar repair of the names' slices, unscreened fallback and calendar repair of the DJX target on (decisions 1, 2 and 5)",
+    ),
+}
+#: The frozen part's pass: the default, and the development row shown in C.6 of another pass.
+DEVELOPMENT = PASSES["development"]
+ROWS = DEVELOPMENT.rows
 ENTRIES = pc.STUDY / "entries_3m.parquet"
 MODEL_S = pc.STUDY / "model_s_3m.parquet"
 #: The independent check of (d) (another agent's results; compared when present): the copy kept in
@@ -88,8 +145,9 @@ CHECK_D_PACKAGE = pc.PM / "diagnostics" / "check_d" / "check_d_results.json"
 CHECK_D_SCRATCH = Path(
     "/private/tmp/claude-501/-Users-idrissdadoun-Code-volsto/75dd7f23-d74c-43a9-b99e-61c23722b22c/scratchpad/r4/check-d/check_d_results.json"
 )
-#: The logs of the run behind the table (one per date; a failed date's log has its traceback).
-RUN_LOGS = pc.LC_OUT / "logs" / "3m_development_repair"
+#: The logs of the run behind the default table (one per date; a failed date's log has its
+#: traceback); another pass has its own (:class:`Pass`, ``--logs``).
+RUN_LOGS = DEVELOPMENT.logs
 #: The stopped production pass at the old defaults: today's row is shown beside check (b).
 PRODUCTION_OLD = pc.LC_OUT / "lcm_3m_norepair.parquet"
 #: Today's production row at the new defaults (decisions 1-2 and 5 on): section A's row.
@@ -129,6 +187,11 @@ CLIP_DEF = (
     "each taken at its own worst calibration slice, inside ±2.5 sd, as a fraction of the particles; it is not the sum of the two sides"
 )
 TODAY = pc.REFERENCE_DATES[0]
+#: The index slices the calendar repair of the DJX target drops (decision 5): a column of the rows
+#: of a pass that has the decision in its code; ``n_dropped_index`` of those rows includes them.
+DROPPED_CALENDAR = "n_dropped_calendar_index"
+#: The index slices dropped by the quote screen, in the per-date table of such a pass.
+DROPPED_SCREEN = "n_dropped_index_screen"
 #: The owner's arithmetic for today in check (b).
 OWNER_B = {"lc_over_copula": 0.9693, "cc_over_copula": 0.9992}
 BASE_SAMPLES = (
@@ -291,8 +354,13 @@ def load(rows_path: Path) -> pd.DataFrame:
         raise ValueError("check_names of the rows is not |Σw E[R_i²] / Σw M_i - 1| <= 2 %")
     frame["names_gap"] = gap
     frame["names_gap_se"] = frame["sum_w_ER2_lc_se"] / frame["sum_w_M"]
-    # what check_no_nan read (scripts/lcm_price.py): the floats of the row but these prefixes
+    # what check_no_nan read (scripts/lcm_price.py): the floats of the row but these prefixes.  A
+    # column that is empty on a priced date that passes the check is not a float of that row (a
+    # key the row does not carry: the columns a later commit writes on the reference dates only),
+    # so it is not what makes the check fail elsewhere: left out
     floats = [c for c in rows.columns if rows[c].dtype == float and not c.startswith(("align_", "C_200", "Cfwd", "profile_"))]  # fmt: skip
+    passing = priced & truth(frame["check_no_nan"])
+    floats = [c for c in floats if np.isfinite(frame.loc[passing, c]).all()]
     frame["non_finite_columns"] = ""
     for i in frame.index[priced & ~truth(frame["check_no_nan"])]:
         frame.loc[i, "non_finite_columns"] = ", ".join(c for c in floats if not np.isfinite(frame.loc[i, c]))  # fmt: skip
@@ -350,6 +418,11 @@ def by_date(frame: pd.DataFrame) -> pd.DataFrame:
     rel_mb = f["EV_basket_part"] / f["M_B_listed"].where(f["M_B_listed"] > 0.0)
     d["flag_index_moment"] = rel_mb.abs() > INDEX_MOMENT_FLAG
     d["n_dropped_index"] = f["n_dropped_index"]
+    if DROPPED_CALENDAR in f.columns:
+        # the rows of a pass with decision 5: n_dropped_index counts the index slices dropped
+        # under any rule; those dropped by the quote screen are the rest (module docstring)
+        d[DROPPED_CALENDAR] = f[DROPPED_CALENDAR]
+        d[DROPPED_SCREEN] = f["n_dropped_index"] - f[DROPPED_CALENDAR]
     d["rho_cc"], d["rho_cop"] = f["rho_cc"], f["rho_cop"]
     d["clip_larger_side"] = np.where(
         f["clip_low_inner_max"] > f["clip_high_inner_max"],
@@ -504,7 +577,65 @@ def production_new_defaults(p_d: float, p_d_se: float) -> dict[str, Any] | None:
     }
 
 
+def development_row(p_d: float, p_d_se: float) -> dict[str, Any] | None:
+    """Today's row of the frozen part's development pass (``DEVELOPMENT.rows``), for check (b) of
+    another pass, in the format of :func:`production_new_defaults` (the status under decision 3
+    recomputed from the gates, as the frozen part prints it).  ``None`` when the file or the row
+    is missing, not priced, or priced against another entry."""
+    if not DEVELOPMENT.rows.exists():
+        return None
+    rows = pd.read_parquet(DEVELOPMENT.rows)
+    rows = rows[(rows["date"] == TODAY) & (rows["status"] != "failed") & rows["ED_lc"].notna()]
+    if len(rows) != 1:
+        return None
+    r = rows.iloc[0]
+    if abs(float(r["P_D_copula"]) - p_d) > 1e-12 * p_d:
+        LOG.warning("%s: the row of %s is priced against another entry; left out", DEVELOPMENT.rows.name, TODAY)  # fmt: skip
+        return None
+    sizes = (float(r["n_particles"]), float(r["n_paths"]), float(r["companion_paths"]))
+    budget = pc.BUDGETS["development"] if sizes == DEVELOPMENT.sizes else f"{sizes[0]:g} particles / {sizes[1]:g} paths (constant-correlation fit on {sizes[2]:g} paths)"  # fmt: skip
+    lc, lc_se, cc, cc_se = (float(r[c]) for c in ("ED_lc", "ED_lc_se", "ED_cc", "ED_cc_se"))
+    values = {
+        "lc_over_cc": (float(r["ratio"]), float(r["ratio_se"])),
+        "lc_over_copula": (lc / p_d, pc.ratio_se(lc, lc_se, p_d, p_d_se)),
+        "cc_over_copula": (cc / p_d, pc.ratio_se(cc, cc_se, p_d, p_d_se)),
+    }
+    failing = [k for k in GATING_CHECKS if not r[k]]
+    return {
+        "values": values,
+        "budget": budget,
+        "commit": str(r["git_commit"]),
+        "status": "check" if failing else "ok",
+        "status_stored": str(r["status"]),
+        "reason_stored": str(r["reason"] or ""),
+    }
+
+
+def same_as_section_a(t: Any) -> bool | None:
+    """Whether today's row of the table read is section A's production row
+    (``PRODUCTION_ROW``): the same ``ED_lc``, ``ED_cc``, their standard errors, the paired ratio
+    and its error, and the commit.  ``None`` when the row file is not on disk."""
+    if not PRODUCTION_ROW.exists():
+        return None
+    r = json.loads(PRODUCTION_ROW.read_text())
+    pairs = (("ED_lc", "ED_lc"), ("ED_lc_se", "ED_lc_se"), ("ED_cc", "ED_cc"), ("ED_cc_se", "ED_cc_se"), ("lc_over_cc", "ratio"), ("lc_over_cc_se", "ratio_se"))  # fmt: skip
+    same = all(r.get(theirs) is not None and float(t[ours]) == float(r[theirs]) for ours, theirs in pairs)  # fmt: skip
+    return same and str(t["git_commit"]) == str(r.get("git_commit"))
+
+
 # ----------------------------------------------------------------------------- samples and summaries
+def screen_drops(d: pd.DataFrame) -> tuple[pd.Series, str, str]:
+    """The index slices dropped by the quote screen on each date, the column of the per-date
+    table that holds them, as the part writes it, and the note a definition adds to it.  In the
+    rows of a pass without decision 5 that is ``n_dropped_index``; with decision 5 the rows'
+    ``n_dropped_index`` also counts the slices its calendar repair drops, and the screen's are
+    ``DROPPED_SCREEN`` (the same quantity as before: no statistic changes its definition)."""
+    if DROPPED_SCREEN not in d.columns:
+        return d["n_dropped_index"].astype(float), "`n_dropped_index`", ""
+    note = f"; `{DROPPED_SCREEN}` = `n_dropped_index` − `{DROPPED_CALENDAR}`: the row's count without the slices dropped by the calendar repair of the DJX target (decision 5)"
+    return d[DROPPED_SCREEN].astype(float), f"`{DROPPED_SCREEN}`", note
+
+
 def samples(d: pd.DataFrame) -> tuple[dict[str, pd.Series], pd.DataFrame]:
     """The samples (boolean masks over the per-date table) and the table that describes them.
     The terciles of the clipped mass are those of ``clip_inner_max`` on all priced dates (low:
@@ -536,13 +667,13 @@ def samples(d: pd.DataFrame) -> tuple[dict[str, pd.Series], pd.DataFrame]:
         ):
             rows.append({"sample": name, "n": int(masks[name].sum()), "definition": text + suffix, "clip_inner_max_from": low, "clip_inner_max_to": high})  # fmt: skip
     rel = d["EV_basket_part_rel_MB"].astype(float).abs()
-    dropped = d["n_dropped_index"].astype(float)
+    dropped, col, col_note = screen_drops(d)
     extra = {
         "all_index10": (priced & ~(rel > INDEX_MOMENT_FLAG), f"priced and |basket part / M_B^listed| at or below {INDEX_MOMENT_FLAG:g} (not `flag_index_moment`)"),
         "all_index15": (priced & ~(rel > INDEX_MOMENT_LIST), f"priced and |basket part / M_B^listed| at or below {INDEX_MOMENT_LIST:g}"),
         "all_names2pct": (priced & truth(d["names_within_2pct"]), "priced and the names' diagnostic inside 2 % (`names_within_2pct`)"),
-        "S_dropidx_lt4": (converged & (dropped < 4), "priced, model S converged and fewer than 4 index slices dropped by the screen (`n_dropped_index` < 4)"),
-        "S_dropidx_0": (converged & (dropped == 0), "priced, model S converged and no index slice dropped by the screen (`n_dropped_index` = 0)"),
+        "S_dropidx_lt4": (converged & (dropped < 4), f"priced, model S converged and fewer than 4 index slices dropped by the screen ({col} < 4{col_note})"),
+        "S_dropidx_0": (converged & (dropped == 0), f"priced, model S converged and no index slice dropped by the screen ({col} = 0{col_note})"),
     }  # fmt: skip
     if tuple(extra) != EXTRA_SAMPLES:
         raise ValueError("the extra samples are not the declared ones")
@@ -812,11 +943,12 @@ def check_d_source(path: Path) -> str:
     return str(path)
 
 
-def failure_clause(date: str, reason: str) -> str:
+def failure_clause(date: str, reason: str, logs: Path = RUN_LOGS) -> str:
     """One clause for a failed date: the step and the leg that failed, read from the reason and
-    from the traceback in the run's log of the date (the call of ``lc_spec_from_smiles`` in which
-    the date raised: the names are fitted one by one first, the index after them)."""
-    log = RUN_LOGS / f"{date}.log"
+    from the traceback in the run's log of the date under ``logs`` (the call of
+    ``lc_spec_from_smiles`` in which the date raised: the names are fitted one by one first, the
+    index after them)."""
+    log = logs / f"{date}.log"
     lines = log.read_text().splitlines() if log.exists() else []
     call = ""
     for i, line in enumerate(lines[:-1]):
@@ -852,16 +984,17 @@ class Book:
     """Formats a number for the Markdown and files its record at the same time, so that every
     number of the part has one (an id asked twice must carry the same value)."""
 
-    def __init__(self, commit: str, source: str) -> None:
+    def __init__(self, commit: str, source: str, budget: str = DEVELOPMENT.budget) -> None:
         self.records: dict[str, dict[str, Any]] = {}
         self.commit = commit
         self.source = source
+        self.budget = pc.BUDGETS[budget]
 
     def num(
         self, id: str, quantity: str, value: float | None, se: float | None = None, *, digits: int = 4, spec: str | None = None,
         show_se: bool = True, study: bool = False, **kwargs: Any,
     ) -> str:  # fmt: skip
-        kwargs.setdefault("budget", pc.BUDGETS["study"] if study else pc.BUDGETS["development"])
+        kwargs.setdefault("budget", pc.BUDGETS["study"] if study else self.budget)
         kwargs.setdefault("commit", STUDY_COMMIT if study else self.commit)
         kwargs.setdefault("source", self.source)
         if study and not kwargs.get("notes"):
@@ -896,8 +1029,11 @@ def md_table(headers: list[str], rows: list[list[str]], align: str = "") -> str:
 def build_markdown(
     d: pd.DataFrame, masks: dict[str, pd.Series], sample_table: pd.DataFrame, qs: list[Quantity],
     table: dict[tuple[str, str], dict[str, dict[str, float]]], fits: dict[tuple[str, str], dict[str, Any]], agreement: tuple[str, dict[str, float]],
-    book: Book, rows_path: Path,
+    book: Book, rows_path: Path, run: Pass = DEVELOPMENT, logs: Path | None = None,
 ) -> str:  # fmt: skip
+    """The Markdown of the part; every number it prints is filed in ``book``.  ``run`` is the pass
+    behind the table (its labels) and ``logs`` the folder of its logs (default: the pass's)."""
+    logs = run.logs if logs is None else logs
     priced = d["priced"].astype(bool)
     md_qs = [q for q in qs if q.in_md]
     n_of = dict(zip(sample_table["sample"], sample_table["n"], strict=True))
@@ -1033,41 +1169,83 @@ def build_markdown(
     gap_abs = d["names_gap"].astype(float).abs()
     rel_abs = d["EV_basket_part_rel_MB"].astype(float).abs()
     idx10, idx15 = priced & (rel_abs > INDEX_MOMENT_FLAG), priced & (rel_abs > INDEX_MOMENT_LIST)
+    # the status of a table written under decision 3 is the row's own: the recomputation agrees on
+    # every date, and the labels say so; a table written before it keeps the recomputed status
+    rows_own = bool((d["status_stored"] == d["status"]).all())
+    how_status = "the row's own status, stored under decision 3" if rows_own else "status recomputed under decision 3"  # fmt: skip
+    how_stored = "the current rule, decision 3" if rows_own else "the rule before decision 3"
+    status_note = "the row's own, under decision 3" if rows_own else "recomputed under decision 3"
+    drops, drop_col, _drop_note = screen_drops(d)
+    with_d5 = DROPPED_CALENDAR in d.columns
     lines: list[str] = []
     add = lines.append
-    add("## C. History, 3m, development budget, decisions 1–2 on")
+    add(f"## C. History, 3m, {run.title.format(commit=commit)}")
     add("")
 
     def count(tag: str, what: str, value: int) -> str:
         return book.num(f"C.hist.count.{tag}", what, value, spec=".0f", unit="dates", definition=what, n=int(value), source=f"{book.source} → tables/C_history_by_date.csv", notes="a count of dates")  # fmt: skip
 
+    if run is not DEVELOPMENT:
+        add(
+            f"After the freeze of the package: this part is not in the frozen package. It is the frozen part `parts/{PART}.md` rebuilt by the same builder (`scripts/pm_history.py --budget {run.budget}`) on the {run.budget}-budget pass "
+            f"`outputs/dispersion_lc/{rows_path.name}` (commit {commit}, {run.decisions}); the frozen part is at the {DEVELOPMENT.budget} budget (`{DEVELOPMENT.rows.name}`, {DEVELOPMENT.decisions}) and is not changed. "
+            "Every number below is of this pass unless its row says otherwise; the tables and figures named below are those of this folder, not the frozen package's."
+        )
+        add("")
     add(
         f"Source: `outputs/dispersion_lc/{rows_path.name}` (one row per date; {count('rows', 'dates of the table', len(d))} dates {d['date'].min()} to {d['date'].max()}: "
-        f"{count('priced', 'priced dates (status not failed)', int(priced.sum()))} priced — {count('ok', 'dates with status ok (status recomputed under decision 3)', statuses.get('ok', 0))} `ok`, "
-        f"{count('check', 'dates with status check (priced, a gating check not passed; status recomputed under decision 3)', statuses.get('check', 0))} `check` (priced, a gating check not passed: the reason is in the per-date CSV) — "
+        f"{count('priced', 'priced dates (status not failed)', int(priced.sum()))} priced — {count('ok', f'dates with status ok ({how_status})', statuses.get('ok', 0))} `ok`, "
+        f"{count('check', f'dates with status check (priced, a gating check not passed; {how_status})', statuses.get('check', 0))} `check` (priced, a gating check not passed: the reason is in the per-date CSV) — "
         f"and {count('failed', 'dates with status failed', statuses.get('failed', 0))} failed), "
         f"joined on the date with `outputs/dispersion/entries_3m.parquet` (basket B1: one row per date, checked) and `outputs/dispersion/model_s_3m.parquet`. "
-        f"Budget: {pc.BUDGETS['development']}; commit of the rows {commit}; calendar repair of the names' slices and the unscreened fallback on (decisions 1–2). "
-        f"The row of {TODAY} in this table is at the development budget."
+        f"Budget: {pc.BUDGETS[run.budget]}; commit of the rows {commit}; {run.repairs}. "
+        f"The row of {TODAY} in this table is at the {run.budget} budget."
     )
     add("")
+    if with_d5:
+        cal = d[DROPPED_CALENDAR].astype(float)
+        add(
+            f"Decision 5 (the calendar repair of the DJX target: the names' rule on the DJX slices). `{DROPPED_CALENDAR}` of the rows is positive on "
+            f"{count('dropped_calendar_index', f'priced dates on which the calendar repair of the DJX target drops an index slice ({DROPPED_CALENDAR} > 0)', int((priced & (cal > 0)).sum()))} of the {int(priced.sum())} priced dates "
+            f"(one slice on {count('dropped_calendar_index_1', f'priced dates with {DROPPED_CALENDAR} = 1', int((priced & (cal == 1)).sum()))}, "
+            f"more than one on {count('dropped_calendar_index_2plus', f'priced dates with {DROPPED_CALENDAR} > 1', int((priced & (cal > 1)).sum()))}); on the other priced dates the repair drops no DJX slice. "
+            f"`n_dropped_index` of these rows counts the index slices dropped under any rule, these included. The slices dropped by the quote screen, which this part tabulates and conditions on (C.0, C.7c), "
+            f"are {drop_col} = `n_dropped_index` − `{DROPPED_CALENDAR}` of the per-date CSV: the same quantity as `n_dropped_index` of the frozen part's table, which has no calendar repair of the index."
+        )
+        add("")
     today_row = d[d["date"] == TODAY]
+    today_stored = "" if rows_own else f"stored: `{today_row['status_stored'].iloc[0]}`; "
     today_status = (
-        f" The row of {TODAY} is `{today_row['status'].iloc[0]}` (stored: `{today_row['status_stored'].iloc[0]}`; names' gap {gap_cell(today_row.iloc[0])} against the 2 % threshold)."
+        f" The row of {TODAY} is `{today_row['status'].iloc[0]}` ({today_stored}names' gap {gap_cell(today_row.iloc[0])} against the 2 % threshold)."
         if len(today_row) == 1 and bool(today_row["priced"].iloc[0])
         else ""
     )
+    stored_counts = f"({count('ok_stored', f'dates with stored status ok ({how_stored})', stored.get('ok', 0))} `ok`, {count('check_stored', f'dates with stored status check ({how_stored})', stored.get('check', 0))} `check`)"
+    rule = "the current rule of `scripts/lcm_price.py` (`GATING_CHECKS`, `row_status`): a priced date is `check` when `check_no_nan`, `check_forward` or `check_index` fails and `ok` otherwise; a failed date stays failed. "
+
+    def now_ok_s() -> str:  # filed where it is printed: the records keep the order of the text
+        return count("check_stored_now_ok", "priced dates stored as check and ok under decision 3", now_ok)  # fmt: skip
+
+    forward_dates = f" ({', '.join(gate_fail['check_forward'])})" if gate_fail["check_forward"] else ""  # fmt: skip
     add(
-        f"Status. The table was written at commit {commit}, before the owner's decision 3 of 2026-10-09 (the names' 2 % check is a reported diagnostic, not a gate): the status stored in its rows "
-        f"({count('ok_stored', 'dates with stored status ok (the rule before decision 3)', stored.get('ok', 0))} `ok`, {count('check_stored', 'dates with stored status check (the rule before decision 3)', stored.get('check', 0))} `check`) follows the earlier rule. "
-        "The status printed and counted in this part is recomputed with the current rule of `scripts/lcm_price.py` (`GATING_CHECKS`, `row_status`): a priced date is `check` when `check_no_nan`, `check_forward` or `check_index` fails and `ok` otherwise; a failed date stays failed. "
-        "The stored status is the column `status_stored` of the per-date CSV. "
-        f"The {int(statuses.get('check', 0))} `check` dates: {count('check_no_nan_only', 'priced dates failing check_no_nan and no other gate', len(nan_only))} fail `check_no_nan` only ({', '.join(nan_only) or 'none'}): "
+        (
+            f"Status. The table was written at commit {commit}, under the owner's decision 3 of 2026-10-09 (the names' 2 % check is a reported diagnostic, not a gate): the status stored in its rows {stored_counts} follows {rule}"
+            f"The status printed and counted in this part is the row's own: recomputed here from the three gates it is the same on every date (the column `status_stored` of the per-date CSV equals `status`; {now_ok_s()} of the dates stored as `check` are `ok` in the recomputation). "
+            if rows_own
+            else f"Status. The table was written at commit {commit}, before the owner's decision 3 of 2026-10-09 (the names' 2 % check is a reported diagnostic, not a gate): the status stored in its rows {stored_counts} follows the earlier rule. "
+            f"The status printed and counted in this part is recomputed with {rule}"
+            "The stored status is the column `status_stored` of the per-date CSV. "
+        )
+        + f"The {int(statuses.get('check', 0))} `check` dates: {count('check_no_nan_only', 'priced dates failing check_no_nan and no other gate', len(nan_only))} fail `check_no_nan` only ({', '.join(nan_only) or 'none'}): "
         f"the non-finite number of these rows is the diagnostic column {', '.join(f'`{c}`' for c in nan_cols) or 'none'}, which is not a price and is not used in this part; "
         f"{count('check_index_fail', 'priced dates failing the index gate check_index', len(gate_fail['check_index']))} fail the index gate `check_index` ({', '.join(gate_fail['check_index']) or 'none'}); "
-        f"`check_forward` fails on {count('check_forward_fail', 'priced dates failing check_forward', len(gate_fail['check_forward']))}. "
-        f"{count('check_stored_now_ok', 'priced dates stored as check and ok under decision 3', now_ok)} of the dates stored as `check` are `ok` under the current rule. "
-        f"Separately, the names' diagnostic (Σw E_LC[R_i²] within 2 % of the listed strips, `check_names`) is outside 2 % on {count('names_outside_2pct', 'priced dates with the names diagnostic outside 2 %', int(names_out.sum()))} priced dates "
+        f"`check_forward` fails on {count('check_forward_fail', 'priced dates failing check_forward', len(gate_fail['check_forward']))}{forward_dates}. "
+        + (
+            ""
+            if rows_own
+            else f"{now_ok_s()} of the dates stored as `check` are `ok` under the current rule. "
+        )
+        + f"Separately, the names' diagnostic (Σw E_LC[R_i²] within 2 % of the listed strips, `check_names`) is outside 2 % on {count('names_outside_2pct', 'priced dates with the names diagnostic outside 2 %', int(names_out.sum()))} priced dates "
         "(column `names_within_2pct` of the per-date CSV; the gap is `names_gap`)." + today_status
     )
     add("")
@@ -1140,7 +1318,7 @@ def build_markdown(
     add(
         md_table(
             ["failed date", "what failed (step, leg)", "exception text (`reason` of the per-date CSV)"],
-            [[r["date"], failure_clause(r["date"], r["reason"]), r["reason"]] for _, r in failed.iterrows()],
+            [[r["date"], failure_clause(r["date"], r["reason"], logs), r["reason"]] for _, r in failed.iterrows()],
             "lll",
         )
         if len(failed)
@@ -1149,8 +1327,8 @@ def build_markdown(
     add("")
     add(
         "Failed dates: no number of the run; they stay in the per-date CSV with the exception text (`reason`). "
-        f"The step and the leg are read from the traceback of the run's log of the date (`outputs/dispersion_lc/logs/{RUN_LOGS.name}/<date>.log`) and the code path it names "
-        "(`scripts/lcm_price.py` → `volsto/studies/disp_lc.py::lc_spec_from_smiles`: each name's smile is screened, repaired and fitted in turn, then the index's is screened and fitted): all three dates stop while the model's inputs (the SVI surfaces) are built, before the local correlation is calibrated."
+        f"The step and the leg are read from the traceback of the run's log of the date (`outputs/dispersion_lc/logs/{logs.name}/<date>.log`) and the code path it names "
+        f"(`scripts/lcm_price.py` → `volsto/studies/disp_lc.py::lc_spec_from_smiles`: each name's smile is screened, repaired and fitted in turn, then the index's is screened{', repaired (decision 5)' if with_d5 else ''} and fitted): all three dates stop while the model's inputs (the SVI surfaces) are built, before the local correlation is calibrated."
     )
     add("")
     flagged = d[priced & truth(d["flag_unscreened"])]
@@ -1221,10 +1399,12 @@ def build_markdown(
     # the index second moment against the listed strip
     rows = []
     listed = d[idx15]
-    for _, r in listed.iterrows():
+    drop_def = f"`n_dropped_index` − `{DROPPED_CALENDAR}` of the row: the index slices dropped by the quote screen, without those dropped by the calendar repair of the DJX target (decision 5)" if with_d5 else "`n_dropped_index` of the row"  # fmt: skip
+    for at, r in listed.iterrows():
         rows.append([
             r["date"], rel_cell(r),
-            book.num(f"C.hist.n_dropped_index.{r['date']}", "index slices dropped by the screen on the date", r["n_dropped_index"], spec=".0f", date=r["date"], unit="slices", definition="`n_dropped_index` of the row", source=book.source, notes="a count of slices"),
+            book.num(f"C.hist.n_dropped_index.{r['date']}", "index slices dropped by the screen on the date", drops[at], spec=".0f", date=r["date"], unit="slices", definition=drop_def, source=book.source, notes="a count of slices"),
+            *([book.num(f"C.hist.{DROPPED_CALENDAR}.{r['date']}", "index slices dropped by the calendar repair of the DJX target (decision 5) on the date", r[DROPPED_CALENDAR], spec=".0f", date=r["date"], unit="slices", definition=f"`{DROPPED_CALENDAR}` of the row", source=book.source, notes="a count of slices")] if with_d5 else []),
             book.num(f"C.hist.rho_cc.{r['date']}", "constant correlation of the companion on the date", r["rho_cc"], spec=".3f", date=r["date"], definition="`rho_cc` of the row: the constant correlation fitted for the companion model", source=book.source, notes="a fitted parameter: no standard error in the row"),
             book.num(f"C.hist.rho_cop.{r['date']}", "the copula's correlation on the date", r["rho_cop"], spec=".3f", date=r["date"], study=True, definition="`rho_cop` of the row (the study's copula correlation of the entry)", source=book.source),
             *(book.num(f"C.hist.index_moment_dates.{r['date']}.{k}", f"{by_key[k].label} on a date with the index second moment more than 15 % from the listed strip", r[k], r[f"{k}_se"], date=r["date"], definition=by_key[k].definition, source="tables/C_history_by_date.csv") for k in ("lc_over_cc", "lc_over_copula", "cc_over_copula")),
@@ -1242,19 +1422,20 @@ def build_markdown(
         f"(|basket part / M_B^listed| > {INDEX_MOMENT_FLAG:g}; column `flag_index_moment` of the per-date CSV). On {count('index_moment_beyond_15pct', 'priced dates with |basket part / M_B^listed| > 0.15', int(idx15.sum()))} of them it is more than {pct(INDEX_MOMENT_LIST)} away:"
     )
     add("")
-    add(md_table(["date", "basket part / M_B^listed", "n_dropped_index", "rho_cc", "rho_cop", "LC/CC", "LC/copula", "CC/copula", "status"], rows, "lrrrrrrrl"))  # fmt: skip
+    drop_heads = [drop_col.strip("`"), *([DROPPED_CALENDAR] if with_d5 else [])]
+    add(md_table(["date", "basket part / M_B^listed", *drop_heads, "rho_cc", "rho_cop", "LC/CC", "LC/copula", "CC/copula", "status"], rows, "lr" + "r" * len(drop_heads) + "rrrrrl"))  # fmt: skip
     add("")
     if len(listed):
-        dropped_lo, dropped_hi = int(listed["n_dropped_index"].min()), int(
-            listed["n_dropped_index"].max()
-        )
+        dropped_lo, dropped_hi = int(drops[idx15].min()), int(drops[idx15].max())
+        also_d5 = f"; the calendar repair of the DJX target (decision 5) drops a slice on {int((listed[DROPPED_CALENDAR].astype(float) > 0).sum())} of them (`{DROPPED_CALENDAR}`)" if with_d5 else ""  # fmt: skip
+        by_screen = " by the quote screen" if with_d5 else ""
         add(
-            f"± is the Monte Carlo standard error of the date. On these {len(listed)} dates the quote screen dropped {dropped_lo} to {dropped_hi} of the index's own slices (`n_dropped_index`): LC and CC are fitted to an index variance that is not the listed strip's, "
+            f"± is the Monte Carlo standard error of the date. On these {len(listed)} dates the quote screen dropped {dropped_lo} to {dropped_hi} of the index's own slices ({drop_col}){also_d5}: LC and CC are fitted to an index variance that is not the listed strip's, "
             "so the comparison with the copula is not like for like on these dates (`rho_cc` against `rho_cop` above). "
             f"Of the extremes over all priced dates (C.2a), these dates supply {'; '.join(extremes_here) or 'none'}. "
             + (
                 f"On the other {len(other)} dates of the flag the basket part / M_B^listed runs from {100 * float(other['EV_basket_part_rel_MB'].min()):+.1f} % to {100 * float(other['EV_basket_part_rel_MB'].max()):+.1f} % "
-                f"and no index slice was dropped on {int((other['n_dropped_index'].astype(float) == 0).sum())} of them (per-date CSV). "
+                f"and no index slice was dropped{by_screen} on {int((drops[other.index] == 0).sum())} of them (per-date CSV). "
                 if len(other)
                 else ""
             )
@@ -1413,7 +1594,7 @@ def build_markdown(
         )
         add("")
         add(
-            "The dates of the extremes of the table above, with the status (recomputed under decision 3) and, where they apply: flagged (a name kept unscreened), "
+            f"The dates of the extremes of the table above, with the status ({status_note}) and, where they apply: flagged (a name kept unscreened), "
             f"the index second moment more than {pct(INDEX_MOMENT_FLAG)} from the listed strip (`flag_index_moment`, with basket part / M_B^listed), the names' second moment more than 2 % from the listed strips (with `names_gap`)."
         )
         add("")
@@ -1482,12 +1663,31 @@ def build_markdown(
     if len(today) == 1 and bool(today["priced"].iloc[0]):
         t = today.iloc[0]
         stored_s = f"stored in the table, before decision 3: `{t['status_stored']}`" + (f", {t['reason_stored']}" if t["reason_stored"] else "")  # fmt: skip
-        status_s = f"`{t['status']}`" + (f" ({t['reason']})" if t["reason"] else "") + f" under decision 3; {stored_s}"  # fmt: skip
-        runs = [("today_dev", f"development budget, decisions 1–2 on (`{rows_path.name}`, commit {commit}, status `{t['status']}`)", {k: (float(t[k]), float(t[f"{k}_se"])) for k in keys_b}, {"source": f"{book.source} (row of {TODAY})", "notes": f"status of the row: {status_s}"})]  # fmt: skip
+        status_s = f"`{t['status']}`" + (f" ({t['reason']})" if t["reason"] else "") + (" (the row's own status, stored under decision 3)" if rows_own else f" under decision 3; {stored_s}")  # fmt: skip
+        own_values = {k: (float(t[k]), float(t[f"{k}_se"])) for k in keys_b}
         old = production_old_defaults(float(t["P_D"]), float(t["P_D_se"]))
-        if old is not None:
-            runs.append(("today_production_old_defaults", f"production budget, old defaults: no repair, no fallback (`{PRODUCTION_OLD.name}`, commit {old['commit']}, status `{old['status']}`)", old["values"], {"budget": old["budget"], "commit": old["commit"], "source": f"outputs/dispersion_lc/{PRODUCTION_OLD.name}", "notes": "the stopped production pass at the old defaults (no calendar repair, no unscreened fallback)"}))  # fmt: skip
-        new = production_new_defaults(float(t["P_D"]), float(t["P_D_se"]))
+        old_run = None if old is None else ("today_production_old_defaults", f"production budget, old defaults: no repair, no fallback (`{PRODUCTION_OLD.name}`, commit {old['commit']}, status `{old['status']}`)", old["values"], {"budget": old["budget"], "commit": old["commit"], "source": f"outputs/dispersion_lc/{PRODUCTION_OLD.name}", "notes": "the stopped production pass at the old defaults (no calendar repair, no unscreened fallback)"})  # fmt: skip
+        # the frozen part's pass: its own row first, then the two production rows; another pass:
+        # the frozen part's development row, the old-defaults production row, then its own row
+        dev: dict[str, Any] | None = None
+        new: dict[str, Any] | None = None
+        if run is DEVELOPMENT:
+            runs = [("today_dev", f"development budget, decisions 1–2 on (`{rows_path.name}`, commit {commit}, status `{t['status']}`)", own_values, {"source": f"{book.source} (row of {TODAY})", "notes": f"status of the row: {status_s}"})]  # fmt: skip
+            if old_run is not None:
+                runs.append(old_run)
+            new = production_new_defaults(float(t["P_D"]), float(t["P_D_se"]))
+        else:
+            runs = []
+            dev = development_row(float(t["P_D"]), float(t["P_D_se"]))
+            if dev is not None:
+                dev_stored = f"stored in the table, before decision 3: `{dev['status_stored']}`" + (f", {dev['reason_stored']}" if dev["reason_stored"] else "")  # fmt: skip
+                runs.append(("today_dev", f"development budget, {DEVELOPMENT.decisions} (the frozen part's row; `{DEVELOPMENT.rows.name}`, commit {dev['commit']}, status `{dev['status']}`)", dev["values"], {"budget": dev["budget"], "commit": dev["commit"], "source": f"outputs/dispersion_lc/{DEVELOPMENT.rows.name} (row of {TODAY})", "notes": f"the row of the frozen part's development pass; status of the row: `{dev['status']}` under decision 3; {dev_stored}"}))  # fmt: skip
+            if old_run is not None:
+                runs.append(old_run)
+            in_a = same_as_section_a(t)
+            a_file = f"`{PRODUCTION_ROW.relative_to(pc.LC_OUT)}`"
+            a_note = "" if in_a is None else (f"; the same row as section A's row file {a_file} (E_LC[D], E_CC[D], their standard errors, the paired ratio and the commit are equal)" if in_a else f"; not the row of section A's row file {a_file}: a number or the commit differs")  # fmt: skip
+            runs.append(("today_production", f"{run.budget} budget, {run.decisions} (this table's row; `{rows_path.name}`, commit {commit}, status `{t['status']}`)", own_values, {"source": f"{book.source} (row of {TODAY})", "notes": f"today's row of this table; status of the row: {status_s}{a_note}"}))  # fmt: skip
         if new is not None:
             new_src = f"outputs/dispersion_lc/{PRODUCTION_ROW.relative_to(pc.LC_OUT)}"
             runs.append(("today_production", f"production budget, decisions 1–2 and 5 on (section A's row; `{PRODUCTION_ROW.relative_to(pc.LC_OUT)}`, commit {new['commit']}, status `{new['status']}`)", new["values"], {"budget": new["budget"], "commit": new["commit"], "source": new_src, "notes": f"today's production row at the new defaults (calendar repair, unscreened fallback, decision 5): section A's row; ratios to the copula with the copula's P_D and P_D_se of entries_3m.parquet (B1); status stored in the row: {new['status_stored']}"}))  # fmt: skip
@@ -1506,13 +1706,18 @@ def build_markdown(
             rows.append([f"minus the owner's arithmetic: {label.split(' (')[0]}", "", *cells])
         add(md_table([f"{TODAY}", "LC/CC", "LC/copula", "CC/copula"], rows))
         add("")
-        today_sentence = f"on {TODAY} at the development budget (decisions 1–2 on) LC/copula = {rows[0][2]} and CC/copula = {rows[0][3]}"
+        tags = [tag for tag, *_ in runs]
+        at = tags.index("today_production") if "today_production" in tags else 0
+        if run is DEVELOPMENT:
+            today_sentence = f"on {TODAY} at the development budget (decisions 1–2 on) LC/copula = {rows[0][2]} and CC/copula = {rows[0][3]}"
+        else:
+            today_sentence = f"on {TODAY} at the {run.budget} budget ({run.decisions}; this table's row) LC/copula = {rows[at][2]} and CC/copula = {rows[at][3]}"
+            if dev is not None:
+                today_sentence += f"; the development row of the frozen part ({DEVELOPMENT.decisions}) gives {rows[0][2]} and {rows[0][3]}"
         if old is not None:
-            today_sentence += (
-                f"; the production row at the old defaults gives {rows[1][2]} and {rows[1][3]}"
-            )
+            at_old = tags.index("today_production_old_defaults")
+            today_sentence += f"; the production row at the old defaults gives {rows[at_old][2]} and {rows[at_old][3]}"
         if new is not None:
-            at = [tag for tag, *_ in runs].index("today_production")
             today_sentence += f"; the production row at the new defaults (decisions 1–2 and 5 on, section A's row) gives {rows[at][2]} and {rows[at][3]}"
         today_sentence += f"; the owner's arithmetic is {OWNER_B['lc_over_copula']:.4f} and {OWNER_B['cc_over_copula']:.4f}"
         # which of today's rows gives the owner's two numbers at the 4 decimals they are written to
@@ -1524,19 +1729,29 @@ def build_markdown(
         )
         if new is not None:
             owner_s += f" The row to quote for {TODAY} is section A's row: the production budget with decisions 1–2 and 5 on (LC/copula {rows[at][2]}, CC/copula {rows[at][3]}); the two other rows are shown for the comparison only."
+        if run is not DEVELOPMENT:
+            is_a = {True: f", which is section A's row ({a_file}: the same E_LC[D], E_CC[D], standard errors, paired ratio and commit)", False: f", which is not the row of section A's row file {a_file} (a number or the commit differs)", None: ""}[in_a]  # fmt: skip
+            others = f"; the {len(runs) - 1} other rows are shown for the comparison only" if len(runs) > 1 else ""  # fmt: skip
+            owner_s += f" The row to quote for {TODAY} is this table's row{is_a}: the {run.budget} budget with {run.decisions} (LC/copula {rows[at][2]}, CC/copula {rows[at][3]}){others}."
         s_today = (
             ""
             if bool(t["model_s_converged"])
             else f" Model S did not converge on {TODAY}: no S/copula for today."
         )
+        beside = ""
+        if dev is not None:
+            beside += f" The development row is the frozen part's row of {TODAY} ({dev['budget']}; commit {dev['commit']}, {DEVELOPMENT.decisions}), read from `{DEVELOPMENT.rows.name}`: status `{dev['status']}` under decision 3, {dev_stored}."
+        if run is not DEVELOPMENT and old is not None:
+            beside += " The production row at the old defaults is the stopped pass without repair or fallback."
         add(
-            f"± is the Monte Carlo standard error of the date (delta method with the copula's `P_D_se` for the ratios to the copula). Today's row of this section's table is at the development budget ({pc.BUDGETS['development']}), "
+            f"± is the Monte Carlo standard error of the date (delta method with the copula's `P_D_se` for the ratios to the copula). Today's row of this section's table is at the {run.budget} budget ({pc.BUDGETS[run.budget]}), "
             f"status {status_s}; the owner's arithmetic is given to 4 decimals."
             + (
                 f" The production row at the new defaults is section A's row of {TODAY} ({new['budget']}; commit {new['commit']}), read from its row file; the production row at the old defaults is the stopped pass without repair or fallback."
                 if new is not None
                 else ""
             )
+            + beside
             + owner_s
             + s_today
         )
@@ -1640,8 +1855,8 @@ def build_markdown(
     add("")
     by_drop = (
         ("S", "all dates of the intersection"),
-        ("S_dropidx_lt4", "without the dates with `n_dropped_index` ≥ 4"),
-        ("S_dropidx_0", "dates with no dropped index slice (`n_dropped_index` = 0)"),
+        ("S_dropidx_lt4", f"without the dates with {drop_col} ≥ 4"),
+        ("S_dropidx_0", f"dates with no dropped index slice ({drop_col} = 0)"),
     )
     rows = []
     rel_label = FITS[0][1]
@@ -1658,8 +1873,13 @@ def build_markdown(
     )  # fmt: skip
     add("")
     add(
-        f"The same OLS as the first fit of C.7a on three samples: the {fits[('S', 'rel')]['n']} dates of the intersection; those with fewer than 4 index slices dropped by the quote screen (`n_dropped_index` < 4); those with none. "
-        f"Newey-West: Bartlett kernel, {NW_LAGS} lags counted in consecutive dates of the sample, with the factor n/(n − k) of HC1 (with no lag it is HC1). The classical and HC1 columns of the first sample are those of C.7a."
+        f"The same OLS as the first fit of C.7a on three samples: the {fits[('S', 'rel')]['n']} dates of the intersection; those with fewer than 4 index slices dropped by the quote screen ({drop_col} < 4); those with none. "
+        + (
+            f"On this pass `n_dropped_index` of the rows also counts the slices dropped by the calendar repair of the DJX target (decision 5); {drop_col} leaves them out, so the three samples are defined as in the frozen part. "
+            if with_d5
+            else ""
+        )
+        + f"Newey-West: Bartlett kernel, {NW_LAGS} lags counted in consecutive dates of the sample, with the factor n/(n − k) of HC1 (with no lag it is HC1). The classical and HC1 columns of the first sample are those of C.7a."
     )
     add("")
     # the two legs of the regressand on the clipped mass alone, on the same dates
@@ -1759,12 +1979,12 @@ def build_markdown(
     )
     add("")
     add(
-        f"The clipped-mass coefficient is stable across the three samples of C.7c: {main['coef'][1]:+.4f} on the {main['n']} dates, {lt4['coef'][1]:+.4f} without the dates with `n_dropped_index` ≥ 4 (n = {lt4['n']}) and {none['coef'][1]:+.4f} on the dates with no dropped index slice (n = {none['n']}); "
+        f"The clipped-mass coefficient is stable across the three samples of C.7c: {main['coef'][1]:+.4f} on the {main['n']} dates, {lt4['coef'][1]:+.4f} without the dates with {drop_col} ≥ 4 (n = {lt4['n']}) and {none['coef'][1]:+.4f} on the dates with no dropped index slice (n = {none['n']}); "
         f"HC1 t {main['t_hc1'][1]:+.2f}, {lt4['t_hc1'][1]:+.2f} and {none['t_hc1'][1]:+.2f}. "
         f"The basket-part coefficient is not: on the {main['n']} dates it is {term_s(main, 2, nw=True)}, not distinguishable from zero under HC1 or Newey-West; "
-        f"without the dates with `n_dropped_index` ≥ 4 it is {term_s(lt4, 2, nw=True)}, R² {lt4['r2']:.4f}, {lt4['coef'][2] / main['coef'][2]:.1f} times the full-sample coefficient; "
+        f"without the dates with {drop_col} ≥ 4 it is {term_s(lt4, 2, nw=True)}, R² {lt4['r2']:.4f}, {lt4['coef'][2] / main['coef'][2]:.1f} times the full-sample coefficient; "
         f"on the dates with no dropped index slice it is {term_s(none, 2, nw=True)}, R² {none['r2']:.4f}, {none['coef'][2] / main['coef'][2]:.1f} times. "
-        f"The first two samples differ by the {main['n'] - lt4['n']} dates with `n_dropped_index` ≥ 4, which include {int((masks['S'] & ~masks['S_dropidx_lt4'] & idx15).sum())} of the {int(idx15.sum())} dates of C.0 where the model's index second moment is more than {pct(INDEX_MOMENT_LIST)} from the listed strip. "
+        f"The first two samples differ by the {main['n'] - lt4['n']} dates with {drop_col} ≥ 4, which include {int((masks['S'] & ~masks['S_dropidx_lt4'] & idx15).sum())} of the {int(idx15.sum())} dates of C.0 where the model's index second moment is more than {pct(INDEX_MOMENT_LIST)} from the listed strip. "
         f"The residuals are serially correlated: lag-1 autocorrelation {main['resid_ac1']:+.2f} on the {main['n']} dates ({lt4['resid_ac1']:+.2f} and {none['resid_ac1']:+.2f} on the two other samples); the classical and HC1 errors do not allow for it; the Newey-West ones do up to {NW_LAGS} rows of the sample, a lower value (C.1)."
     )
     add("")
@@ -1776,7 +1996,7 @@ def build_markdown(
         "- `figures/F1_forward_over_copula.pdf` (data: `figures/F1_forward_over_copula.csv`): by entry date, LC/copula, S/copula (converged dates) and the listed-variance forward over the copula √(EQV/EV); priced dates only. "
         f"The three lines are broken (a gap) at the {int((~priced).sum())} failed dates and at the {len(absent)} monthly dates of the study that have no row in the LC table (C, Dates): no line joins across a failed or an absent month; a date with a gap on both sides is drawn as a dot. "
         f"On these {len(no_line)} dates {f1_empty} "
-        f"The CSV has one line per date of the table (as `tables/C_history_by_date.csv`) plus one empty line per absent monthly date (`in_lc_table` False). The last LC point is the development-budget row of {TODAY}"
+        f"The CSV has one line per date of the table (as `tables/C_history_by_date.csv`) plus one empty line per absent monthly date (`in_lc_table` False). The last LC point is the {run.budget}-budget row of {TODAY}"
         + (
             f"; the study's last monthly date before it is {before_today[-1]}, which has no row in the table, so that point stands alone and is drawn as a dot. "
             if before_today and before_today[-1] in absent
@@ -1794,7 +2014,7 @@ def build_markdown(
 
 
 # ----------------------------------------------------------------------------- figures
-def figure_f1(d: pd.DataFrame) -> None:
+def figure_f1(d: pd.DataFrame, base: Path = pc.PM) -> None:
     """LC, model S and the listed-variance forward over the copula's forward by entry date.  The
     study's monthly dates that have no row in the table are added as empty lines, so that a line
     is broken there as it is at a failed date; a date with a gap on both sides is drawn as a dot."""
@@ -1824,11 +2044,13 @@ def figure_f1(d: pd.DataFrame) -> None:
     ax.legend(frameon=False, fontsize=8, ncol=3, loc="upper left")
     ax.tick_params(labelsize=8)
     fig.tight_layout()
-    pc.save_figure(fig, "F1_forward_over_copula", frame)
+    pc.save_figure(fig, "F1_forward_over_copula", frame, base)
     plt.close(fig)
 
 
-def figure_f2(table: dict[tuple[str, str], dict[str, dict[str, float]]]) -> None:
+def figure_f2(
+    table: dict[tuple[str, str], dict[str, dict[str, float]]], base: Path = pc.PM
+) -> None:
     rows = []
     for model, stem in (
         ("LC", "C_lc_over_copula"),
@@ -1859,7 +2081,7 @@ def figure_f2(table: dict[tuple[str, str], dict[str, dict[str, float]]]) -> None
     ax.legend(frameon=False, fontsize=8, loc="lower left")
     ax.tick_params(labelsize=8)
     fig.tight_layout()
-    pc.save_figure(fig, "F2_calls_over_copula_by_strike", frame)
+    pc.save_figure(fig, "F2_calls_over_copula_by_strike", frame, base)
     plt.close(fig)
 
 
@@ -1867,10 +2089,28 @@ def figure_f2(table: dict[tuple[str, str], dict[str, dict[str, float]]]) -> None
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument(
+        "--budget",
+        choices=tuple(PASSES),
+        default=DEVELOPMENT.budget,
+        help="the pass behind the table: the budget its priced rows must have and the labels of the part (default: development, the frozen part's)",
+    )
+    parser.add_argument(
         "--rows",
         type=Path,
-        default=ROWS,
-        help="the 3m development table (default: lcm_3m_dev_repair.parquet)",
+        default=None,
+        help="the 3m table (default: the pass's, lcm_3m_dev_repair.parquet for the development budget and lcm_3m.parquet for the production one)",
+    )
+    parser.add_argument(
+        "--logs",
+        type=Path,
+        default=None,
+        help="the folder of the logs of the run behind the table, one per date (default: the pass's)",
+    )
+    parser.add_argument(
+        "--base",
+        type=Path,
+        default=pc.PM,
+        help="the folder written to: parts/, tables/ and figures/ under it (default: the package, which refuses its frozen files)",
     )
     parser.add_argument(
         "--no-status",
@@ -1879,12 +2119,20 @@ def main() -> None:
     )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
-    frame = load(args.rows)
+    run = PASSES[args.budget]
+    rows_path = run.rows if args.rows is None else args.rows
+    logs = run.logs if args.logs is None else args.logs
+    base = args.base.resolve()
+    frame = load(rows_path)
     priced = frame["priced"]
     budget = frame.loc[priced, ["n_particles", "n_paths", "companion_paths"]].drop_duplicates()
-    if budget.to_numpy().tolist() != [[2e5, 2e5, 1e5]]:
+    if budget.to_numpy().tolist() != [list(run.sizes)]:
         raise ValueError(
-            f"the priced rows are not all at the development budget: {budget.to_dict('records')}"
+            f"the priced rows are not all at the {run.budget} budget: {budget.to_dict('records')}"
+        )
+    if run is not DEVELOPMENT and DROPPED_CALENDAR not in frame.columns:
+        raise ValueError(
+            f"{rows_path.name} has no column {DROPPED_CALENDAR}: not a pass with decision 5 in its code"
         )
     commits = sorted(frame.loc[priced, "git_commit"].dropna().unique())
     commit = ", ".join(commits)
@@ -1893,30 +2141,37 @@ def main() -> None:
     qs = quantities()
     table, summary = all_summaries(d, masks, qs)
     fits, regression = regressions(d, masks)
-    agreement = compare_check_d(fits, args.rows.name)
+    agreement = compare_check_d(fits, rows_path.name)
     LOG.info("%s", agreement[0])
 
     first = ["date", "status", "status_stored", "reason", "reason_stored", "T", "half", "clip_tercile"]  # fmt: skip
     out = d[[*first, *(c for c in d.columns if c not in first and c != "priced")]]
-    pc.save_table(out, "C_history_by_date")
-    pc.save_table(summary, "C_history_summaries")
-    pc.save_table(sample_table, "C_history_samples")
-    pc.save_table(regression, "C_history_regression")
-    figure_f1(d)
-    figure_f2(table)
-    book = Book(commit, f"outputs/dispersion_lc/{args.rows.name}")
-    markdown = build_markdown(d, masks, sample_table, qs, table, fits, agreement, book, args.rows)
-    pc.write_part(PART, list(book.records.values()), markdown)
+    pc.save_table(out, "C_history_by_date", base)
+    pc.save_table(summary, "C_history_summaries", base)
+    pc.save_table(sample_table, "C_history_samples", base)
+    pc.save_table(regression, "C_history_regression", base)
+    figure_f1(d, base)
+    figure_f2(table, base)
+    book = Book(commit, f"outputs/dispersion_lc/{rows_path.name}", run.budget)
+    markdown = build_markdown(
+        d, masks, sample_table, qs, table, fits, agreement, book, rows_path, run, logs
+    )
+    pc.write_part(PART, list(book.records.values()), markdown, base)
     n_priced, n_failed = int(priced.sum()), int((~priced).sum())
     line = (
         f"C_history: parts/{PART}.md/.json ({len(book.records)} records), tables/C_history_by_date.csv, C_history_summaries.csv, C_history_samples.csv, "
-        f"C_history_regression.csv, figures F1_forward_over_copula and F2_calls_over_copula_by_strike (pdf + csv) from {args.rows.name} "
-        f"({n_priced} priced, {n_failed} failed, commit {commit}, development budget)"
+        f"C_history_regression.csv, figures F1_forward_over_copula and F2_calls_over_copula_by_strike (pdf + csv) from {rows_path.name} "
+        f"({n_priced} priced, {n_failed} failed, commit {commit}, {run.budget} budget)"
     )
-    if not args.no_status:
+    # another folder than the package is not the package's part: no line in its STATUS.md
+    if not args.no_status and base == pc.PM.resolve():
         pc.status(line)
     LOG.info(
-        "section C written: %d dates, %d priced, %d records", len(d), n_priced, len(book.records)
+        "section C written under %s: %d dates, %d priced, %d records",
+        base,
+        len(d),
+        n_priced,
+        len(book.records),
     )
 
 

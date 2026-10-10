@@ -2,6 +2,7 @@
 redone at the local-correlation (LC) price.
 
     python scripts/pm_study_arithmetic.py [--lc-table lcm_3m_dev_repair.parquet] [--base DIR]
+        [--expect-budget development|production] [--heading TEXT] [--rows-dir DIR] [--no-status]
 
 Three results of the study's report are recomputed with the LC price in place of the copula's, by
 the method the study used for its skew-consistent model ("model S"):
@@ -41,6 +42,16 @@ mean LC price over the mean copula price on the samples of the split (the form i
 model part holds on the sub-samples: against the copula's, not as a level); the caveat of the
 package's section V3 on the LC calls at 1.25 and 1.5 times the copula's forward price, with the
 shares read from ``parts/V_validation.json``; the labels of every interval and standard error.
+
+Added after the freeze of 2026-10-09 (options and labels; no statistic changed: on the default
+table the part and its tables are byte for byte the frozen ones): ``--expect-budget`` (the budget
+the LC table must be at; the labels, the commit and the source of every LC record follow the table
+read), ``--heading`` (a first line of the Markdown, which must name the table's budget and
+commit), ``--rows-dir`` (the pass's row files, against which the non-finite columns behind a
+failed ``check_no_nan`` are checked), ``--no-status`` (never a line in ``STATUS.md``).  On a table
+whose stored status is already the current rule's the status paragraph says so; a column that the
+table fills on a row where the key is absent is not counted as read by ``check_no_nan``; the
+dates that FAIL ``check_forward`` are named.
 
 Writes ``parts/C_arith.json`` and ``.md`` and ``tables/C_arith_*.csv`` of the package.  Reads the
 study's tables only (nothing is written outside the package).
@@ -99,6 +110,14 @@ IDX_TARGET = "index smile error against its target (the model's own SVI fit of t
 #: The strikes of the study's T5_model_S on which section V3 of the package (another builder's
 #: part) measured the share of the LC call carried by runaway paths.
 RUNAWAY_STRIKES = ("125", "150")
+#: The budgets of an LC pass, (particles, paths, paths of the constant-correlation fit): the key
+#: of ``pm_common.BUDGETS`` and the name of the pass in the labels.
+BUDGET_OF = {(2e5, 2e5, 1e5): "development", (8e5, 8e5, 4e5): "production"}
+PASS_LABEL = {"development": "LC variant development pass", "production": "LC production pass"}
+#: Floats of a row that ``check_no_nan`` of ``lcm_price`` does not read: by prefix, and the columns
+#: written after the check (the derived columns and ``seconds_total``).
+NO_NAN_SKIP = ("align_", "C_200", "Cfwd", "profile_")
+NO_NAN_AFTER = ("seconds_total", *lp.DERIVED_COLUMNS)
 N_RESAMPLES = 2000
 SEED_RATIO = 11  # disp_stats.bootstrap_ratio
 SEED_SPLIT = 5  # disp_report.py, kq_ci (the interval of D4)
@@ -214,8 +233,11 @@ def study_trades() -> pd.DataFrame:
     return d
 
 
-def samples(lc_table: Path) -> dict[str, Any]:
-    """The samples of the part and how they are counted."""
+def samples(lc_table: Path, expect_budget: str = "development", rows_dir: Path | None = None) -> dict[str, Any]:  # fmt: skip
+    """The samples of the part and how they are counted.  ``expect_budget``: the budget every LC
+    row of the intersection must be at (a key of ``BUDGET_OF``'s values); ``rows_dir``: the row
+    files of the pass (``<date>.json``), when given the non-finite floats of each row that fails
+    ``check_no_nan`` are read there and must be the ones found in the table."""
     d = study_trades()
     ms = pd.read_parquet(pc.STUDY / f"model_s_{TENOR}.parquet")
     lc = pd.read_parquet(lc_table)
@@ -230,7 +252,8 @@ def samples(lc_table: Path) -> dict[str, Any]:
     monthly = monthly[monthly["has_outcome"]].reset_index(drop=True)
     lc_cols = ["date", "status", "reason", "n_names_unscreened", "names_unscreened", "git_commit", "n_particles", "n_paths", "companion_paths",
                "P_D_copula", "EV_copula", "EQV", "K_100", *need, *lp.GATING_CHECKS, "check_names", "wing_binds", "idx_err_atm", "idx_err_atm_se",
-               "idx_err_90", "idx_err_90_se", "sum_w_ER2_lc", "sum_w_ER2_lc_se", "sum_w_M", "E_Rbar2_lc", "E_Rbar2_lc_se", "M_B_listed"]  # fmt: skip
+               "idx_err_90", "idx_err_90_se", "sum_w_ER2_lc", "sum_w_ER2_lc_se", "sum_w_M", "E_Rbar2_lc", "E_Rbar2_lc_se", "M_B_listed",
+               "forward_error", "forward_error_se"]  # fmt: skip
     inter = monthly.merge(priced[lc_cols], on="date", how="inner", suffixes=("", "_lcrow"))
     inter = inter.sort_values("date").reset_index(drop=True)
     # the LC rows' copies of the study's columns are the study's
@@ -264,18 +287,32 @@ def samples(lc_table: Path) -> dict[str, Any]:
             raise ValueError(f"LC rows: {a} differs from {b} - {c} by up to {gap:.3g}")
     # the non-finite columns behind a failed check_no_nan: the float columns the check reads
     # (lcm_price: every float of the row but align_*, C_200*, Cfwd*, profile_*)
-    read = [c for c in lc.columns if lc[c].dtype.kind == "f" and not c.startswith(("align_", "C_200", "Cfwd", "profile_"))]  # fmt: skip
+    read = [c for c in lc.columns if lc[c].dtype.kind == "f" and not c.startswith(NO_NAN_SKIP)]
+    # a column that is not finite on a priced row that passes the check is a key absent from
+    # that row, which the table fills (the check fails on any non-finite float it reads): such a
+    # column is not counted as read (none on the variant development table)
+    passing = priced[priced["check_no_nan"].astype(bool)]
+    read = [c for c in read if np.isfinite(passing[c].astype(float)).all()]
     rows_nan = lc[lc["date"].isin(inter.loc[~inter["check_no_nan"].astype(bool), "date"])]
     no_nan_failed = [{"date": r["date"], "columns": [c for c in read if not np.isfinite(r[c])]} for r in rows_nan.sort_values("date").to_dict("records")]  # fmt: skip
+    if rows_dir is not None:
+        for r in no_nan_failed:
+            row = json.loads((rows_dir / f"{r['date']}.json").read_text())
+            in_row = sorted(k for k, v in row.items() if isinstance(v, float) and not np.isfinite(v) and not k.startswith(NO_NAN_SKIP) and k not in NO_NAN_AFTER)  # fmt: skip
+            if in_row != sorted(r["columns"]):
+                raise ValueError(f"{r['date']}: the non-finite floats of the row file ({in_row}) are not those found in the table ({sorted(r['columns'])})")  # fmt: skip
     only_gate = inter[list(lp.GATING_CHECKS)].astype(bool)
+    no_nan_only = ~only_gate["check_no_nan"] & only_gate["check_forward"] & only_gate["check_index"]
     SAMPLE_LABEL["intersection_index_ok"] = f"the intersection without the {int((~inter['index_gate_ok']).sum())} dates that fail the index gate"  # fmt: skip
     if TODAY in set(inter["date"]) or TODAY in set(monthly["date"]):
         raise ValueError(f"{TODAY} must not be in the sample (no outcome yet)")
     commits = sorted(set(inter["git_commit"].dropna().astype(str)))
     budget = inter[["n_particles", "n_paths", "companion_paths"]].drop_duplicates()
-    if len(budget) != 1 or tuple(budget.iloc[0]) != (2e5, 2e5, 1e5):
+    if expect_budget not in BUDGET_OF.values():
+        raise ValueError(f"unknown budget {expect_budget!r}: one of {sorted(BUDGET_OF.values())}")
+    if len(budget) != 1 or BUDGET_OF.get(tuple(budget.iloc[0])) != expect_budget:
         raise ValueError(
-            f"the LC rows are not all at the development budget: {budget.to_dict('records')}"
+            f"the LC rows are not all at the {expect_budget} budget: {budget.to_dict('records')}"
         )
     return {
         "weekly": weekly,
@@ -290,8 +327,10 @@ def samples(lc_table: Path) -> dict[str, Any]:
         "meta": {
             "date_intersection_unflagged": int((on_dates["n_names_unscreened"].fillna(0) == 0).sum()),
             "status_current_counts": inter["status_current"].value_counts().to_dict(),
-            "no_nan_failed": no_nan_failed, "no_nan_only": int((~only_gate["check_no_nan"] & only_gate["check_forward"] & only_gate["check_index"]).sum()),
+            "no_nan_failed": no_nan_failed, "no_nan_only": int(no_nan_only.sum()), "no_nan_only_dates": list(inter.loc[no_nan_only, "date"]),
             "forward_failed": int((~only_gate["check_forward"]).sum()),
+            "forward_failed_rows": inter.loc[~only_gate["check_forward"], ["date", "forward_error", "forward_error_se", "check_no_nan", "check_index", "flagged"]].to_dict("records"),
+            "budget": expect_budget, "stored_is_current": bool((inter["status"] == inter["status_current"]).all()),
             "index_failed": inter.loc[~inter["index_gate_ok"], ["date", "wing_binds", "idx_err_atm", "idx_err_atm_se", "idx_err_90", "idx_err_90_se", "check_no_nan", "check_forward", "flagged"]].to_dict("records"),
             "index_waived": {
                 "wing_binds": int(wing.sum()), "wing_binds_outside": int((wing & outside).sum()), "outside": int(outside.sum()), "within": int((~outside).sum()),
@@ -768,15 +807,17 @@ def build(S: dict[str, Any]) -> tuple[list[dict[str, Any]], str, dict[str, pd.Da
             notes = f"{notes}; {NOTE_LC_SAMPLE}" if notes else NOTE_LC_SAMPLE
         records.append(pc.record(
             f"C.arith.{id_}", SECTION, quantity, value, se, tenor=TENOR, unit=unit, definition=definition,
-            budget=pc.BUDGETS["development" if lc else "study"], commit=meta["commit"] if lc else "the study's tables (no commit column)",
+            budget=pc.BUDGETS[meta["budget"] if lc else "study"], commit=meta["commit"] if lc else "the study's tables (no commit column)",
             source=f"tables/{table}.csv <- {src_lc if lc or on_lc_sample else SRC_STUDY}", n=n, notes=notes,
         ))  # fmt: skip
 
     # -- samples
     waived = meta["index_waived"]
+    lc_pass = PASS_LABEL[meta["budget"]]
+    stored_rule = "the current rule: the stored status is the recomputed one on every trade" if meta["stored_is_current"] else "the rule before decision 3"  # fmt: skip
     counts = [
-        ("lc_rows", "LC variant development pass: entry dates", meta["lc_rows"]),
-        ("lc_priced", "LC variant development pass: priced dates", meta["lc_priced"]),
+        ("lc_rows", f"{lc_pass}: entry dates", meta["lc_rows"]),
+        ("lc_priced", f"{lc_pass}: priced dates", meta["lc_priced"]),
         ("model_s_converged", "model S: converged dates", meta["ms_converged"]),
         ("date_intersection", "priced LC dates that are converged model S dates", meta["date_intersection"]),
         ("trades.study_monthly", "trades of the study's monthly subset", len(S["study_monthly"])),
@@ -784,8 +825,8 @@ def build(S: dict[str, Any]) -> tuple[list[dict[str, Any]], str, dict[str, pd.Da
         ("trades.intersection_flagged", "of which flagged (a name kept unscreened)", int(S["intersection"]["flagged"].sum())),
         ("trades.intersection_unflagged", "trades of the intersection without the flagged dates", len(S["intersection_unflagged"])),
         ("date_intersection_unflagged", "priced LC dates that are converged model S dates, without the flagged dates", meta["date_intersection_unflagged"]),
-        ("trades.intersection.status_stored_ok", "trades of the intersection with stored status ok (the rule before decision 3)", meta["status_counts"].get("ok", 0)),
-        ("trades.intersection.status_stored_check", "trades of the intersection with stored status check (the rule before decision 3)", meta["status_counts"].get("check", 0)),
+        ("trades.intersection.status_stored_ok", f"trades of the intersection with stored status ok ({stored_rule})", meta["status_counts"].get("ok", 0)),
+        ("trades.intersection.status_stored_check", f"trades of the intersection with stored status check ({stored_rule})", meta["status_counts"].get("check", 0)),
         ("trades.intersection.status_current_ok", "trades of the intersection with status ok under the current rule (lcm_price.row_status)", meta["status_current_counts"].get("ok", 0)),
         ("trades.intersection.status_current_check", "trades of the intersection with status check under the current rule (lcm_price.row_status)", meta["status_current_counts"].get("check", 0)),
         ("trades.intersection.check_no_nan_failed", "trades of the intersection that fail check_no_nan", len(meta["no_nan_failed"])),
@@ -982,7 +1023,7 @@ def markdown(S: dict[str, Any], gap: pd.DataFrame, payout: pd.DataFrame, sp: pd.
     out: list[str] = [
         "### The gap, the payout per 1 of premium and the price-over-payoff split at the LC price (3m, the monthly subset)",
         "",
-        f"Source: `outputs/dispersion_lc/{meta['lc_table']}` (commit {meta['commit']}, {pc.BUDGETS['development']}), joined on the entry date with the study's `entries_3m.parquet` and `outcomes_3m.parquet` "
+        f"Source: `outputs/dispersion_lc/{meta['lc_table']}` (commit {meta['commit']}, {pc.BUDGETS[meta['budget']]}), joined on the entry date with the study's `entries_3m.parquet` and `outcomes_3m.parquet` "
         "(basket B1: one row per date, checked) and `model_s_3m.parquet`. Method, the study's for model S: P&L at the model's price = P&L at the copula's price + (copula price − model price), per trade, in % of notional.",
         "",
         "Files: `tables/C_arith_sample.csv`, `C_arith_reproduction.csv`, `C_arith_gap.csv`, `C_arith_payout.csv`, `C_arith_split.csv`, `C_arith_second_moments.csv` (long tables with every standard error, interval and Monte Carlo error), "
@@ -1010,7 +1051,33 @@ def markdown(S: dict[str, Any], gap: pd.DataFrame, payout: pd.DataFrame, sp: pd.
     failed = ", ".join(str(r["date"]) for r in meta["lc_failed"])
     cur = meta["status_current_counts"]
     stored_reasons = "; ".join(f"'{k}' on {v}" for k, v in meta["stored_reasons"].items())
-    nan_cols = ", ".join(f"`{c}`" for c in sorted({c for r in meta["no_nan_failed"] for c in r["columns"]}))  # fmt: skip
+    nan_set = sorted({c for r in meta["no_nan_failed"] for c in r["columns"]})
+    nan_cols = ", ".join(f"`{c}`" for c in nan_set)
+    # what the columns are, in words: written for the one column met so far
+    nan_what = "the only non-finite column the check reads on these rows is" if len(nan_set) == 1 else "the non-finite columns the check reads on these rows are"  # fmt: skip
+    nan_gloss = " (the standard error of the index smile error at +2.5 standard deviations, a diagnostic column)" if nan_set == ["idx_err_p25_se"] else ""  # fmt: skip
+    rule = (
+        "(`row_status`: `check` when one of `check_no_nan`, `check_forward`, `check_index` fails)"
+    )
+    if meta["stored_is_current"]:
+        stored_vs_current = (
+            f"The stored status is the current rule's: `scripts/lcm_price.py` {rule}; the names' 2 % check is a diagnostic, not a gate (the owner's decision 3 of 2026-10-09). "
+            f"Recomputed here from the rows' check columns it is the stored one on every trade: {', '.join(f'{k} {v}' for k, v in sorted(cur.items(), reverse=True))}."
+        )  # fmt: skip
+    else:
+        stored_vs_current = (
+            "The stored status was written under the rule before the owner's decision 3 of 2026-10-09 "
+            f"(the names' 2 % check is a diagnostic, not a gate). Under the current rule of `scripts/lcm_price.py` {rule}, "
+            f"recomputed here from the rows' check columns: {', '.join(f'{k} {v}' for k, v in sorted(cur.items(), reverse=True))}."
+        )  # fmt: skip
+    if meta["forward_failed"]:
+        fwd_rows = "; ".join(f"{r['date']} ({1e4 * r['forward_error']:+.2f} ± {1e4 * r['forward_error_se']:.2f} basis points of the forward, {abs(r['forward_error']) / r['forward_error_se']:.1f} standard errors)" for r in meta["forward_failed_rows"])  # fmt: skip
+        forward_text = (
+            f"{meta['forward_failed']} FAIL `check_forward` (the basket's forward under the LC Monte Carlo within three standard errors of its target), forward error, LC Monte Carlo minus target: {fwd_rows}; "
+            "these trades are in every summary of this part and no table of this part leaves them out."
+        )  # fmt: skip
+    else:
+        forward_text = f"`check_forward` fails on {meta['forward_failed']} trades."
     idx_failed = "; ".join(
         f"{r['date']} ({r['idx_err_90']:+.2f} ± {r['idx_err_90_se']:.2f} vol points at 90 % of the forward, {r['idx_err_atm']:+.2f} ± {r['idx_err_atm_se']:.2f} at the money)" for r in meta["index_failed"]
     )  # fmt: skip
@@ -1023,7 +1090,7 @@ def markdown(S: dict[str, Any], gap: pd.DataFrame, payout: pd.DataFrame, sp: pd.
         "",
         "| sample | entry dates | trades |",
         "|---|---|---|",
-        f"| LC variant development pass (`{meta['lc_table']}`, commit {meta['commit']}, {pc.BUDGETS['development']}): priced | {meta['lc_priced']} of {meta['lc_rows']} | |",
+        f"| {PASS_LABEL[meta['budget']]} (`{meta['lc_table']}`, commit {meta['commit']}, {pc.BUDGETS[meta['budget']]}): priced | {meta['lc_priced']} of {meta['lc_rows']} | |",
         f"| model S: converged | {meta['ms_converged']} of {meta['ms_rows']} | |",
         f"| priced LC dates that are converged model S dates | {meta['date_intersection']} | {n_i} |",
         f"| the same without the flagged dates (a name kept unscreened) | | {n_u} |",
@@ -1043,14 +1110,12 @@ def markdown(S: dict[str, Any], gap: pd.DataFrame, payout: pd.DataFrame, sp: pd.
         f"this part has {n_i} trades because the study drops that date (a stuck member); without the flagged dates the two counts are {meta['date_intersection_unflagged']} dates and {n_u} trades.",
         "",
         f"Status of the LC rows on the {n_i} trades. Stored in the table: {', '.join(f'{k} {v}' for k, v in sorted(meta['status_counts'].items()))} "
-        f"(stored reasons: {stored_reasons}). The stored status was written under the rule before the owner's decision 3 of 2026-10-09 "
-        "(the names' 2 % check is a diagnostic, not a gate). Under the current rule of `scripts/lcm_price.py` (`row_status`: `check` when one of `check_no_nan`, `check_forward`, `check_index` fails), "
-        f"recomputed here from the rows' check columns: {', '.join(f'{k} {v}' for k, v in sorted(cur.items(), reverse=True))}. Of the {cur.get('check', 0)} `check` trades: "
-        f"{meta['no_nan_only']} fail `check_no_nan` and no other gate ({', '.join(r['date'] for r in meta['no_nan_failed'])}); the only non-finite column the check reads on these rows is {nan_cols} "
-        "(the standard error of the index smile error at +2.5 standard deviations, a diagnostic column); no price column is among them, and every price used in this part is finite. "
+        f"(stored reasons: {stored_reasons}). {stored_vs_current} Of the {cur.get('check', 0)} `check` trades: "
+        f"{meta['no_nan_only']} fail `check_no_nan` and no other gate ({', '.join(meta['no_nan_only_dates'])}); {nan_what} {nan_cols}"
+        f"{nan_gloss}; no price column is among them, and every price used in this part is finite. "
         f"{n_fail} FAIL the index gate `check_index` ({IDX_TARGET} within {INDEX_TOL} vol points at the money and at 90 % of the forward; the gate is waived when the wing binds, `wing_binds`: clipped mass above 1 %), "
         f"index smile error, LC Monte Carlo minus target: {idx_failed}. "
-        f"`check_forward` fails on {meta['forward_failed']} trades. The dates that fail the index gate are in every summary of this part; tables C_arith_gap, C_arith_payout and C_arith_split each carry the rows "
+        f"{forward_text} The dates that fail the index gate are in every summary of this part; tables C_arith_gap, C_arith_payout and C_arith_split each carry the rows "
         f"\"{SAMPLE_LABEL['intersection_index_ok']}\" ({len(S['intersection_index_ok'])} trades). "
         f"What the gate does not test: it is waived on {wv['wing_binds']} of the {n_i} trades because the wing binds, and on {wv['wing_binds_outside']} of those {wv['wing_binds']} the index smile error at the money or at 90 % of the forward exceeds {INDEX_TOL} vol points "
         f"(error at 90 % of the forward: median {wv['median_90_waived_outside']:+.2f} vol points on these {wv['wing_binds_outside']} trades; over the {n_i} trades median {wv['median_90']:+.2f}, "
@@ -1412,10 +1477,19 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])
     ap.add_argument("--lc-table", default="lcm_3m_dev_repair.parquet", help="the LC table in outputs/dispersion_lc (default: the variant development pass)")  # fmt: skip
     ap.add_argument("--base", default=str(pc.PM), help="the folder written to (default: the package; any other folder is a dry run and appends no line to STATUS.md)")  # fmt: skip
+    ap.add_argument("--expect-budget", default="development", choices=sorted(BUDGET_OF.values()), help="the budget the LC rows must be at (default: development); the labels follow it")  # fmt: skip
+    ap.add_argument("--heading", default="", help="a first line of the Markdown (e.g. what was built after the freeze); it must name the budget and the commit of the table read")  # fmt: skip
+    ap.add_argument("--rows-dir", default=None, help="the row files of the pass (<date>.json): the non-finite columns behind a failed check_no_nan are checked against them")  # fmt: skip
+    ap.add_argument("--no-status", action="store_true", help="never append a line to STATUS.md")
     args = ap.parse_args()
     base = Path(args.base)
-    S = samples(pc.LC_OUT / args.lc_table)
+    S = samples(pc.LC_OUT / args.lc_table, args.expect_budget, Path(args.rows_dir) if args.rows_dir else None)  # fmt: skip
     records, md, tables = build(S)
+    if args.heading:
+        named = (S["meta"]["budget"], *S["meta"]["commit"].split(", "))
+        if not all(x in args.heading for x in named):
+            raise ValueError(f"the heading must name the budget and the commit of the table read: {named}")  # fmt: skip
+        md = f"**{args.heading}**\n\n{md}"
     tables["C_arith_trades"] = trades_table(S)
     for name, frame in tables.items():
         log.info("%s", pc.save_table(frame, name, base))
@@ -1426,8 +1500,8 @@ def main() -> None:
     meta = S["meta"]
     log.info("%s", md)
     log.info("records: %d; reproduction: %d of %d printed numbers matched", len(records), int(rep["match"].sum()), len(rep))  # fmt: skip
-    if base != pc.PM:
-        log.info("dry run in %s: no line in STATUS.md", base)
+    if args.no_status or base != pc.PM:
+        log.info("%s in %s: no line in STATUS.md", "--no-status" if base == pc.PM else "dry run", base)  # fmt: skip
         return
     if part.read_text() == before:
         log.info("the part is unchanged: no new line in STATUS.md")
